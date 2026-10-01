@@ -443,7 +443,7 @@ transitions linked back to message indices.
   viewer events, transcripts, and local-server orchestration.
 - `inference/agent/tool_agent.py`: OpenAI-compatible tool-calling duck.
 - `inference/agent/python_tool_sandbox.py`: isolated Python tool runtime.
-- `inference/agent/priority_scheduler.py`: priority scoring and continuation tables.
+- `inference/agent/scheduling/`: the two game-scheduling strategies - `priority.py` ((A + B) × C scoring and continuation tables) and `ucb.py` (Yield-UCB).
 - `inference/utils/segmentation.py`: connected-component board segmentation.
 - `inference/utils/frame_diff.py`: cell and component change descriptions.
 - `inference/utils/animation.py`: intermediate frames and compressed timelines.

@@ -362,6 +362,37 @@ These are final heuristic tail values, without an efficiency multiplier. This is
 
 Normalization multiplies A by `55 / (N(N+1)/2)`, using a ten-level game as the reference. B is not normalized. The lookup and normalization switches remain off by default; the notebook enables the submission settings explicitly.
 
+### Yield-UCB scheduler (alternative ranking)
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_SCHEDULER` | `priority` | `priority` ranks handovers by `(A + B) × C` above. `ucb` ranks them by Yield-UCB. Any other value is an error. |
+| `ARC3_UCB_DENOMINATOR` | `actions` | Exploration count: lifetime environment actions (`actions`) or lifetime generated tokens (`tokens`). |
+| `ARC3_UCB_C` | `0.0002` for actions, `0.005` for tokens | Nonnegative exploration coefficient, in yield × √count. An explicit value, including 0, overrides the denominator's default. |
+| `ARC3_UCB_RECENT_WEIGHT` | `0.5` | Weight in [0, 1] of the yield over the latest 32,000 generated tokens; the lifetime yield gets the rest. |
+
+Yield-UCB measures what a game has returned instead of estimating what it could still bank:
+
+```
+W     = L(L+1)/2                                   # L = levels completed
+yield = (1 − w) × W / lifetime_tokens + w × ΔW_last_32k / min(lifetime_tokens, 32000)
+value = yield + c × √(ln(1 + elapsed_minutes) / count)
+```
+
+`elapsed_minutes` is the gate's shared clock. Gains are recorded at the generated-token position of the step that completed the level. A count of zero ranks highest. The value is mapped monotonically into an integer below one priority band, so the cache bands, untrimmed-first admission and backend `priority` hint all behave as with `priority`. Waiting games are always re-scored at admission, because the bonus moves with the clock.
+
+Only the ranking changes. There are no time quanta: a game keeps its slot until context trimming invalidates its prefix, then hands over exactly as above. Endgame, pace and tail-fade settings apply only to `priority`.
+
+### Context trim log
+
+Every trim that reaches a handover logs one INFO line, in either scheduler mode and with or without a gate:
+
+```
+context trim g03:<game_id> level=3 actions=250 gen_tokens=120000 | token_budget msgs=40->22 est=30100->22000 budget=… target=… | scheduler=ucb rate=5.9e-05 bonus=2.2e-05 count=250 elapsed_min=20.0 rank=448871 | waiting=4 waited_ms=0
+```
+
+The second field lists every eviction since the previous request, in order: `token_budget` or `forced_drain` (token trimmer, with message counts and estimated input tokens), `force_reduce` (after a server rejection), `persist` (turn cap, control pruning or image removal when history is stored), `history_cleared`, and `summary_replaced`. `waiting` is how many games were queued when the slot was given up; `waited_ms` near 0 means the game won its slot straight back.
+
 ## 12. Yielding, reasoning, and provider compatibility
 
 ### Resumption behavior
@@ -476,7 +507,7 @@ All paths below are relative to `ARC3-Inference/`.
 | Segmentation and differences | `inference/utils/segmentation.py`, `inference/utils/frame_diff.py` — latter new |
 | Animations and images | `inference/utils/animation.py` — new; `inference/agent/vision_context.py` |
 | Function retention | `inference/utils/retained_functions.py` — new |
-| Priority gate, formulas, references | `inference/agent/priority_scheduler.py`, `inference/agent/priority_pace_reference.json` — new; integration in `tool_agent.py` and `solver.py` |
+| Priority gate, formulas, references | `inference/agent/scheduling/priority.py`, `inference/agent/scheduling/ucb.py`, `inference/agent/scheduling/priority_pace_reference.json` — new; integration in `tool_agent.py` and `solver.py` |
 | Provider transport | `inference/utils/openai_compat.py` |
 | Runner/build | `inference/framework/run.py`, `Makefile` |
 | Viewer | `viewer/data.py`, `viewer/index.html` |
