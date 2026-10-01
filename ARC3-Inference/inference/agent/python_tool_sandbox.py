@@ -282,7 +282,17 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return builtins.__import__(name, globals, locals, fromlist, level)
 
 
-    def _set_limits(timeout_seconds):
+    def _set_limits(timeout_seconds, memory_limit_bytes):
+        # Volunteer as the kernel OOM killer's first victim. The CPU limit and
+        # the host's wall-clock deadline bound time, not memory: a snippet that
+        # built list(itertools.permutations(...)) over 33 cells grew at about
+        # 1.6 GiB/s, exhausted host RAM inside its 30 s budget, and the OOM
+        # killer took the largest process - the model server - instead of it.
+        try:
+            with open("/proc/self/oom_score_adj", "w") as handle:
+                handle.write("1000")
+        except OSError:
+            pass
         if resource is None:
             return
         cpu_limit = max(1, int(timeout_seconds)) + 1
@@ -290,8 +300,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             (getattr(resource, "RLIMIT_CPU", None), cpu_limit),
             (getattr(resource, "RLIMIT_FSIZE", None), 1_000_000),
             (getattr(resource, "RLIMIT_NOFILE", None), 32),
+            # Address-space cap: allocation past it raises MemoryError inside
+            # the snippet instead of starving the host. Not enforced on macOS.
+            (getattr(resource, "RLIMIT_AS", None), memory_limit_bytes),
         ):
-            if limit is None:
+            if limit is None or value is None:
                 continue
             try:
                 resource.setrlimit(limit, (value, value))
@@ -348,7 +361,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         sandbox_cwd = str(initial.get("sandbox_cwd", "")).strip()
         if sandbox_cwd:
             os.chdir(sandbox_cwd)
-        _set_limits(timeout_seconds)
+        memory_limit_bytes = int(initial.get("memory_limit_bytes") or 0) or None
+        _set_limits(timeout_seconds, memory_limit_bytes)
+        # Headroom to report a MemoryError: freed before building the reply.
+        _memory_reserve = bytearray(8 * 1024 * 1024)
 
         action_results = []
         stdout = io.StringIO()
@@ -705,6 +721,34 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "action_results": _json_safe(action_results),
                 }
             )
+        except MemoryError:
+            # Free the reserve first so the reply can be built at all. Retained
+            # functions are small and kept if collecting them still fits; the
+            # snippet's data globals may hold what filled memory, so they go.
+            _memory_reserve = None
+            try:
+                retention = _collect_retention_payload()
+            except MemoryError:
+                retention = {}
+            runtime_globals.clear()
+            limit_text = (
+                f"{memory_limit_bytes / 2**30:g} GiB" if memory_limit_bytes else "the sandbox limit"
+            )
+            _send(
+                {
+                    "type": "error",
+                    **retention,
+                    "error": (
+                        f"MemoryError: the snippet exceeded the sandbox memory limit ({limit_text}) "
+                        "and was stopped; nothing after the failing line ran. Do not materialize "
+                        "huge collections such as list(itertools.permutations(...)) or an unbounded "
+                        "BFS frontier: iterate lazily with generators or itertools.islice, sample, "
+                        "prune, or bound the search depth."
+                    ),
+                    "stdout": stdout.getvalue()[-4000:],
+                    "action_results": _json_safe(action_results),
+                }
+            )
         except (
             KnownNoOpActionError,
             RepeatedActionInStateError,
@@ -762,6 +806,28 @@ def _sanitize_host_error_text(text: str) -> str:
     return "Sandbox process exited unexpectedly."
 
 
+_DEFAULT_MEMORY_LIMIT_MB = 2048
+
+
+def _sandbox_memory_limit_bytes() -> int:
+    """Per-snippet address-space cap; ``ARC3_PYTHON_MEMORY_LIMIT_MB=0`` disables it."""
+    try:
+        megabytes = int(os.environ.get("ARC3_PYTHON_MEMORY_LIMIT_MB", _DEFAULT_MEMORY_LIMIT_MB))
+    except ValueError:
+        megabytes = _DEFAULT_MEMORY_LIMIT_MB
+    return max(0, megabytes) * 2**20
+
+
+def _memory_kill_error(memory_limit_bytes: int) -> str:
+    limit = f" ({memory_limit_bytes / 2**30:g} GiB)" if memory_limit_bytes else ""
+    return (
+        f"MemoryError: the snippet ran out of sandbox memory{limit} and the sandbox was "
+        "stopped. Do not materialize huge collections such as list(itertools.permutations(...)) "
+        "or an unbounded BFS frontier: iterate lazily with generators or itertools.islice, "
+        "sample, prune, or bound the search depth."
+    )
+
+
 def _sandbox_env() -> dict[str, str]:
     return {
         "PYTHONUNBUFFERED": "1",
@@ -814,6 +880,7 @@ def run_sandboxed_python(
     retain_imports: bool = False,
     repair_hints: bool = False,
 ) -> dict[str, Any]:
+    memory_limit_bytes = _sandbox_memory_limit_bytes()
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
         try:
@@ -857,6 +924,7 @@ def run_sandboxed_python(
                 "repair_hints": repair_hints,
                 "animation_enabled": animation_handler is not None,
                 "timeout_seconds": timeout_seconds,
+                "memory_limit_bytes": memory_limit_bytes,
                 "sandbox_cwd": sandbox_dir,
                 "state": initial_state,
                 "color_chars": ARC_COLOR_CHARS,
@@ -882,6 +950,16 @@ def run_sandboxed_python(
             if line is None:
                 stderr = process.stderr.read()
                 _wait_for_process_exit(process)
+                # Out of memory before it could reply: a MemoryError it could
+                # not report, or the kernel OOM killer (oom_score_adj makes the
+                # sandbox its first choice) - SIGKILL we did not send.
+                if "MemoryError" in stderr or process.returncode == -signal.SIGKILL:
+                    _sanitize_host_error_text(stderr)
+                    return {
+                        "error": _memory_kill_error(memory_limit_bytes),
+                        "stdout": "",
+                        "action_results": list(host_action_results),
+                    }
                 return {
                     "error": _sanitize_host_error_text(stderr),
                     "stdout": "",

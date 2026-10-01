@@ -147,6 +147,14 @@ Known-no-op, known-death, repeated-state, and terminal-stop exceptions derive fr
 |---|---|---|
 | `ARC3_BOARD_DUMP_GUARD` | Off | Compresses long full-width ASCII board dumps in tool output and adds a reminder to print useful computed facts or small regions. Short crops remain available. |
 
+### Python sandbox memory guard
+
+The timeout bounds time, not memory: a snippet building `list(itertools.permutations(...))` grows at over 1 GiB/s and can exhaust host RAM well inside its 30 s budget, after which the kernel OOM killer takes the largest process, the model server. Each sandbox therefore caps its address space (`RLIMIT_AS`, enforced on Linux) and sets `oom_score_adj` to 1000 so that, if the host still runs out, the kernel kills the sandbox instead. Either way the model receives a `MemoryError` naming the limit and suggesting lazy iteration, sampling, pruning, or a bounded search; actions already taken stand, and retained functions are kept when they can still be collected.
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_PYTHON_MEMORY_LIMIT_MB` | `2048` | Per-snippet address-space cap in MiB; `0` disables it, leaving only the OOM-killer preference. |
+
 ## 6. More faithful Python state and action results
 
 These changes are unconditional unless a setting is shown.
