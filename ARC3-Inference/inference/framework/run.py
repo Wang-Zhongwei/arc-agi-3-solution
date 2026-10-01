@@ -28,7 +28,7 @@ import taaf.deploy_slurm
 import taaf.game
 import taaf.game_api
 
-from inference.framework.kaggle import DUCK_HARNESS_PUBLIC_GAME_IDS
+from inference.framework.kaggle import DUCK_HARNESS_PUBLIC_GAME_IDS, apply_harness_env
 from inference.framework.solver import HarnessSolver
 from inference.utils.run_artifacts import save_git_info, setup_experiment_directory
 
@@ -41,6 +41,10 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 load_dotenv(dotenv_path=_project_root / ".env.example")
 load_dotenv(dotenv_path=_project_root / ".env", override=True)
+# Config harness_env (ARC3_*) fills in whatever the shell and .env left unset.
+# Settings that tool_agent and solver read per call take effect; the few read
+# at import time come from the shell, as before.
+apply_harness_env()
 
 
 def _configure_logging() -> None:
