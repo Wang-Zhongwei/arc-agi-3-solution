@@ -198,6 +198,10 @@ _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0
 # the turn.
 _LOCAL_ANALYZER_YIELD_TOKENS = _get_env_int("LOCAL_ANALYZER_YIELD_TOKENS", 0)
 _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
+# Most thinking tokens a gameplay request may generate before the think block
+# is closed and the model must answer. Zero disables. See _thinking_budget_mode
+# for how it is enforced.
+_LOCAL_ANALYZER_THINKING_TOKEN_BUDGET = _get_env_int("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", 0)
 _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
 _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
 _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
@@ -1296,6 +1300,29 @@ def _resume_diff_image_enabled() -> bool:
 
     Costs roughly one image per resumption. Off by default."""
     return _get_env_bool("ARC3_RESUME_DIFF_IMAGE", False)
+
+
+def _thinking_budget_mode() -> str:
+    """How LOCAL_ANALYZER_THINKING_TOKEN_BUDGET is enforced: auto, server or continue.
+
+    `server` sends vLLM's `thinking_token_budget`, which closes the think block
+    inside the sampler. sglang has no equivalent request field: its
+    ThinkingBudgetLogitProcessor hardcodes Qwen3's <think> ids (Flash Next uses
+    248068/248069) and is skipped by EAGLE verification, so with speculative
+    decoding it never fires.
+
+    `continue` works on any sglang server: the request is capped at the budget,
+    and a reply cut off there is resumed with `</think>` appended to its
+    thinking via `continue_final_message`, so the model writes its answer next.
+    It relies on sglang's semantics (render with the generation prompt, then
+    append the assistant content verbatim); vLLM re-renders the final message
+    through the template, which inserts an empty think block, hence `server`
+    there.
+
+    `auto` (default) asks /models who serves: owned_by=vllm picks `server`,
+    anything else `continue`."""
+    mode = os.environ.get("ARC3_THINKING_BUDGET_MODE", "").strip().lower()
+    return mode if mode in ("server", "continue") else "auto"
 
 
 def _reasoning_effort_ladder() -> list[str]:
@@ -3435,6 +3462,26 @@ def _extract_reasoning_text(message: dict[str, Any]) -> str:
     return _normalize_message_content(reasoning)
 
 
+def _merge_budget_usage(
+    first: dict[str, Any] | None, resumed: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Usage of a budget-cut reply and its continuation, reported as one reply.
+
+    Generated tokens add up. The prompt is the first request's: it is what was
+    sent for this turn, and context calibration compares it with those messages
+    (the continuation repeats them, almost entirely from the prefix cache)."""
+    if not first or not resumed:
+        return first or resumed
+    merged = dict(first)
+    for key in ("completion_tokens", "reasoning_tokens"):
+        if first.get(key) is not None or resumed.get(key) is not None:
+            merged[key] = int(first.get(key) or 0) + int(resumed.get(key) or 0)
+    merged["total_tokens"] = int(merged.get("prompt_tokens") or 0) + int(
+        merged.get("completion_tokens") or 0
+    )
+    return merged
+
+
 def _is_context_length_error(exc: BaseException) -> bool:
     message = str(exc).lower().replace("\u2019", "'")
     return (
@@ -5224,6 +5271,98 @@ class ToolAgent:
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
     ) -> _ChatCompletionResult:
+        """One gameplay completion, with the thinking budget applied.
+
+        An explicit max_tokens marks a side request (the rolling summary), which
+        keeps its own limit and is not budgeted."""
+        budget = _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET
+        thinking = (
+            bool(_LOCAL_ANALYZER_ENABLE_THINKING) if enable_thinking is None else enable_thinking
+        )
+        request = dict(
+            tools=tools,
+            request_timeout_seconds=request_timeout_seconds,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+        )
+        output_cap = self._max_output_tokens
+        if (
+            budget <= 0
+            or not thinking
+            or max_tokens is not None
+            or (output_cap is not None and output_cap <= budget)
+        ):
+            return self._chat_completion_once(messages, **request)
+        if self._thinking_budget_enforcement() == "server":
+            return self._chat_completion_once(
+                messages, **request, extra_payload={"thinking_token_budget": budget}
+            )
+
+        first = self._chat_completion_once(messages, **{**request, "max_tokens": budget})
+        thinking_text = _extract_reasoning_text(first.message).strip()
+        if first.finish_reason != "length" or first.message.get("tool_calls") or not thinking_text:
+            return first
+        # Cut off at the budget. Close the think block and let the model answer:
+        # sglang renders the conversation with the generation prompt (which
+        # opens <think>) and appends this content verbatim. Any answer the first
+        # reply had started is dropped and written again after </think>.
+        # separate_reasoning=false keeps the answer out of reasoning_content -
+        # the qwen3 parser would otherwise wait for a </think> that is already
+        # in the prompt - while tool calls are still parsed.
+        resumed = self._chat_completion_once(
+            [*messages, {"role": "assistant", "content": f"{thinking_text}\n</think>\n\n"}],
+            **{
+                **request,
+                "max_tokens": None if output_cap is None else output_cap - budget,
+            },
+            extra_payload={"continue_final_message": True, "separate_reasoning": False},
+        )
+        message = dict(resumed.message)
+        message.pop("reasoning", None)
+        message["reasoning_content"] = thinking_text
+        return _ChatCompletionResult(
+            message=message,
+            finish_reason=resumed.finish_reason,
+            usage=_merge_budget_usage(first.usage, resumed.usage),
+            served_by=resumed.served_by or first.served_by,
+        )
+
+    def _thinking_budget_enforcement(self) -> str:
+        """`server` or `continue`, resolving `auto` once per agent from /models."""
+        mode = _thinking_budget_mode()
+        if mode != "auto":
+            return mode
+        resolved = getattr(self, "_thinking_budget_resolved", None)
+        if resolved is None:
+            resolved = "continue"
+            try:
+                response = requests.get(
+                    f"{self._model.base_url.rstrip('/')}/models",
+                    headers=self._headers(),
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, 30),
+                )
+                owners = {
+                    str(card.get("owned_by", "")).lower()
+                    for card in (response.json().get("data") or [])
+                }
+                if "vllm" in owners:
+                    resolved = "server"
+            except Exception as exc:  # detection must not fail the turn
+                log.warning("thinking budget: could not read /models (%s); using continue", exc)
+            log.info("thinking budget %d enforced by %s", _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET, resolved)
+            self._thinking_budget_resolved = resolved
+        return resolved
+
+    def _chat_completion_once(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        request_timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
+        enable_thinking: bool | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> _ChatCompletionResult:
         payload = build_chat_payload(
             provider=self._model.provider,
             model=self._model.model_id,
@@ -5244,6 +5383,7 @@ class ToolAgent:
         provider_prefs = _openrouter_provider_prefs(self._model.provider)
         if provider_prefs:
             payload["provider"] = provider_prefs
+        payload.update(extra_payload or {})
         # merge rather than assign: the payload builder may already have set
         # chat_template_kwargs (enable_thinking), and replacing the dict would
         # drop it - as a request-level dict can also drop a server-side default
