@@ -19,8 +19,12 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.noop_repeat_guard import NoopRepeatGuard, action_signature
-from inference.agent.priority_scheduler import (
+from inference.agent.scheduling.priority import (
     ProgressPace, PrioritySnapshot, parse_total_levels, priority_value,
+)
+from inference.agent.scheduling.ucb import (
+    YieldProgress, YieldSnapshot, resolve_ucb_c, ucb_rank, ucb_value,
+    weighted_levels,
 )
 from inference.utils.animation import (
     _transient_cells as _animation_transient_cells,
@@ -1974,9 +1978,41 @@ def _diag(agent: Any, where: str) -> None:
 
 
 def _priority_refresh_enabled() -> bool:
-    return any(_get_env_bool(name, False) for name in (
+    # Yield-UCB's bonus moves with the shared clock, so it always refreshes.
+    return _scheduler() == "ucb" or any(_get_env_bool(name, False) for name in (
         "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
     ))
+
+
+def _scheduler() -> str:
+    """Which ranking the gate uses at a trim handover: 'priority' or 'ucb'.
+
+    'priority' is the (A + B) * C estimate of what a game can still bank.
+    'ucb' is Yield-UCB: observed weighted levels per generated token plus an
+    exploration bonus. Either way games switch only at context trims, so the
+    choice changes who gets a freed slot, never when slots are freed.
+    """
+    value = os.environ.get("ARC3_SCHEDULER", "").strip().lower() or "priority"
+    if value not in ("priority", "ucb"):
+        raise ValueError("ARC3_SCHEDULER must be 'priority' or 'ucb'")
+    return value
+
+
+def _ucb_denominator() -> str:
+    return os.environ.get("ARC3_UCB_DENOMINATOR", "").strip().lower() or "actions"
+
+
+def _ucb_c() -> float:
+    raw = os.environ.get("ARC3_UCB_C", "").strip()
+    try:
+        explicit = float(raw) if raw else None
+    except ValueError:
+        raise ValueError("ARC3_UCB_C must be finite and nonnegative") from None
+    return resolve_ucb_c(_ucb_denominator(), explicit)
+
+
+def _ucb_recent_weight() -> float:
+    return min(1.0, max(0.0, _get_env_float("ARC3_UCB_RECENT_WEIGHT", 0.5)))
 
 
 def _priority_action_count(summary: dict[str, Any]) -> int:
@@ -1995,7 +2031,7 @@ def _load_pace_reference(path: str) -> dict[str, Any]:
 def _pace_reference_tokens(level: int) -> float:
     path = os.environ.get("ARC3_PRIORITY_PACE_REFERENCE", "").strip()
     if not path:
-        path = str(Path(__file__).with_name("priority_pace_reference.json"))
+        path = str(Path(__file__).parent / "scheduling" / "priority_pace_reference.json")
     reference = _load_pace_reference(path)
     return float(reference["by_level"].get(str(level), reference["fallback_tokens"]))
 
@@ -2042,7 +2078,12 @@ class _PriorityGate:
             if deadline is not None:
                 self._clock_deadline = min(self._clock_deadline, deadline) if self._clock_deadline is not None else deadline
 
-    def _snapshot_priority(self, snapshot: PrioritySnapshot, now: float) -> int:
+    def elapsed_minutes(self, now: float) -> float:
+        return max(0.0, now - self._clock_start) / 60.0 if self._clock_start is not None else 0.0
+
+    def _snapshot_priority(self, snapshot: PrioritySnapshot | YieldSnapshot, now: float) -> int:
+        if isinstance(snapshot, YieldSnapshot):
+            return ucb_rank(ucb_value(snapshot, self.elapsed_minutes(now)))
         elapsed = max(0.0, now - self._clock_start) if self._clock_start is not None else 0.0
         endgame = _endgame_start_minutes() > 0 and elapsed >= 60 * _endgame_start_minutes()
         tail_fraction = None
@@ -2092,19 +2133,28 @@ class _PriorityGate:
             self._free += 1
             self._pump()
 
-    def handover(self, priority: int, snapshot: PrioritySnapshot | None = None) -> None:  # noqa: D401
+    def handover(
+        self, priority: int, snapshot: PrioritySnapshot | YieldSnapshot | None = None,
+    ) -> tuple[int, int]:  # noqa: D401
         """Give up the slot and immediately compete for it again.
 
         The caller may win it straight back, which is the right outcome when
         nothing else is waiting or everything else is further along.
+        Returns (games waiting when the slot was given up, milliseconds spent
+        waiting to get it back) for the trim log.
         """
         _t0 = time.monotonic()
         with self._cond:
+            waiting = len(self._waiting)
             self._free += 1
             self._enqueue_and_wait(priority, snapshot)
-        _GATE_STATS["handover_ms"] += int(1000 * (time.monotonic() - _t0))
+        waited_ms = int(1000 * (time.monotonic() - _t0))
+        _GATE_STATS["handover_ms"] += waited_ms
+        return waiting, waited_ms
 
-    def _enqueue_and_wait(self, priority: int, snapshot: PrioritySnapshot | None = None) -> None:
+    def _enqueue_and_wait(
+        self, priority: int, snapshot: PrioritySnapshot | YieldSnapshot | None = None,
+    ) -> None:
         # TEMPORARY: with slots == games nobody should ever block here
         _GATE_STATS["enqueued"] += 1
         self._seq += 1
@@ -3565,6 +3615,8 @@ class ToolAgent:
         self._tokens_at_level_start = 0
         self._progress_pace = ProgressPace()
         self._pace_last_completed_level = 0
+        self._yield_progress = YieldProgress()
+        self._pending_trim_reasons: list[str] = []
         # queue position spreads the untrimmed band so games do not tie
         self._diag_name = f"g{int(dispatch_index):02d}"
         self._game_elapsed_seconds: float | None = None
@@ -3895,6 +3947,7 @@ class ToolAgent:
         summary = self._last_step_summary
         if not summary:
             return
+        self._observe_yield(summary)
         wipe_reason = ""
         revise_reason = ""
         if summary.get("level_transition"):
@@ -6316,7 +6369,7 @@ class ToolAgent:
             # this discards history without going through the trimmer, so the
             # prefix is invalid and the flag has to be set by hand - otherwise
             # the next request keeps a priority that assumes a warm cache
-            self._note_history_evicted()
+            self._note_history_evicted(f"summary_replaced msgs={replaced_count}")
         else:
             self._history_messages.append(request)
             self._history_messages.append(reply)
@@ -6444,11 +6497,16 @@ class ToolAgent:
             trimmed.pop(0)
         return trimmed
 
-    def _note_history_evicted(self) -> None:
+    def _note_history_evicted(self, reason: str = "unspecified") -> None:
         # The scheduler consumes the first flag at the next handover. The
         # second stays set so summaries remain visible after history is lost.
         self._context_was_trimmed = True
         self._has_evicted = True
+        # getattr: agents unpickled from before the trim log existed
+        reasons = getattr(self, "_pending_trim_reasons", None)
+        if reasons is None:
+            reasons = self._pending_trim_reasons = []
+        reasons.append(reason)
 
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         original_history = messages[1:]
@@ -6463,7 +6521,7 @@ class ToolAgent:
         trimmed = self._trim_messages_for_context(messages, tools=tools)
         if not trimmed:
             if original_history:
-                self._note_history_evicted()
+                self._note_history_evicted(f"history_cleared msgs={len(original_history)}")
             return []
         token_trim_dropped = len(trimmed) < before_trim
         trimmed_history = trimmed[1:]
@@ -6486,7 +6544,10 @@ class ToolAgent:
         # can change the cached prefix without the token trimmer dropping any
         # messages. Image removal can leave the message count unchanged.
         if history != original_history:
-            self._note_history_evicted()
+            self._note_history_evicted(
+                f"persist msgs={len(original_history)}->{len(history)}"
+                f" token_trim={int(token_trim_dropped)}"
+            )
         return history
 
     def _priority_total_levels(self) -> int:
@@ -6509,6 +6570,33 @@ class ToolAgent:
             log.warning("priority: total level count unavailable or invalid; using 10")
         return 10
 
+    def _levels_completed(self, summary: dict[str, Any]) -> int:
+        # summary["level"] is levels_completed + 1, held at the last level once won
+        level = int(summary.get("level") or 1)
+        return level if summary.get("run_complete") else max(0, level - 1)
+
+    def _observe_yield(self, summary: dict[str, Any]) -> None:
+        """Record weighted levels at the current lifetime token position."""
+        progress = getattr(self, "_yield_progress", None)
+        if progress is None:
+            progress = self._yield_progress = YieldProgress()
+        progress.observe(
+            self._session_generated_tokens,
+            weighted_levels(self._levels_completed(summary)),
+        )
+
+    def _yield_snapshot(self, summary: dict[str, Any]) -> YieldSnapshot:
+        self._observe_yield(summary)
+        tokens = int(self._session_generated_tokens)
+        count = (
+            tokens if _ucb_denominator() == "tokens"
+            else _priority_action_count(summary)
+        )
+        return YieldSnapshot(
+            rate=self._yield_progress.rate(tokens, _ucb_recent_weight()),
+            count=count, c=_ucb_c(),
+        )
+
     def _maybe_handover(self) -> None:
         """Re-price this game, and yield the slot if a gate is running.
 
@@ -6520,7 +6608,12 @@ class ToolAgent:
         if not self._context_was_trimmed:
             return
         self._context_was_trimmed = False
+        reasons = getattr(self, "_pending_trim_reasons", None) or []
+        self._pending_trim_reasons = []
         summary = self._last_step_summary or {}
+        if _scheduler() == "ucb":
+            self._handover_yield_ucb(summary, reasons)
+            return
         level = int(summary.get("level") or 1)
         actions = max(
             0, _priority_action_count(summary) - self._actions_at_level_start
@@ -6552,9 +6645,66 @@ class ToolAgent:
         # after it, with the prefix rebuilt, returns to the warm band
         self._priority_current = estimate
         self._priority_next = estimate + _PRIORITY_BAND
+        waiting, waited_ms = None, None
         if gate is not None:
             _diag(self, "gate")
-            gate.handover(estimate, snapshot)
+            waiting, waited_ms = gate.handover(estimate, snapshot)
+        self._log_context_trim(
+            reasons, summary, f"scheduler=priority priority={estimate}",
+            waiting, waited_ms,
+        )
+
+    def _handover_yield_ucb(self, summary: dict[str, Any], reasons: list[str]) -> None:
+        """Yield-UCB counterpart of the priority handover: same trigger and
+        bands, ranked by observed yield plus an exploration bonus."""
+        snapshot = self._yield_snapshot(summary)
+        gate = _priority_gate()
+        if gate is not None:
+            elapsed = gate.elapsed_minutes(time.monotonic())
+        else:
+            elapsed = (getattr(self, "_game_elapsed_seconds", None) or 0.0) / 60.0
+        value = ucb_value(snapshot, elapsed)
+        estimate = ucb_rank(value)
+        self._priority_current = estimate
+        self._priority_next = estimate + _PRIORITY_BAND
+        waiting, waited_ms = None, None
+        if gate is not None:
+            _diag(self, "gate")
+            waiting, waited_ms = gate.handover(estimate, snapshot)
+        self._log_context_trim(
+            reasons, summary,
+            f"scheduler=ucb rate={snapshot.rate:.3e} bonus={value - snapshot.rate:.3e}"
+            f" count={snapshot.count} elapsed_min={elapsed:.1f} rank={estimate}",
+            waiting, waited_ms,
+        )
+
+    def _log_context_trim(
+        self, reasons: list[str], summary: dict[str, Any], ranking: str,
+        waiting: int | None, waited_ms: int | None,
+    ) -> None:
+        """One line per trim that reached a handover: why the prefix broke,
+        how the game was ranked, and what the handover cost.
+
+        Several evictions can precede one request (token budget, turn cap,
+        control pruning); they are joined in order. waited_ms near zero means
+        the game won its slot straight back.
+        """
+        gate = (
+            f" | waiting={waiting} waited_ms={waited_ms}" if waiting is not None
+            else " | no gate"
+        )
+        name = getattr(self, "_diag_name", "?")
+        try:
+            session = getattr(getattr(self, "_step_env_callback", None), "__self__", None)
+            name = f"{name}:{session.game.game_run.game_id}"
+        except Exception:
+            pass
+        log.info(
+            "context trim %s level=%s actions=%s gen_tokens=%d | %s | %s%s",
+            name, summary.get("level") or 1,
+            _priority_action_count(summary), int(self._session_generated_tokens),
+            "; ".join(reasons) or "unspecified", ranking, gate,
+        )
 
     def _in_endgame(self) -> bool:
         """Whether this game has been running long enough to switch phase.
@@ -6647,8 +6797,11 @@ class ToolAgent:
                 and _head_is_summary()
             )
 
+        estimate_before: int | None = None
         while history:
             used = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+            if estimate_before is None:
+                estimate_before = used
             over_budget = used > budget_tokens
             if not over_budget and not draining:
                 break
@@ -6682,7 +6835,13 @@ class ToolAgent:
         # divergence point regardless. That makes it the one moment when
         # yielding the slot to another game costs nothing.
         if len(history) != len(messages) - 1:
-            self._note_history_evicted()
+            after = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+            self._note_history_evicted(
+                f"{'forced_drain' if force_drain else 'token_budget'}"
+                f" msgs={len(messages) - 1}->{len(history)}"
+                f" est={estimate_before or 0}->{after}"
+                f" budget={budget_tokens} target={target_tokens}"
+            )
         return [system_message, *history]
 
     def _force_reduce_messages(
@@ -6697,7 +6856,7 @@ class ToolAgent:
         history = list(messages[1:])
         if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
             return list(messages)
-        self._note_history_evicted()
+        self._note_history_evicted(f"force_reduce msgs={len(messages) - 1}->{len(history)}")
         return [system_message, *history]
 
     def analyze(

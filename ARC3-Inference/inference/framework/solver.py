@@ -47,6 +47,11 @@ from inference.agent.tool_agent import (
     _priority_gate,
 )
 from inference.framework.kaggle import (
+    kaggle_serving_config,
+    pennyroyal_dataset_sources,
+    pennyroyal_model_sources,
+    pennyroyal_setup_command,
+    pennyroyal_teardown_command,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -1471,22 +1476,43 @@ class HarnessSolver(Solver):
                 object.__setattr__(new, key, copy.deepcopy(value, memo))
         return new
 
+    # Read at deploy time from the launcher's config (kaggle section); the
+    # notebook never evaluates these.
+    def _kaggle_pennyroyal(self) -> bool:
+        return self.kaggle_enable_vllm and kaggle_serving_config()["serving"] == "pennyroyal"
+
     @property
     def kaggle_dataset_sources(self) -> list[str]:
         if not self.kaggle_enable_vllm:
             return []
+        if self._kaggle_pennyroyal():
+            return pennyroyal_dataset_sources()
         return duck_kaggle_dataset_sources(self._kaggle_vllm_config())
+
+    @property
+    def kaggle_model_sources(self) -> list[str]:
+        return pennyroyal_model_sources() if self._kaggle_pennyroyal() else []
+
+    @property
+    def kaggle_docker_image(self) -> str | None:
+        if not self.kaggle_enable_vllm:
+            return None
+        return kaggle_serving_config().get("docker_image") or None
 
     @property
     def kaggle_setup_commands(self) -> list[str]:
         if not self.kaggle_enable_vllm:
             return []
+        if self._kaggle_pennyroyal():
+            return [pennyroyal_setup_command()]
         return [duck_kaggle_setup_command(self._kaggle_vllm_config())]
 
     @property
     def kaggle_teardown_commands(self) -> list[str]:
         if not self.kaggle_enable_vllm:
             return []
+        if self._kaggle_pennyroyal():
+            return [pennyroyal_teardown_command()]
         return [duck_kaggle_teardown_command()]
 
     def _kaggle_vllm_config(self) -> DuckKaggleVllmConfig:

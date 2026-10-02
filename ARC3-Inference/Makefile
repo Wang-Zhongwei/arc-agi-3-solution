@@ -11,7 +11,10 @@ RUNS_DIR ?= $(REPO_ROOT)/runs
 RUNS_ZIP ?= $(REPO_ROOT)/runs.zip
 
 UV ?= uv
-UV_RUN ?= $(UV) run --no-sync
+LOCAL_TAAF_SRC ?= $(abspath $(REPO_ROOT)/../tufa-arc-agi-framework/src)
+# Explicit source paths: macOS can flag the venv's editable .pth files hidden,
+# and Python skips hidden .pth files, leaving `inference` unimportable.
+UV_RUN ?= PYTHONPATH="$(REPO_ROOT)$(if $(wildcard $(LOCAL_TAAF_SRC)/taaf),:$(LOCAL_TAAF_SRC)):$$PYTHONPATH" $(UV) run --no-sync
 PYTHON ?= python3
 CONFIG_PATH_ORIGIN := $(origin CONFIG_PATH)
 CONFIG_PATH ?= configs/inference.json
@@ -120,11 +123,17 @@ ifeq ($(origin DEPLOYMENT_SLURM_EXTRA_SBATCH_FLAGS),undefined)
 DEPLOYMENT_SLURM_EXTRA_SBATCH_FLAGS := $(shell $(CONFIG_VALUE) deployment.slurm.extra_sbatch_flags [])
 endif
 KAGGLE_DUCK_PUBLIC_HARNESS ?= false
-KAGGLE_MAKE_SHARE_VERSION ?= false
+# Config kaggle.* supplies these so `make kaggle-duck CONFIG_PATH=...` needs no
+# extra flags; command-line values still win.
+KAGGLE_MAKE_SHARE_VERSION ?= $(shell $(CONFIG_VALUE) kaggle.make_share_version false)
 KAGGLE_USERNAME ?=
-KAGGLE_KERNEL_SLUG ?= $(if $(strip $(RUN_NAME)),taaf-$(RUN_NAME)$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_MAKE_SHARE_VERSION)),-share),)
-KAGGLE_KERNEL_TITLE ?=
-KAGGLE_DATASET_REF ?=
+KAGGLE_CONFIG_KERNEL_SLUG := $(shell $(CONFIG_VALUE) kaggle.kernel_slug)
+KAGGLE_KERNEL_SLUG ?= $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),$(if $(strip $(RUN_NAME)),taaf-$(RUN_NAME)$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_MAKE_SHARE_VERSION)),-share),))
+KAGGLE_KERNEL_TITLE ?= $(shell $(CONFIG_VALUE) kaggle.kernel_title)
+# kaggle.dataset_slug is owned by whichever account deploys (kaggle-as sets
+# KAGGLE_USERNAME), so one config works for every teammate.
+KAGGLE_CONFIG_DATASET_SLUG := $(shell $(CONFIG_VALUE) kaggle.dataset_slug)
+KAGGLE_DATASET_REF ?= $(if $(and $(KAGGLE_USERNAME),$(KAGGLE_CONFIG_DATASET_SLUG)),$(KAGGLE_USERNAME)/$(KAGGLE_CONFIG_DATASET_SLUG),)
 KAGGLE_ADDITIONAL_DATASET_SOURCES ?=
 KAGGLE_PUBLIC ?= false
 KAGGLE_ENABLE_INTERNET ?= false
@@ -288,6 +297,11 @@ DEPLOYMENT_SLURM_START_LOCAL_SERVER := $(shell $(CONFIG_VALUE) deployment.slurm.
 endif
 DEPLOYMENT_SLURM_LOCAL_SERVER_CONFIG ?= $(CONFIG_PATH)
 
+# ARC3_* harness settings (scheduler, gate, ...) forwarded to local runs and
+# into the Kaggle notebook's runtime environment.
+ARC3_HARNESS_ENV_JSON := $(shell $(CONFIG_VALUE) harness_env {})
+# Kaggle serving (kaggle.serving = vllm | pennyroyal, model/wheel sources, image).
+ARC3_KAGGLE_JSON := $(shell $(CONFIG_VALUE) kaggle {})
 ifeq ($(origin MULTIMODAL_CONTEXT),undefined)
 MULTIMODAL_CONTEXT := $(shell $(CONFIG_VALUE) multimodal.context)
 endif
@@ -359,6 +373,8 @@ export LOCAL_ANALYZER_ENABLE_THINKING
 export LOCAL_ANALYZER_SITE_URL
 export LOCAL_ANALYZER_APP_NAME
 export MULTIMODAL_CONTEXT
+export ARC3_HARNESS_ENV_JSON
+export ARC3_KAGGLE_JSON
 export MULTIMODAL_UPSCALE
 export CHAT_PROVIDER
 export OPENROUTER_API_KEY
@@ -551,7 +567,9 @@ kaggle-duck: DATASET =
 kaggle-duck: GAME_TAGS =
 kaggle-duck: EXCLUDE_GAME_TAGS =
 kaggle-duck: MODEL = local
-kaggle-duck: RUN_NAME = duck-harness-kaggle
+kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
+# Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments.
+kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs/kaggle
 kaggle-duck: MAX_RUNTIME_MINUTES = 132
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 540
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =

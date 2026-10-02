@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 from dataclasses import dataclass
 
 from inference.utils.openai_compat import normalize_provider
@@ -66,6 +68,88 @@ def duck_kaggle_dataset_sources(
     return [cfg.wheelhouse_dataset_source, cfg.model_dataset_source]
 
 
+# Endpoint keys belong to whichever server the notebook starts.
+_SERVING_KEYS = frozenset({
+    "LOCAL_ANALYZER_BASE_URL", "OPENAI_BASE_URL", "LOCAL_ANALYZER_PROVIDER",
+    "OPENAI_PROVIDER", "LOCAL_ANALYZER_MODEL_ID", "INFERENCE_ANALYZER_MODEL",
+})
+
+
+def harness_env() -> dict[str, str]:
+    """Harness settings from the config's `harness_env` section.
+
+    The Makefile exports the section as ARC3_HARNESS_ENV_JSON. Any harness
+    variable is accepted (ARC3_*, LOCAL_ANALYZER_*, MULTIMODAL_*, ...) except
+    the endpoint keys, which the serving setup pins. Values are stringified
+    like any env var.
+    """
+    raw = os.environ.get("ARC3_HARNESS_ENV_JSON", "").strip()
+    if not raw:
+        return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("harness_env must be a JSON object")
+    bad = sorted(str(key) for key in data if str(key) in _SERVING_KEYS)
+    if bad:
+        raise ValueError(f"harness_env cannot set serving endpoint keys {bad}")
+    return {
+        str(key): ("1" if value is True else "0" if value is False else str(value))
+        for key, value in data.items() if value is not None
+    }
+
+
+def apply_harness_env() -> None:
+    """Local runs: config settings fill in what the shell did not set."""
+    for key, value in harness_env().items():
+        os.environ.setdefault(key, value)
+
+
+def kaggle_serving_config() -> dict:
+    """The config's `kaggle` section, exported by the Makefile as ARC3_KAGGLE_JSON."""
+    raw = os.environ.get("ARC3_KAGGLE_JSON", "").strip()
+    data = json.loads(raw) if raw else {}
+    if not isinstance(data, dict):
+        raise ValueError("kaggle config section must be a JSON object")
+    serving = data.get("serving", "vllm")
+    if serving not in ("vllm", "pennyroyal"):
+        raise ValueError(f"kaggle.serving must be 'vllm' or 'pennyroyal', got {serving!r}")
+    if serving == "pennyroyal":
+        for key in ("wheelhouse_dataset_source", "model_source"):
+            if not data.get(key):
+                raise ValueError(f"kaggle.serving=pennyroyal requires kaggle.{key}")
+    return {**data, "serving": serving}
+
+
+def pennyroyal_dataset_sources() -> list[str]:
+    return [kaggle_serving_config()["wheelhouse_dataset_source"]]
+
+
+def pennyroyal_model_sources() -> list[str]:
+    cfg = kaggle_serving_config()
+    return [ref for ref in (cfg["model_source"], cfg.get("draft_model_source")) if ref]
+
+
+def pennyroyal_setup_command() -> str:
+    """Start Flash Next on Pennyroyal SGLang, then publish endpoint + harness env."""
+    cfg = kaggle_serving_config()
+    spec = {
+        key: cfg[key] for key in (
+            "wheelhouse_dataset_source", "model_source", "draft_model_source",
+            "served_model_name", "port", "server_startup_timeout_s", "sglang",
+        ) if key in cfg
+    }
+    spec["env"] = harness_env()
+    launcher = "$TAAF_KAGGLE_BUNDLE_DIR/src/ARC3-Inference/inference/framework/pennyroyal_launch.py"
+    return f'ARC3_PENNYROYAL_SPEC={shlex.quote(json.dumps(spec))} "$PYTHON" "{launcher}"'
+
+
+def pennyroyal_teardown_command() -> str:
+    return (
+        'pid_file="$TAAF_KAGGLE_WORKING_DIR/sglang-server.pid"; '
+        '[ -f "$pid_file" ] && kill "$(cat "$pid_file")" 2>/dev/null; rm -f "$pid_file"; true'
+    )
+
+
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
     cfg = config or DuckKaggleVllmConfig()
     wheelhouse_owner, wheelhouse_slug = _split_dataset_source(
@@ -123,6 +207,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
+        "__HARNESS_ENV__": repr(harness_env()),
     }
     script = _DUCK_VLLM_SETUP_SCRIPT
     for placeholder, value in replacements.items():
@@ -396,6 +481,9 @@ setup_env = {
     'MULTIMODAL_UPSCALE': __MULTIMODAL_UPSCALE__,
 }
 setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])
+# ARC3_* harness settings from the launcher config's harness_env section.
+setup_env.update(__HARNESS_ENV__)
+print('Harness env: ' + json.dumps(__HARNESS_ENV__, sort_keys=True), flush=True)
 existing_setup_env = {}
 if setup_env_path.exists():
     existing_setup_env = json.loads(setup_env_path.read_text(encoding='utf-8'))
