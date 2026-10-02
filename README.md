@@ -39,6 +39,60 @@ The detailed option reference is available in the [configuration guide](ARC3-Inf
 | [tufa-arc-agi-framework/](tufa-arc-agi-framework/) | Tufa's bundled game execution framework. |
 | [taaf-duck-harness-kaggle-share.ipynb](taaf-duck-harness-kaggle-share.ipynb) | Tufa's original bundled notebook; see the competition notebook above for this solution. |
 
+## Shared run data through Google Drive
+
+Run data is shared separately from Git in the
+[Google Drive runs folder](https://drive.google.com/drive/folders/1HrQgVYv8xtV2eFShNbwS--RqCT-yx7jy)
+(`arc-agi-3-solution/runs`). It contains `kaggle/<owner>/<notebook>/vNN/` for
+Kaggle results and `local/` for HPC results when available.
+
+After receiving access to the shared folder, sync it to your computer with
+Google Drive for desktop, or download it on a machine without Drive sync.
+For a folder under **Shared with me**, add a shortcut to **My Drive** so it is
+accessible through Drive for desktop. Make the data available offline and
+wait for the files to finish downloading before opening the viewer. A
+downloaded copy will need to be refreshed manually to receive new runs.
+
+From the repository root, set `RUN_DATA_DIR` to your local copy of the shared
+`runs` folder, then create the link on macOS or Linux:
+
+```bash
+cd ARC3-Inference
+RUN_DATA_DIR="/absolute/path/to/arc-agi-3-solution/runs"
+if [ ! -d "$RUN_DATA_DIR/kaggle" ]; then
+    echo "Check RUN_DATA_DIR; it must contain kaggle/."
+elif [ -e runs ] || [ -L runs ]; then
+    echo "runs already exists; move it aside or unlink the old symlink first."
+else
+    ln -s "$RUN_DATA_DIR" runs
+fi
+ls -ld runs
+ls runs/kaggle
+```
+
+For example, a synced folder on macOS can look like:
+
+```text
+~/Library/CloudStorage/GoogleDrive-<your-google-account>/My Drive/CS Projects/Kaggles/arc-agi-3-solution/runs
+```
+
+Your account and folder location will differ. Link to the folder containing
+`kaggle/`, rather than to a single notebook or version. If `runs` is already
+a directory with your own data, move it to an unused backup path before
+linking and merge any needed runs into the shared folder. If it is an old
+symlink, `unlink runs` removes only the link.
+
+With Drive sync enabled, new files written through `runs/` will sync to the
+shared Drive folder.
+**`make clean` deletes the contents of `runs/`, including the shared data
+when linked.** Use `unlink runs` to disconnect this checkout. Run data and
+the symlink are ignored by Git.
+
+The current shared snapshots omit the large `*_requests.jsonl` and
+`requests.jsonl` logs. Saved transcripts, viewer artifacts, event sidecars,
+game states, source snapshots, and evaluations remain; exact model-request
+history and any viewer details that depend on those logs are unavailable.
+
 ## Inspect a saved run
 
 The viewer does not require a model server or GPU. From the repository root, with `uv` installed:
