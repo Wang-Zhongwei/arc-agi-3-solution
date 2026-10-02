@@ -5,18 +5,30 @@ import argparse
 import gzip
 import json
 import logging
+import mimetypes
+import re
+import subprocess
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from inference.utils.run_artifacts import is_selectable_run_dir_name
+from inference.tools.score_registry import load_score_registry
+from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
+from viewer.data import _run_key, list_run_dirs
 from viewer.data import load_game_payload, load_game_shell_payload, load_game_step_payload, load_run_summary
+from viewer.thumbnails import game_thumbnail_png
+from viewer.serving import serving_metrics
+from viewer.comparison_records import filter_score, load_annotations, run_summary, save_annotation
 
 
 log = logging.getLogger(__name__)
 _GZIP_MIN_BYTES = 1024
+_STATIC_SUBDIRS = {"solver_analysis", "movies"}
+_SPLIT_STATIC_SUBDIRS = {"passes", "seeds"}
+_COMMIT_RE = re.compile(r"(?m)^commit:\s*([0-9a-fA-F]{40})\s*$")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 @dataclass(frozen=True)
@@ -28,16 +40,284 @@ class _ResponseBody:
 def _index_html_path() -> Path:
     return Path(__file__).resolve().parent / "index.html"
 
-def _index_html_path() -> Path:
-    return Path(__file__).resolve().parent / "index.html"
+
+def _comparison_html_path() -> Path:
+    return Path(__file__).resolve().parent / "comparison.html"
+
+
+def _curves_html_path() -> Path:
+    return Path(__file__).resolve().parent / "curves.html"
+
+
+def _game_peek_js_path() -> Path:
+    return Path(__file__).resolve().parent / "game_peek.js"
+
+
+def _comparison_json_path(runs_dir: Path) -> Path:
+    return runs_dir / "inference_score_comparison.json"
+
+
+def _apply_unified_file_diff(base_text: str, diff_text: str, file_path: str) -> str:
+    """Apply one file's unified diff from a run's git_info.txt snapshot."""
+    marker = f"diff --git a/{file_path} b/{file_path}"
+    start = diff_text.find(marker)
+    if start < 0:
+        return base_text
+    end = diff_text.find("\ndiff --git ", start + len(marker))
+    section = diff_text[start : end if end >= 0 else None].splitlines()
+    base_lines = base_text.splitlines()
+    output: list[str] = []
+    cursor = 0
+    index = 0
+
+    while index < len(section):
+        match = _HUNK_RE.match(section[index])
+        if match is None:
+            index += 1
+            continue
+        old_start = int(match.group(1)) - 1
+        if old_start < cursor:
+            raise ValueError(f"Overlapping diff hunks for {file_path}")
+        output.extend(base_lines[cursor:old_start])
+        cursor = old_start
+        index += 1
+        while index < len(section) and not section[index].startswith("@@ "):
+            line = section[index]
+            if line.startswith("diff --git "):
+                break
+            if line == "\\ No newline at end of file":
+                index += 1
+                continue
+            if not line or line[0] not in {" ", "+", "-"}:
+                index += 1
+                continue
+            content = line[1:]
+            if line[0] in {" ", "-"}:
+                if cursor >= len(base_lines) or base_lines[cursor] != content:
+                    raise ValueError(f"Diff context does not match {file_path}")
+                cursor += 1
+            if line[0] in {" ", "+"}:
+                output.append(content)
+            index += 1
+
+    output.extend(base_lines[cursor:])
+    return "\n".join(output) + ("\n" if base_text.endswith("\n") else "")
+
+
+def _load_run_inference_config(run_dir: Path) -> dict | None:
+    """Load the run's selected serving config, then legacy snapshots."""
+    run_config_paths = [
+        run_dir / "run_config.json",
+        *sorted(run_dir.glob("passes/*/run_config.json")),
+        *sorted(run_dir.glob("seeds/*/run_config.json")),
+    ]
+    config_names: list[str] = []
+    for run_config_path in run_config_paths:
+        try:
+            run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+            selected = run_config.get("deployment", {}).get("slurm", {}).get("local_server_config")
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(selected, str) and selected.strip():
+            config_names.append(Path(selected).name)
+            break
+    if not config_names:
+        config_names.append("inference.json")
+    snapshot_paths: list[Path] = []
+    for config_name in dict.fromkeys(config_names):
+        bundled_relative_path = Path("src/ARC3-Inference/configs") / config_name
+        snapshot_paths.extend([
+            run_dir / config_name,
+            run_dir / "configs" / config_name,
+            run_dir / bundled_relative_path,
+            *sorted(run_dir.glob(f"passes/*/{bundled_relative_path}")),
+            *sorted(run_dir.glob(f"seeds/*/{bundled_relative_path}")),
+            *sorted(run_dir.glob(f"*/{bundled_relative_path}")),
+        ])
+    seen: set[Path] = set()
+    for snapshot_path in snapshot_paths:
+        if snapshot_path in seen or not snapshot_path.is_file():
+            continue
+        seen.add(snapshot_path)
+        try:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            log.warning("Could not load inference config snapshot %s", snapshot_path, exc_info=True)
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    git_info_path = run_dir / "git_info.txt"
+    if not git_info_path.is_file():
+        return None
+    git_info = git_info_path.read_text(encoding="utf-8")
+    match = _COMMIT_RE.search(git_info)
+    if match is None:
+        return None
+
+    project_root = Path(__file__).resolve().parents[1]
+    try:
+        repository_root = Path(
+            subprocess.run(
+                ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        )
+        config_path = (project_root / "configs" / config_names[0]).relative_to(repository_root).as_posix()
+        committed = subprocess.run(
+            ["git", "-C", str(repository_root), "show", f"{match.group(1)}:{config_path}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        reconstructed = _apply_unified_file_diff(committed, git_info, config_path)
+        payload = json.loads(reconstructed)
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, json.JSONDecodeError):
+        log.warning("Could not recover inference config for %s", run_dir, exc_info=True)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_evaluation(evaluation_path: Path) -> dict | None:
+    """Return a run's evaluation.json as a dict, or None when it is unusable."""
+    try:
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        log.warning("Skipping unreadable evaluation %s", evaluation_path, exc_info=True)
+        return None
+    return evaluation if isinstance(evaluation, dict) else None
+
+
+def _load_comparison_payload(runs_dir: Path, *, games: set[str] | None = None,
+                             passes: set[str] | None = None) -> dict:
+    """Build the comparison payload from every evaluated run on disk.
+
+    ``<run>/evaluation.json`` is the source of truth for which runs can be
+    compared and for their public scores, so a run shows up as soon as it is
+    evaluated, regardless of whether (or under which name) it was registered.
+    ``inference_score_comparison.json`` only contributes what evaluation.json
+    cannot hold: frontier references, semi-private imports, and score-set labels.
+    """
+    payload = load_score_registry(_comparison_json_path(runs_dir))
+    registered = payload.get("runs") if isinstance(payload.get("runs"), dict) else {}
+    annotations = load_annotations(runs_dir)
+    available_games: set[str] = set()
+    available_passes: set[str] = set()
+    runs: dict[str, dict] = {}
+    for run_dir in list_run_dirs(runs_dir):
+        evaluation_path = run_dir / "evaluation.json"
+        if not evaluation_path.is_file():
+            continue
+        evaluation = _load_evaluation(evaluation_path)
+        if evaluation is None:
+            continue
+        available_games.update((evaluation.get("games") or {}).keys())
+        for game in (evaluation.get("games") or {}).values():
+            available_passes.update((game.get("trial_scores") or {}).keys())
+        if games or passes:
+            evaluation = filter_score(evaluation, games, passes)
+        recovered_server = serving_metrics(run_dir, evaluation.get("server"))
+        if recovered_server:
+            evaluation["server"] = recovered_server
+        run_id = _run_key(run_dir, runs_dir)
+        registered_entry = registered.get(run_id)
+        entry = {
+            key: value
+            for key, value in (registered_entry.items() if isinstance(registered_entry, dict) else ())
+            if key not in {"scores", "inference_config"}
+        }
+        metadata = evaluation.get("metadata") if isinstance(evaluation.get("metadata"), dict) else {}
+        entry["run_id"] = run_id
+        entry["scores"] = {
+            "public": {
+                "score": evaluation,
+                "score_path": evaluation_path.relative_to(runs_dir).as_posix(),
+                "updated_at": metadata.get("created_at"),
+            }
+        }
+        entry["inference_config"] = _load_run_inference_config(run_dir)
+        entry["summary"] = run_summary(run_dir, evaluation)
+        entry["annotation"] = annotations.get(run_id, {})
+        runs[run_id] = entry
+    payload["runs"] = runs
+    payload["available_games"] = sorted(available_games)
+    payload["selected_games"] = sorted(games or set())
+    payload["available_passes"] = sorted(available_passes)
+    payload["selected_passes"] = sorted(passes or set())
+    payload["run_order"] = sorted(runs, key=run_dir_sort_key, reverse=True)
+    return payload
+
+
+_CURVE_GAME_FIELDS = (
+    "score",
+    "trial_scores",
+    "generated_tokens_mean",
+    "actions_mean",
+    "levels_completed_mean",
+    "levels_completed", "states", "generated_tokens", "actions", "turns",
+    "total_levels",
+)
+
+
+def _load_curves_payload(runs_dir: Path) -> dict:
+    """Score-vs-tokens/actions data for every evaluated run on disk.
+
+    Sends each run's per-trial curves (``progression_lanes``) so the curves page
+    can pool any subset of games, plus the per-game means that place an
+    endpoint for runs whose evaluation has no reconstructable history.
+    """
+    annotations = load_annotations(runs_dir)
+    runs: list[dict] = []
+    for run_dir in list_run_dirs(runs_dir):
+        evaluation_path = run_dir / "evaluation.json"
+        if not evaluation_path.is_file():
+            continue
+        evaluation = _load_evaluation(evaluation_path)
+        if evaluation is None:
+            continue
+        games = evaluation.get("games") if isinstance(evaluation.get("games"), dict) else {}
+        metadata = evaluation.get("metadata") if isinstance(evaluation.get("metadata"), dict) else {}
+        runs.append({
+            "run_id": _run_key(run_dir, runs_dir),
+            "score": evaluation.get("score"),
+            "summary": run_summary(run_dir, evaluation),
+            "server": serving_metrics(run_dir, evaluation.get("server")),
+            "annotation": annotations.get(_run_key(run_dir, runs_dir), {}),
+            "evaluated_at": metadata.get("created_at"),
+            "games": {
+                game_id: {key: game.get(key) for key in _CURVE_GAME_FIELDS}
+                for game_id, game in games.items()
+                if isinstance(game, dict)
+            },
+            "curves": {
+                "tokens": evaluation.get("score_progression"),
+                "actions": evaluation.get("action_progression"),
+            },
+            "lanes": evaluation.get("progression_lanes"),
+        })
+    runs.sort(key=lambda run: run_dir_sort_key(run["run_id"]), reverse=True)
+    return {"runs": runs}
 
 
 def _load_index_html() -> str:
     return _index_html_path().read_text(encoding="utf-8")
 
 
+def _load_comparison_html() -> str:
+    return _comparison_html_path().read_text(encoding="utf-8")
+
+
 def _index_html_version() -> int:
-    return _index_html_path().stat().st_mtime_ns
+    return max(
+        _index_html_path().stat().st_mtime_ns,
+        _comparison_html_path().stat().st_mtime_ns,
+        _curves_html_path().stat().st_mtime_ns,
+        _game_peek_js_path().stat().st_mtime_ns,
+    )
 
 
 def _requested_run_dir(*, runs_dir: Path, default_run_dir: Path | None, requested_run: str | None) -> Path | None:
@@ -55,7 +335,35 @@ def _requested_run_dir(*, runs_dir: Path, default_run_dir: Path | None, requeste
     if default_run_dir is not None and requested_name == default_run_dir.name:
         return default_run_dir
 
-    return runs_dir / requested_name
+    # Run identifiers are now paths relative to runs/ ("local/<run>",
+    # "kaggle/<owner>/<slug>/v07"), because leaf names collide across notebooks. Since the
+    # identifier is attacker-controllable, confine the result to runs/ before using it.
+    candidate = (runs_dir / requested_name).resolve()
+    try:
+        candidate.relative_to(runs_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _resolve_static_file(run_dir: Path | None, rel_path: Path) -> Path | None:
+    """Find *rel_path* inside *run_dir* or any of its pass/seed sub-dirs."""
+    if run_dir is None:
+        return None
+    candidate = run_dir / rel_path
+    if candidate.is_file():
+        return candidate
+    for sub in ("passes", "seeds"):
+        sub_dir = run_dir / sub
+        if not sub_dir.is_dir():
+            continue
+        for child in sub_dir.iterdir():
+            if not child.is_dir():
+                continue
+            candidate = child / rel_path
+            if candidate.is_file():
+                return candidate
+    return None
 
 
 class _ViewerHandler(BaseHTTPRequestHandler):
@@ -63,11 +371,54 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 
     runs_dir: Path
     run_dir: Path | None
+    environments_dir: Path | None = None
+
+    def do_POST(self) -> None:
+        if urlparse(self.path).path != "/api/run-annotation":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        # Only JSON requests from this viewer may mutate local annotations.
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc != self.headers.get("Host"):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        if self.headers.get_content_type() != "application/json":
+            self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 100000:
+                raise ValueError("Invalid annotation request size.")
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise ValueError("Annotation request must be an object.")
+            valid_runs = set(_load_comparison_payload(self.runs_dir)["runs"])
+            saved = save_annotation(self.runs_dir, body.get("run_id"), body.get("annotation"),
+                                    valid_runs=valid_runs)
+        except (ValueError, TypeError) as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        except OSError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json({"annotation": saved})
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/index.html"}:
             self._send_html(_load_index_html())
+            return
+        if parsed.path in {"/comparison", "/comparison.html"}:
+            self._send_html(_load_comparison_html())
+            return
+        if parsed.path in {"/curves", "/curves.html"}:
+            self._send_html(_curves_html_path().read_text(encoding="utf-8"))
+            return
+        if parsed.path == "/game-peek.js":
+            self._send_bytes(_game_peek_js_path().read_bytes(), "application/javascript; charset=utf-8")
+            return
+        if parsed.path == "/api/thumbnail":
+            self._handle_thumbnail_api(parsed.query)
             return
         if parsed.path == "/api/viewer-version":
             self._send_json({"version": _index_html_version()})
@@ -75,16 +426,91 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/run":
             self._handle_run_api(parsed.query)
             return
+        if parsed.path == "/api/comparison":
+            self._handle_comparison_api(parsed.query)
+            return
+        if parsed.path == "/api/curves":
+            self._send_json(_load_curves_payload(self.runs_dir))
+            return
         if parsed.path == "/api/game":
             self._handle_game_api(parsed.query)
             return
         if parsed.path == "/api/game-step":
             self._handle_game_step_api(parsed.query)
             return
+        if self._try_serve_static(parsed.path, parsed.query):
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def _try_serve_static(self, path: str, query: str) -> bool:
+        rel = path.lstrip("/")
+        parts = Path(rel).parts
+        if not parts or ".." in parts:
+            return False
+        if parts[0] in _STATIC_SUBDIRS:
+            safe_rel = Path(*parts)
+        elif len(parts) >= 3 and parts[0] in _SPLIT_STATIC_SUBDIRS and parts[2] in _STATIC_SUBDIRS:
+            safe_rel = Path(*parts)
+        else:
+            return False
+        params = parse_qs(query)
+        requested_run = params.get("run", [None])[0]
+        run_dir = _requested_run_dir(
+            runs_dir=self.runs_dir,
+            default_run_dir=self.run_dir,
+            requested_run=requested_run,
+        )
+        resolved = _resolve_static_file(run_dir, safe_rel)
+        if resolved is None:
+            return False
+        content_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+        body = resolved.read_bytes()
+        body = self._maybe_gzip(body)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        if body.is_gzipped:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", str(len(body.body)))
+        self.end_headers()
+        self.wfile.write(body.body)
+        return True
 
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
+
+    def _handle_thumbnail_api(self, query: str) -> None:
+        params = parse_qs(query)
+        game_id = params.get("game", [""])[0]
+        try:
+            png = game_thumbnail_png(game_id, environments_dir=self.environments_dir)
+        except Exception:
+            log.warning("Thumbnail rendering failed for %r", game_id, exc_info=True)
+            png = None
+        if png is None:
+            self.send_error(HTTPStatus.NOT_FOUND, "No thumbnail for this game")
+            return
+        self._send_bytes(png, "image/png", cache_control="public, max-age=86400")
+
+    def _send_bytes(self, body: bytes, content_type: str, *, cache_control: str = "no-store") -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_comparison_api(self, query: str = "") -> None:
+        try:
+            raw = parse_qs(query).get("games", [""])[0]
+            games = {game.strip() for game in raw.split(",") if game.strip()}
+            raw_passes = parse_qs(query).get("passes", [""])[0]
+            passes = {value.strip() for value in raw_passes.split(",") if value.strip()}
+            payload = _load_comparison_payload(self.runs_dir, games=games, passes=passes)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._send_json({"error": f"Invalid comparison JSON: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self._send_json(payload)
 
     def _handle_run_api(self, query: str) -> None:
         params = parse_qs(query)
@@ -199,14 +625,17 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         accept_encoding = self.headers.get("Accept-Encoding", "")
         if len(content) < _GZIP_MIN_BYTES or "gzip" not in accept_encoding.lower():
             return _ResponseBody(body=content, is_gzipped=False)
-        return _ResponseBody(body=gzip.compress(content), is_gzipped=True)
+        return _ResponseBody(body=gzip.compress(content, compresslevel=1), is_gzipped=True)
 
 
-def build_handler(*, runs_dir: Path, run_dir: Path | None) -> type[_ViewerHandler]:
+def build_handler(
+    *, runs_dir: Path, run_dir: Path | None, environments_dir: Path | None = None
+) -> type[_ViewerHandler]:
     """Bind configuration into the request handler class."""
     handler_cls = type("ViewerHandler", (_ViewerHandler,), {})
     handler_cls.runs_dir = runs_dir
     handler_cls.run_dir = run_dir
+    handler_cls.environments_dir = environments_dir
     return handler_cls
 
 
@@ -216,13 +645,19 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8011)
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--run-dir", default=None, help="Optional explicit run directory to view.")
+    parser.add_argument(
+        "--environments-dir",
+        default=None,
+        help="Offline ARC env files used for game thumbnails (default: configs/inference.json environment.environments_dir).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
     runs_dir = Path(args.runs_dir)
     run_dir = Path(args.run_dir) if args.run_dir else None
-    handler = build_handler(runs_dir=runs_dir, run_dir=run_dir)
+    environments_dir = Path(args.environments_dir) if args.environments_dir else None
+    handler = build_handler(runs_dir=runs_dir, run_dir=run_dir, environments_dir=environments_dir)
     server = ThreadingHTTPServer((args.host, args.port), handler)
 
     target = run_dir if run_dir is not None else runs_dir

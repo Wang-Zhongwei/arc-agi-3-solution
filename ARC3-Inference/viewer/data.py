@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
+from inference.tools.score_registry import DEFAULT_MINIMUM_RUN_DATE
+from inference.utils.run_artifacts import (
+    is_kaggle_version_dir_name,
+    is_selectable_run_dir_name,
+    iter_run_dirs,
+    run_dir_sort_key,
+)
 from inference.utils.viewer_artifacts import load_raw_events
 
 
@@ -73,7 +79,7 @@ _RUNTIME_VALUE_SYMBOLS = {
     "history.frame.shape",
     "history.frame.segmentation",
     "valid_actions",
-    "last_action_call_result",
+    "last_action_result",
 }
 _RUNTIME_CALL_SYMBOLS = {
     "action",
@@ -89,6 +95,15 @@ class _NormalizedGameArtifact:
     full: dict[str, Any]
 
 
+def _run_key(path: Path, runs_dir: str | Path) -> str:
+    """Identify a run by its path relative to runs/ -- leaf names now collide
+    (every kernel slug has a ``v01``)."""
+    try:
+        return path.resolve().relative_to(Path(runs_dir).resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
 def _direct_run_dir(path: str | Path) -> Path | None:
     candidate = Path(path)
     if candidate.is_dir() and is_selectable_run_dir_name(candidate.name):
@@ -96,8 +111,26 @@ def _direct_run_dir(path: str | Path) -> Path | None:
     return None
 
 
+def _is_auto_selectable_run_dir(path: Path) -> bool:
+    """Return whether a Qwen 3.8-era run has data the viewer can display.
+
+    Kaggle runs are named by kernel version (``v07``), so the date-prefix cutoff only
+    applies to timestamped run names -- ``"v07"[:8] >= "20260815"`` is False and would
+    hide every Kaggle run.
+    """
+    if not path.is_dir() or not is_selectable_run_dir_name(path.name):
+        return False
+    if not is_kaggle_version_dir_name(path.name) and path.name[:8] < DEFAULT_MINIMUM_RUN_DATE:
+        return False
+    if (path / "evaluation.json").is_file():
+        return True
+    artifacts_dir = path / "artifacts"
+    artifact_dirs = [artifacts_dir] if artifacts_dir.exists() else _seed_artifact_dirs(path)
+    return any(next(directory.glob("*viewer_data.json"), None) is not None for directory in artifact_dirs)
+
+
 def find_latest_run_dir(base_dir: str | Path = "runs") -> Path | None:
-    """Return the newest timestamped run directory, if any."""
+    """Return the newest displayable Qwen 3.8-era run directory, if any."""
     runs_dir = Path(base_dir)
     if not runs_dir.exists():
         return None
@@ -105,14 +138,14 @@ def find_latest_run_dir(base_dir: str | Path = "runs") -> Path | None:
     if direct_run_dir is not None:
         return direct_run_dir
     candidates = sorted(
-        [path for path in runs_dir.iterdir() if path.is_dir() and is_selectable_run_dir_name(path.name)],
+        [path for path in iter_run_dirs(runs_dir) if _is_auto_selectable_run_dir(path)],
         key=run_dir_sort_key,
     )
     return candidates[-1] if candidates else None
 
 
 def list_run_dirs(base_dir: str | Path = "runs") -> list[Path]:
-    """Return timestamped run directories, newest first."""
+    """Return displayable Qwen 3.8-era run directories, newest first."""
     runs_dir = Path(base_dir)
     if not runs_dir.exists():
         return []
@@ -120,7 +153,7 @@ def list_run_dirs(base_dir: str | Path = "runs") -> list[Path]:
     if direct_run_dir is not None:
         return [direct_run_dir]
     return sorted(
-        [path for path in runs_dir.iterdir() if path.is_dir() and is_selectable_run_dir_name(path.name)],
+        [path for path in iter_run_dirs(runs_dir) if _is_auto_selectable_run_dir(path)],
         key=run_dir_sort_key,
         reverse=True,
     )
@@ -136,7 +169,7 @@ def _resolve_run_dir(*, runs_dir: str | Path, run_dir: str | Path | None) -> Pat
 def load_run_summary(*, runs_dir: str | Path = "runs", run_dir: str | Path | None = None) -> dict[str, Any]:
     """Load lightweight run metadata and per-game summaries for the viewer shell."""
     resolved_run_dir = _resolve_run_dir(runs_dir=runs_dir, run_dir=run_dir)
-    available_runs = [path.name for path in list_run_dirs(runs_dir)]
+    available_runs = [_run_key(path, runs_dir) for path in list_run_dirs(runs_dir)]
     cache_key = (
         str(resolved_run_dir.resolve()),
         "summary",
@@ -144,10 +177,13 @@ def load_run_summary(*, runs_dir: str | Path = "runs", run_dir: str | Path | Non
     )
     cached = _RUN_PAYLOAD_CACHE.get(cache_key)
     if cached is None:
+        games = _load_game_summaries(resolved_run_dir)
         cached = {
             "source": "viewer_data",
             "arc_palette": _arc_palette(),
-            "games": _load_game_summaries(resolved_run_dir),
+            "games": games,
+            "evaluation": _load_evaluation(resolved_run_dir),
+            "artifact_snapshot": _build_artifact_snapshot(resolved_run_dir, games),
         }
         for existing_key in [key for key in _RUN_PAYLOAD_CACHE if key[:2] == cache_key[:2] and key != cache_key]:
             _RUN_PAYLOAD_CACHE.pop(existing_key, None)
@@ -155,11 +191,13 @@ def load_run_summary(*, runs_dir: str | Path = "runs", run_dir: str | Path | Non
 
     return {
         "run_name": resolved_run_dir.name,
-        "selected_run": resolved_run_dir.name,
+        "selected_run": _run_key(resolved_run_dir, runs_dir),
         "available_runs": available_runs,
         "source": cached["source"],
         "arc_palette": cached["arc_palette"],
         "games": cached["games"],
+        "evaluation": cached["evaluation"],
+        "artifact_snapshot": cached["artifact_snapshot"],
     }
 
 
@@ -171,7 +209,7 @@ def load_run_payload(
 ) -> dict[str, Any]:
     """Load a viewer payload for a specific run, or the latest run by default."""
     resolved_run_dir = _resolve_run_dir(runs_dir=runs_dir, run_dir=run_dir)
-    available_runs = [path.name for path in list_run_dirs(runs_dir)]
+    available_runs = [_run_key(path, runs_dir) for path in list_run_dirs(runs_dir)]
     cache_key = (
         str(resolved_run_dir.resolve()),
         "compact" if compact else "full",
@@ -191,7 +229,7 @@ def load_run_payload(
 
     return {
         "run_name": resolved_run_dir.name,
-        "selected_run": resolved_run_dir.name,
+        "selected_run": _run_key(resolved_run_dir, runs_dir),
         "available_runs": available_runs,
         "source": cached["source"],
         "arc_palette": cached["arc_palette"],
@@ -375,10 +413,12 @@ def _artifact_metadata(root_run_dir: Path, viewer_data_path: Path) -> dict[str, 
 
 def _run_dir_fingerprint(run_dir: Path) -> tuple[Any, ...]:
     relevant_paths: list[Path] = []
-    relevant_paths.extend(_viewer_data_paths(run_dir))
+    viewer_paths = _viewer_data_paths(run_dir)
+    relevant_paths.extend(viewer_paths)
     relevant_paths.extend(sorted(run_dir.glob("*requests.jsonl")))
     relevant_paths.extend(sorted(run_dir.glob("seeds/*/*requests.jsonl")))
     relevant_paths.extend(sorted(run_dir.glob("seeds/*/run_config.json")))
+    relevant_paths.extend(path for path in (run_dir / "evaluation.json",) if path.exists())
     total_size = 0
     max_mtime_ns = 0
     for path in relevant_paths:
@@ -392,8 +432,97 @@ def _run_dir_fingerprint(run_dir: Path) -> tuple[Any, ...]:
         len(relevant_paths),
         total_size,
         max_mtime_ns,
-        bool(_viewer_data_paths(run_dir)),
+        bool(viewer_paths),
     )
+
+
+def _load_evaluation(run_dir: Path) -> dict[str, Any] | None:
+    """Load the run's sole canonical evaluation artifact."""
+    payload = _load_optional_json(run_dir / "evaluation.json")
+    return {**payload, "source_file": "evaluation.json"} if payload else None
+
+
+def _build_artifact_snapshot(run_dir: Path, games: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build trace-derived snapshot data without presenting it as evaluation or score."""
+    score_games: dict[str, dict[str, Any]] = {}
+    action_total = 0
+    event_total = 0
+    runtime_symbol_total = 0
+    snapshot_scores: list[float] = []
+
+    for index, game in enumerate(games):
+        game_id = str(game.get("game_id") or f"game-{index + 1}")
+        split_label = game.get("pass_label")
+        split_kind = "pass"
+        if split_label in (None, ""):
+            split_label = game.get("seed_label")
+            split_kind = "seed"
+        trial_label = (
+            f"{run_dir.name}/{split_kind}-{split_label}"
+            if split_label not in (None, "")
+            else f"{run_dir.name}/view-{index}"
+        )
+        last_event = game.get("lastEvent") if isinstance(game.get("lastEvent"), dict) else {}
+        entry = score_games.setdefault(
+            game_id,
+            {
+                "trial_scores": {},
+                "actions": {},
+                "turns": {},
+                "levels_completed": {},
+                "events": {},
+                "runtime_symbol_uses": {},
+                "trial_count": 0,
+            },
+        )
+
+        score = last_event.get("score")
+        if isinstance(score, (int, float)):
+            entry["trial_scores"][trial_label] = score
+            snapshot_scores.append(float(score))
+        action_count = _coerce_optional_int(last_event.get("action_num"))
+        if action_count is not None:
+            entry["actions"][trial_label] = action_count
+            action_total += action_count
+        turn_count = _coerce_optional_int(last_event.get("analysis_step"))
+        if turn_count is not None:
+            entry["turns"][trial_label] = turn_count
+        level = _coerce_optional_int(last_event.get("level"))
+        if level is not None:
+            entry["levels_completed"][trial_label] = level
+        event_count = int(game.get("eventCount") or 0)
+        runtime_uses = int(game.get("runtimeSymbolUseCount") or 0)
+        entry["events"][trial_label] = event_count
+        entry["runtime_symbol_uses"][trial_label] = runtime_uses
+        entry["trial_count"] += 1
+        event_total += event_count
+        runtime_symbol_total += runtime_uses
+
+    for entry in score_games.values():
+        scores = list(entry["trial_scores"].values())
+        entry["score"] = sum(scores) / len(scores) if scores else None
+
+    unique_games = len(score_games)
+    return {
+        "version": 0,
+        "provisional": True,
+        "source_file": "viewer artifacts",
+        "semantics": "trace_snapshot",
+        "score": sum(snapshot_scores) / len(snapshot_scores) if snapshot_scores else None,
+        "usage": {
+            "totals": {
+                "actions": action_total,
+                "events": event_total,
+                "runtime_symbol_uses": runtime_symbol_total,
+            },
+        },
+        "games": score_games,
+        "metadata": {
+            "game_count": unique_games,
+            "trial_count": len(games),
+            "dataset_description": "Live artifact snapshot; evaluation has not run",
+        },
+    }
 
 
 def _arc_palette() -> list[str]:
@@ -511,6 +640,7 @@ def _load_game_summary(run_dir: Path, path: Path) -> dict[str, Any]:
     else:
         compact_payload = _summary_payload_from_raw_events(payload)
     compact_payload.update(metadata)
+    _normalize_artifact_static_urls(compact_payload)
     return _summary_from_compact_payload(compact_payload)
 
 
@@ -531,16 +661,7 @@ def _load_game_shell(run_dir: Path, path: Path) -> dict[str, Any]:
         compact_payload = _summary_payload_from_raw_events(payload)
 
     raw_events = _raw_event_dicts(payload, viewer_data_path=path)
-    request_snapshots = _load_request_snapshots(
-        _resolve_request_log_path(
-            run_dir=_artifact_run_dir(path),
-            viewer_data_path=path,
-            game_id=str(payload.get("game_id") or "").strip(),
-        )
-    )
-    step_summaries = _build_lightweight_viewer_steps(
-        raw_events, request_snapshots=request_snapshots
-    )
+    step_summaries = _build_lightweight_viewer_steps(raw_events)
     if not step_summaries and _is_compact_saved_game_payload(payload):
         step_summaries = [
             _lazy_step_summary_from_compact_step(step, index)
@@ -549,6 +670,7 @@ def _load_game_shell(run_dir: Path, path: Path) -> dict[str, Any]:
         ]
 
     compact_payload.update(metadata)
+    _normalize_artifact_static_urls(compact_payload)
     compact_payload["viewer_steps"] = step_summaries
     compact_payload["stepCount"] = len(step_summaries)
     compact_payload["stepsAreLazy"] = True
@@ -558,16 +680,7 @@ def _load_game_shell(run_dir: Path, path: Path) -> dict[str, Any]:
 def _load_game_step(run_dir: Path, path: Path, step_index: int) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     raw_events = _raw_event_dicts(payload, viewer_data_path=path)
-    step_summaries = _build_lightweight_viewer_steps(
-        raw_events,
-        request_snapshots=_load_request_snapshots(
-            _resolve_request_log_path(
-                run_dir=_artifact_run_dir(path),
-                viewer_data_path=path,
-                game_id=str(payload.get("game_id") or "").strip(),
-            )
-        ),
-    )
+    step_summaries = _build_lightweight_viewer_steps(raw_events)
     if not step_summaries and _is_compact_saved_game_payload(payload):
         steps = [step for step in payload.get("viewer_steps") or [] if isinstance(step, dict)]
         if step_index >= len(steps):
@@ -659,6 +772,7 @@ def _load_game_artifact(run_dir: Path, path: Path) -> _NormalizedGameArtifact:
     if _is_compact_saved_game_payload(payload):
         compact_payload = compact_saved_game_payload(payload, viewer_data_path=path, request_snapshots=request_snapshots)
         compact_payload.update(metadata)
+        _normalize_artifact_static_urls(compact_payload)
         return _NormalizedGameArtifact(
             summary=_summary_from_compact_payload(compact_payload),
             compact=compact_payload,
@@ -671,6 +785,7 @@ def _load_game_artifact(run_dir: Path, path: Path) -> _NormalizedGameArtifact:
     viewer_steps = _build_viewer_steps(normalized_events, request_snapshots=request_snapshots)
     compact_payload = _compact_game_payload(payload, normalized_events=normalized_events, viewer_steps=viewer_steps)
     compact_payload.update(metadata)
+    _normalize_artifact_static_urls(compact_payload)
     full_payload = {
         **payload,
         **metadata,
@@ -722,6 +837,22 @@ def _summary_from_compact_payload(compact_payload: dict[str, Any]) -> dict[str, 
     if isinstance(last_event, dict) and last_event:
         game["lastEvent"] = dict(last_event)
     return game
+
+
+def _normalize_artifact_static_urls(compact_payload: dict[str, Any]) -> None:
+    replay_url = str(compact_payload.get("replay_url") or "").strip()
+    if not replay_url:
+        return
+    split_dir_kind = str(compact_payload.get("split_dir_kind") or "").strip()
+    split_dir = str(compact_payload.get("split_dir") or "").strip()
+    if split_dir_kind not in {"passes", "seeds"} or not split_dir:
+        compact_payload["replay_url"] = replay_url
+        return
+    parts = Path(replay_url).parts
+    if parts[:2] == (split_dir_kind, split_dir):
+        compact_payload["replay_url"] = replay_url
+        return
+    compact_payload["replay_url"] = str(Path(split_dir_kind, split_dir, replay_url))
 
 
 def _compact_game_payload(
@@ -913,7 +1044,7 @@ def _compact_last_event_summary(event: dict[str, Any] | None) -> dict[str, Any] 
     status = str(event.get("status") or "").strip()
     if status:
         summary["status"] = status
-    for key in ("action_num", "score", "reward"):
+    for key in ("action_num", "analysis_step", "score", "reward", "level", "state"):
         if event.get(key) is not None:
             summary[key] = event.get(key)
     transcript = str(event.get("transcript") or "")
@@ -937,17 +1068,10 @@ def _compact_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
         }
         if raw_section.get("inContext") is False:
             section["inContext"] = False
-        turn_role = raw_section.get("turnRole")
-        if turn_role in ("current", "history"):
-            section["turnRole"] = turn_role
         sections.append(section)
     if not sections:
         return None
-    compact: dict[str, Any] = {"sections": sections}
-    usage = context.get("usage")
-    if isinstance(usage, dict) and usage:
-        compact["usage"] = usage
-    return compact
+    return {"sections": sections}
 
 
 def _compact_step_event(event: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -991,14 +1115,6 @@ def _compact_viewer_step(step: dict[str, Any]) -> dict[str, Any]:
     for key in ("reward", "score", "state", "level"):
         if step.get(key) is not None:
             compact[key] = step.get(key)
-    if isinstance(step.get("usage"), dict):
-        # summary-level token badges: the frontend falls back to this when a
-        # step has not been expanded, so it must survive compaction
-        compact["usage"] = dict(step["usage"])
-    if step.get("worldModelUpdates"):
-        compact["worldModelUpdates"] = list(step["worldModelUpdates"])
-    if step.get("analysisStep") is not None:
-        compact["analysisStep"] = step.get("analysisStep")
     context = _compact_context(step.get("context"))
     if context is not None:
         compact["context"] = context
@@ -1060,8 +1176,6 @@ def _load_request_snapshots(path: Path | None) -> list[dict[str, Any]]:
                 "analysis_step": _normalize_positive_int(payload.get("analysis_step")),
                 "action": _normalize_positive_int(payload.get("action")),
                 "request_index_within_turn": _normalize_positive_int(payload.get("request_index_within_turn")),
-                "event": str(payload.get("event") or "").strip() or None,
-                "usage": payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
             }
         )
     return snapshots
@@ -1083,6 +1197,24 @@ def _split_labeled_sections(text: str) -> list[dict[str, str]]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         content = text[start:end].strip()
         sections.append({"label": label, "content": content, "kind": _classify_section(label)})
+    # Transcripts retain raw output channels; render the history representation
+    # recorded by the analyzer, including for previously downloaded runs.
+    reasoning_as_content = any(
+        section["label"] == "ANALYZER STATUS"
+        and re.search(r"^reasoning_as_content:\s*True\s*$", section["content"], re.MULTILINE)
+        for section in sections
+    )
+    if reasoning_as_content:
+        rendered: list[dict[str, str]] = []
+        for section in sections:
+            if section["label"] == "ASSISTANT" and rendered and rendered[-1]["label"] == "THINKING":
+                rendered[-1]["content"] += "\n\n" + section["content"]
+            else:
+                rendered.append(section)
+        for section in rendered:
+            if section["label"] == "THINKING":
+                section["label"] = "ASSISTANT"
+        return rendered
     return sections
 
 
@@ -1116,42 +1248,6 @@ def _normalized_number(value: Any) -> int | float:
     except (TypeError, ValueError):
         return 0
     return int(parsed) if parsed.is_integer() else parsed
-
-
-_WORLD_MODEL_PREFIXES = (
-    "World model:",
-    "Goal model:",
-    "Action model:",
-    "Recent findings:",
-    "Open questions:",
-    "Plan:",
-    "Cross-level notes:",
-)
-
-
-def _world_model_updates_in_transcript(transcript: Any) -> list[str]:
-    """Names of memory sections the assistant updated in this transcript.
-
-    Scans ASSISTANT sections only: the USER PROMPT re-renders the carried
-    world model every turn and must not count as an update."""
-    text = str(transcript or "")
-    if not text:
-        return []
-    matches = list(_SECTION_RE.finditer(text))
-    updated: list[str] = []
-    for index, match in enumerate(matches):
-        if match.group(1).strip() != "ASSISTANT":
-            continue
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        for line in text[start:end].splitlines():
-            stripped = line.strip()
-            for prefix in _WORLD_MODEL_PREFIXES:
-                if stripped.startswith(prefix):
-                    name = prefix[:-1]
-                    if name not in updated:
-                        updated.append(name)
-    return updated
 
 
 def _normalize_analysis_step(value: Any) -> int | None:
@@ -1353,51 +1449,6 @@ def _transcript_sections_from_events(
     return sections
 
 
-def _analysis_step_usage(
-    request_snapshots: list[dict[str, Any]] | None,
-    analysis_step: int | None,
-) -> dict[str, Any] | None:
-    """Sum prompt/completion tokens over all response snapshots of one
-    analysis step. Prompt sums count each exchange's full prefill (real
-    compute, though shared prefixes may be cached server-side)."""
-    if not request_snapshots or analysis_step is None:
-        return None
-    prompt_total = completion_total = requests = 0
-    last_prompt = None
-    for snapshot in request_snapshots:
-        if snapshot.get("analysis_step") != analysis_step:
-            continue
-        raw = snapshot.get("usage")
-        if not isinstance(raw, dict):
-            continue
-
-        def _pick(*keys: str) -> int | None:
-            for key in keys:
-                value = raw.get(key)
-                if isinstance(value, (int, float)):
-                    return int(value)
-            return None
-
-        prompt = _pick("prompt_tokens", "input_tokens")
-        completion = _pick("completion_tokens", "output_tokens", "generated_tokens")
-        if prompt is None and completion is None:
-            continue
-        requests += 1
-        if prompt is not None:
-            prompt_total += prompt
-            last_prompt = prompt
-        if completion is not None:
-            completion_total += completion
-    if requests == 0:
-        return None
-    return {
-        "promptTokens": prompt_total,
-        "completionTokens": completion_total,
-        "requests": requests,
-        "lastPromptTokens": last_prompt,
-    }
-
-
 def _latest_request_snapshot(
     request_snapshots: list[dict[str, Any]],
     *,
@@ -1437,56 +1488,11 @@ def _section_signature(section: dict[str, Any]) -> tuple[str, str]:
     )
 
 
-def _signatures_match(a: tuple[str, str], b: tuple[str, str]) -> bool:
-    """Exact match, or prefix-equal USER PROMPT contents. Multimodal message
-    builders append image/frame headers to the prompt text inside content
-    parts (e.g. 'Current grid image:', 'Grid frames: ...'), so the request
-    snapshot's rendering of a user prompt is the transcript's rendering plus
-    a suffix; treat those as the same message so the dedup merge does not
-    show the current prompt twice. The length floor guards against
-    collapsing genuinely different short prompts."""
-    if a == b:
-        return True
-    label_a, content_a = a
-    label_b, content_b = b
-    if label_a != label_b or label_a != "USER PROMPT":
-        return False
-    if not content_a or not content_b:
-        return False
-    shorter, longer = sorted((content_a, content_b), key=len)
-    return len(shorter) >= 48 and longer.startswith(shorter)
-
-
-def _default_in_context_for_transcript_section(section: dict[str, Any]) -> bool:
-    return str(section.get("label", "")).strip() != "THINKING"
-
-
-def _pending_transcript_context() -> dict[str, Any]:
-    """Context shown for a step whose analysis transcript has not been written
-    yet (the step is still in progress). Prevents the confusing fallback of
-    displaying the previous step's transcript on the current card."""
-    return {
-        "sections": [
-            {
-                "label": "TRANSCRIPT PENDING",
-                "content": (
-                    "This analysis step is still in progress - its transcript is "
-                    "written when the step finishes. Reload once the step "
-                    "completes to see the prompt, reasoning, and tool calls."
-                ),
-                "kind": "status",
-                "inContext": False,
-            }
-        ]
-    }
-
-
 def _extract_context(
     analysis_events: list[dict[str, Any]] | None,
     *,
     include_system_prompt: bool,
     request_snapshot: dict[str, Any] | None = None,
-    request_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not analysis_events:
         return None
@@ -1506,12 +1512,12 @@ def _extract_context(
             signature = _section_signature(section)
             found_index = None
             for index in range(search_start, len(request_signatures)):
-                if _signatures_match(request_signatures[index], signature):
+                if request_signatures[index] == signature:
                     found_index = index
                     break
             if found_index is None:
                 transcript_insertions[search_start].append(
-                    {**section, "inContext": _default_in_context_for_transcript_section(section)}
+                    {**section, "inContext": True}
                 )
                 continue
             search_start = found_index + 1
@@ -1522,7 +1528,7 @@ def _extract_context(
                 sections.append(request_sections[index])
     else:
         sections.extend(
-            {**section, "inContext": _default_in_context_for_transcript_section(section)}
+            {**section, "inContext": True}
             for section in transcript_sections
         )
 
@@ -1543,23 +1549,11 @@ def _extract_context(
 
     if not sections:
         return None
-    user_prompt_indices = [
-        index for index, section in enumerate(sections)
-        if section.get("label") == "USER PROMPT"
-    ]
-    if user_prompt_indices:
-        for index in user_prompt_indices[:-1]:
-            sections[index]["turnRole"] = "history"
-        sections[user_prompt_indices[-1]]["turnRole"] = "current"
     return {
         "sections": sections,
         "hasExactModelContext": bool(request_sections),
         "requestIndexWithinTurn": request_snapshot.get("request_index_within_turn") if request_snapshot else None,
         "messageCount": len(request_snapshot.get("messages", [])) if request_snapshot else 0,
-        "usage": _analysis_step_usage(
-            request_snapshots,
-            request_snapshot.get("analysis_step") if request_snapshot else None,
-        ),
     }
 
 
@@ -1644,12 +1638,7 @@ def _build_analysis_frame_step(
         request_snapshots,
         analysis_step=_normalize_analysis_step(group.get("analysis_step")),
     )
-    if analysis_event is None:
-        context_events: list[dict[str, Any]] = []
-    elif request_snapshot is not None:
-        context_events = [analysis_event]
-    else:
-        context_events = prior_analysis_events
+    context_events = [analysis_event] if (request_snapshot is not None and analysis_event is not None) else prior_analysis_events
 
     return _apply_action_summary(
         {
@@ -1657,31 +1646,19 @@ def _build_analysis_frame_step(
             "sourceEventIndex": group.get("source_event_index", 0),
             "event": summary_event,
             "boardEvent": board_event,
-            "context": (
-                _extract_context(
-                    context_events,
-                    include_system_prompt=include_system_prompt,
-                    request_snapshot=request_snapshot,
-        request_snapshots=request_snapshots,
-                )
-                if analysis_event is not None
-                else _pending_transcript_context()
+            "context": _extract_context(
+                context_events,
+                include_system_prompt=include_system_prompt,
+                request_snapshot=request_snapshot,
             ),
-            "localContext": (
-                _extract_context(
-                    [analysis_event],
-                    include_system_prompt=include_system_prompt,
-                )
-                if analysis_event is not None
-                else _pending_transcript_context()
+            "localContext": _extract_context(
+                [analysis_event] if analysis_event is not None else [],
+                include_system_prompt=include_system_prompt,
             ),
             "score": board_event.get("score") if board_event else None,
             "state": board_event.get("state") if board_event else None,
             "level": board_event.get("level") if board_event else None,
             "stepKind": "turn",
-            "worldModelUpdates": _world_model_updates_in_transcript(
-                (analysis_event or {}).get("transcript")
-            ),
         },
         action_summary,
     )
@@ -1754,9 +1731,6 @@ def _lightweight_analysis_step(
             "level": board_event.get("level") if board_event else None,
             "stepKind": "turn",
             "analysisStep": group.get("analysis_step"),
-            "worldModelUpdates": _world_model_updates_in_transcript(
-                (group.get("analysis_event") or {}).get("transcript")
-            ),
             "lazy": True,
             "detailLoaded": False,
         },
@@ -1822,17 +1796,7 @@ def _lightweight_standalone_action_step(
     }
 
 
-def _build_lightweight_viewer_steps(
-    events: list[dict[str, Any]],
-    *,
-    request_snapshots: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """Step summaries for the initial (unexpanded) render.
-
-    Token usage is attached here rather than only on hydration: it comes from
-    the request log keyed by analysis step, needs none of the expensive
-    transcript work, and the badges are most useful when scanning a whole game
-    - which is exactly when no step has been clicked yet."""
+def _build_lightweight_viewer_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not events:
         return []
 
@@ -1935,18 +1899,6 @@ def _build_lightweight_viewer_steps(
     )
     for index, step in enumerate(steps):
         step["stepIndex"] = index
-        if step.get("stepKind") in ("result", "action"):
-            # A "Latest State" or action step is a board display, not an
-            # analyzer exchange. It inherits analysisStep from the group it
-            # belongs to, so looking usage up by that key returned the numbers
-            # of the analysis step beside it - which read as the previous
-            # step's statistics copied onto the latest one.
-            continue
-        usage = _analysis_step_usage(
-            request_snapshots, _normalize_analysis_step(step.get("analysisStep"))
-        )
-        if usage:
-            step["usage"] = usage
 
     if steps:
         return steps
@@ -1984,56 +1936,20 @@ def _hydrate_lightweight_step(
 ) -> dict[str, Any]:
     step = dict(summary)
     step["detailLoaded"] = True
-    if summary.get("stepKind") == "result":
-        # "Latest State" card: shows the board after the last executed action.
-        # Its transcript belongs to the previous card; do not duplicate it here
-        # (matches the non-lazy builder, which sets context to None).
-        note = {
-            "sections": [
-                {
-                    "label": "LATEST BOARD STATE",
-                    "content": (
-                        "This card shows the board after the most recent executed "
-                        "action. The transcript for that step is on the previous card."
-                    ),
-                    "kind": "status",
-                    "inContext": False,
-                }
-            ]
-        }
-        step["context"] = note
-        step["localContext"] = note
-        return step
     analysis_step = _normalize_analysis_step(summary.get("analysisStep"))
     if analysis_step is None:
         return step
 
-    analysis_events = [
-        event
-        for event in events
-        if event.get("type") == "analysis"
-        and _normalize_analysis_step(event.get("analysis_step")) == analysis_step
-    ]
-    if not analysis_events:
-        pending = _pending_transcript_context()
-        step["context"] = pending
-        step["localContext"] = pending
+    analysis_event = next(
+        (
+            event
+            for event in events
+            if event.get("type") == "analysis" and _normalize_analysis_step(event.get("analysis_step")) == analysis_step
+        ),
+        None,
+    )
+    if analysis_event is None:
         return step
-    if len(analysis_events) == 1:
-        analysis_event = analysis_events[0]
-    else:
-        # The step was retried (e.g. after a request failure): every attempt
-        # wrote its own analysis event. Merge them so no attempt's transcript
-        # (and in particular no executed tool call) is hidden.
-        analysis_event = dict(analysis_events[-1])
-        merged_parts = []
-        for attempt_number, attempt_event in enumerate(analysis_events, 1):
-            merged_parts.append(
-                f"===== ATTEMPT {attempt_number} of {len(analysis_events)} "
-                "(this analysis step was retried) =====\n"
-                + str(attempt_event.get("transcript") or "")
-            )
-        analysis_event["transcript"] = "\n\n".join(merged_parts)
 
     normalized_event = _normalize_event(analysis_event)
     request_snapshot = _latest_request_snapshot(request_snapshots, analysis_step=analysis_step)
@@ -2041,23 +1957,10 @@ def _hydrate_lightweight_step(
         [normalized_event],
         include_system_prompt=step_index == 0,
         request_snapshot=request_snapshot,
-        request_snapshots=request_snapshots,
-    )
-    # Mirror the eager builder: `context` is the exact model window (full
-    # history as the request saw it, plus usage); `localContext` is this
-    # turn's own transcript only - the view the step card renders by
-    # default. Assigning the window to both (the old behavior) made every
-    # hydrated card open with the full conversation history on top.
-    local_context = _extract_context(
-        [normalized_event],  # normalize PARSES transcript into sections
-        include_system_prompt=step_index == 0,
     )
     if context is not None:
-        step["context"] = context
-    if local_context is not None:
-        step["localContext"] = local_context
-    elif context is not None:
         step["localContext"] = context
+        step["context"] = context
     return step
 
 
