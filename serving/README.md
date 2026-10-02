@@ -2,7 +2,7 @@
 
 This folder contains the offline wheelhouse builder and custom serving patches for the ARC-AGI-3 notebook. It builds on [John Pezzulli's Pennyroyal SGLang fork](https://github.com/jpezzulli/sglang-rtxpro6000), pinned to **v2.5.3**, commit `d00d88efc8d6281b12be4f4073126aec95038c55`.
 
-See the [repository README](../README.md) for the solution overview and reproduction path, and the [write-up](../WRITEUP.md) for the reasoning behind the serving and prefix-cache changes.
+See the [repository README](../README.md) for the solution overview and reproduction path, and the [write-up](../WRITEUP.md) for the reasoning behind the serving and prefix-cache changes. [MEMORY_BUDGET.md](MEMORY_BUDGET.md) compares GPU and host memory budgets across the Milestone 2 top 3 and duck-harness.
 
 ## Included patches
 
