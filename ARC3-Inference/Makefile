@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := interactive
 
-.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck run _taaf-run chat eval score_run significance view trace traces zip clean cluster_view_queue
+.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck run _taaf-run chat eval score_run significance view pull-kaggle trace traces zip clean cluster_view_queue
 
 -include .env
 
@@ -670,6 +670,16 @@ view:
 		--port "$(VIEW_PORT)" \
 		--runs-dir "$(VIEW_RUNS_DIR)" \
 		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)")
+
+pull-kaggle:
+	@if [ -z "$(NOTEBOOK)" ] || [ -z "$(VERSION)" ]; then \
+		echo "Usage: make pull-kaggle NOTEBOOK=[owner/]slug VERSION=N [SOURCE=true]"; \
+		exit 1; \
+	fi
+	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src:$$PYTHONPATH" $(UV_RUN) python -m inference.tools.pull_kaggle \
+		"$(NOTEBOOK)" "$(VERSION)" \
+		--runs-dir "$(RUNS_DIR)" \
+		$(if $(filter true TRUE 1 yes YES on ON,$(SOURCE)),--source)
 
 trace: traces
 

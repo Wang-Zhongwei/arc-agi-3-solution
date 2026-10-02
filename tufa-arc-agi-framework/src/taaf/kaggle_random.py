@@ -192,7 +192,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"Kaggle dry-run bundles: {job_dir / 'kaggle'}")
     elif args.wait:
         handle.wait()
-        print(f"Kaggle output: {job_dir / 'kaggle-output'}")
+        print(f"Kaggle output: {job_dir}")
     else:
         print("Kaggle deployment submitted; not waiting for completion.")
 
@@ -216,7 +216,7 @@ def _resolve_job_dir(args: argparse.Namespace) -> Path:
 
 
 def _load_staged_benchmark(job_dir: Path) -> taaf.benchmark.Benchmark:
-    bundle_benchmark = job_dir / "kaggle" / "source-dataset" / "benchmark_initial.pkl"
+    bundle_benchmark = job_dir / "benchmark_initial.pkl"
     if bundle_benchmark.is_file():
         import pickle
 

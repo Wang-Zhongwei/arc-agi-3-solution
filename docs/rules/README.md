@@ -10,8 +10,6 @@ Each role—[Harness](../roles/harness/README.md), [Infrastructure](../roles/inf
 
 4. A t-test result is recommended following the [guide](t-test.md), unless it is a no-brainer fix. For those fixes, explain what was wrong and how you checked it.
 
-5. Run data is synced through Google Drive into `ARC3-Inference/runs/`. Keep downloaded `runs/kaggle/` artifacts out of Git; link the exact runs used in your report.
+5. Run data is synced through Google Drive into `ARC3-Inference/runs/`: `runs/local/` for HPC runs and `runs/kaggle/` for Kaggle runs. Version snapshot is kept in `<run_folder>/src`. 
 
 6. From `ARC3-Inference/`, run `make view PORT=8022` to inspect the data.
-
-7. For each successfully submitted Kaggle version, create an annotated Git tag and push it to GitHub. Use `<notebook-name>-v<version>-<submitted-date>` with the date in `MMDD`, e.g. `adaptive-reasoning-v30-0920`

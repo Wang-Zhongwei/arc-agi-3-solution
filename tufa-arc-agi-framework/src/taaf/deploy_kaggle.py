@@ -3,9 +3,12 @@
 The launcher writes two Kaggle bundles under ``benchmark.job_dir``:
 
 1. a source dataset containing the pickled benchmark and source snapshots
-   for Tufa repos;
-2. a notebook kernel rendered from ``src/taaf/kaggle/taaf_kaggle_run.ipynb``
-   with small deployment-specific placeholders filled in.
+   for Tufa repos, written directly into ``job_dir`` (``src/``,
+   ``benchmark_initial.pkl``, ...) like the Slurm target, and uploaded from a
+   temporary copy so the rest of ``job_dir`` stays off Kaggle;
+2. a notebook kernel in ``job_dir/kernel`` rendered from
+   ``src/taaf/kaggle/taaf_kaggle_run.ipynb`` with small deployment-specific
+   placeholders filled in.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import pickle
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import unicodedata
 from collections.abc import Iterable
@@ -55,12 +59,14 @@ class KaggleHandle(taaf.deploy.DeploymentHandle):
     - ``kernel_id``: Kaggle kernel id, ``owner/slug``.
     - ``dataset_ref``: source dataset id, ``owner/slug``.
     - ``uploaded``: false for dry-run packaging.
+    - ``kernel_version``: version number the push created, or None.
     - ``poll_interval_s``: cadence for ``wait()`` status polling.
     """
 
     kernel_id: str = ""
     dataset_ref: str = ""
     uploaded: bool = False
+    kernel_version: int | None = None
     poll_interval_s: float = 30.0
     output_dir: Path | None = None
     _cached_benchmark: taaf.benchmark.Benchmark | None = field(default=None, init=False, repr=False)
@@ -95,19 +101,21 @@ class KaggleHandle(taaf.deploy.DeploymentHandle):
         kernel_id = str(meta.get("job_id") or cfg.get("kernel_id") or "")
         dataset_ref = str(cfg.get("source_dataset_ref") or cfg.get("dataset_ref") or "")
         uploaded = bool(cfg.get("uploaded", True))
+        kernel_version = cfg.get("kernel_version")
         output_raw = cfg.get("output_dir")
         output_dir = Path(output_raw) if isinstance(output_raw, str) and output_raw else None
         return cls(
-            job_dir=job_dir, kernel_id=kernel_id, dataset_ref=dataset_ref, uploaded=uploaded, output_dir=output_dir
+            job_dir=job_dir, kernel_id=kernel_id, dataset_ref=dataset_ref, uploaded=uploaded,
+            kernel_version=int(kernel_version) if kernel_version else None, output_dir=output_dir
         )
 
     def _load_or_pull_benchmark(self) -> taaf.benchmark.Benchmark:
         if self._cached_benchmark is not None:
             return self._cached_benchmark
-        candidates = [self.job_dir / "benchmark.json"]
-        output_dir = self.output_dir or (self.job_dir / "kaggle-output")
-        candidates.append(output_dir / "benchmark.json")
-        for path in candidates:
+        # Outputs land at the top of job_dir, where pull_kaggle and the viewer expect them.
+        output_dir = self.output_dir or self.job_dir
+        candidates = _dedupe([str(self.job_dir / "benchmark.json"), str(output_dir / "benchmark.json")])
+        for path in map(Path, candidates):
             if path.is_file():
                 self._cached_benchmark = taaf.benchmark.Benchmark.from_json(path)
                 return self._cached_benchmark
@@ -198,6 +206,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
     kernel_id: str = field(default="", init=False)
     source_dataset_ref: str = field(default="", init=False)
     uploaded: bool = field(default=False, init=False)
+    kernel_version: int | None = field(default=None, init=False)
     actual_run_as_submission: bool = field(default=False, init=False)
     is_competition_rerun: bool = field(default=False, init=False)
 
@@ -262,15 +271,13 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             quoted = " ".join(_shell_quote(pkg) for pkg in pip_packages)
             setup_commands.append(f'"$PYTHON" -m pip install --no-deps {quoted}')
 
-        staging_root = job_dir / "kaggle"
-        source_bundle = staging_root / "source-dataset"
-        kernel_bundle = staging_root / "kernel"
+        kernel_bundle = job_dir / "kernel"
         taaf.deploy.write_git_status(job_dir)
         preamble = taaf.deploy.format_preamble(benchmark)
-        _write_source_dataset_bundle(
+        source_entries = _write_source_dataset_bundle(
             benchmark=benchmark,
             target=self,
-            bundle_dir=source_bundle,
+            bundle_dir=job_dir,
             preamble=preamble,
             setup_commands=setup_commands,
             teardown_commands=teardown_commands,
@@ -291,13 +298,17 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
         )
 
         self.uploaded = False
+        self.kernel_version = None
         if not self.dry_run:
             if key is None:
                 raise RuntimeError("Missing Kaggle API key. Set KAGGLE_KEY or ~/.kaggle/kaggle.json.")
             _ensure_kaggle_cli_available()
             _check_kaggle_auth(username, key)
-            _ensure_dataset(source_bundle, dataset_ref, self.dataset_version_message, username, key)
-            _push_kernel(
+            with tempfile.TemporaryDirectory() as tmp:
+                source_bundle = Path(tmp) / "source-dataset"
+                _copy_entries(source_entries, source_bundle)
+                _ensure_dataset(source_bundle, dataset_ref, self.dataset_version_message, username, key)
+            self.kernel_version = _push_kernel(
                 kernel_bundle,
                 accelerator=None if self.cpu_only else self.accelerator,
                 timeout=self.kernel_push_timeout_s,
@@ -318,6 +329,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             kernel_id=self.kernel_id,
             dataset_ref=dataset_ref,
             uploaded=self.uploaded,
+            kernel_version=self.kernel_version,
         )
 
 
@@ -493,9 +505,13 @@ def _write_source_dataset_bundle(
     setup_commands: list[str],
     teardown_commands: list[str],
     make_share_version: bool = False,
-) -> None:
+) -> list[Path]:
+    """Write the source dataset files into ``bundle_dir`` and return them.
+
+    ``bundle_dir`` may be a run's ``job_dir``, so it is not cleared first; the
+    returned top-level entries are what gets uploaded as the dataset.
+    """
     notebook_name = SHARE_NOTEBOOK_NAME if make_share_version else NOTEBOOK_NAME
-    shutil.rmtree(bundle_dir, ignore_errors=True)
     bundle_dir.mkdir(parents=True, exist_ok=True)
     taaf.deploy.snapshot_editable_sources(
         bundle_dir / "src",
@@ -543,6 +559,30 @@ def _write_source_dataset_bundle(
         + "\n",
         encoding="utf-8",
     )
+    return [
+        bundle_dir / name
+        for name in (
+            "src",
+            "benchmark_initial.pkl",
+            "deploy_target.pkl",
+            "preamble.txt",
+            "git_status.txt",
+            "setup_commands.json",
+            "teardown_commands.json",
+            DATASET_BUNDLE_MARKER,
+            "README.dataset.md",
+            "dataset-metadata.json",
+        )
+    ]
+
+
+def _copy_entries(entries: list[Path], dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        if entry.is_dir():
+            shutil.copytree(entry, dest_dir / entry.name)
+        else:
+            shutil.copy2(entry, dest_dir / entry.name)
 
 
 def _write_kernel_bundle(
@@ -760,6 +800,9 @@ def _wait_for_dataset_version_change(
     )
 
 
+_KERNEL_VERSION_RE = re.compile(r"[Kk]ernel version (\d+) successfully pushed")
+
+
 def _push_kernel(
     bundle_dir: Path,
     *,
@@ -767,15 +810,42 @@ def _push_kernel(
     timeout: int | None,
     username: str,
     key: str,
-) -> None:
+) -> int | None:
+    """Push the kernel and return the kernel version number the push created.
+
+    ``kaggle kernels push`` exits 0 even when it rejects the push (it prints
+    "Kernel push error: ..."), so check the output too.
+    """
     command = ["kaggle", "kernels", "push", "-p", str(bundle_dir)]
     if accelerator:
         command.extend(["--accelerator", accelerator])
     if timeout is not None:
         command.extend(["-t", str(timeout)])
-    result = subprocess.run(command, env=_kaggle_env(username, key), text=True, check=False)
+    result = subprocess.run(
+        command, env=_kaggle_env(username, key), text=True, check=False, capture_output=True
+    )
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if stdout:
+        print(stdout, end="" if stdout.endswith("\n") else "\n", flush=True)
+    if stderr:
+        print(stderr, end="" if stderr.endswith("\n") else "\n", flush=True)
     if result.returncode != 0:
         raise RuntimeError(f"`{' '.join(command)}` failed with exit code {result.returncode}.")
+    combined = f"{stdout}\n{stderr}"
+    if "Kernel push error" in combined:
+        raise RuntimeError(
+            f"`{' '.join(command)}` was rejected by Kaggle (exit code 0):\n{combined.strip()}"
+        )
+    match = _KERNEL_VERSION_RE.search(combined)
+    if match is None:
+        print(
+            "deploy.kaggle: push succeeded but no kernel version was reported; "
+            "the run directory cannot be named by version.",
+            flush=True,
+        )
+        return None
+    return int(match.group(1))
 
 
 def package_for_local_debug(
@@ -790,6 +860,7 @@ def package_for_local_debug(
     the marker). Note that :func:`run_source_bundle_locally` still only executes
     the default variant — see its docstring.
     """
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     if target.dataset_ref:
         target.source_dataset_ref = normalize_dataset_ref(target.dataset_ref)

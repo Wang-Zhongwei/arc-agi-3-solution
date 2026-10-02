@@ -490,10 +490,52 @@ def _experiment_dir(args: argparse.Namespace) -> Path:
             save_git_info(path)
         return path
     path, _log_file = setup_experiment_directory(
-        base_output_dir=_experiments_dir(args),
+        base_output_dir=_run_root_for_target(args),
         run_name=args.run_name or None,
     )
     return path
+
+
+def _run_root_for_target(args: argparse.Namespace) -> Path:
+    """Route a new run into runs/local/ or runs/kaggle/<owner>/<slug>/<bucket>/.
+
+    Kaggle deploys land in ``_pending`` first; once the push reports a kernel version
+    the directory is renamed to ``v<NN>`` (see ``_promote_kaggle_run_dir``). Dry runs
+    never produce a version, so they go straight to ``dry-runs``.
+    """
+    root = _experiments_dir(args)
+    target = str(getattr(args, "deployment_target", "") or "").strip().lower()
+    if target != "kaggle":
+        return root / "local"
+    slug = _default_kaggle_kernel_slug(args)
+    owner, _ = taaf.deploy_kaggle._resolve_kaggle_credentials(
+        str(getattr(args, "kaggle_username", "") or "").strip() or None
+    )
+    bucket = "dry-runs" if bool(getattr(args, "kaggle_dry_run", False)) else "_pending"
+    return root / "kaggle" / taaf.deploy_kaggle.slugify(owner) / slug / bucket
+
+
+def _promote_kaggle_run_dir(run_dir: Path, kernel_version: int | None) -> Path:
+    """Rename runs/kaggle/<owner>/<slug>/_pending/<timestamp>/ to .../v<NN>/ after a push.
+
+    Leaves the directory in ``_pending`` when the push did not report a version, so a
+    rejected push is visibly distinct from one that created a kernel version.
+    """
+    if run_dir.parent.name != "_pending":
+        return run_dir
+    if not kernel_version:
+        print(
+            f"deploy.kaggle: no kernel version reported; run dir stays at {run_dir}",
+            flush=True,
+        )
+        return run_dir
+    target = run_dir.parent.parent / f"v{int(kernel_version):02d}"
+    if target.exists():
+        print(f"deploy.kaggle: {target} already exists; leaving {run_dir} in _pending", flush=True)
+        return run_dir
+    run_dir.rename(target)
+    print(f"deploy.kaggle: run dir -> {target}", flush=True)
+    return target
 
 
 def _optional_positive_float(raw_value: Any, *, option_name: str) -> float | None:
@@ -1170,6 +1212,14 @@ def _run(args: argparse.Namespace) -> None:
         job_id = getattr(handle, "job_id", None)
         kernel_id = getattr(handle, "kernel_id", "")
         uploaded = bool(getattr(handle, "uploaded", True))
+        if kernel_id and uploaded:
+            # Name the run directory by the kernel version the push created. Must happen
+            # before handle.wait() so the output downloads into the version dir.
+            promoted = _promote_kaggle_run_dir(run_dir, getattr(handle, "kernel_version", None))
+            if promoted != run_dir:
+                run_dir = promoted
+                with contextlib.suppress(Exception):
+                    handle.job_dir = run_dir
         if kernel_id:
             print(f"Kaggle kernel: {kernel_id}")
             print(f"Kaggle notebook: https://www.kaggle.com/code/{kernel_id}")
@@ -1177,7 +1227,7 @@ def _run(args: argparse.Namespace) -> None:
             if dataset_ref:
                 print(f"Kaggle source dataset: {dataset_ref}")
             if not uploaded:
-                print(f"Kaggle dry-run bundles: {run_dir / 'kaggle'}")
+                print(f"Kaggle dry-run bundles: {run_dir}")
         elif job_id:
             print(f"Slurm job id: {job_id}")
             print(f"Slurm stdout: {run_dir / 'stdout.log'}")
@@ -1185,7 +1235,7 @@ def _run(args: argparse.Namespace) -> None:
         if args.deployment_wait and (not kernel_id or uploaded):
             handle.wait()
             if kernel_id:
-                print(f"Kaggle output: {run_dir / 'kaggle-output'}")
+                print(f"Kaggle output: {run_dir}")
         elif args.deployment_wait and kernel_id and not uploaded:
             print("Kaggle dry-run requested; nothing remote to wait for.")
         elif kernel_id and uploaded:
