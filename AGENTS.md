@@ -19,3 +19,4 @@
 - Keep credentials outside Git. If using a configured alternate profile, prefix the command with `kaggle-as <profile>` and ensure private input datasets are shared with that account.
 - Resolve both flat and namespaced Kaggle mounts for wheelhouses and datasets. Prefer this run's packaged TAAF source over a serving bundle's copy.
 - Record the pushed version. `QUEUED` or `RUNNING` means submitted, not evaluated; report results only from completed, exact-version artifacts.
+- For each successful submission, create an annotated tag on its exact source/config commit and push it to GitHub: `<notebook-name>-v<version>-<MMDD>`, e.g. `adaptive-reasoning-v30-0920`. Include the full date and Kaggle version URL in the annotation, link the tag in the submission report, and never move an existing submission tag.

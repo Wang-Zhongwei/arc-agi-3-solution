@@ -13,3 +13,5 @@ Each role—[Harness](../roles/harness/README.md), [Infrastructure](../roles/inf
 5. Run data is synced through Google Drive into `ARC3-Inference/runs/`. Keep downloaded `runs/kaggle/` artifacts out of Git; link the exact runs used in your report.
 
 6. From `ARC3-Inference/`, run `make view PORT=8022` to inspect the data.
+
+7. For each successfully submitted Kaggle version, create an annotated Git tag and push it to GitHub. Use `<notebook-name>-v<version>-<submitted-date>` with the date in `MMDD`, e.g. `adaptive-reasoning-v30-0920`
