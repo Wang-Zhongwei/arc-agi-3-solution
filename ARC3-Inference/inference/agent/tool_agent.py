@@ -5178,31 +5178,19 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
-        lines.extend(
-            [
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_call_result`, `frame_diff(before, after)`, and `action(actions)`.",
-                "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
-                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
-            ]
-        )
-        # Upstream states four things about the world model here, and with
-        # ARC3_MEMORY_SECTIONS=off three of them are false or unanswerable: the
-        # block they refer to is suppressed, so "Below you are provided with the
-        # current world model" is followed by nothing, and the model is told in
-        # capitals to always give a revised version with nowhere to put it.
-        # Observed as a drop in replies carrying any assistant text at all,
-        # 76% to 43% - a broken instruction, not an absent one, which is why
-        # `off` was never a clean control.
+        # The standing instructions this opener used to repeat every turn - the
+        # tool and its globals, no numeric grid, compact output, how to diff the
+        # latest change, inspect in Python and score candidates, watch for
+        # HUD-only changes, call and batch action(), the tool-call format, MOUSE
+        # row/col - are all in the system prompt (runtime state, visual game,
+        # Python tool and tool session sections), so they are not restated here.
         #
-        # The first sentence loses only its middle clause: "from the newest
-        # history" attaches to inspecting the evidence just as well, so the
-        # remainder still says use Python, inspect, and score against the goal.
-        if _memory_sections_disabled():
-            lines.append(
-                "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
-            )
-        else:
+        # The world-model lines stay: they introduce the memory block that
+        # follows in this message. With ARC3_MEMORY_SECTIONS=off that block is
+        # suppressed, and so are they - upstream's version told the model to
+        # revise a world model it was never shown, and replies carrying any
+        # assistant text dropped from 76% to 43%.
+        if not _memory_sections_disabled():
             lines.extend(
                 [
                     "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
@@ -5211,9 +5199,8 @@ class ToolAgent:
                 ]
             )
         if not _dedupe_multicall_line():
-            # kept mid-opener only for the upstream wording; the surviving copy
-            # in the closing block is where a note about calling action() twice
-            # belongs, next to the instruction to call it at all
+            # upstream wording, kept for the dedupe arm's control; the system
+            # prompt already says action() may be called more than once
             lines.append(
                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
                 "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
@@ -5222,24 +5209,7 @@ class ToolAgent:
         if knowledge_lines:
             lines.extend(knowledge_lines)
             lines.append("end of world model. ")
-        if action_num == 0:
-            lines.append(
-                "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
-            )
-        else:
-            lines.append(
-                "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
-            )
-        lines.extend(
-            [
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
-                "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
-                *self._memory_section_guidance(bool(knowledge_lines)),
-                TOOL_CALL_FORMAT_GUIDANCE,
-            ]
-        )
-        if "MOUSE" in _normalize_valid_actions(valid_actions):
-            lines.append("If you use MOUSE, include integer row and col arguments.")
+        lines.extend(self._memory_section_guidance(bool(knowledge_lines)))
         if _opener_commit_hint():
             # last line of the opener, where the resumption prompt sits relative
             # to the reply it influences
