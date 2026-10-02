@@ -569,7 +569,8 @@ kaggle-duck: EXCLUDE_GAME_TAGS =
 kaggle-duck: MODEL = local
 kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
 # Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments.
-kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs/kaggle
+# The run router adds kaggle/<owner>/<slug>/ under this root.
+kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
 kaggle-duck: MAX_RUNTIME_MINUTES = 132
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 540
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
