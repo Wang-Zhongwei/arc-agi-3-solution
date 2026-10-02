@@ -2,7 +2,7 @@
 
 ## Workflow
 
-- Follow [commit rules](docs/rules/commits.md) and the [A/B comparison guide](docs/rules/README.md). Work on your role's branch; document tested changes before opening a PR.
+- Follow [commit rules](docs/rules/README.md) and the [A/B comparison guide](docs/rules/t-test.md). Work on your role's branch; document tested changes before opening a PR.
 - Use Make targets from `ARC3-Inference/`. If local editable imports fail, set `PYTHONPATH=.:../tufa-arc-agi-framework/src` before the command.
 - Keep parameter definitions in [CONFIGURATION.md](ARC3-Inference/CONFIGURATION.md), role plans in `docs/roles/`, experiment reports in `docs/<theme>/`, and submission decisions in `docs/submission/`.
 
