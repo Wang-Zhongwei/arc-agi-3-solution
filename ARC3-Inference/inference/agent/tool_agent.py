@@ -1307,26 +1307,24 @@ def _resume_diff_image_enabled() -> bool:
 
 
 def _thinking_budget_mode() -> str:
-    """How LOCAL_ANALYZER_THINKING_TOKEN_BUDGET is enforced: auto, server or continue.
+    """Which server enforces LOCAL_ANALYZER_THINKING_TOKEN_BUDGET: auto, vllm or sglang.
 
-    `server` sends vLLM's `thinking_token_budget`, which closes the think block
-    inside the sampler. sglang has no equivalent request field: its
-    ThinkingBudgetLogitProcessor hardcodes Qwen3's <think> ids (Flash Next uses
-    248068/248069) and is skipped by EAGLE verification, so with speculative
-    decoding it never fires.
+    Both close the think block in the server, in the same request, and both
+    work with speculative decoding.
 
-    `continue` works on any sglang server: the request is capped at the budget,
-    and a reply cut off there is resumed with `</think>` appended to its
-    thinking via `continue_final_message`, so the model writes its answer next.
-    It relies on sglang's semantics (render with the generation prompt, then
-    append the assistant content verbatim); vLLM re-renders the final message
-    through the template, which inserts an empty think block, hence `server`
-    there.
+    `vllm` sends `thinking_token_budget`.
 
-    `auto` (default) asks /models who serves: owned_by=vllm picks `server`,
-    anything else `continue`."""
+    `sglang` sends `custom_params.thinking_budget`, which its reasoner grammar
+    enforces once the server runs with --enable-strict-thinking: after the
+    budget the only allowed token is </think>, whose id comes from the model's
+    tokenizer. Grammar masks are applied per draft position during EAGLE
+    verification, so this holds under MTP. (sglang's ThinkingBudgetLogitProcessor
+    is no alternative: it hardcodes Qwen3's <think> ids - Flash Next uses
+    248068/248069 - and EAGLE verification skips custom logit processors.)
+
+    `auto` (default) asks /models who serves (owned_by)."""
     mode = os.environ.get("ARC3_THINKING_BUDGET_MODE", "").strip().lower()
-    return mode if mode in ("server", "continue") else "auto"
+    return mode if mode in ("vllm", "sglang") else "auto"
 
 
 def _reasoning_effort_ladder() -> list[str]:
@@ -3512,26 +3510,6 @@ def _extract_reasoning_text(message: dict[str, Any]) -> str:
     return _normalize_message_content(reasoning)
 
 
-def _merge_budget_usage(
-    first: dict[str, Any] | None, resumed: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Usage of a budget-cut reply and its continuation, reported as one reply.
-
-    Generated tokens add up. The prompt is the first request's: it is what was
-    sent for this turn, and context calibration compares it with those messages
-    (the continuation repeats them, almost entirely from the prefix cache)."""
-    if not first or not resumed:
-        return first or resumed
-    merged = dict(first)
-    for key in ("completion_tokens", "reasoning_tokens"):
-        if first.get(key) is not None or resumed.get(key) is not None:
-            merged[key] = int(first.get(key) or 0) + int(resumed.get(key) or 0)
-    merged["total_tokens"] = int(merged.get("prompt_tokens") or 0) + int(
-        merged.get("completion_tokens") or 0
-    )
-    return merged
-
-
 def _is_context_length_error(exc: BaseException) -> bool:
     message = str(exc).lower().replace("\u2019", "'")
     return (
@@ -5315,28 +5293,17 @@ class ToolAgent:
             kwargs["reasoning_effort"] = ladder[rung]
         return kwargs
 
-    def _chat_completion(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None,
-        request_timeout_seconds: float | None = None,
-        max_tokens: int | None = None,
-        enable_thinking: bool | None = None,
-    ) -> _ChatCompletionResult:
-        """One gameplay completion, with the thinking budget applied.
+    def _thinking_budget_fields(
+        self, *, max_tokens: int | None, enable_thinking: bool | None
+    ) -> dict[str, Any]:
+        """Request fields that cap this request's thinking, or {} if unbudgeted.
 
-        An explicit max_tokens marks a side request (the rolling summary), which
-        keeps its own limit and is not budgeted."""
+        Not budgeted: side requests with their own max_tokens (the rolling
+        summary), requests without thinking, and any request whose output cap
+        already falls within the budget."""
         budget = _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET
         thinking = (
             bool(_LOCAL_ANALYZER_ENABLE_THINKING) if enable_thinking is None else enable_thinking
-        )
-        request = dict(
-            tools=tools,
-            request_timeout_seconds=request_timeout_seconds,
-            max_tokens=max_tokens,
-            enable_thinking=enable_thinking,
         )
         output_cap = self._max_output_tokens
         if (
@@ -5345,68 +5312,63 @@ class ToolAgent:
             or max_tokens is not None
             or (output_cap is not None and output_cap <= budget)
         ):
-            return self._chat_completion_once(messages, **request)
-        if self._thinking_budget_enforcement() == "server":
-            return self._chat_completion_once(
-                messages, **request, extra_payload={"thinking_token_budget": budget}
-            )
+            return {}
+        server = self._thinking_budget_server()
+        if server == "vllm":
+            return {"thinking_token_budget": budget}
+        if server == "sglang":
+            return {"custom_params": {"thinking_budget": budget}}
+        return {}
 
-        first = self._chat_completion_once(messages, **{**request, "max_tokens": budget})
-        thinking_text = _extract_reasoning_text(first.message).strip()
-        if first.finish_reason != "length" or first.message.get("tool_calls") or not thinking_text:
-            return first
-        # Cut off at the budget. Close the think block and let the model answer:
-        # sglang renders the conversation with the generation prompt (which
-        # opens <think>) and appends this content verbatim. Any answer the first
-        # reply had started is dropped and written again after </think>.
-        # separate_reasoning=false keeps the answer out of reasoning_content -
-        # the qwen3 parser would otherwise wait for a </think> that is already
-        # in the prompt - while tool calls are still parsed.
-        resumed = self._chat_completion_once(
-            [*messages, {"role": "assistant", "content": f"{thinking_text}\n</think>\n\n"}],
-            **{
-                **request,
-                "max_tokens": None if output_cap is None else output_cap - budget,
-            },
-            extra_payload={"continue_final_message": True, "separate_reasoning": False},
-        )
-        message = dict(resumed.message)
-        message.pop("reasoning", None)
-        message["reasoning_content"] = thinking_text
-        return _ChatCompletionResult(
-            message=message,
-            finish_reason=resumed.finish_reason,
-            usage=_merge_budget_usage(first.usage, resumed.usage),
-            served_by=resumed.served_by or first.served_by,
-        )
+    def _thinking_budget_server(self) -> str:
+        """`vllm`, `sglang`, or "" when unknown (the request then goes unbudgeted).
 
-    def _thinking_budget_enforcement(self) -> str:
-        """`server` or `continue`, resolving `auto` once per agent from /models."""
-        mode = _thinking_budget_mode()
-        if mode != "auto":
-            return mode
-        resolved = getattr(self, "_thinking_budget_resolved", None)
-        if resolved is None:
-            resolved = "continue"
+        Resolved once per agent. On sglang it also checks /server_info, because
+        without --enable-strict-thinking the budget is accepted and ignored."""
+        server = getattr(self, "_thinking_budget_server_name", None)
+        if server is not None:
+            return server
+        base = self._model.base_url.rstrip("/")
+        server = _thinking_budget_mode()
+        if server == "auto":
             try:
-                response = requests.get(
-                    f"{self._model.base_url.rstrip('/')}/models",
+                cards = requests.get(
+                    f"{base}/models",
                     headers=self._headers(),
                     timeout=(_CONNECT_TIMEOUT_SECONDS, 30),
+                ).json().get("data") or []
+            except Exception as exc:  # retried on the next request
+                log.warning("thinking budget: could not read /models (%s); request sent without it", exc)
+                return ""
+            owners = {str(card.get("owned_by", "")).lower() for card in cards}
+            server = "vllm" if "vllm" in owners else "sglang" if "sglang" in owners else ""
+            if not server:
+                log.error(
+                    "thinking budget: /models owned_by %s is neither vllm nor sglang; "
+                    "set ARC3_THINKING_BUDGET_MODE. Requests go without a budget.",
+                    sorted(owners),
                 )
-                owners = {
-                    str(card.get("owned_by", "")).lower()
-                    for card in (response.json().get("data") or [])
-                }
-                if "vllm" in owners:
-                    resolved = "server"
-            except Exception as exc:  # detection must not fail the turn
-                log.warning("thinking budget: could not read /models (%s); using continue", exc)
-            log.info("thinking budget %d enforced by %s", _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET, resolved)
-            self._thinking_budget_resolved = resolved
-        return resolved
+        if server == "sglang":
+            root = base[: -len("/v1")] if base.endswith("/v1") else base
+            try:
+                strict = requests.get(
+                    f"{root}/server_info",
+                    headers=self._headers(),
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, 30),
+                ).json().get("enable_strict_thinking")
+            except Exception as exc:
+                strict = None
+                log.warning("thinking budget: could not read /server_info (%s)", exc)
+            if strict is False:
+                log.error(
+                    "thinking budget: sglang runs without --enable-strict-thinking, "
+                    "so custom_params.thinking_budget is ignored"
+                )
+        log.info("thinking budget %d sent as the %s field", _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET, server or "(none)")
+        self._thinking_budget_server_name = server
+        return server
 
-    def _chat_completion_once(
+    def _chat_completion(
         self,
         messages: list[dict[str, Any]],
         *,
@@ -5414,7 +5376,6 @@ class ToolAgent:
         request_timeout_seconds: float | None = None,
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
-        extra_payload: dict[str, Any] | None = None,
     ) -> _ChatCompletionResult:
         payload = build_chat_payload(
             provider=self._model.provider,
@@ -5436,7 +5397,9 @@ class ToolAgent:
         provider_prefs = _openrouter_provider_prefs(self._model.provider)
         if provider_prefs:
             payload["provider"] = provider_prefs
-        payload.update(extra_payload or {})
+        payload.update(
+            self._thinking_budget_fields(max_tokens=max_tokens, enable_thinking=enable_thinking)
+        )
         # merge rather than assign: the payload builder may already have set
         # chat_template_kwargs (enable_thinking), and replacing the dict would
         # drop it - as a request-level dict can also drop a server-side default
