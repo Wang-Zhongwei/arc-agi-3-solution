@@ -156,6 +156,10 @@ CFG = dict(
     SPEC_ACCEPT_SINGLE=1.0,
     SPEC_ACCEPT_ACC=1.0,
     SPEC_STEPS=3,
+    # The harness's thinking budget (custom_params.thinking_budget) is enforced
+    # by sglang's reasoner grammar, which only filters tokens in strict mode.
+    # Strict mode also keeps tool-call and end-of-turn tokens out of thinking.
+    STRICT_THINKING=int(SPEC.get("env", {}).get("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET") or 0) > 0,
 )
 CFG.update(SPEC.get("sglang", {}))
 CFG["SPEC"] = CFG["SPEC"] and bool(DRAFT_MODEL_DIR)
@@ -426,6 +430,7 @@ tmpl = Path(MODEL_DIR, "chat_template.jinja")
 if tmpl.is_file(): args += ["--chat-template", str(tmpl)]
 if not CFG["AUTOTUNE"]: args += ["--disable-flashinfer-autotune"]
 if CFG["GDN_MTP_CACHE_MODE"]: args += ["--gdn-mtp-cache-mode", CFG["GDN_MTP_CACHE_MODE"]]
+if CFG["STRICT_THINKING"]: args += ["--enable-strict-thinking"]
 if CFG["SPEC"]:
     args += ["--speculative-algorithm", "NEXTN", "--speculative-num-steps", str(CFG["SPEC_STEPS"]),
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", str(CFG["SPEC_STEPS"]+1),
