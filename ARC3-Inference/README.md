@@ -318,22 +318,45 @@ Important files include:
 
 ## Viewer
 
+From `ARC3-Inference/`, browse local runs and downloaded Kaggle versions:
+
+```bash
+make view PORT=8022
+```
+
+Open `http://127.0.0.1:8022`. Discovery includes
+`runs/kaggle/<owner>/<notebook>/vNN/`, retaining the full path so versions with
+the same number remain distinct. The comparison and curve pages use each
+run's `evaluation.json`; game rendering uses saved viewer artifacts and event
+sidecars, with request logs supplying additional model-context and usage data.
+Keep downloaded Kaggle artifacts out of Git.
+
+On the comparison curves, hover for scores and their difference, or use the
+arrow keys to move between points.
+
+If an evaluation lacks serving metrics, the viewer reads available
+`server.log`, `serve.log`, `vllm.log`, or `sglang.log` files. SGLang throughput
+is averaged over logged prefill/decode samples; its prefill cache reuse is
+the ratio of logged cached tokens to cached plus new tokens. These are not
+whole-run throughput or vLLM sliding-window cache-hit measurements. Column
+tooltips describe the derived values; unavailable measurements remain blank.
+
 Start the viewer for a saved run on the port from `configs/inference.json`:
 
 ```bash
 make view VIEW_RUN_DIR=/path/to/your/run
 ```
 
-Override the port:
+Override the port (`VIEW_PORT` takes precedence over `PORT`):
 
 ```bash
 make view VIEW_RUN_DIR=/path/to/your/run VIEW_PORT=8012
 ```
 
-Point at a run root (clear the default single-run selection):
+Point at a different run root:
 
 ```bash
-make view VIEW_RUN_DIR= VIEW_RUNS_DIR=/path/to/runs
+make view VIEW_RUNS_DIR=/path/to/runs
 ```
 
 Point at one exact run:
@@ -344,6 +367,10 @@ make view VIEW_RUN_DIR=/shared/arc_3_results/$USER/<run-name>
 
 The viewer shows run summaries, per-game progress, boards, actions, rewards,
 level transitions, and the duck's transcript.
+
+Game thumbnails are optional and require offline environments plus `arc_agi`.
+Pass `VIEW_ENVIRONMENTS_DIR=/path/to/environments` to enable them when those
+dependencies are available; saved boards and transcripts render independently.
 
 This fork corrects per-turn transcript display, includes all recorded attempts
 when an analysis step is retried, and distinguishes pending transcripts from

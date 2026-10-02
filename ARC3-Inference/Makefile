@@ -331,12 +331,12 @@ BOOTSTRAP_SEED ?=
 
 VIEW_HOST ?= 127.0.0.1
 ifeq ($(origin VIEW_PORT),undefined)
-VIEW_PORT := $(shell $(CONFIG_VALUE) viewer.port 8011)
+VIEW_PORT := $(if $(PORT),$(PORT),$(shell $(CONFIG_VALUE) viewer.port 8011))
 endif
 VIEW_RUNS_DIR ?= $(RUNS_DIR)
-# Default to the bundled example-run at the repo root (this exposition ships one),
-# so a bare `make view` opens it. Falls back to VIEW_RUNS_DIR when absent.
-VIEW_RUN_DIR ?= $(wildcard $(REPO_ROOT)/../example-run)
+# Discover local and downloaded Kaggle runs unless a run is explicitly selected.
+VIEW_RUN_DIR ?=
+VIEW_ENVIRONMENTS_DIR ?=
 
 export LOCAL_ANALYZER_BASE_URL
 export LOCAL_ANALYZER_PROVIDER
@@ -665,11 +665,12 @@ significance:
 		$(if $(filter true TRUE 1 yes YES on ON,$(ALLOW_INTERSECTION)),--allow-intersection)
 
 view:
-	$(UV_RUN) inference-view \
+	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src:$$PYTHONPATH" $(UV_RUN) python -m viewer.server \
 		--host "$(VIEW_HOST)" \
 		--port "$(VIEW_PORT)" \
 		--runs-dir "$(VIEW_RUNS_DIR)" \
-		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)")
+		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)") \
+		$(if $(VIEW_ENVIRONMENTS_DIR),--environments-dir "$(VIEW_ENVIRONMENTS_DIR)")
 
 pull-kaggle:
 	@if [ -z "$(NOTEBOOK)" ] || [ -z "$(VERSION)" ]; then \

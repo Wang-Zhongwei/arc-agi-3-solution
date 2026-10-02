@@ -1,0 +1,132 @@
+"""Recover missing comparison metrics from downloaded serving logs."""
+from __future__ import annotations
+
+import re
+import statistics
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+_METRICS = (
+    "prompt_throughput_tokens_per_s", "generation_throughput_tokens_per_s",
+    "prefix_cache_hit_rate_pct", "gpu_kv_cache_usage_pct",
+)
+_NUMBER = r"([0-9]+(?:\.[0-9]+)?)"
+_FIELDS = {
+    "input": re.compile(r"input throughput \(token/s\):\s*" + _NUMBER),
+    "generation": re.compile(r"gen throughput \(token/s\):\s*" + _NUMBER),
+    "kv": re.compile(r"full token usage:\s*" + _NUMBER),
+    "new": re.compile(r"#new-token:\s*(\d+)"),
+    "cached": re.compile(r"#cached-token:\s*(\d+)"),
+}
+_VLLM_FIELDS = {
+    "prompt_throughput_tokens_per_s": re.compile(r"Avg prompt throughput:\s*" + _NUMBER),
+    "generation_throughput_tokens_per_s": re.compile(r"Avg generation throughput:\s*" + _NUMBER),
+    "prefix_cache_hit_rate_pct": re.compile(r"Prefix cache hit rate:\s*" + _NUMBER),
+    "gpu_kv_cache_usage_pct": re.compile(r"GPU KV cache usage:\s*" + _NUMBER),
+}
+
+
+def _value(pattern: re.Pattern, line: str) -> float | None:
+    match = pattern.search(line)
+    return float(match.group(1)) if match else None
+
+
+def _stats(values: list[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    return {"mean": statistics.fmean(values), "median": statistics.median(values),
+            "min": min(values), "max": max(values)}
+
+
+@lru_cache(maxsize=32)
+def _parse_log(path: str, mtime_ns: int, size: int) -> dict[str, Any] | None:
+    # Stat arguments invalidate cached extraction when a log changes.
+    values: dict[str, list[float]] = {key: [] for key in _METRICS}
+    cached_tokens = new_tokens = samples = 0
+    backends: set[str] = set()
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if "Avg prompt throughput:" in line:
+            backends.add("vllm")
+            samples += 1
+            fields = {key: _value(pattern, line) for key, pattern in _VLLM_FIELDS.items()}
+            running = re.search(r"Running:\s*(\d+)", line)
+            waiting = re.search(r"Waiting:\s*(\d+)", line)
+            active = any(fields[key] for key in _METRICS[:2]) or any(
+                match and int(match.group(1)) for match in (running, waiting)
+            )
+            for key, value in fields.items():
+                if value is not None and (key not in _METRICS[:2] or active):
+                    values[key].append(value)
+        elif "Prefill batch," in line or "Decode batch," in line:
+            backends.add("sglang")
+            samples += 1
+            prefill = "Prefill batch," in line
+            throughput = _value(_FIELDS["input" if prefill else "generation"], line)
+            if throughput is not None:
+                key = _METRICS[0 if prefill else 1]
+                values[key].append(throughput)
+            kv = _value(_FIELDS["kv"], line)
+            if kv is not None:
+                values[_METRICS[3]].append(100 * kv)
+            if prefill:
+                new = _value(_FIELDS["new"], line)
+                cached = _value(_FIELDS["cached"], line)
+                if new is not None and cached is not None:
+                    new_tokens += int(new)
+                    cached_tokens += int(cached)
+    if not samples:
+        return None
+    result = {key: _stats(items) for key, items in values.items()}
+    result.update(log=path, sample_count=samples, backend="/".join(sorted(backends)))
+    if backends == {"sglang"}:
+        total = cached_tokens + new_tokens
+        # This is a ratio of logged token counts, not a mean of batch percentages
+        # and not the sliding-window hit rate emitted by vLLM.
+        result[_METRICS[2]] = {"mean": 100 * cached_tokens / total} if total else None
+        result["prefill_tokens"] = {"cached": cached_tokens, "new": new_tokens}
+    return result
+
+
+def serving_metrics(run_dir: Path, recorded: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep populated evaluation metrics; recover absent metrics from local logs."""
+    recorded = recorded or {}
+    if recorded.get("sample_count") or any(recorded.get(key) for key in _METRICS):
+        return recorded
+    servers = []
+    for directory in [run_dir, *sorted(run_dir.glob("passes/*")), *sorted(run_dir.glob("seeds/*"))]:
+        # Alternative filenames for the same server: do not count them twice.
+        for name in ("server.log", "serve.log", "vllm.log", "sglang.log"):
+            path = directory / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            parsed = _parse_log(str(path), stat.st_mtime_ns, stat.st_size)
+            if parsed:
+                servers.append(parsed)
+                break
+    if not servers:
+        return recorded
+    block = {**recorded, "per_server": servers, "logs_found": len(servers),
+             "sample_count": sum(item["sample_count"] for item in servers),
+             "source": "serving logs", "aggregation": "per-server"}
+    sglang = any("sglang" in item["backend"] for item in servers)
+    if sglang:
+        block["metric_labels"] = {
+            _METRICS[2]: "Logged prefill cache reuse / %",
+            _METRICS[3]: "KV token pool use / %",
+        }
+        block["notes"] = (
+            "SGLang throughput uses means of logged prefill/decode samples, not whole-run rates. "
+            "Prefill cache reuse is cached / (cached + new) logged tokens; "
+            "KV use is the logged full-token-pool occupancy. "
+            "These differ from vLLM interval throughput and sliding-window cache hit rates."
+        )
+    else:
+        block["notes"] = "Recovered from vLLM logs; throughput averages active samples only."
+    return block
