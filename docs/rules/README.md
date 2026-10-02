@@ -1,53 +1,15 @@
-# t-test guidance
+# Rules
 
-For a `n` game x `k` pass runs, there are 2 ways of doing the formal [t-test](https://www.itl.nist.gov/div898/handbook/prc/section3/prc311.htm) 
+Each role—[Harness](../roles/harness/README.md), [Infrastructure](../roles/infrastructure/README.md), and [Strategy Solutionist](../roles/strategy/README.md)—works on its own branch. Coordinate when your changes affect another role.
 
-1. Across-game t-test
-2. Across-pass t-test
+1. Commit features on your separate branch.
 
-To illustrate the difference, let's see a toy example: 3 games × 2 passes
+2. Before merging tested features into `main`, write an A/B comparison report in `docs/<theme>/<report_name>.md` and create a pull request. Link the report in the PR so others can see what changed and how it performed.
 
-| A (baseline) | Pass 1 | Pass 2 |
-| --- | ---: | ---: |
-| Game 1 | 20 | 20 |
-| Game 2 | 20 | 20 |
-| Game 3 | 20 | 20 |
+3. Write the original doc yourself and let an agent help fix it. Do NOT fill it with AI slop. Include the necessary links and references.
 
-| B (candidate) | Pass 1 | Pass 2 |
-| --- | ---: | ---: |
-| Game 1 | 28 | 32 |
-| Game 2 | 16 | 20 |
-| Game 3 | 22 | 26 |
+4. A t-test result is recommended following the [guide](t-test.md), unless it is a no-brainer fix. For those fixes, explain what was wrong and how you checked it.
 
-| D = B − A | Pass 1 | Pass 2 | Game mean |
-| --- | ---: | ---: | ---: |
-| Game 1 | +8 | +12 | +10 |
-| Game 2 | −4 | 0 | −2 |
-| Game 3 | +2 | +6 | +4 |
-| Pass mean | +2 | +6 | +4 |
+5. Run data is synced through Google Drive into `ARC3-Inference/runs/`. Keep downloaded `runs/kaggle/` artifacts out of Git; link the exact runs used in your report.
 
-**1. Across games:** $d = (10, -2, 4)$, $N = 3$.
-
-$$
-\bar d = \frac{10 - 2 + 4}{3} = 4, \qquad
-s_d = \sqrt{\frac{(10-4)^2 + (-2-4)^2 + (4-4)^2}{3-1}} = \sqrt{36} = 6
-$$
-
-$$
-t = \frac{\bar d}{s_d/\sqrt{N}} = \frac{4}{6/\sqrt{3}} \approx 1.155, \qquad \mathrm{df} = 2, \qquad p_{\text{one-sided}} \approx 0.184
-$$
-
-**2. Across passes:** $d = (2, 6)$, $k = 2$.
-
-$$
-\bar d = \frac{2 + 6}{2} = 4, \qquad
-s_d = \sqrt{\frac{(2-4)^2 + (6-4)^2}{2-1}} = \sqrt{8} \approx 2.828
-$$
-
-$$
-t = \frac{\bar d}{s_d/\sqrt{k}} = \frac{4}{\sqrt{8}/\sqrt{2}} = 2, \qquad \mathrm{df} = 1, \qquad p_{\text{one-sided}} \approx 0.148
-$$
-
-I think **across-games** is a more of a fit to this competition. In other words, if an approach has improved performance on most games,
- we tend to believe this is the better approach. 
-
+6. From `ARC3-Inference/`, run `make view PORT=8022` to inspect the data.
