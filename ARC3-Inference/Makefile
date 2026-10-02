@@ -571,11 +571,20 @@ kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL
 # Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments.
 # The run router adds kaggle/<owner>/<slug>/ under this root.
 kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
-kaggle-duck: MAX_RUNTIME_MINUTES = 132
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 540
+# The competition run plays all ~110 hidden games in one wave, as in dfranzen's
+# Milestone 2 notebook: every game is live from the start (CONCURRENT_JOBS above
+# the game count) with a per-game cap close to the whole budget, and the priority
+# or UCB gate (ARC3_MAX_ACTIVE_STREAMS) decides which games generate. 28 lanes x
+# 132 min ran four waves with a fixed slice per game instead.
+# The public (non-submission) run plays the 25 public games, also in one wave, and
+# stops at its soft end, MAX_EXPERIMENT_RUNTIME_MINUTES - 10 after notebook start;
+# the competition run ignores that soft end. 150 gives ~131 min of public play
+# after server startup, close to the previous 132-minute public cap.
+kaggle-duck: MAX_RUNTIME_MINUTES = 532
+kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 150
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
 kaggle-duck: N_PASSES = 1
-kaggle-duck: CONCURRENT_JOBS = 28
+kaggle-duck: CONCURRENT_JOBS = 120
 kaggle-duck: ANALYZER_TIMEOUT = 900
 kaggle-duck: _taaf-run
 
