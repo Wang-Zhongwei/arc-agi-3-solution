@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
-from viewer.server import _load_curves_payload
+import pytest
+
+from viewer.server import _load_comparison_payload, _load_curves_payload
 
 
 def _write_evaluation(run_dir: Path, **extra) -> None:
@@ -51,6 +53,34 @@ def test_curves_payload_sends_lanes_and_game_means_for_every_evaluated_run(tmp_p
         "generated_tokens": None, "actions": None, "turns": None,
     }
     assert oldest["lanes"] is None and oldest["curves"]["tokens"] is None
+
+
+@pytest.mark.parametrize("loader", [_load_curves_payload, _load_comparison_payload])
+@pytest.mark.parametrize("games", [
+    [],
+    [{"game_id": "aa01-1", "score": 30.0}],
+    "aa01-1",
+    {"aa01-1": []},
+    {"aa01-1": None},
+])
+def test_payload_skips_incompatible_game_shapes_without_losing_valid_runs(
+    tmp_path: Path, caplog, loader, games,
+) -> None:
+    valid = tmp_path / "kaggle" / "owner" / "slug" / "v01"
+    invalid = valid.parent / "v02"
+    _write_evaluation(valid)
+    _write_evaluation(invalid, games=games)
+    invalid_path = invalid / "evaluation.json"
+    original = invalid_path.read_text()
+
+    payload = loader(tmp_path)
+
+    runs = payload["runs"]
+    run_ids = list(runs) if isinstance(runs, dict) else [run["run_id"] for run in runs]
+    assert run_ids == ["kaggle/owner/slug/v01"]
+    assert str(invalid_path) in caplog.text
+    assert "games" in caplog.text
+    assert invalid_path.read_text() == original
 
 
 def test_curves_page_is_linked_from_viewer_pages() -> None:
