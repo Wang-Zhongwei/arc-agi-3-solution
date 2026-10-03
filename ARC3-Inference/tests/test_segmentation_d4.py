@@ -36,7 +36,7 @@ def test_exhaustive_small_masks_pose_reconstruction_and_d4_invariance():
         expected_hashes = set()
         for _, _, observed in variants(mask):
             signature = _object_signature(cells(observed), 'B')
-            colored, angle, symmetry, pose, shape, mirror = signature
+            colored, angle, symmetry, pose, shape, mirror, form = signature
             expected_hashes.add((colored, shape))
             recovered = [row[::-1] for row in canonical] if mirror else canonical
             for _ in range((angle or 0) // 90):
