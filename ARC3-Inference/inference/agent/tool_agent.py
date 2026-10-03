@@ -5178,19 +5178,25 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
-        # The standing instructions this opener used to repeat every turn - the
-        # tool and its globals, no numeric grid, compact output, how to diff the
-        # latest change, inspect in Python and score candidates, watch for
-        # HUD-only changes, call and batch action(), the tool-call format, MOUSE
-        # row/col - are all in the system prompt (runtime state, visual game,
-        # Python tool and tool session sections), so they are not restated here.
+        # The tool mechanics this opener used to repeat every turn - the tool and
+        # its globals, no numeric grid, compact output, how to diff the latest
+        # change, call and batch action(), the tool-call format, MOUSE row/col -
+        # are all in the system prompt (runtime state, visual game, Python tool
+        # and tool session sections), so they are not restated here. The
+        # methodology lines (inspect and score candidates, ground on turn one,
+        # then focus on the latest change) stay as a per-turn nudge.
         #
-        # The world-model lines stay: they introduce the memory block that
+        # The world-model lines stay too: they introduce the memory block that
         # follows in this message. With ARC3_MEMORY_SECTIONS=off that block is
         # suppressed, and so are they - upstream's version told the model to
         # revise a world model it was never shown, and replies carrying any
-        # assistant text dropped from 76% to 43%.
-        if not _memory_sections_disabled():
+        # assistant text dropped from 76% to 43%. That arm keeps the first
+        # sentence without its world-model clause.
+        if _memory_sections_disabled():
+            lines.append(
+                "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
+            )
+        else:
             lines.extend(
                 [
                     "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
@@ -5209,6 +5215,14 @@ class ToolAgent:
         if knowledge_lines:
             lines.extend(knowledge_lines)
             lines.append("end of world model. ")
+        if action_num == 0:
+            lines.append(
+                "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
+            )
+        else:
+            lines.append(
+                "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
+            )
         lines.extend(self._memory_section_guidance(bool(knowledge_lines)))
         if _opener_commit_hint():
             # last line of the opener, where the resumption prompt sits relative
