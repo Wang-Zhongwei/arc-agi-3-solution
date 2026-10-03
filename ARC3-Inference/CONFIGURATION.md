@@ -67,9 +67,13 @@ Segmentation still uses same-color **four-connectivity**. Diagonal contacts, mul
 
 Each node exposes `bbox`, an inclusive `(r0, c0, r1, c1)` tuple in frame coordinates, and `parent`, the innermost enclosing node's ID or `None`. `parent` is the inverse of the direct `children` relation. Counts and hashes cover only the node's own pixels, excluding its children.
 
+Sandbox frames support `frame[r0:r1, c0:c1]` with Python half-open bounds, negative indices, and unit steps. Crops retain the frame's step/level and interface. Segmentation is recomputed from the cropped pixels, so IDs and containment belong to the crop and edge-crossing components are clipped. Bounding boxes and boundaries retain original-frame coordinates, including through nested slices.
+
 ### `frame_diff` — unconditional Python helper
 
 Added `frame_diff(before=None, after=None)` to the sandbox. Its defaults compare `previous_frame` with `current_frame`. It returns a compact structured account of changed cells and candidate object changes: movement, rotation, appearance, disappearance, recoloring, and resizing. Different-sized frames return an explicit full-redraw/shape-mismatch result.
+
+It also compares matching crops, for example `frame_diff(previous_frame[1:2, 2:3], current_frame[1:2, 2:3])`. Only cells inside the crops contribute; returned coordinates stay in the original frame. Different crop origins raise `ValueError`; different shapes retain the existing shape-mismatch result.
 
 Matching uses component information and assignment heuristics. Multiple similar objects, merges, splits, and segmentation changes can make the correspondence ambiguous. Automatic prompt rendering bounds expensive matching for large groups of identical components; direct Python inspection remains available independently of the automatic hint.
 
