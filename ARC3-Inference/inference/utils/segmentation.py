@@ -6,6 +6,7 @@ the Python-tool sandbox bootstrap, where project packages are not importable.
 """
 
 import hashlib
+import math
 
 _ORTH = ((-1, 0), (1, 0), (0, -1), (0, 1))
 # clockwise Moore-neighbour offsets, starting at NW
@@ -79,6 +80,25 @@ def _cells_hash(norm_cells, color):
     return hashlib.sha1(payload).hexdigest()[:16]
 
 
+def _object_scale(cells):
+    """Largest exact uniform square-block factor of the tight occupancy mask."""
+    norm = _normalize_cells(cells)
+    height = max(r for r, _ in norm) + 1
+    width = max(c for _, c in norm) + 1
+    common = math.gcd(height, width)
+    for scale in range(common, 1, -1):
+        if common % scale or len(norm) % (scale * scale):
+            continue
+        blocks = {}
+        for r, c in norm:
+            block = (r // scale, c // scale)
+            blocks[block] = blocks.get(block, 0) + 1
+        # Every occupied block must be full; all other blocks are entirely zero.
+        if all(count == scale * scale for count in blocks.values()):
+            return scale
+    return 1
+
+
 def _object_signature(cells, color):
     """Rotation-canonical identity of an object.
 
@@ -135,6 +155,7 @@ def segment_layer(layer, color_chars):
         hash regardless of position (lets objects be matched across frames, or when
         several similar objects appear in one frame).
       - ``pixels``: number of cells in the component.
+      - ``scale``: largest exact square-block factor of its own tight binary mask.
       - ``bbox``: inclusive ``(r0, c0, r1, c1)`` bounds of the component's own
         cells, in frame coordinates.
       - ``boundary``: the component's outer perimeter as an ordered, clockwise list of
@@ -252,6 +273,7 @@ def segment_layer(layer, color_chars):
                 "pose_hash": signature[3],
                 "shape_hash": signature[4],
                 "pixels": len(comp["cells"]),
+                "scale": _object_scale(comp["cells"]),
                 "bbox": (min(rows), min(cols), max(rows), max(cols)),
                 "boundary": [[r, c] for r, c in boundary],
                 "children": children[cid],

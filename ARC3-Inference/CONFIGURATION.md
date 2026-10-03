@@ -67,6 +67,8 @@ Segmentation still uses same-color **four-connectivity**. Diagonal contacts, mul
 
 Each node exposes `bbox`, an inclusive `(r0, c0, r1, c1)` tuple in frame coordinates, and `parent`, the innermost enclosing node's ID or `None`. `parent` is the inverse of the direct `children` relation. Counts and hashes cover only the node's own pixels, excluding its children.
 
+Each node also exposes `scale`: the largest integer k dividing both tight-mask dimensions for which every aligned k×k block is uniformly occupied or empty. It uses only the node's own pixels, with blocks anchored at its bbox top-left. A primitive L has scale 1, its exact ×2 enlargement has scale 2, and a filled 4×4 square has scale 4. This is a geometric factor, not an inferred game cell size; crops recompute it from their clipped nodes.
+
 Sandbox frames support `frame[r0:r1, c0:c1]` with Python half-open bounds, negative indices, and unit steps. Crops retain the frame's step/level and interface. Segmentation is recomputed from the cropped pixels, so IDs and containment belong to the crop and edge-crossing components are clipped. Bounding boxes and boundaries retain original-frame coordinates, including through nested slices.
 
 ### `frame_diff` — unconditional Python helper
