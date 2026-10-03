@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from viewer.server import _load_comparison_payload, _load_curves_payload
+from viewer.server import _load_comparison_payload, _load_curves_payload, _load_evaluation
 
 
 def _write_evaluation(run_dir: Path, **extra) -> None:
@@ -57,8 +57,6 @@ def test_curves_payload_sends_lanes_and_game_means_for_every_evaluated_run(tmp_p
 
 @pytest.mark.parametrize("loader", [_load_curves_payload, _load_comparison_payload])
 @pytest.mark.parametrize("games", [
-    [],
-    [{"game_id": "aa01-1", "score": 30.0}],
     "aa01-1",
     {"aa01-1": []},
     {"aa01-1": None},
@@ -90,3 +88,18 @@ def test_curves_page_is_linked_from_viewer_pages() -> None:
     html = (viewer / "curves.html").read_text(encoding="utf-8")
     assert 'fetch("/api/curves"' in html
     assert "function pool(lanes)" in html
+
+
+@pytest.mark.parametrize("loader", [_load_curves_payload, _load_comparison_payload])
+@pytest.mark.parametrize("games", [[], [{"game_id": "aa01-1", "score": 30.0,
+                                        "levels_completed": 1.5, "states": "won"}]])
+def test_payload_accepts_list_games_and_scalar_trial_summaries(tmp_path, loader, games):
+    run = tmp_path / "kaggle" / "owner" / "slug" / "v01"
+    _write_evaluation(run, games=games)
+    path = run / "evaluation.json"
+    original = path.read_text()
+    runs = loader(tmp_path)["runs"]
+    assert len(runs) == 1
+    score = _load_evaluation(path)
+    assert set(score["games"]) == ({"aa01-1"} if games else set())
+    assert path.read_text() == original
