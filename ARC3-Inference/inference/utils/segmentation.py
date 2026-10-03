@@ -135,12 +135,16 @@ def segment_layer(layer, color_chars):
         hash regardless of position (lets objects be matched across frames, or when
         several similar objects appear in one frame).
       - ``pixels``: number of cells in the component.
+      - ``bbox``: inclusive ``(r0, c0, r1, c1)`` bounds of the component's own
+        cells, in frame coordinates.
       - ``boundary``: the component's outer perimeter as an ordered, clockwise list of
         ``[row, col]`` corner points -- a Moore-neighbour trace reduced to only the
         vertices where the contour changes direction (enclosed holes are not traced).
       - ``children``: ids of components directly enclosed by this node. A is a child of
         B only if B is the innermost component that fully surrounds A (every path from A
         to the grid edge crosses B), which yields a clean nesting tree.
+      - ``parent``: id of the innermost enclosing component, or ``None`` if no
+        component encloses this one. This is the inverse of ``children``.
 
     Returns a dict with:
       - ``nodes``: list of the node dicts above, in id order.
@@ -221,9 +225,11 @@ def segment_layer(layer, color_chars):
     # parent = innermost encloser. enclosers are transitive, so along a nesting chain the
     # innermost component is the one that is itself most deeply enclosed.
     children = [[] for _ in range(n)]
+    parents = [None] * n
     for a in range(n):
         if enclosers[a]:
             parent = max(enclosers[a], key=lambda e: (len(enclosers[e]), -e))
+            parents[a] = parent
             children[parent].append(a)
     for child_list in children:
         child_list.sort()
@@ -234,6 +240,8 @@ def segment_layer(layer, color_chars):
         color = color_chars[max(0, min(15, comp["value"]))]
         boundary = _corner_points(_trace_outer_contour(comp["cells"], comp["start"]))
         signature = _object_signature(comp["cells"], color)
+        rows = [r for r, _ in comp["cells"]]
+        cols = [c for _, c in comp["cells"]]
         nodes.append(
             {
                 "id": cid,
@@ -244,8 +252,10 @@ def segment_layer(layer, color_chars):
                 "pose_hash": signature[3],
                 "shape_hash": signature[4],
                 "pixels": len(comp["cells"]),
+                "bbox": (min(rows), min(cols), max(rows), max(cols)),
                 "boundary": [[r, c] for r, c in boundary],
                 "children": children[cid],
+                "parent": parents[cid],
             }
         )
 
