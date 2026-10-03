@@ -120,6 +120,26 @@ def _mask_hash(encoding, color=None):
     return hashlib.sha1(repr(payload).encode()).hexdigest()[:16]
 
 
+def _silhouette_hash(cells):
+    """Fill holes unreachable from the padded exterior by four-neighbor steps."""
+    occupied = set(_normalize_cells(cells))
+    height = max(r for r, _ in occupied) + 1
+    width = max(c for _, c in occupied) + 1
+    reached = {(-1, -1)}
+    stack = [(-1, -1)]
+    while stack:
+        r, c = stack.pop()
+        for dr, dc in _ORTH:
+            point = (r + dr, c + dc)
+            if (-1 <= point[0] <= height and -1 <= point[1] <= width
+                    and point not in occupied and point not in reached):
+                reached.add(point)
+                stack.append(point)
+    filled = [(r, c) for r in range(height) for c in range(width)
+              if (r, c) not in reached]
+    return _mask_hash(min(_mask_encoding(v) for _, _, v in _d4_variants(filled)))
+
+
 def _object_signature(cells, color):
     """D4 hashes and pose relative to the canonical reduced, color-free mask."""
     norm = _normalize_cells(cells)
@@ -156,6 +176,7 @@ def segment_layer(layer, color_chars):
       - ``hash``: colored-mask signature ignoring position, rotation and reflection.
       - ``shape_hash``: the same equivalence without color.
       - ``form_hash``: shape signature after exact integer scale reduction.
+      - ``silhouette_hash``: shape signature after filling enclosed holes; retains size.
       - ``pose_hash``: exact colored-mask signature ignoring position only.
       - ``rotation`` and ``mirrored``: canonical-to-observed pose; reflect left-right
         first, then rotate clockwise. None denotes symmetry ambiguity.
@@ -279,6 +300,7 @@ def segment_layer(layer, color_chars):
                 "shape_hash": signature[4],
                 "mirrored": signature[5],
                 "form_hash": signature[6],
+                "silhouette_hash": _silhouette_hash(comp["cells"]),
                 "pixels": len(comp["cells"]),
                 "scale": _object_scale(comp["cells"]),
                 "bbox": (min(rows), min(cols), max(rows), max(cols)),
