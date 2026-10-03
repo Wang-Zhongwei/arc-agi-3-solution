@@ -340,6 +340,11 @@ is averaged over logged prefill/decode samples; its prefill cache reuse is
 the ratio of logged cached tokens to cached plus new tokens. These are not
 whole-run throughput or vLLM sliding-window cache-hit measurements. Column
 tooltips describe the derived values; unavailable measurements remain blank.
+The curves table shows prompt/decode throughput in tok/s and token cache hit
+rate, with the 10th and 90th percentiles (P10–P90) below each mean. Quantiles
+use linear interpolation over logged samples and are shown separately per
+server. For SGLang, the cache mean is token-weighted while quantiles describe
+individual prefill-batch percentages. Startup samples are included.
 
 Start the viewer for a saved run on the port from `configs/inference.json`:
 

@@ -35,8 +35,9 @@ def _value(pattern: re.Pattern, line: str) -> float | None:
 def _stats(values: list[float]) -> dict[str, float] | None:
     if not values:
         return None
+    deciles = statistics.quantiles(values, n=10, method="inclusive") if len(values) > 1 else [values[0]] * 9
     return {"mean": statistics.fmean(values), "median": statistics.median(values),
-            "min": min(values), "max": max(values)}
+            "min": min(values), "max": max(values), "p10": deciles[0], "p90": deciles[-1]}
 
 
 @lru_cache(maxsize=32)
@@ -44,6 +45,7 @@ def _parse_log(path: str, mtime_ns: int, size: int) -> dict[str, Any] | None:
     # Stat arguments invalidate cached extraction when a log changes.
     values: dict[str, list[float]] = {key: [] for key in _METRICS}
     cached_tokens = new_tokens = samples = 0
+    cache_reuse_percentages: list[float] = []
     backends: set[str] = set()
     try:
         lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -79,6 +81,8 @@ def _parse_log(path: str, mtime_ns: int, size: int) -> dict[str, Any] | None:
                 if new is not None and cached is not None:
                     new_tokens += int(new)
                     cached_tokens += int(cached)
+                    if new + cached > 0:
+                        cache_reuse_percentages.append(100 * cached / (cached + new))
     if not samples:
         return None
     result = {key: _stats(items) for key, items in values.items()}
@@ -87,7 +91,10 @@ def _parse_log(path: str, mtime_ns: int, size: int) -> dict[str, Any] | None:
         total = cached_tokens + new_tokens
         # This is a ratio of logged token counts, not a mean of batch percentages
         # and not the sliding-window hit rate emitted by vLLM.
-        result[_METRICS[2]] = {"mean": 100 * cached_tokens / total} if total else None
+        cache_stats = _stats(cache_reuse_percentages)
+        if cache_stats is not None:
+            cache_stats["mean"] = 100 * cached_tokens / total
+        result[_METRICS[2]] = cache_stats
         result["prefill_tokens"] = {"cached": cached_tokens, "new": new_tokens}
     return result
 
@@ -124,6 +131,7 @@ def serving_metrics(run_dir: Path, recorded: dict[str, Any] | None) -> dict[str,
         block["notes"] = (
             "SGLang throughput uses means of logged prefill/decode samples, not whole-run rates. "
             "Prefill cache reuse is cached / (cached + new) logged tokens; "
+            "its mean is token-weighted and P10/P90 describe individual prefill batches. "
             "KV use is the logged full-token-pool occupancy. "
             "These differ from vLLM interval throughput and sliding-window cache hit rates."
         )
