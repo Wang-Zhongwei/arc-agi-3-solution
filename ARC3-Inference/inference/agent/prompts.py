@@ -131,6 +131,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "\n\nRuntime variables inside every `python` tool call:\n"
     "- `current_frame` is a lightweight frame view for the latest environment state.\n"
     "- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
+    "- `frame[r0:r1, c0:c1]` returns a cropped frame using half-open bounds and unit steps. Crop node IDs are local to the crop; bbox/boundary coordinates stay in the original frame. Components crossing crop edges are clipped.\n"
     "- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.\n"
     "- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.\n"
     "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores position AND rotation -- equal hashes indicate matching color and shape up to rotation; they do not establish object identity), `rotation` (degrees clockwise from the object's canonical orientation: 0/90/180/270, reduced to 0/90 for 2-fold symmetric shapes, `None` for fully symmetric ones), `rotational_symmetry` (1, 2, or 4), `pose_hash` (the rotation-SENSITIVE variant, if you need to match exact orientation), `shape_hash` (color-independent pose shape signature), `pixels` (cell count), `bbox` (inclusive `(r0, c0, r1, c1)` bounds in frame coordinates), `boundary` (clockwise outer-perimeter corner points as `[row, col]` cell coordinates), `children` (ids of directly enclosed objects), and `parent` (id of the innermost enclosing object, or `None`).\n"
@@ -228,6 +229,7 @@ PYTHON_ADDENDUM_TAIL = (
 
 FRAME_DIFF_HINT_ADDENDUM = (
     "- `frame_diff(before=None, after=None)` compares two frames. Omitted arguments default to `previous_frame` and `current_frame`, respectively.\n"
+    "- Matching crops are supported: `frame_diff(previous_frame[1:2, 2:3], current_frame[1:2, 2:3])`. Use the same original-frame bounds; returned coordinates remain in the original frame.\n"
     "- It returns a dictionary containing `changed_cell_count` (an integer) and lists named `moved`, `rotated`, `appeared`, `disappeared`, `changed_color`, and `resized`. Unchanged objects are omitted.\n"
     "- Object-level changes are inferred by matching same-color, 4-connected components between frames: cells connect through shared edges, not diagonally. A game object may therefore be split into several components, or touching same-color objects may form one component.\n"
     "- `moved` describes components matched at different positions. Matching does not establish persistent object identity: with multiple similar components, the reported correspondence may be ambiguous or incorrect. Movement combined with rotation includes `rotated_by` in degrees clockwise; `rotated` describes rotation in place.\n"

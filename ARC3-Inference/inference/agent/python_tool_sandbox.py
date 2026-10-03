@@ -158,18 +158,43 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     class FrameView:
-        def __init__(self, *, ascii, step, level, shape, grid):
+        def __init__(self, *, ascii, step, level, shape, grid, origin=(0, 0)):
             self.ascii = ascii
             self.step = step
             self.level = level
             self.shape = tuple(shape)
             self._grid = grid
+            self._origin = origin
             self._segmentation = None
+
+        def __getitem__(self, key):
+            if not isinstance(key, tuple) or len(key) != 2 or not all(isinstance(s, slice) for s in key):
+                raise TypeError("Use frame[r0:r1, c0:c1] with two slices.")
+            if any(s.step not in (None, 1) for s in key):
+                raise ValueError("Frame slices require unit steps.")
+            r0, r1, _ = key[0].indices(self.shape[0])
+            c0, c1, _ = key[1].indices(self.shape[1])
+            grid = [row[c0:c1] for row in self._grid[r0:r1]]
+            ascii = "\n".join(
+                "".join(COLOR_CHARS[max(0, min(15, int(cell)))] for cell in row)
+                for row in grid
+            )
+            return FrameView(
+                ascii=ascii, step=self.step, level=self.level,
+                shape=(max(0, r1 - r0), max(0, c1 - c0)), grid=grid,
+                origin=(self._origin[0] + r0, self._origin[1] + c0),
+            )
 
         @property
         def segmentation(self):
             if self._segmentation is None:
                 self._segmentation = segment_layer(self._grid, COLOR_CHARS)
+                dr, dc = self._origin
+                if dr or dc:
+                    for node in self._segmentation["nodes"]:
+                        r0, c0, r1, c1 = node["bbox"]
+                        node["bbox"] = (r0 + dr, c0 + dc, r1 + dr, c1 + dc)
+                        node["boundary"] = [[r + dr, c + dc] for r, c in node["boundary"]]
             return self._segmentation
 
         def __str__(self):
@@ -390,11 +415,14 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             if before.shape != after.shape:
                 return {"changed_cell_count": -1, "note": "frame shapes differ; full redraw",
                         "before_shape": before.shape, "after_shape": after.shape}
+            if before._origin != after._origin:
+                raise ValueError("frame_diff requires frames/crops with the same original-frame bounds.")
             return compute_frame_diff(
                 before._grid,
                 after._grid,
                 before.segmentation.get("nodes", []),
                 after.segmentation.get("nodes", []),
+                origin=before._origin,
             )
 
         def _refresh_state(state_payload):

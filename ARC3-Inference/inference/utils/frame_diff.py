@@ -79,19 +79,20 @@ def _node_center2(node):
     rows = [p[0] for p in points]; cols = [p[1] for p in points]
     return (min(rows) + max(rows), min(cols) + max(cols))
 
-def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
+def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *, origin=(0, 0)):
     # Object-level diff between two same-shaped grids with precomputed
     # segmentation nodes. Returns only what changed; unchanged objects are
     # omitted. When max_group_match is set, identical-hash groups larger than
     # it skip pairwise matching and report plain appeared/disappeared entries
     # (guards against O(n^3) assignment on e.g. hundreds of identical pixels).
+    # Cropped grids are local; node coordinates include their original-frame origin.
     changed = set()
     for r, (row_a, row_b) in enumerate(zip(grid_a, grid_b)):
         if row_a == row_b:
             continue
         for c, (va, vb) in enumerate(zip(row_a, row_b)):
             if va != vb:
-                changed.add((r, c))
+                changed.add((r + origin[0], c + origin[1]))
     if not changed:
         return {"changed_cell_count": 0, "moved": [], "rotated": [],
                 "appeared": [], "disappeared": [],
