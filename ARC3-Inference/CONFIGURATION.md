@@ -69,6 +69,10 @@ Each node exposes `bbox`, an inclusive `(r0, c0, r1, c1)` tuple in frame coordin
 
 Each node also exposes `scale`: the largest integer k dividing both tight-mask dimensions for which every aligned k×k block is uniformly occupied or empty. It uses only the node's own pixels, with blocks anchored at its bbox top-left. A primitive L has scale 1, its exact ×2 enlargement has scale 2, and a filled 4×4 square has scale 4. This is a geometric factor, not an inferred game cell size; crops recompute it from their clipped nodes.
 
+Node hashes now use a D4 canonical mask: the lexicographically smallest `(height, width, row-major bits)` among four rotations and their reflections. `hash` includes color; `shape_hash` ignores color; `pose_hash` preserves the observed orientation and color. All ignore position but retain size and holes. Digest values and the rotation reference change from the previous C4 scheme.
+
+`rotation` and `mirrored` reconstruct the observed mask from its canonical scale-reduced reference: optionally reflect left-right, rotate clockwise, then enlarge by `scale`. `mirrored=None` means either reflection flag can describe the pose; use no reflection for reconstruction. `rotation=None` means fourfold symmetry; use zero for reconstruction. Neither field proves an action occurred. Until the mirrored diff bucket is added, chiral reflections remain appeared/disappeared; exact recolors verify occupied cells so recolor-plus-transform is not mistaken for recolor alone.
+
 Sandbox frames support `frame[r0:r1, c0:c1]` with Python half-open bounds, negative indices, and unit steps. Crops retain the frame's step/level and interface. Segmentation is recomputed from the cropped pixels, so IDs and containment belong to the crop and edge-crossing components are clipped. Bounding boxes and boundaries retain original-frame coordinates, including through nested slices.
 
 ### `frame_diff` — unconditional Python helper

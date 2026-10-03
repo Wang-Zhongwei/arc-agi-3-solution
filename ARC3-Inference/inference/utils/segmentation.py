@@ -75,11 +75,6 @@ def _rotate_cells_90(norm_cells):
     return sorted((c, max_r - r) for r, c in norm_cells)
 
 
-def _cells_hash(norm_cells, color):
-    payload = repr((color, norm_cells)).encode()
-    return hashlib.sha1(payload).hexdigest()[:16]
-
-
 def _object_scale(cells):
     """Largest exact uniform square-block factor of the tight occupancy mask."""
     norm = _normalize_cells(cells)
@@ -99,42 +94,49 @@ def _object_scale(cells):
     return 1
 
 
-def _object_signature(cells, color):
-    """Rotation-canonical identity of an object.
+def _mask_encoding(cells):
+    height = max(r for r, _ in cells) + 1
+    width = max(c for _, c in cells) + 1
+    occupied = set(cells)
+    return height, width, tuple(int((r, c) in occupied)
+                               for r in range(height) for c in range(width))
 
-    Hashes the shape in all four 90-degree rotations (extend the transform list
-    with reflections for full D4 canonicalization later) and takes the lowest
-    hash as the canonical id. Returns (canonical_hash, rotation, symmetry,
-    pose_hash) where:
-      - canonical_hash: identical for all rotated copies of the same shape+color.
-      - rotation: degrees CLOCKWISE to rotate the canonical form to obtain the
-        observed object. None for 4-fold symmetric shapes (all rotations equal);
-        reduced mod 180 (i.e. 0 or 90) for 2-fold symmetric shapes.
-      - symmetry: rotational symmetry order (1, 2, or 4).
-      - pose_hash: the classic rotation-SENSITIVE hash of the observed pose.
-    """
+
+def _reflect_cells(cells):
+    width = max(c for _, c in cells) + 1
+    return sorted((r, width - 1 - c) for r, c in cells)
+
+
+def _d4_variants(cells):
+    for mirrored in (False, True):
+        variant = _reflect_cells(cells) if mirrored else cells
+        for angle in (0, 90, 180, 270):
+            yield mirrored, angle, variant
+            variant = _rotate_cells_90(variant)
+
+
+def _mask_hash(encoding, color=None):
+    payload = encoding if color is None else (color, encoding)
+    return hashlib.sha1(repr(payload).encode()).hexdigest()[:16]
+
+
+def _object_signature(cells, color):
+    """D4 hashes and pose relative to the canonical reduced, color-free mask."""
     norm = _normalize_cells(cells)
-    variants = [norm]
-    for _ in range(3):
-        variants.append(_rotate_cells_90(variants[-1]))
-    hashes = [_cells_hash(v, color) for v in variants]
-    # The reference orientation is picked from the COLOUR-FREE hash. Choosing it
-    # from the colour-bearing one made the argmin depend on the colour, so the
-    # same shape in the same orientation reported a different rotation for a red
-    # object than for a blue one - and a model comparing rotations across
-    # objects was reading noise.
-    shape_hashes = [_cells_hash(v, "__shape__") for v in variants]
-    k = shape_hashes.index(min(shape_hashes))
-    canonical = hashes[k]
-    distinct = len(set(shape_hashes))
-    symmetry = {1: 4, 2: 2, 4: 1}.get(distinct, 1)
-    rotation = ((4 - k) % 4) * 90  # so observed = canonical rotated this much CW
+    canonical = min(_mask_encoding(v) for _, _, v in _d4_variants(norm))
+    scale = _object_scale(norm)
+    reduced = sorted({(r // scale, c // scale) for r, c in norm})
+    reference = min((v for _, _, v in _d4_variants(reduced)), key=_mask_encoding)
+    matches = [(mirror, angle) for mirror, angle, v in _d4_variants(reference)
+               if v == reduced]
+    flags = {mirror for mirror, _ in matches}
+    mirrored = None if len(flags) == 2 else matches[0][0]
+    rotation = min(angle for mirror, angle in matches if mirror == bool(mirrored))
+    symmetry = sum(v == reduced for mirror, _, v in _d4_variants(reduced) if not mirror)
     if symmetry == 4:
         rotation = None
-    elif symmetry == 2:
-        rotation = rotation % 180
-    shape_hash = _cells_hash(norm, "__shape__")
-    return canonical, rotation, symmetry, hashes[0], shape_hash
+    return (_mask_hash(canonical, color), rotation, symmetry,
+            _mask_hash(_mask_encoding(norm), color), _mask_hash(canonical), mirrored)
 
 
 def segment_layer(layer, color_chars):
@@ -150,10 +152,11 @@ def segment_layer(layer, color_chars):
     Each node is a dict with:
       - ``id``: index in the top-left ordering.
       - ``color``: the component's ARC color character (looked up in ``color_chars``).
-      - ``hash``: a translation-invariant signature of the object -- its color plus its
-        cell shape normalized to a top-left origin -- so the same shape gets the same
-        hash regardless of position (lets objects be matched across frames, or when
-        several similar objects appear in one frame).
+      - ``hash``: colored-mask signature ignoring position, rotation and reflection.
+      - ``shape_hash``: the same equivalence without color.
+      - ``pose_hash``: exact colored-mask signature ignoring position only.
+      - ``rotation`` and ``mirrored``: canonical-to-observed pose; reflect left-right
+        first, then rotate clockwise. None denotes symmetry ambiguity.
       - ``pixels``: number of cells in the component.
       - ``scale``: largest exact square-block factor of its own tight binary mask.
       - ``bbox``: inclusive ``(r0, c0, r1, c1)`` bounds of the component's own
@@ -272,6 +275,7 @@ def segment_layer(layer, color_chars):
                 "rotational_symmetry": signature[2],
                 "pose_hash": signature[3],
                 "shape_hash": signature[4],
+                "mirrored": signature[5],
                 "pixels": len(comp["cells"]),
                 "scale": _object_scale(comp["cells"]),
                 "bbox": (min(rows), min(cols), max(rows), max(cols)),
