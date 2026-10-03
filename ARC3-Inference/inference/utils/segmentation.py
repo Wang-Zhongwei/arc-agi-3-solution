@@ -136,7 +136,8 @@ def _object_signature(cells, color):
     if symmetry == 4:
         rotation = None
     return (_mask_hash(canonical, color), rotation, symmetry,
-            _mask_hash(_mask_encoding(norm), color), _mask_hash(canonical), mirrored)
+            _mask_hash(_mask_encoding(norm), color), _mask_hash(canonical), mirrored,
+            _mask_hash(_mask_encoding(reference)))
 
 
 def segment_layer(layer, color_chars):
@@ -154,6 +155,7 @@ def segment_layer(layer, color_chars):
       - ``color``: the component's ARC color character (looked up in ``color_chars``).
       - ``hash``: colored-mask signature ignoring position, rotation and reflection.
       - ``shape_hash``: the same equivalence without color.
+      - ``form_hash``: shape signature after exact integer scale reduction.
       - ``pose_hash``: exact colored-mask signature ignoring position only.
       - ``rotation`` and ``mirrored``: canonical-to-observed pose; reflect left-right
         first, then rotate clockwise. None denotes symmetry ambiguity.
@@ -276,6 +278,7 @@ def segment_layer(layer, color_chars):
                 "pose_hash": signature[3],
                 "shape_hash": signature[4],
                 "mirrored": signature[5],
+                "form_hash": signature[6],
                 "pixels": len(comp["cells"]),
                 "scale": _object_scale(comp["cells"]),
                 "bbox": (min(rows), min(cols), max(rows), max(cols)),
