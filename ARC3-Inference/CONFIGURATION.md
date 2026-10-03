@@ -65,6 +65,8 @@ Extended the existing segmentation representation with rotation-aware shape info
 
 Segmentation still uses same-color **four-connectivity**. Diagonal contacts, multicolor objects, and touching objects can therefore produce components that differ from the game’s conceptual objects. Hashes describe shapes/appearances; they are not unique object IDs.
 
+Each node exposes `bbox`, an inclusive `(r0, c0, r1, c1)` tuple in frame coordinates, and `parent`, the innermost enclosing node's ID or `None`. `parent` is the inverse of the direct `children` relation. Counts and hashes cover only the node's own pixels, excluding its children.
+
 ### `frame_diff` — unconditional Python helper
 
 Added `frame_diff(before=None, after=None)` to the sandbox. Its defaults compare `previous_frame` with `current_frame`. It returns a compact structured account of changed cells and candidate object changes: movement, rotation, appearance, disappearance, recoloring, and resizing. Different-sized frames return an explicit full-redraw/shape-mismatch result.
