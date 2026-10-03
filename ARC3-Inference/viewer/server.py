@@ -189,7 +189,18 @@ def _load_evaluation(evaluation_path: Path) -> dict | None:
     except (OSError, UnicodeError, json.JSONDecodeError):
         log.warning("Skipping unreadable evaluation %s", evaluation_path, exc_info=True)
         return None
-    return evaluation if isinstance(evaluation, dict) else None
+    if not isinstance(evaluation, dict):
+        return None
+    games = evaluation.get("games")
+    if games is not None:
+        if not isinstance(games, dict):
+            log.warning("Skipping evaluation %s: games must be an object keyed by game ID, got %s",
+                        evaluation_path, type(games).__name__)
+            return None
+        if any(not isinstance(game, dict) for game in games.values()):
+            log.warning("Skipping evaluation %s: games entries must be objects", evaluation_path)
+            return None
+    return evaluation
 
 
 def _load_comparison_payload(runs_dir: Path, *, games: set[str] | None = None,
