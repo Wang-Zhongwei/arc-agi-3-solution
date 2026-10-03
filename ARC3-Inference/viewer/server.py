@@ -192,6 +192,14 @@ def _load_evaluation(evaluation_path: Path) -> dict | None:
     if not isinstance(evaluation, dict):
         return None
     games = evaluation.get("games")
+    if isinstance(games, list):
+        # Other harnesses write game records as a list rather than keyed by ID.
+        games = {
+            str(game["game_id"]): game
+            for game in games
+            if isinstance(game, dict) and game.get("game_id") is not None
+        }
+        evaluation["games"] = games
     if games is not None:
         if not isinstance(games, dict):
             log.warning("Skipping evaluation %s: games must be an object keyed by game ID, got %s",
@@ -200,6 +208,7 @@ def _load_evaluation(evaluation_path: Path) -> dict | None:
         if any(not isinstance(game, dict) for game in games.values()):
             log.warning("Skipping evaluation %s: games entries must be objects", evaluation_path)
             return None
+
     return evaluation
 
 

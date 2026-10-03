@@ -32,8 +32,10 @@ def run_summary(run_dir: Path, score: dict) -> dict:
     scores = [value for game in games.values() if (value := _number(game.get("score"))) is not None]
     levels = possible = progressed = won = trials = 0
     for game in games.values():
-        completed = game.get("levels_completed") or {}
-        states = game.get("states") or {}
+        # Per-trial dicts; some harnesses store a scalar mean here instead.
+        completed = game.get("levels_completed")
+        completed = completed if isinstance(completed, dict) else {}
+        states = game.get("states") if isinstance(game.get("states"), dict) else {}
         for trial, count in completed.items():
             count, total = _number(count), _number(game.get("total_levels"))
             if count is None:
