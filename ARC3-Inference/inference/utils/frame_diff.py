@@ -79,6 +79,29 @@ def _node_center2(node):
     rows = [p[0] for p in points]; cols = [p[1] for p in points]
     return (min(rows) + max(rows), min(cols) + max(cols))
 
+def _node_mask(grid, node, origin):
+    # Recover the component from an occupied boundary cell, not its bbox corner
+    # (which may be empty). Coordinates in the resulting mask are bbox-local.
+    points = node.get("boundary") or []
+    if not points:
+        return frozenset()
+    r, c = points[0][0] - origin[0], points[0][1] - origin[1]
+    value = grid[r][c]
+    cells = {(r, c)}
+    stack = [(r, c)]
+    while stack:
+        r, c = stack.pop()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (0 <= nr < len(grid) and 0 <= nc < len(grid[nr])
+                    and (nr, nc) not in cells and grid[nr][nc] == value):
+                cells.add((nr, nc))
+                stack.append((nr, nc))
+    r0 = min(r for r, _ in cells)
+    c0 = min(c for _, c in cells)
+    return frozenset((r - r0, c - c0) for r, c in cells)
+
+
 def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *, origin=(0, 0)):
     # Object-level diff between two same-shaped grids with precomputed
     # segmentation nodes. Returns only what changed; unchanged objects are
@@ -147,12 +170,16 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
             moved.append(base_entry)
         # same hash, same position, same rotation: unchanged -> omit
 
+    # Reflected chiral poses cannot be classified by rotation subtraction.
+    # Keep them unmatched until the mirrored diff bucket is implemented.
+    masks_a = {id(n): _node_mask(grid_a, n, origin) for n in before_nodes}
+    masks_b = {id(n): _node_mask(grid_b, n, origin) for n in after_nodes}
     groups_before = {}
     for node in before_nodes:
-        groups_before.setdefault(node.get("hash"), []).append(node)
+        groups_before.setdefault((node.get("hash"), node.get("mirrored")), []).append(node)
     groups_after = {}
     for node in after_nodes:
-        groups_after.setdefault(node.get("hash"), []).append(node)
+        groups_after.setdefault((node.get("hash"), node.get("mirrored")), []).append(node)
 
     for key, group_a in groups_before.items():
         group_b = groups_after.pop(key, [])
@@ -166,6 +193,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                                     "pixels": node_a.get("pixels"),
                                     "hash": node_a.get("hash"),
                                     "shape_hash": node_a.get("shape_hash"),
+                                    "_mask": masks_a[id(node_a)],
                                     "at": list(_node_topleft(node_a)),
                                     "bbox": list(_node_bbox(node_a))})
             for node_b in group_b:
@@ -173,6 +201,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                                  "pixels": node_b.get("pixels"),
                                  "hash": node_b.get("hash"),
                                  "shape_hash": node_b.get("shape_hash"),
+                                 "_mask": masks_b[id(node_b)],
                                  "at": list(_node_topleft(node_b)),
                                  "bbox": list(_node_bbox(node_b))})
             continue
@@ -182,6 +211,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                                     "pixels": node_a.get("pixels"),
                                     "hash": node_a.get("hash"),
                                     "shape_hash": node_a.get("shape_hash"),
+                                    "_mask": masks_a[id(node_a)],
                                     "at": list(_node_topleft(node_a)),
                                     "bbox": list(_node_bbox(node_a))})
             continue
@@ -213,6 +243,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                                         "pixels": node_a.get("pixels"),
                                         "hash": node_a.get("hash"),
                                     "shape_hash": node_a.get("shape_hash"),
+                                    "_mask": masks_a[id(node_a)],
                                         "at": list(_node_topleft(node_a)),
                                         "bbox": list(_node_bbox(node_a))})
         else:
@@ -222,6 +253,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                                      "pixels": node_b.get("pixels"),
                                      "hash": node_b.get("hash"),
                              "shape_hash": node_b.get("shape_hash"),
+                                 "_mask": masks_b[id(node_b)],
                                      "at": list(_node_topleft(node_b)),
                                      "bbox": list(_node_bbox(node_b))})
             continue
@@ -232,6 +264,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                              "pixels": node_b.get("pixels"),
                              "hash": node_b.get("hash"),
                              "shape_hash": node_b.get("shape_hash"),
+                                 "_mask": masks_b[id(node_b)],
                              "at": list(_node_topleft(node_b)),
                              "bbox": list(_node_bbox(node_b))})
     # Phase A - changed_color: EXACT pairs only. Same position, byte-
@@ -247,6 +280,8 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
             if (gone["at"] == new["at"]
                     and gone.get("shape_hash")
                     and gone.get("shape_hash") == new.get("shape_hash")
+                    and gone["bbox"] == new["bbox"]
+                    and gone["_mask"] == new["_mask"]
                     and gone["color"] != new["color"]):
                 changed_color.append({"at": gone["at"],
                                       "pixels": gone["pixels"],
@@ -278,7 +313,7 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
     candidates = []
     for gi, gone in enumerate(disappeared):
         for ni, new in enumerate(appeared):
-            if gone["color"] != new["color"]:
+            if gone["color"] != new["color"] or gone.get("hash") == new.get("hash"):
                 continue
             bg = gone.get("bbox") or (0, 0, -1, -1)
             bn = new.get("bbox") or (0, 0, -1, -1)
@@ -302,6 +337,8 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *
                         "after_hash": new.get("hash")})
     disappeared = [entry for index, entry in enumerate(disappeared) if index not in used_gone]
     appeared = [entry for index, entry in enumerate(appeared) if index not in used_new]
+    for entry in appeared + disappeared:
+        entry.pop("_mask", None)
     return {"changed_cell_count": len(changed), "moved": moved,
             "rotated": rotated,
             "appeared": appeared, "disappeared": disappeared,
