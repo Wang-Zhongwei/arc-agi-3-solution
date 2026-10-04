@@ -152,6 +152,9 @@ def fetch_source(
             refs = [dataset_ref]
         else:
             refs = [ref for ref in sources if ref.split("/")[-1].startswith(SOURCE_DATASET_PREFIX)]
+            # A config's kaggle.dataset_slug renames the bundle; TAAF still uploads
+            # it under the deploying owner, unlike external inputs.
+            refs = refs or [ref for ref in sources if ref.split("/")[0] == owner]
         versions = []
         if len(refs) == 1:
             request = ApiGetDatasetRequest()
@@ -163,7 +166,7 @@ def fetch_source(
     notebook.write_text(kernel.blob.source, encoding="utf-8")
     print(f"[v{version}] notebook  {notebook}")
     if len(refs) != 1:
-        print(f"[v{version}] expected one {SOURCE_DATASET_PREFIX}* dataset source, found {sources}; pass --dataset-ref")
+        print(f"[v{version}] expected one {SOURCE_DATASET_PREFIX}* or {owner}/* dataset source, found {sources}; pass --dataset-ref")
         return False
 
     start = _run_start(target)
