@@ -9,7 +9,7 @@ figures/thinking_vs_level_up_ls20.png and prints the tests.
 
 Needs the pulled runs under ARC3-Inference/runs/kaggle (or ARC3_RUNS_DIR).
 
-    python3 docs/reasoning/scripts/thinking_vs_level_up.py
+    python3 docs/reasoning/scripts/thinking_vs_level_up_ls20.py
 """
 
 import csv
