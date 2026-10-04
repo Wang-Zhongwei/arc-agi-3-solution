@@ -41,4 +41,4 @@ The cap is not extended, because the hidden run has no slack: 4 × 132 min plus 
 
 ## Results
 
-Pending.
+Version 1 was pushed on 2026-10-04 from commit `458e575` (clean tree), with 28 lanes and a 132-min per-game cap. It was QUEUED at the time of writing. Record its scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=1`.
