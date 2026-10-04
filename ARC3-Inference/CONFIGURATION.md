@@ -400,6 +400,14 @@ value = yield + c × √(ln(1 + elapsed_minutes) / count)
 
 Only the ranking changes. There are no time quanta: a game keeps its slot until context trimming invalidates its prefix, then hands over exactly as above. Endgame, pace and tail-fade settings apply only to `priority`.
 
+### Soft stop at the per-game cap
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_GAME_SOFT_STOP_SECONDS` | `0`: disabled | Grace G before `max_runtime_s_per_game`. From cap − G the game starts no new turn, but the turn in flight finishes: its thinking continuations run, its actions execute, and a context trim keeps the gate slot instead of handing over. Only the cap itself cuts a turn. |
+
+Without it, a game is cut wherever it is when the cap passes, usually between thinking continuations of a turn that has not acted yet, and its request timeout is shortened to the time left. The cap is unchanged, so a lane spends no longer on a game than before. That matters when games run in waves (`concurrent_jobs` below the game count): each lane plays several games back to back, and the notebook's 9-hour limit leaves no room for one to overrun. In v3's turns, 300 s covers about 95% of turn lengths (p50 35 s, p90 153 s, p95 266 s, gate waits included).
+
 ### Context trim log
 
 Every trim that reaches a handover logs one INFO line, in either scheduler mode and with or without a gate:

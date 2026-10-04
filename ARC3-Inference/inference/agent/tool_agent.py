@@ -2321,6 +2321,19 @@ def _priority_human_actions() -> float:
     return max(1.0, _get_env_float("ARC3_PRIORITY_HUMAN_ACTIONS", 25.0))
 
 
+def game_soft_stop_seconds() -> float:
+    """Grace before max_runtime_s_per_game in which a game only finishes.
+
+    From max_runtime_s_per_game minus this, the game starts no new turn, but the
+    turn in flight - its thinking continuations and the actions it ends in - runs
+    on, cut only at max_runtime_s_per_game itself, and keeps its gate slot rather
+    than parking at a handover it may not leave before the cap. The hard cap is
+    unchanged, so the time a lane spends on one game is unchanged too, which keeps
+    a run of several waves inside the notebook's wall clock. 0 disables.
+    """
+    return max(0.0, _get_env_float("ARC3_GAME_SOFT_STOP_SECONDS", 0.0))
+
+
 def _endgame_start_minutes() -> float:
     """Wall-clock minutes from a game's start before it switches phase.
 
@@ -5883,6 +5896,11 @@ class ToolAgent:
         elapsed = payload.get("run_elapsed_seconds")
         if isinstance(elapsed, (int, float)):
             self._game_elapsed_seconds = float(elapsed)
+        # kept as a deadline, not a remainder, so the handover check stays
+        # current between steps
+        remaining = payload.get("time_remaining_seconds")
+        if isinstance(remaining, (int, float)):
+            self._game_deadline = time.monotonic() + float(remaining)
         if payload.get("error"):
             compact["error"] = payload.get("error")
         return compact
@@ -6590,6 +6608,11 @@ class ToolAgent:
         self._context_was_trimmed = False
         reasons = getattr(self, "_pending_trim_reasons", None) or []
         self._pending_trim_reasons = []
+        if self._in_soft_stop_grace():
+            # A game that only finishes its last turn keeps its slot: parked
+            # here, it could wait past its cap and lose the turn anyway.
+            log.info("context trim in soft-stop grace: keeping the gate slot")
+            return
         summary = self._last_step_summary or {}
         if _scheduler() == "ucb":
             self._handover_yield_ucb(summary, reasons)
@@ -6688,6 +6711,16 @@ class ToolAgent:
             _priority_action_count(summary), int(self._session_generated_tokens),
             "; ".join(reasons) or "unspecified", ranking, gate,
         )
+
+    def _in_soft_stop_grace(self) -> bool:
+        """Whether the game is past its soft stop, only finishing its turn."""
+        grace = game_soft_stop_seconds()
+        # getattr: unset until a step has reported the clock, and on an agent
+        # unpickled from before the field existed
+        deadline = getattr(self, "_game_deadline", None)
+        if grace <= 0.0 or deadline is None:
+            return False
+        return time.monotonic() >= deadline - grace
 
     def _in_endgame(self) -> bool:
         """Whether this game has been running long enough to switch phase.
