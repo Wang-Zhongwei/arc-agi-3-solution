@@ -1955,7 +1955,8 @@ def _priority_refresh_enabled() -> bool:
     # Yield-UCB's bonus moves with the shared clock, so it always refreshes.
     return _scheduler() == "ucb" or any(_get_env_bool(name, False) for name in (
         "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
-    )) or _priority_thinking_reference() > 0
+        "ARC3_PRIORITY_THINKING",
+    ))
 
 
 def _scheduler() -> str:
@@ -2238,12 +2239,14 @@ def _priority_token_scale() -> float:
 
 
 def _priority_thinking_reference() -> float:
-    """Reasoning tokens of a typical action-emitting call; 0 (default) disables
-    the thinking multiplier. Enabling it also enables refreshed ranking, since
-    the multiplier travels on the queued snapshot."""
-    value = _get_env_float("ARC3_PRIORITY_THINKING_REF", 0.0)
-    if not math.isfinite(value) or value < 0:
-        raise ValueError("ARC3_PRIORITY_THINKING_REF must be finite and >= 0")
+    """Reference for the thinking multiplier: reasoning tokens of a typical
+    action-emitting call. 0 when ARC3_PRIORITY_THINKING is off. Like pace, it
+    also enables refreshed ranking, since the multiplier travels on the snapshot."""
+    if not _get_env_bool("ARC3_PRIORITY_THINKING", False):
+        return 0.0
+    value = _get_env_float("ARC3_PRIORITY_THINKING_REF", 2048.0)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("ARC3_PRIORITY_THINKING_REF must be finite and > 0")
     return value
 
 

@@ -336,9 +336,10 @@ The implementation smooths relative completion costs, shrinks estimates toward n
 
 | Setting | Default | Role |
 |---|---|---|
-| `ARC3_PRIORITY_THINKING_REF` | `0` (off) | Reasoning tokens of a typical action-emitting call. A positive value multiplies each game's priority by `clip((t / ref) ^ -0.5, 0.5, 2)`, where `t` is the reasoning tokens of the game's most recent model call. Suggested: `2048`. |
+| `ARC3_PRIORITY_THINKING` | Off | Multiplies each game's priority by `clip((t / ref) ^ -0.5, 0.5, 2)`, where `t` is the reasoning tokens of the game's most recent model call. |
+| `ARC3_PRIORITY_THINKING_REF` | `2048` | `ref`: reasoning tokens of a typical action-emitting call. |
 
-Short deliberation right before an action goes with understanding the level. Across 60 games, the call that emitted a level-up turn's action had a median of 260 reasoning tokens, against 1,162 for other turns ([report](../docs/reasoning/thinking-vs-level-up.md)). At `2048`, a 512-token call doubles the priority and an 8,192-token call halves it. The reference applies equally to every game, so it only sets where the clip takes effect. The multiplier applies in both the main and endgame phases. It is ignored when the server reports no `reasoning_tokens`. Enabling it also enables refreshed ranking.
+Short deliberation right before an action goes with understanding the level. Across 60 games, the call that emitted a level-up turn's action had a median of 260 reasoning tokens, against 1,162 for other turns ([report](../docs/reasoning/thinking-vs-level-up.md)). At `2048`, a 512-token call doubles the priority and an 8,192-token call halves it. The reference applies equally to every game, so it only sets where the clip takes effect. The multiplier applies in both the main and endgame phases. It is ignored when the server reports no `reasoning_tokens`. Like pace, enabling it also enables refreshed ranking. It combines freely with pace, tail fade and the tail lookups.
 
 ### Tail fading and endgame
 

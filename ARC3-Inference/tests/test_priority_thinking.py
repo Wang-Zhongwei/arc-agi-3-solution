@@ -41,13 +41,17 @@ def test_usage_reasoning_tokens():
 
 def test_env_flag(monkeypatch):
     for name in ("ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
-                 "ARC3_SCHEDULER", "ARC3_PRIORITY_THINKING_REF"):
+                 "ARC3_SCHEDULER", "ARC3_PRIORITY_THINKING", "ARC3_PRIORITY_THINKING_REF"):
         monkeypatch.delenv(name, raising=False)
     assert _priority_thinking_reference() == 0.0
     assert not _priority_refresh_enabled()
     monkeypatch.setenv("ARC3_PRIORITY_THINKING_REF", "1024")
+    assert _priority_thinking_reference() == 0.0  # reference alone does not enable it
+    monkeypatch.setenv("ARC3_PRIORITY_THINKING", "1")
     assert _priority_thinking_reference() == 1024.0
     assert _priority_refresh_enabled()
-    monkeypatch.setenv("ARC3_PRIORITY_THINKING_REF", "-1")
+    monkeypatch.delenv("ARC3_PRIORITY_THINKING_REF")
+    assert _priority_thinking_reference() == 2048.0
+    monkeypatch.setenv("ARC3_PRIORITY_THINKING_REF", "0")
     with pytest.raises(ValueError):
         _priority_thinking_reference()
