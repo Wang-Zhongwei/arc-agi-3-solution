@@ -1,4 +1,4 @@
-"""Render per-game thumbnails (initial frame) from the offline ARC-AGI-3 env files."""
+"""Render initial-frame thumbnails from saved runs or offline ARC-AGI-3 env files."""
 from __future__ import annotations
 
 import io
@@ -8,15 +8,18 @@ import os
 import re
 import threading
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
-from viewer.data import _ARC_COLOR_MAP, _hex_to_rgb
+from inference.utils.viewer_artifacts import load_raw_events, raw_events_jsonl_sidecar_path
+from viewer.data import _ARC_COLOR_MAP, _hex_to_rgb, _viewer_data_paths, list_run_dirs
 
 log = logging.getLogger(__name__)
 
 ARC_PLAY_BASE_URL = "https://arcprize.org/tasks"
 THUMBNAIL_SIZE = 256
 _BASE_ID_RE = re.compile(r"^[a-z0-9]{4}$")
+_GAME_ID_RE = re.compile(r"^[a-z0-9]{4}(?:-[a-z0-9]+)?$")
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CACHE_DIR = _PROJECT_ROOT / ".cache" / "viewer-thumbnails"
 _MEMORY_CACHE: dict[str, bytes] = {}
@@ -123,21 +126,83 @@ def render_grid_png(grid: list[list[int]], *, size: int = THUMBNAIL_SIZE) -> byt
     return buffer.getvalue()
 
 
-def game_thumbnail_png(game_id: str, *, environments_dir: Path | None = None) -> bytes | None:
-    """Return the PNG thumbnail for ``game_id`` (cached in memory and on disk), or None."""
+def _saved_initial_grid(game_id: str, runs_dir: Path) -> list[list[int]] | None:
+    """Read the initial board of the exact saved game version, without loading its trace."""
     base_id = base_game_id(game_id)
-    if base_id is None:
+    for run_dir in list_run_dirs(runs_dir):
+        for path in _viewer_data_paths(run_dir):
+            # Artifact filenames include the game version and pass index.
+            if not path.name.startswith(game_id + "_p" if "-" in game_id else base_id + "-"):
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("game_id") != game_id and ("-" in game_id or base_game_id(payload.get("game_id")) != base_id):
+                    continue
+                sidecar = raw_events_jsonl_sidecar_path(path)
+                if "events" not in payload and sidecar.is_file():
+                    # Initial events come first; later lines can contain large transcripts.
+                    with sidecar.open(encoding="utf-8") as file:
+                        for line in file:
+                            if not line.strip():
+                                continue
+                            event = json.loads(line)
+                            if isinstance(event, dict) and event.get("type") == "initial" and event.get("board"):
+                                return event["board"]
+                else:
+                    for event in load_raw_events(payload, viewer_data_path=path):
+                        if event.get("type") == "initial" and event.get("board"):
+                            return event["board"]
+                for step in payload.get("viewer_steps") or []:
+                    event = step.get("boardEvent") or step.get("event") or {}
+                    if event.get("type") == "initial" and event.get("board"):
+                        return event["board"]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                log.debug("Could not read initial frame from %s", path, exc_info=True)
+    return None
+
+
+def game_thumbnail_png(
+    game_id: str, *, environments_dir: Path | None = None, runs_dir: Path | None = None,
+) -> bytes | None:
+    """Return an initial-frame PNG, using saved boards before offline environments."""
+    game_id = str(game_id).strip().lower()
+    base_id = base_game_id(game_id)
+    if base_id is None or not _GAME_ID_RE.fullmatch(game_id):
         return None
+    shared_cache_path = None
+    if runs_dir is not None:
+        shared_cache_path = runs_dir / "thumbnails" / f"{game_id}.png"
+        cache_key = f"{runs_dir.resolve()}:{game_id}"
+        cached = _MEMORY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            data = shared_cache_path.read_bytes()
+            if data.startswith(b"\x89PNG\r\n\x1a\n"):
+                _MEMORY_CACHE[cache_key] = data
+                return data
+        except OSError:
+            pass
+        grid = _saved_initial_grid(game_id, runs_dir)
+        if grid is not None:
+            data = render_grid_png(grid)
+            _persist_thumbnail(shared_cache_path, data)
+            _MEMORY_CACHE[cache_key] = data
+            return data
     environments_dir = environments_dir or default_environments_dir()
     if environments_dir is None or not environments_dir.is_dir():
         return None
     cached = _MEMORY_CACHE.get(base_id)
     if cached is not None:
+        if shared_cache_path is not None:
+            _persist_thumbnail(shared_cache_path, cached)
         return cached
     source_mtime = _env_metadata_mtime(environments_dir, base_id)
     if source_mtime is None:
         return None
-    cache_path = _CACHE_DIR / f"{base_id}.png"
+    cache_path = shared_cache_path or _CACHE_DIR / f"{base_id}.png"
     try:
         if cache_path.is_file() and cache_path.stat().st_mtime >= source_mtime:
             data = cache_path.read_bytes()
@@ -153,12 +218,22 @@ def game_thumbnail_png(game_id: str, *, environments_dir: Path | None = None) ->
     if grid is None:
         return None
     data = render_grid_png(grid)
-    try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".png.tmp")
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, cache_path)
-    except OSError:
-        log.debug("Could not persist thumbnail cache for %s", base_id, exc_info=True)
+    _persist_thumbnail(cache_path, data)
     _MEMORY_CACHE[base_id] = data
     return data
+
+
+def _persist_thumbnail(cache_path: Path, data: bytes) -> None:
+    """Write complete PNGs atomically, including in the Drive-backed runs folder."""
+    tmp_path = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=cache_path.parent, suffix=".tmp", delete=False) as file:
+            tmp_path = Path(file.name)
+            file.write(data)
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        log.debug("Could not persist thumbnail cache at %s", cache_path, exc_info=True)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)

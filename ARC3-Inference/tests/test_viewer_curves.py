@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from viewer.server import _load_comparison_payload, _load_curves_payload, _load_evaluation
+from viewer.server import _load_comparison_payload, _load_curves_payload, _load_evaluation, _load_level_lanes
 
 
 def _write_evaluation(run_dir: Path, **extra) -> None:
@@ -88,6 +88,68 @@ def test_curves_page_is_linked_from_viewer_pages() -> None:
     html = (viewer / "curves.html").read_text(encoding="utf-8")
     assert 'fetch("/api/curves"' in html
     assert "function pool(lanes)" in html
+
+
+def test_level_lanes_use_completion_costs_with_nonlinear_scores_and_shared_token_knots(tmp_path):
+    run = tmp_path / "v01"
+    artifacts = run / "artifacts"
+    artifacts.mkdir(parents=True)
+    artifact = {"game_id": "aa01-1", "levels_completed": 2, "actions_per_level": [2, 3, 4]}
+    path = artifacts / "aa01-1_p0_viewer_data.json"
+    original = json.dumps(artifact)
+    path.write_text(original)
+    evaluation = {"games": {"aa01-1": {"trial_scores": {"v01": 40}, "levels_completed": {"v01": 2}}},
+                  "progression_lanes": {
+                      "actions": {"aa01-1": {"v01": [[0, 0], [2, 1], [5, 40], [9, 40]]}},
+                      "tokens": {"aa01-1": {"v01": [[0, 0], [10, 1], [10, 40], [30, 40]]}},
+                  }}
+
+    lanes = _load_level_lanes(run, evaluation)
+
+    assert lanes["actions"]["aa01-1"]["v01"] == [[0, 0], [2, 1], [5, 2], [9, 2]]
+    assert lanes["tokens"]["aa01-1"]["v01"] == [[0, 0], [10, 1], [10, 2], [30, 2]]
+    assert evaluation["progression_lanes"]["tokens"]["aa01-1"]["v01"][-1] == [30, 40]
+    assert path.read_text() == original
+
+
+@pytest.mark.parametrize("counts,completed,has_history", [
+    ([2, 3, 4], 2, False),
+    ([1, 4, 4], 2, True),  # Completion action absent from the evaluated history.
+    ([2, 3, 4], 1, True),  # Artifact and evaluation disagree on final levels.
+])
+def test_level_lanes_omit_missing_or_inconsistent_history(tmp_path, counts, completed, has_history):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "aa01-1_p0_viewer_data.json").write_text(json.dumps({
+        "game_id": "aa01-1", "levels_completed": 2, "actions_per_level": counts,
+    }))
+    evaluation = {"games": {"aa01-1": {"trial_scores": {"p0": 40}, "levels_completed": {"p0": completed}}},
+                  "progression_lanes": {
+                      "actions": {"aa01-1": {"p0": [[0, 0], [2, 1], [5, 40], [9, 40]]}},
+                      "tokens": {"aa01-1": {"p0": [[0, 0], [10, 1], [20, 40], [30, 40]]}},
+                  } if has_history else None}
+
+    assert _load_level_lanes(tmp_path, evaluation) == {"actions": {}, "tokens": {}}
+
+
+def test_level_lanes_match_passes_using_recorded_pass_offset(tmp_path):
+    run = tmp_path / "v02"
+    artifacts = run / "passes" / "5" / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts.parent / "run_config.json").write_text(json.dumps({"pass_offset": 5}))
+    (artifacts / "aa01-1_p0_viewer_data.json").write_text(json.dumps({
+        "game_id": "aa01-1", "pass_index": 0, "levels_completed": 1, "actions_per_level": [2, 7],
+    }))
+    evaluation = {"games": {"aa01-1": {"trial_scores": {"v02/pass-0": 0, "v02/pass-5": 40},
+                                       "levels_completed": {"v02/pass-0": 0, "v02/pass-5": 1}}},
+                  "progression_lanes": {
+                      "actions": {"aa01-1": {"v02/pass-5": [[0, 0], [2, 40], [9, 40]]}},
+                      "tokens": {"aa01-1": {"v02/pass-5": [[0, 0], [10, 40], [30, 40]]}},
+                  }}
+
+    lanes = _load_level_lanes(run, evaluation)
+
+    assert lanes["tokens"]["aa01-1"] == {"v02/pass-5": [[0, 0], [10, 1], [30, 1]]}
 
 
 @pytest.mark.parametrize("loader", [_load_curves_payload, _load_comparison_payload])
