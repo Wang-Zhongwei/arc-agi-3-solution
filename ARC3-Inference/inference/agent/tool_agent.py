@@ -2777,8 +2777,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += (
             " Each turn's message includes an 'Auto frame diff' section summarizing "
             "object-level changes since your previous analyzer turn (it spans all "
-            "actions executed in between, not just the last one). Treat it as ground "
-            "truth for what changed, consult it before acting, and call `frame_diff()` "
+            "actions executed in between, not just the last one). Use it as a summary "
+            "of candidate object changes, consult it before acting, and call `frame_diff()` "
             "in python when you need per-action or full object detail."
         )
     if _DIFF_IMAGE and current_grid_image_enabled():
@@ -2816,6 +2816,12 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         # either way - this only controls whether the model is told about it,
         # so the arm measures whether knowing costs more than it returns.
         prompt += FRAME_DIFF_HINT_ADDENDUM
+    if _get_env_bool("ARC3_HUD_DISPLAY", False) and _persistent_functions():
+        prompt += (
+            "- If you define `hud(f=current_frame)`, later user prompts show its reading "
+            "for the current board. Return a compact summary and revise the helper "
+            "when the layout or your understanding changes.\n"
+        )
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
         prompt += STEP_VERIFICATION_ADDENDUM
@@ -4776,8 +4782,56 @@ class ToolAgent:
             self._kept_functions = {}
             payload["function_retention"] = "Your retained functions were cleared after a retention error; redefine any you need."
 
-    def _build_user_message(self, user_prompt: str, current_frame: Frame | None) -> dict[str, Any]:
+    def _hud_display_context(
+        self, current_frame: Frame | None, history_entries: list[HistoryEntry],
+    ) -> str:
+        if not _get_env_bool("ARC3_HUD_DISPLAY", False) or not _persistent_functions():
+            return ""
+        kept = getattr(self, "_kept_functions", {})
+        if current_frame is None or "hud" not in kept:
+            return ""
+        blocked_action = False
+
+        def no_action(*args, **kwargs):
+            nonlocal blocked_action
+            blocked_action = True
+            raise RuntimeError("HUD display cannot execute actions.")
+
+        try:
+            reading = run_sandboxed_python(
+                code="result = hud()", timeout_seconds=min(3, self._python_timeout),
+                initial_state={
+                    "current_frame": _ascii_frame_view_payload(current_frame),
+                    "history": _ascii_history_view_payload(history_entries),
+                    "valid_actions": list(self._current_valid_actions),
+                    "last_action_call_result": dict(self._last_action_call_result or {}),
+                    "death_ledger": self._death_ledger_payload()
+                    if _get_env_bool("ARC3_DEATH_LEDGER", False) else None,
+                },
+                action_handler=no_action, kept_functions=list(kept.values()),
+                retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
+            )
+            if blocked_action:
+                return "\n\nCurrent HUD: unavailable (hud() attempted an action)."
+            if reading.get("error"):
+                reason = str(reading["error"]).splitlines()[-1][:200]
+                return "\n\nCurrent HUD: unavailable (" + reason + ")."
+            value = reading.get("result")
+            text = (json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                    if value is not None else str(reading.get("stdout") or "").strip())
+            if not text:
+                return "\n\nCurrent HUD: unavailable (hud() returned no reading)."
+            if len(text) > 1000:
+                text = text[:1000] + " … [truncated]"
+            return "\n\nCurrent HUD (your hud() reading): " + text
+        except Exception:
+            return "\n\nCurrent HUD: unavailable (hud() could not be evaluated)."
+
+    def _build_user_message(
+        self, user_prompt: str, current_frame: Frame | None, *, hud_context: str = "",
+    ) -> dict[str, Any]:
         user_prompt += self._retained_function_context()
+        user_prompt += hud_context
         image_part = current_grid_image_part(current_frame)
         diff_part = self._pending_diff_image
         diff_label = self._pending_diff_image_label
@@ -6875,6 +6929,7 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
+        hud_context = self._hud_display_context(current_frame, history_entries)
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,
@@ -6959,14 +7014,16 @@ class ToolAgent:
             opening_message = self._build_user_message(
                 _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION,
                 current_frame,
+                hud_context=hud_context,
             )
         elif resume_mode == "short":
             opening_message = self._build_user_message(
-                _yield_resume_prompt(resume_reason), resume_frame
+                _yield_resume_prompt(resume_reason), resume_frame, hud_context=hud_context,
             )
         else:
             opening_message = self._build_user_message(
-                user_prompt, resume_frame if resuming_after_yield else current_frame
+                user_prompt, resume_frame if resuming_after_yield else current_frame,
+                hud_context=hud_context,
             )
         # log what was actually SENT, not the argument that was passed in: on a
         # resumed invocation the short/state_only substitution happens here, so
