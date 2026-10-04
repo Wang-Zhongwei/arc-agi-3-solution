@@ -191,6 +191,8 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         # outside Make are unaffected.
         "__LOCAL_ANALYZER_PROVIDER__": repr(analyzer_provider),
         "__LOCAL_ANALYZER_APP_NAME__": repr(os.environ.get("LOCAL_ANALYZER_APP_NAME", "ARC3 Kaggle Harness")),
+        "__ARC3_PERSISTENT_FUNCTIONS__": repr(os.environ.get("ARC3_PERSISTENT_FUNCTIONS", "false")),
+        "__ARC3_HUD_DISPLAY__": repr(os.environ.get("ARC3_HUD_DISPLAY", "false")),
         "__LOCAL_ANALYZER_MAX_OUTPUT__": repr(os.environ.get("LOCAL_ANALYZER_MAX_OUTPUT", "0")),
         "__LOCAL_ANALYZER_THINKING_TOKEN_BUDGET__": repr(
             os.environ.get("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", "0")
@@ -466,6 +468,8 @@ setup_env = {
     'LOCAL_ANALYZER_MODEL_ID': SERVED_MODEL_NAME,
     'INFERENCE_ANALYZER_MODEL': SERVED_MODEL_NAME,
     'LOCAL_ANALYZER_APP_NAME': __LOCAL_ANALYZER_APP_NAME__,
+    'ARC3_PERSISTENT_FUNCTIONS': __ARC3_PERSISTENT_FUNCTIONS__,
+    'ARC3_HUD_DISPLAY': __ARC3_HUD_DISPLAY__,
     'LOCAL_ANALYZER_CONTEXT_WINDOW': str(ANALYZER_CONTEXT_WINDOW),
     'LOCAL_ANALYZER_MAX_OUTPUT': __LOCAL_ANALYZER_MAX_OUTPUT__,
     'LOCAL_ANALYZER_THINKING_TOKEN_BUDGET': __LOCAL_ANALYZER_THINKING_TOKEN_BUDGET__,

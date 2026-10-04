@@ -294,6 +294,12 @@ endif
 ifeq ($(origin LOCAL_ANALYZER_APP_NAME),undefined)
 LOCAL_ANALYZER_APP_NAME := $(shell $(CONFIG_VALUE) analyzer.app_name ARC3 Agent Harness)
 endif
+ifeq ($(origin ARC3_PERSISTENT_FUNCTIONS),undefined)
+ARC3_PERSISTENT_FUNCTIONS := $(shell $(CONFIG_VALUE) analyzer.persistent_functions false)
+endif
+ifeq ($(origin ARC3_HUD_DISPLAY),undefined)
+ARC3_HUD_DISPLAY := $(shell $(CONFIG_VALUE) analyzer.hud_display false)
+endif
 ifeq ($(origin ANALYZER_TIMEOUT),undefined)
 ANALYZER_TIMEOUT := $(shell $(CONFIG_VALUE) analyzer.timeout 120)
 endif
@@ -380,6 +386,8 @@ export LOCAL_ANALYZER_YIELD_SECONDS
 export LOCAL_ANALYZER_ENABLE_THINKING
 export LOCAL_ANALYZER_SITE_URL
 export LOCAL_ANALYZER_APP_NAME
+export ARC3_PERSISTENT_FUNCTIONS
+export ARC3_HUD_DISPLAY
 export MULTIMODAL_CONTEXT
 export ARC3_HARNESS_ENV_JSON
 export ARC3_KAGGLE_JSON

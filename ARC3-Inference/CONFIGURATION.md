@@ -205,6 +205,18 @@ Added optional retention of eligible Python function definitions between otherwi
 | `ARC3_PERSISTENT_FUNCTIONS_SCOPE` | `levelup` | `turn`: retain within an analyzer turn; `levelup`: retain until a level change; `game`: retain throughout the game. |
 | `ARC3_PERSISTENT_FUNCTIONS_IMPORTS` | Off | Also retains supported explicit import dependencies needed by retained definitions. |
 | `ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS` | Off | Enables extended instructions for repairing rejected function retention. |
+| `ARC3_HUD_DISPLAY` | Off | Evaluates an available retained `hud()` on the current frame and includes its reading in the next user prompt. Requires function retention. |
+
+Enable HUD display through JSON:
+
+```json
+"analyzer": {
+  "persistent_functions": true,
+  "hud_display": true
+}
+```
+
+Make maps these keys to `ARC3_PERSISTENT_FUNCTIONS` and `ARC3_HUD_DISPLAY`, including local/Slurm runs and generated Kaggle setup. Environment or Make overrides take precedence. If no retained `hud` exists, the prompt has no HUD section. The agent supplies `def hud(f=current_frame): ...` (or another zero-argument-callable definition), returning a compact reading; printed output is also accepted. Retained helper dependencies are restored against the current runtime state. Readings run in an isolated sandbox with actions blocked, a three-second maximum timeout, and output limited to 1,000 characters. Failures show a brief `Current HUD: unavailable` line and leave the game and retained definitions intact. The section appears in full, short, and state-only openers, including yield resumptions. Existing retention scopes still determine whether a HUD helper survives level/game changes; turn-scoped helpers can supply the next opener's reading before they are cleared.
 
 The retention mechanism checks top-level definitions and their dependencies, including dependencies on other retained functions. Unsupported definitions or unavailable globals are rejected rather than silently restored in an invalid form. Imports inside a function remain a way to make the function self-contained without enabling import retention.
 

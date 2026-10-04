@@ -65,7 +65,7 @@ The agent knows game reset but didn't trigger better replanning and reflection. 
 
 
 # Solutions
-The current contract and remaining prompt work are defined in [Implementation](#implementation). The earlier, broader suggestions below are retained for reference; they are not the current scope.
+The current contract and prompt guidance are defined in [Implementation](#implementation). The earlier, broader suggestions below are retained for reference; they are not the current scope.
 
 1. Add `scale` and make `shape_hash` be scale invariant. Also `frame_diff` only shows a single transform. How to redesign it to make it compositional?
     - **Adjusted:** make *every* hash ignore scale (and position), add `scale`, `bbox`, `mirrored` and a logical-scale `grid`, and add `form_hash` ("same shape at all?"). A scale-invariant `shape_hash` alone isn't enough: it keeps orientation, so it still can't say "same shape, different rotation", which was the agent's exact question at step 326. (§1)
@@ -212,9 +212,11 @@ Use a short field guide alongside the schema:
 
 > `pose_hash` compares exact colored masks. `hash` also allows rotation and reflection; `shape_hash` also ignores color; `form_hash` also ignores uniform scale. `silhouette_hash` compares exterior shapes at the same size, ignoring holes. `rotation` and `mirrored` describe pose relative to a canonical mask, not actions that occurred. Node masks exclude children.
 
-**Pending behavioral prompt edit:** retain observed control effects; check each action when searching for a state and stop when the property being changed matches; if a budget or lives indicator is identified, read it with an agent-written `hud(frame)` helper and compare readings before retrying after a restart. Replace conflicting bar/batching guidance in place.
+**Implemented behavioral prompt edit:** retain observed control effects and revise them when contradicted by new evidence; check each action when searching for a state and stop when the property being changed matches. If budget or lives indicators are identified, write a `hud(f=current_frame)` helper and compare readings before and after the fatal action and on the restarted board before replanning. This replaces the earlier bar/batching guidance in place.
 
 Direct runtime-name defaults refresh after actions and when retained definitions are restored for another call; explicit historical-frame defaults and copies stay fixed.
+
+Optional `analyzer.hud_display` includes the agent's retained `hud()` reading for the current frame in later user prompts. Enable `analyzer.persistent_functions` as well. HUD evaluation cannot execute actions; missing helpers add no section, and failures show a brief unavailable reading. See [configuration](../../../ARC3-Inference/CONFIGURATION.md#7-retaining-model-written-functions).
 
 ## Frame_diff
 
@@ -277,9 +279,11 @@ Transform fields describe the before-to-after change, not the nodes' canonical p
 >
 > Returns `changed_cell_count` and lists `moved`, `rotated`, `mirrored`, `scaled`, `changed_color`, `resized`, `appeared`, `disappeared`. Matched entries include `before_id`, `after_id`, `before_bbox`, `after_bbox`; appearance/disappearance entries include `id`, `bbox`, `color`, `hash`, `pixels`.
 >
-> `rotated_by` is clockwise degrees; `mirrored.axis` names the reflection; `scaled.scale_factor` is the verified uniform scale ratio. Recolor entries give `shape_hash`, `before_color`, `after_color`. `resized` is a same-color overlap heuristic with `before_pixels` and `after_pixels`, not proof of scaling. Unchanged nodes are omitted; unsupported combinations remain unmatched. Hashes are not unique tracking IDs.
+> Transform fields describe the before-to-after change, not canonical pose. `rotated_by` is clockwise degrees; `mirrored.axis` names the reflection; `scaled.scale_factor` is the verified uniform scale ratio. Recolor entries give `shape_hash`, `before_color`, `after_color`. `resized` is a same-color overlap heuristic with `color`, `before_pixels` and `after_pixels`, not proof of scaling; it can include backgrounds and budget bars. Unchanged nodes are omitted; each matched pair gets one change. Unsupported combinations remain `disappeared`/`appeared`, which do not necessarily mean destruction/creation. IDs index the supplied frame/crop's `segmentation['nodes']`; hashes are not unique tracking IDs.
 
 For the user prompt, the existing auto-diff renderer in `tool_agent.py` (`_DIFF_BUCKETS`, `_diff_entry_line`, `_render_auto_frame_diff`) includes `mirrored` and `scaled` and uses the new IDs/bboxes. Discarded coordinate fields and combined move/rotation entries are removed. Enablement, token budget, and truncation are preserved, with no additional instruction block. Aggregation resolves color/pixel metadata from the paired nodes.
+
+When auto-diff is enabled, the system prompt describes it as a summary of candidate object changes rather than ground truth. The agent-facing guidance does not describe the assignment algorithm.
 
 ```text
 - rotated: node 3->7, 90° CW, bbox (...) -> (...)
