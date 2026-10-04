@@ -179,7 +179,7 @@ The timeout bounds time, not memory: a snippet building `list(itertools.permutat
 
 These changes are unconditional unless a setting is shown.
 
-- **Per-action history metadata:** executed actions retain their individual compact result metadata in history and `transitions[i].result`, rather than assigning the batch result only to the final transition and leaving older transitions empty.
+- **Per-action transition results:** each executed action's compact outcome is available through `transitions[i].result` or `last_transition.result`. History entries expose only `.action` and `.frame`; frames, including `current_frame` and `previous_frame`, have no `.result`. Older saved runtime files remain readable.
 - **Separate batch result:** the global **`last_action_call_result` replaces `last_action_result`**. It describes the most recent model `action(...)` call, including a batch or refusal. This is an intentional model-facing API rename, without an old-name compatibility alias.
 - **Stable inspection:** `last_action_call_result` survives intervening inspection-only snippets and analyzer turns. It is empty before the first applicable call.
 - **Correct death/reset distinction:** automatic RESET has its own transition metadata marked automatic. It does not overwrite the model’s fatal action-call result with a successful reset result.
@@ -205,6 +205,7 @@ Added optional retention of eligible Python function definitions between otherwi
 | `ARC3_PERSISTENT_FUNCTIONS_SCOPE` | `levelup` | `turn`: retain within an analyzer turn; `levelup`: retain until a level change; `game`: retain throughout the game. |
 | `ARC3_PERSISTENT_FUNCTIONS_IMPORTS` | Off | Also retains supported explicit import dependencies needed by retained definitions. |
 | `ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS` | Off | Enables extended instructions for repairing rejected function retention. |
+| `ARC3_API_SIGNATURES` | Off | Set `analyzer.api_signatures` in JSON to prepend runtime objects/globals, action and frame-diff return schemas, and snippet-output guidance to the system prompt’s detailed explanation. Includes animation accessors when enabled. Make exports this option for local/Slurm and Kaggle runs; environment or Make overrides take precedence. |
 | `ARC3_HUD_DISPLAY` | Off | Evaluates an available retained `hud()` on the current frame and includes its reading in the next user prompt. Requires function retention. |
 
 Enable HUD display through JSON:
@@ -313,7 +314,7 @@ The original structured memory mechanism remains, with configurable subsets, lif
 
 Section updates accompanying tool calls are processed rather than silently lost. Oversized or degenerate memory writes cannot repeatedly inject an enormous corrupted block into later prompts. Degenerate assistant output also has a recovery path instead of being treated as useful context.
 
-Disabling structured memory removes its storage/parsing and most associated prompt scaffolding; this is separate from rolling summaries and retained Python functions. It is not a guarantee that no legacy prompt sentence ever uses the words “world model.”
+Setting `ARC3_MEMORY_SECTIONS=off` disables structured-memory storage/parsing and instructions to maintain or update a world model in system and user prompts. Rolling summaries and retained Python functions have separate settings.
 
 ## 11. Priority scheduling and compute allocation
 

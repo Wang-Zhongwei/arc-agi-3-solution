@@ -42,7 +42,8 @@ class Frame:
 class HistoryEntry:
     action: str
     frame: Frame
-    result: dict[str, Any] = field(default_factory=dict)
+    # Internal transport metadata; public action outcomes belong to transitions.
+    _transition_result: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 def normalize_grid(raw: Any) -> tuple[tuple[int, ...], ...]:
@@ -96,9 +97,10 @@ def history_entry_from_payload(payload: Any) -> HistoryEntry | None:
     frame = frame_from_payload(payload.get("frame"))
     if frame is None:
         return None
+    transition_result = payload.get("transition_result", payload.get("result"))
     return HistoryEntry(
         action=str(payload.get("action", "")).strip(), frame=frame,
-        result=dict(payload["result"]) if isinstance(payload.get("result"), dict) else {},
+        _transition_result=dict(transition_result) if isinstance(transition_result, dict) else {},
     )
 
 
@@ -106,7 +108,7 @@ def history_entry_to_payload(entry: HistoryEntry) -> dict[str, Any]:
     return {
         "action": entry.action,
         "frame": frame_to_payload(entry.frame),
-        "result": dict(getattr(entry, "result", {}) or {}),
+        "transition_result": dict(entry._transition_result),
     }
 
 
