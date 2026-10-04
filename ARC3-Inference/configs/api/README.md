@@ -14,11 +14,11 @@ Four variants of the Kaggle notebook `api-signatures-and-frame-diff`. Queue wait
 | Config | Notebook | Version | Status | Score (10 passes) |
 | --- | --- | --- | --- | --- |
 | `v0.json` | `jonathanwang2022/api-signatures-and-frame-diff` | 3 | Complete | 30.06 ± 12.67; 3.9/7 levels |
-| `v1.json` | `jonathanwang2022/api-signatures-and-frame-diff` | — | Skipped | — |
+| `v1.json` | `jonathanwang2022/api-signatures-and-frame-diff` | 5 | Queued | — |
 | `v2.json` | `ticbudja/api-signatures-and-frame-diff` | 1 | Queued | — |
 | `v3.json` | `ticbudja/api-signatures-and-frame-diff` | 2 | Not pushed | — |
 
-`jonathanwang2022` versions 1–2 (v0, v1) played no games because of the `'__auto__'` notebook bug, version 4 (v1) was cancelled while queued, and version 5 (v1) was abandoned in the queue. Pulled runs live in `runs/kaggle/<owner>/api-signatures-and-frame-diff/vNN/` with `evaluation.json` from `make score_run`.
+`jonathanwang2022` versions 1–2 (v0, v1) played no games because of the `'__auto__'` notebook bug, and version 4 (v1) was cancelled after a long queue. Pulled runs live in `runs/kaggle/<owner>/api-signatures-and-frame-diff/vNN/` with `evaluation.json` from `make score_run`.
 
 Base: `configs/scheduling/v2.json` (the 1003 one-wave Yield-UCB submission): Flash Next on Pennyroyal SGLang and its full `harness_env`, including game-scoped persistent functions, which `hud()` needs. Overrides: `kaggle.public_games = ["ls20-9607627b"]`, 10 passes, 230,000 generated tokens per game/pass, 240-minute per-game and notebook caps, so the token budget is the binding limit.
 
