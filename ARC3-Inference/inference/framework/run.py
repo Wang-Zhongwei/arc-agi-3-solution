@@ -316,6 +316,10 @@ def _make_deployment_target(
             "make_share_version": bool(
                 getattr(args, "kaggle_make_share_version", False)
             ),
+            "public_games": _parse_optional_list(
+                getattr(args, "kaggle_public_games", ""),
+                option_name="--kaggle-public-games",
+            ),
         }
         if resolved_max_runtime_s is not None:
             target_kwargs["max_runtime_s"] = float(resolved_max_runtime_s)
@@ -934,6 +938,10 @@ def _write_run_config(
                 "make_share_version": bool(
                     getattr(args, "kaggle_make_share_version", False)
                 ),
+                "public_games": _parse_optional_list(
+                    getattr(args, "kaggle_public_games", ""),
+                    option_name="--kaggle-public-games",
+                ),
             },
         },
         "competition_arcade": {
@@ -1381,6 +1389,12 @@ def main() -> None:
         help="Only write the Kaggle source/kernel bundles locally; do not upload.",
     )
     parser.add_argument("--kaggle-dataset-version-message", default="")
+    parser.add_argument(
+        "--kaggle-public-games",
+        default="",
+        help="Games the offline (non-rerun) Kaggle notebook plays, as exact ids or "
+        "id prefixes such as ar25, comma-separated or JSON list. Empty plays all offline games.",
+    )
     parser.add_argument("--slurm-gpu", choices=["B200", "B300", "RTX"], default="B200")
     parser.add_argument("--slurm-gpu-count", type=int, default=1)
     parser.add_argument("--slurm-time", default="06:00:00")

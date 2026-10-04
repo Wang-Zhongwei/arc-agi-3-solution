@@ -464,6 +464,19 @@ Additional recovery work:
 
 These changes do not increase the server’s true context limit. Correctly matching the harness context setting to the serving configuration is still necessary for efficient operation.
 
+### Kaggle run shape
+
+`make kaggle-duck` reads these from the config's `kaggle` section. The Make variable `KAGGLE_<SETTING>` in capitals (for example `KAGGLE_PUBLIC_RUNTIME_MINUTES=60`) overrides the config.
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `public_games` | `[]` | Games the public (offline, non-rerun) notebook plays, in this order. Each entry is an exact game id or its prefix before `-` (`ar25`); an entry matching no game, or several, fails the run. Empty plays all bundled offline games. Competition reruns always play the gateway's full list. |
+| `public_runtime_minutes` | `140` | Minutes after notebook start at which the public run stops play (its soft end). Server startup takes about 9 of them; draining, diagnostics and teardown add about 2–3 minutes after it. The notebook budget is this plus 10. |
+| `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
+| `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
+
+Every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
+
 ## 14. Diagnostics, transcript viewer, and build plumbing
 
 ### Viewer and request accounting — unconditional

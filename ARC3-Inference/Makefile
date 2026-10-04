@@ -142,6 +142,14 @@ KAGGLE_ACCELERATOR ?= NvidiaRtxPro6000
 KAGGLE_RUN_AS_SUBMISSION ?= false
 KAGGLE_DRY_RUN ?= false
 KAGGLE_DATASET_VERSION_MESSAGE ?=
+# Run shape for make kaggle-duck; see CONFIGURATION.md "Kaggle run shape".
+KAGGLE_PUBLIC_GAMES ?= $(shell $(CONFIG_VALUE) kaggle.public_games [])
+KAGGLE_PUBLIC_RUNTIME_MINUTES ?= $(shell $(CONFIG_VALUE) kaggle.public_runtime_minutes 140)
+KAGGLE_PRIVATE_RUNTIME_MINUTES ?= $(shell $(CONFIG_VALUE) kaggle.private_runtime_minutes 532)
+KAGGLE_CONCURRENT_JOBS ?= $(shell $(CONFIG_VALUE) kaggle.concurrent_jobs 120)
+# The notebook's soft end is its budget minus a 10-minute buffer, so the budget is
+# the public play time plus 10.
+KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES = $(shell $(PYTHON) -c 'print(float("$(KAGGLE_PUBLIC_RUNTIME_MINUTES)") + 10)')
 
 ifeq ($(origin SERVER_BACKEND),undefined)
 SERVER_BACKEND := $(shell $(CONFIG_VALUE) server.backend vllm)
@@ -567,20 +575,20 @@ kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL
 # Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments;
 # the runner adds kaggle/<owner>/<slug>/.
 kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
-# The competition run plays all ~110 hidden games in one wave, as in dfranzen's
-# Milestone 2 notebook: every game is live from the start (CONCURRENT_JOBS above
-# the game count) with a per-game cap close to the whole budget, and the priority
-# or UCB gate (ARC3_MAX_ACTIVE_STREAMS) decides which games generate. 28 lanes x
-# 132 min ran four waves with a fixed slice per game instead.
-# The public (non-submission) run plays the 25 public games, also in one wave, and
-# stops at its soft end, MAX_EXPERIMENT_RUNTIME_MINUTES - 10 after notebook start;
-# the competition run ignores that soft end. 150 gives ~131 min of public play
-# after server startup, close to the previous 132-minute public cap.
-kaggle-duck: MAX_RUNTIME_MINUTES = 532
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 150
+# Both runs play every game in one wave, as in dfranzen's Milestone 2 notebook:
+# every game is live from the start (CONCURRENT_JOBS at least the game count; the
+# notebook raises it if not) and the priority or UCB gate (ARC3_MAX_ACTIVE_STREAMS)
+# decides which games generate. The UCB gate only works in one wave; the 1001
+# submission's 28 lanes x 132 min ran ~110 hidden games in four waves.
+# Competition run: the per-game cap, kaggle.private_runtime_minutes, is the whole
+# play time; it ignores the soft end.
+# Public run: plays kaggle.public_games and stops at its soft end,
+# kaggle.public_runtime_minutes after notebook start.
+kaggle-duck: MAX_RUNTIME_MINUTES = $(KAGGLE_PRIVATE_RUNTIME_MINUTES)
+kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = $(KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES)
 kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
 kaggle-duck: N_PASSES = 1
-kaggle-duck: CONCURRENT_JOBS = 120
+kaggle-duck: CONCURRENT_JOBS = $(KAGGLE_CONCURRENT_JOBS)
 kaggle-duck: ANALYZER_TIMEOUT = 900
 kaggle-duck: _taaf-run
 
@@ -640,6 +648,7 @@ _taaf-run:
 		$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_RUN_AS_SUBMISSION)),--kaggle-run-as-submission,) \
 		$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_DRY_RUN)),--kaggle-dry-run,) \
 		$(if $(strip $(KAGGLE_DATASET_VERSION_MESSAGE)),--kaggle-dataset-version-message '$(KAGGLE_DATASET_VERSION_MESSAGE)',) \
+		$(if $(filter-out [],$(strip $(KAGGLE_PUBLIC_GAMES))),--kaggle-public-games '$(KAGGLE_PUBLIC_GAMES)',) \
 		--slurm-gpu "$(DEPLOYMENT_SLURM_GPU)" \
 		--slurm-gpu-count "$(DEPLOYMENT_SLURM_GPU_COUNT)" \
 		--slurm-time "$(DEPLOYMENT_SLURM_TIME)" \

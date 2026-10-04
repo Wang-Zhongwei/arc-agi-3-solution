@@ -178,6 +178,10 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
       ``dataset_ref`` are left untouched.
     - ``cpu_only``: disables GPU for cheap public/offline smoke tests.
       The default honors R2.52: RTX6000 GPU with internet disabled.
+    - ``public_games``: offline (non-rerun) notebook runs play only these
+      games, in this order. Each entry is an exact game id or its prefix
+      before ``-`` (``"ar25"``). Empty plays every bundled offline game.
+      Competition reruns always play the gateway's full game list.
     - ``dry_run``: write bundles and metadata but do not call Kaggle.
     """
 
@@ -197,6 +201,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
     cpu_only: bool = False
     accelerator: str | None = DEFAULT_ACCELERATOR
     max_runtime_s: float = 12 * 3600.0
+    public_games: list[str] = field(default_factory=lambda: list[str]())
     kernel_push_timeout_s: int | None = None
     dataset_version_message: str = "Update TAAF Kaggle source bundle."
     dry_run: bool = False
