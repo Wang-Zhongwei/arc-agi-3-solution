@@ -126,7 +126,7 @@ def test_single_cell_crop_recolor_uses_original_coordinates():
 
     assert diff["changed_cell_count"] == 1
     assert len(diff["changed_color"]) == 1
-    assert diff["changed_color"][0]["at"] == [1, 2]
+    assert diff["changed_color"][0]["before_bbox"] == [1, 2, 1, 2]
     assert diff["changed_color"][0]["before_color"] == ARC_COLOR_CHARS[0]
     assert diff["changed_color"][0]["after_color"] == ARC_COLOR_CHARS[1]
 
@@ -144,9 +144,9 @@ result = {'crop': frame_diff(previous_frame[5:10, 7:12], current_frame[5:10, 7:1
 
     assert result["crop"]["changed_cell_count"] == 2
     assert result["full"]["changed_cell_count"] == 3
-    moved = next(n for n in result["crop"]["moved"] if n["color"] == ARC_COLOR_CHARS[1])
-    assert moved["from"] == [6, 8]
-    assert moved["to"] == [7, 9]
+    moved = next(n for n in result["crop"]["moved"] if n["before_bbox"] == [6, 8, 6, 8])
+    assert moved["before_bbox"] == [6, 8, 6, 8]
+    assert moved["after_bbox"] == [7, 9, 7, 9]
 
 
 @pytest.mark.parametrize("bucket, before_mask, after_mask", [
@@ -165,14 +165,15 @@ def test_existing_diff_buckets_keep_original_coordinates(bucket, before_mask, af
 
     diff = _result("result = frame_diff(previous_frame[3:8, 4:10], current_frame[3:8, 4:10])",
                    embed(before_mask), embed(after_mask))
-    entry = next(n for n in diff[bucket] if n["color"] == ARC_COLOR_CHARS[1])
+    entry = next(n for n in diff[bucket] if n.get("before_id", n.get("id")) == 1)
     if bucket == "resized":
-        assert entry["at_before"] == entry["at_after"] == [4, 5]
+        assert entry["before_bbox"] == entry["after_bbox"] == [4, 5, 5, 7]
         assert entry["before_pixels"] == entry["after_pixels"] == 4
     else:
-        assert entry["at"] == [4, 5]
         if bucket == "rotated":
             assert entry["rotated_by"] == 90
+            assert entry["before_bbox"] == [4, 5, 6, 6]
+            assert entry["after_bbox"] == [4, 5, 5, 7]
         else:
             assert entry["bbox"] == [4, 5, 4, 5]
 
@@ -199,3 +200,32 @@ def test_different_origins_are_rejected_but_shape_mismatch_is_preserved():
     assert diff["changed_cell_count"] == -1
     assert diff["before_shape"] == [2, 2]
     assert diff["after_shape"] == [3, 2]
+
+
+@pytest.mark.parametrize('bucket', ['mirrored', 'scaled'])
+def test_new_transform_buckets_work_in_cropped_sandbox(bucket):
+    before = [[0]*12 for _ in range(10)]
+    after = [[0]*12 for _ in range(10)]
+    mask = [[1, 0, 0], [1, 1, 1]]
+    if bucket == 'mirrored':
+        other = [row[::-1] for row in mask]
+        start = (5, 5)
+    else:
+        other = [[v for v in row for _ in range(2)] for row in mask for _ in range(2)]
+        start = (4, 4)
+    for r, row in enumerate(mask, 5):
+        for c, value in enumerate(row, 5):
+            before[r][c] = value
+    for r, row in enumerate(other, start[0]):
+        for c, value in enumerate(row, start[1]):
+            after[r][c] = value
+    result = _result("""
+result = frame_diff(previous_frame[3:9, 3:11], current_frame[3:9, 3:11])
+""", before, after)
+    entry = next(e for e in result[bucket] if e['before_bbox'] == [5, 5, 6, 7])
+    if bucket == 'mirrored':
+        assert entry['axis'] == '|'
+        assert entry['after_bbox'] == [5, 5, 6, 7]
+    else:
+        assert entry['scale_factor'] == 2
+        assert entry['after_bbox'] == [4, 4, 7, 9]

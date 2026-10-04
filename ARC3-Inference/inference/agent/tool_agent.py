@@ -2658,44 +2658,43 @@ def _estimate_diff_tokens(text: str) -> int:
 
 
 def _diff_entry_line(bucket: str, entry: dict[str, Any]) -> str:
-    color = entry.get("color")
-    pixels = entry.get("pixels")
-    if bucket == "moved":
-        line = f"moved: color {color} {pixels}px {entry.get('from')}->{entry.get('to')}"
-        if entry.get("rotated_by"):
-            line += f" rotated_by {entry['rotated_by']}"
-        return line
+    if bucket in ("appeared", "disappeared"):
+        return (f"{bucket}: node {entry['id']}, color {entry['color']} {entry['pixels']}px, "
+                f"bbox {entry['bbox']}")
+    detail = ""
     if bucket == "rotated":
-        return (
-            f"rotated: color {color} {pixels}px by {entry.get('rotated_by')} "
-            f"at {entry.get('at')}"
-        )
-    if bucket == "changed_color":
-        return (
-            f"recolored at {entry.get('at')}: color "
-            f"{entry.get('before_color')}->{entry.get('after_color')} "
-            f"({entry.get('pixels')}px)"
-        )
-    if bucket == "resized":
-        return (
-            f"resized: color {entry.get('color')} "
-            f"{entry.get('before_pixels')}->{entry.get('after_pixels')}px "
-            f"at {entry.get('at_before')}"
-        )
-    return f"{bucket}: color {color} {pixels}px at {entry.get('at')}"
+        detail = f", {entry['rotated_by']}° CW"
+    elif bucket == "mirrored":
+        detail = f", axis {entry['axis']}"
+    elif bucket == "scaled":
+        detail = f", scale {entry['before_scale']}->{entry['after_scale']} (×{entry['scale_factor']:g})"
+    elif bucket == "changed_color":
+        detail = f", {entry['before_color']}->{entry['after_color']}"
+    elif bucket == "resized":
+        detail = f", color {entry['color']}, pixels {entry['before_pixels']}->{entry['after_pixels']}"
+    return (f"{bucket}: node {entry['before_id']}->{entry['after_id']}{detail}, "
+            f"bbox {entry['before_bbox']} -> {entry['after_bbox']}")
 
 
-_DIFF_BUCKETS = ("moved", "rotated", "changed_color", "resized", "appeared", "disappeared")
+_DIFF_BUCKETS = ("moved", "rotated", "mirrored", "scaled", "changed_color", "resized", "appeared", "disappeared")
 
 
 def _render_auto_frame_diff(
-    diff: dict[str, Any], budget_tokens: int, total_cells: int | None = None
+    diff: dict[str, Any], budget_tokens: int, total_cells: int | None = None,
+    *, nodes_before: list[dict] | None = None, nodes_after: list[dict] | None = None,
 ) -> list[str]:
     """Render a frame diff as prompt lines, degrading to stay under budget:
     full listing -> aggregated by (bucket, color, pixels) -> counts only.
     Resized entries covering most of the grid (the background reshaping as
     collateral of other objects moving) are elided as noise; the callable
     frame_diff() keeps them."""
+    before = {n["id"]: n for n in nodes_before or []}
+    after = {n["id"]: n for n in nodes_after or []}
+
+    def metadata(entry):
+        node = after.get(entry.get("after_id")) or before.get(entry.get("before_id")) or entry
+        return node.get("color"), node.get("pixels", entry.get("after_pixels"))
+
     if total_cells:
         resized = diff.get("resized") or []
         kept = [e for e in resized if (e.get("before_pixels") or 0) * 2 < total_cells]
@@ -2719,16 +2718,16 @@ def _render_auto_frame_diff(
         entries = list(diff.get(bucket) or [])
         if not entries:
             continue
-        entries.sort(key=lambda e: -(e.get("pixels") or e.get("after_pixels") or 0))
+        entries.sort(key=lambda e: -(metadata(e)[1] or 0))
         groups: dict[tuple, int] = {}
         for entry in entries:
-            key = (entry.get("color"), entry.get("pixels"))
+            key = metadata(entry)
             groups[key] = groups.get(key, 0) + 1
         shown = 0
         for entry in entries:
             if shown >= 3:
                 break
-            key = (entry.get("color"), entry.get("pixels"))
+            key = metadata(entry)
             if groups.get(key, 0) > 3:
                 continue
             lines.append("- " + _diff_entry_line(bucket, entry))
@@ -4164,15 +4163,18 @@ class ToolAgent:
                 f"Auto frame diff ({span}): grid shape changed "
                 f"({prev_rows}x{prev_cols} -> {cur_rows}x{cur_cols}); diff skipped."
             ]
+        nodes_before = segment_layer(previous_frame.grid, ARC_COLOR_CHARS).get("nodes", [])
+        nodes_after = segment_layer(current_frame.grid, ARC_COLOR_CHARS).get("nodes", [])
         diff = compute_frame_diff(
             previous_frame.grid,
             current_frame.grid,
-            segment_layer(previous_frame.grid, ARC_COLOR_CHARS).get("nodes", []),
-            segment_layer(current_frame.grid, ARC_COLOR_CHARS).get("nodes", []),
+            nodes_before,
+            nodes_after,
             max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
         )
         rendered = _render_auto_frame_diff(
-            diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=cur_rows * cur_cols
+            diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=cur_rows * cur_cols,
+            nodes_before=nodes_before, nodes_after=nodes_after,
         )
         lines = [
             f"Auto frame diff ({span}; covers everything since your previous "
@@ -4402,11 +4404,13 @@ class ToolAgent:
                 "New level inventory skipped (boards have different shapes)."
             )
             return lines
+        nodes_before = segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", [])
+        nodes_after = segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", [])
         diff = compute_frame_diff(
             grid_a,
             grid_b,
-            segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", []),
-            segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", []),
+            nodes_before,
+            nodes_after,
             max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
         )
         lines.append(
@@ -4419,7 +4423,8 @@ class ToolAgent:
         )
         lines.extend(
             _render_auto_frame_diff(
-                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols
+                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols,
+                nodes_before=nodes_before, nodes_after=nodes_after,
             )
         )
         return lines
@@ -4550,15 +4555,18 @@ class ToolAgent:
                 (len(r) for r in grid_a), default=0
             ) != cols:
                 return [f"{label} skipped (grid shape changed)."]
+            nodes_before = segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", [])
+            nodes_after = segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", [])
             diff = compute_frame_diff(
                 grid_a,
                 grid_b,
-                segment_layer(grid_a, ARC_COLOR_CHARS).get("nodes", []),
-                segment_layer(grid_b, ARC_COLOR_CHARS).get("nodes", []),
+                nodes_before,
+                nodes_after,
                 max_group_match=_AUTO_FRAME_DIFF_MAX_GROUP,
             )
             rendered = _render_auto_frame_diff(
-                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols
+                diff, _AUTO_FRAME_DIFF_BUDGET, total_cells=rows * cols,
+                nodes_before=nodes_before, nodes_after=nodes_after,
             )
             return [label, *rendered]
 

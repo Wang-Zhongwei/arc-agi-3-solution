@@ -14,7 +14,7 @@ There are three knobs
     - model was forced to match the exact shape as the target
 
 
-On the other hand, APIs (see in [report](../../../comparison/comparison_report_zhongwei.md)) already expose 
+At the time of this ls20 run, the APIs (see [report](../../../comparison/comparison_report_zhongwei.md)) already exposed:
 ```python
 class Node:
     id: int                        # list index, top-most then left-most
@@ -65,7 +65,7 @@ The agent knows game reset but didn't trigger better replanning and reflection. 
 
 
 # Solutions
-The current proposal is defined in [Implementation](#implementation). The earlier, broader suggestions below are retained for reference; they are not the current scope.
+The current contract and remaining prompt work are defined in [Implementation](#implementation). The earlier, broader suggestions below are retained for reference; they are not the current scope.
 
 1. Add `scale` and make `shape_hash` be scale invariant. Also `frame_diff` only shows a single transform. How to redesign it to make it compositional?
     - **Adjusted:** make *every* hash ignore scale (and position), add `scale`, `bbox`, `mirrored` and a logical-scale `grid`, and add `form_hash` ("same shape at all?"). A scale-invariant `shape_hash` alone isn't enough: it keeps orientation, so it still can't say "same shape, different rotation", which was the agent's exact question at step 326. (§1)
@@ -81,7 +81,7 @@ The current proposal is defined in [Implementation](#implementation). The earlie
 # Implementation
 
 ## Node
-Proposed node contract. Keep same-color, 4-connected nodes and containment. Extend their fields; compare explicitly selected parts when a pattern spans multiple nodes.
+Implemented node contract. Nodes remain same-color, 4-connected components with containment; compare explicitly selected parts when a pattern spans multiple nodes.
 
 Nodes remain dictionaries, accessed as `node["children"]`, for example. The types below describe their fields.
 
@@ -113,7 +113,7 @@ A mask is the node's tightly cropped binary occupancy: `1` for its own pixels, `
 
 | Field | Differences ignored | Differences preserved |
 |---|---|---|
-| `pose_hash` | Position | Color, rotation, reflection, size, holundes |
+| `pose_hash` | Position | Color, rotation, reflection, size, holes |
 | `hash` | Position, rotation, reflection | Color, size, holes |
 | `shape_hash` | Position, rotation, reflection, color | Size, holes |
 | `form_hash` | Position, rotation, reflection, color, uniform integer scale | Holes and remaining geometry |
@@ -168,7 +168,7 @@ For reconstruction, interpret `mirrored=None` as no reflection and `rotation=Non
 Mathematically, this field is reflection parity relative to the reference: `False` is orientation-preserving, `True` is orientation-reversing, and `None` means both are possible. Keep the agent-facing name `mirrored`. Chirality is a property of the shape (whether its mirror can be matched by rotation), not its current pose.
 
 | Mask | `mirrored` | `rotation` | `rotational_symmetry` |
-|---|---|---|---|we d
+|---|---|---|---|
 | Square | `None` | `None` | 4 |
 | Non-square rectangle | `None` | 0 or 90, relative to canonical | 2 |
 | Shape with no rotation or reflection symmetry | `False` or `True` | 0, 90, 180 or 270 | 1 |
@@ -183,7 +183,7 @@ The four rotations form C4; adding reflections gives D4. Scale reduction and hol
 
 ### Frame slicing
 
-Require `frame[r0:r1, c0:c1]` to return the same frame interface, including `.ascii`, `.shape`, and `.segmentation`, so it works directly with `frame_diff`. This is proposed functionality; the current sandbox `FrameView` has no slicing method.
+`frame[r0:r1, c0:c1]` returns the same frame interface, including `.ascii`, `.shape`, and `.segmentation`, and works directly with `frame_diff`. Slicing is implemented in the sandbox `FrameView`.
 
 ```python
 a = before[1:2, 2:3]                # half-open bounds: one row and one column
@@ -198,13 +198,13 @@ nodes = a.segmentation["nodes"]
 
 ### Compatibility with frame_diff
 
-The current API's `hash` ignores rotation only, and its `shape_hash` is color-free but orientation-sensitive. This proposal changes both meanings and the canonical reference used by `rotation`.
+Daniel's original API had a rotation-invariant `hash` and a color-free, orientation-sensitive `shape_hash`. The implementation now uses the D4 meanings and canonical rotation reference defined above.
 
-- Equal `hash` values can now include reflected poses. Match classification must handle reflection; rotation-angle subtraction alone is insufficient when reflection is involved.
-- The current exact-recolor check uses `shape_hash`. Replace that check with equality of the original color-free masks at the same position so a recolor plus rotation/reflection is not called only a recolor. This needs no additional public hash.
-- Current `resized` entries pair remaining same-color nodes using bounding-box overlap, not equal form. They can include a 4-pixel shape changing into another 4-pixel shape. Do not interpret that bucket as proof of uniform scaling; verify the masks before claiming it.
+- Equal `hash` values can include reflected poses. Match classification verifies rotations and reflections against the masks instead of subtracting canonical rotation angles.
+- Exact recoloring requires equal `shape_hash`, original color-free masks, and bboxes, with different colors. A changed pose cannot be classified as only a recolor. This needs no additional public hash.
+- `resized` pairs remaining same-color nodes with different `form_hash` values using bounding-box overlap. It can include a 4-pixel shape changing into another 4-pixel shape. Exact uniform scaling is verified separately and reported as `scaled`.
 
-The implementation must check hash consumers and update their assumptions together. These definitions are a proposal, not an evaluated runtime change.
+These contracts are implemented and covered by focused tests. The [matching study](../../matching/README.md) records the assignment comparison and its limitations; it does not measure game-solving performance.
 
 ### System prompt edit
 
@@ -212,12 +212,12 @@ Use a short field guide alongside the schema:
 
 > `pose_hash` compares exact colored masks. `hash` also allows rotation and reflection; `shape_hash` also ignores color; `form_hash` also ignores uniform scale. `silhouette_hash` compares exterior shapes at the same size, ignoring holes. `rotation` and `mirrored` describe pose relative to a canonical mask, not actions that occurred. Node masks exclude children.
 
-Keep the behavioral edit short as well: retain observed control effects; check each action when searching for a state and stop when the property being changed matches; if a budget or lives indicator is identified, read it with an agent-written `hud(frame)` helper and compare readings before retrying after a restart. Replace conflicting bar/batching guidance in place.
+**Pending behavioral prompt edit:** retain observed control effects; check each action when searching for a state and stop when the property being changed matches; if a budget or lives indicator is identified, read it with an agent-written `hud(frame)` helper and compare readings before retrying after a restart. Replace conflicting bar/batching guidance in place.
 
 ## Frame_diff
 
 ```python
-# Proposed return schema: types stand in for values; lists may have zero or more entries.
+# Implemented return schema: types stand in for values; lists may have zero or more entries.
 # IDs belong to the supplied frames/crops; bboxes use original-frame coordinates.
 # Bboxes are inclusive (r0, c0, r1, c1).
 pair = {
@@ -251,7 +251,7 @@ result = {
 
 ### Grouping rules
 
-Use hashes to find candidates, then verify masks. Omit unchanged nodes first. Match one-to-one using spatial proximity; leave ambiguous pairs unmatched. Each pair belongs to one bucket only.
+Use hashes to find candidates, then verify masks. Omit unchanged nodes first. Within each form group, Hungarian assignment maximizes the number of valid pairs, then minimizes total bbox-center Manhattan distance. Equal-cost assignments are resolved deterministically by solver order; they do not establish persistent identity. Each pair belongs to one bucket only. `resized` uses the separate fallback below.
 
 | Bucket | Rule |
 |---|---|
@@ -260,14 +260,14 @@ Use hashes to find candidates, then verify masks. Omit unchanged nodes first. Ma
 | `mirrored` | Equal `hash`; one reflection maps the masks; same center tolerance. Prefer `rotated` when both work; otherwise choose the first valid axis in the order listed above. |
 | `scaled` | Equal `form_hash`, color, and oriented reduced masks; different scales, bbox centers differ by at most one pixel per axis. Verify exact uniform scaling. |
 | `changed_color` | Equal `shape_hash`, original binary masks, and bboxes; different colors. |
-| `resized` | After exact matches: same color, different `form_hash`, bbox intersection area / smaller bbox area ≥ 0.5. Pair greedily by overlap, then bbox-area similarity. This is a geometry-change heuristic, not exact scaling. |
+| `resized` | After exact matches: same color, different `form_hash`, bbox intersection area / smaller bbox area ≥ 0.5. Pair greedily by overlap, then bbox-area similarity; leave tied candidates sharing a node unmatched. This is a geometry-change heuristic, not exact scaling. |
 | `appeared` / `disappeared` | Unmatched after/before nodes, including unsupported combinations. |
 
 Transform fields describe the before-to-after change, not the nodes' canonical pose. No combined-change records.
 
 ## Minimal prompt changes for frame_diff
 
-Apply these when the runtime implements the new contract. In `prompts.py`, add slicing to the existing frame description and replace the affected lines in `FRAME_DIFF_HINT_ADDENDUM`:
+`prompts.py` now documents slicing in the existing frame description and the new return fields in `FRAME_DIFF_HINT_ADDENDUM`. The concise guidance is:
 
 > `frame[r0:r1, c0:c1]` returns a cropped frame with half-open bounds. Crop node IDs are local to the crop; coordinates stay in the original frame. Edge-crossing components are clipped.
 >
@@ -275,9 +275,9 @@ Apply these when the runtime implements the new contract. In `prompts.py`, add s
 >
 > Returns `changed_cell_count` and lists `moved`, `rotated`, `mirrored`, `scaled`, `changed_color`, `resized`, `appeared`, `disappeared`. Matched entries include `before_id`, `after_id`, `before_bbox`, `after_bbox`; appearance/disappearance entries include `id`, `bbox`, `color`, `hash`, `pixels`.
 >
-> `rotated_by` is clockwise degrees; `mirrored.axis` names the reflection; `scaled.scale_factor` is the verified uniform scale ratio. Recolor entries give `shape_hash`, `before_color`, `after_color`. `resized` is a same-color overlap heuristic with `before_pixels` and `after_pixels`, not proof of scaling. Unchanged nodes are omitted; combinations remain unmatched. Hashes are not unique tracking IDs.
+> `rotated_by` is clockwise degrees; `mirrored.axis` names the reflection; `scaled.scale_factor` is the verified uniform scale ratio. Recolor entries give `shape_hash`, `before_color`, `after_color`. `resized` is a same-color overlap heuristic with `before_pixels` and `after_pixels`, not proof of scaling. Unchanged nodes are omitted; unsupported combinations remain unmatched. Hashes are not unique tracking IDs.
 
-For the user prompt, update the existing auto-diff renderer in `tool_agent.py` (`_DIFF_BUCKETS`, `_diff_entry_line`, `_render_auto_frame_diff`): include `mirrored` and `scaled`, use the new IDs/bboxes, and remove references to discarded coordinate fields and combined move/rotation entries. Keep the current enablement, token budget, and truncation; do not add another instruction block. Resolve color/pixel metadata from the paired nodes where the existing aggregation needs it.
+For the user prompt, the existing auto-diff renderer in `tool_agent.py` (`_DIFF_BUCKETS`, `_diff_entry_line`, `_render_auto_frame_diff`) includes `mirrored` and `scaled` and uses the new IDs/bboxes. Discarded coordinate fields and combined move/rotation entries are removed. Enablement, token budget, and truncation are preserved, with no additional instruction block. Aggregation resolves color/pixel metadata from the paired nodes.
 
 ```text
 - rotated: node 3->7, 90° CW, bbox (...) -> (...)

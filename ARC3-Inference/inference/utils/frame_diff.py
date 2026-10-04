@@ -1,17 +1,8 @@
-"""Object-level frame diff core, shared by the sandbox runtime and the host.
+"""Object-level frame diffs shared by host and isolated Python sandbox.
 
-This module must stay dependency-free (stdlib only, no imports): its source is
-injected verbatim into the sandbox bootstrap template (see
-python_tool_sandbox.py), which runs under ``python -I -S`` and cannot import
-project modules. The host imports it normally for the auto frame-diff feature.
+Keep this module self-contained: its source is injected into the sandbox.
 """
 
-
-def _node_topleft(node):
-    points = node.get("boundary") or []
-    if not points:
-        return (0, 0)
-    return (min(p[0] for p in points), min(p[1] for p in points))
 
 def _hungarian(cost):
     # Minimum-cost assignment (Jonker-Volgonant style with potentials).
@@ -64,20 +55,22 @@ def _hungarian(cost):
             assignment[p[j] - 1] = j - 1
     return assignment
 
-def _node_bbox(node):
-    points = node.get("boundary") or []
-    if not points:
-        return (0, 0, 0, 0)
-    rows = [p[0] for p in points]; cols = [p[1] for p in points]
-    return (min(rows), min(cols), max(rows), max(cols))
 
-def _node_center2(node):
-    # bbox center in half-cell units (ints): (r0+r1, c0+c1)
-    points = node.get("boundary") or []
-    if not points:
-        return (0, 0)
-    rows = [p[0] for p in points]; cols = [p[1] for p in points]
-    return (min(rows) + max(rows), min(cols) + max(cols))
+def _hungarian_candidates(candidates):
+    if not candidates:
+        return []
+    rows = sorted({i for _, i, _, _ in candidates})
+    cols = sorted({j for _, _, j, _ in candidates})
+    edges = {(i, j): (rank, change) for rank, i, j, change in candidates}
+    # Maximize valid cardinality, then minimize total center distance. Dummies
+    # represent unmatched rows; forbidden edges always cost more than dummies.
+    penalty = (len(rows) + 1) * (max(rank for rank, *_ in candidates) + 1)
+    cost = [[edges.get((i, j), (2*penalty, None))[0] for j in cols]
+            + [penalty]*len(rows) for i in rows]
+    assignment = _hungarian(cost)
+    return [(rows[r], cols[c], edges[rows[r], cols[c]][1])
+            for r, c in enumerate(assignment) if c < len(cols) and (rows[r], cols[c]) in edges]
+
 
 def _node_mask(grid, node, origin):
     # Recover the component from an occupied boundary cell, not its bbox corner
@@ -102,244 +95,183 @@ def _node_mask(grid, node, origin):
     return frozenset((r - r0, c - c0) for r, c in cells)
 
 
+def _rotate_mask(mask):
+    height = max(r for r, _ in mask) + 1
+    return frozenset((c, height - 1 - r) for r, c in mask)
+
+
+def _reflections(mask):
+    height = max(r for r, _ in mask) + 1
+    width = max(c for _, c in mask) + 1
+    # Axis order resolves shapes with multiple valid reflections.
+    yield "-", frozenset((height - 1 - r, c) for r, c in mask)
+    yield "|", frozenset((r, width - 1 - c) for r, c in mask)
+    yield "/", frozenset((width - 1 - c, height - 1 - r) for r, c in mask)
+    yield "\\", frozenset((c, r) for r, c in mask)
+
+
+def _reduced_mask(mask, scale):
+    reduced = frozenset((r // scale, c // scale) for r, c in mask)
+    # Every occupied block must be full for this to be exact uniform scaling.
+    return reduced if len(mask) == len(reduced) * scale * scale else None
+
+
+def _center2(node):
+    r0, c0, r1, c1 = node["bbox"]
+    return r0 + r1, c0 + c1
+
+
+def _single_change(a, b, ma, mb):
+    same_color = a["color"] == b["color"]
+    if same_color and a["pose_hash"] == b["pose_hash"] and ma == mb:
+        if a["bbox"] != b["bbox"]:
+            return "moved", {"hash": a["hash"]}
+        return None
+    ca, cb = _center2(a), _center2(b)
+    near = all(abs(x - y) <= 2 for x, y in zip(ca, cb))
+    if same_color and near and a["hash"] == b["hash"]:
+        rotated = ma
+        for angle in (90, 180, 270):
+            rotated = _rotate_mask(rotated)
+            if rotated == mb:
+                return "rotated", {"hash": a["hash"], "rotated_by": angle}
+        for axis, reflected in _reflections(ma):
+            if reflected == mb:
+                return "mirrored", {"hash": a["hash"], "axis": axis}
+    if same_color and near and a["form_hash"] == b["form_hash"] and a["scale"] != b["scale"]:
+        reduced = _reduced_mask(ma, a["scale"])
+        if reduced is not None and reduced == _reduced_mask(mb, b["scale"]):
+            return "scaled", {"form_hash": a["form_hash"],
+                              "before_scale": a["scale"], "after_scale": b["scale"],
+                              "scale_factor": b["scale"] / a["scale"]}
+    if (not same_color and a["shape_hash"] == b["shape_hash"]
+            and a["bbox"] == b["bbox"] and ma == mb):
+        return "changed_color", {"shape_hash": a["shape_hash"],
+                                 "before_color": a["color"], "after_color": b["color"]}
+    return None
+
+
+def _unique_nearest(candidates):
+    """Reject shared equal-rank candidates in the resize fallback."""
+    best_a, best_b = {}, {}
+    for rank, i, j, change in candidates:
+        for best, key in ((best_a, i), (best_b, j)):
+            if key not in best or rank < best[key][0]:
+                best[key] = (rank, 1)
+            elif rank == best[key][0]:
+                best[key] = (rank, best[key][1] + 1)
+    return [(i, j, change) for rank, i, j, change in candidates
+            if best_a[i] == (rank, 1) and best_b[j] == (rank, 1)]
+
+
+def _bbox_area(box):
+    return (box[2] - box[0] + 1) * (box[3] - box[1] + 1)
+
+
 def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None, *, origin=(0, 0)):
-    # Object-level diff between two same-shaped grids with precomputed
-    # segmentation nodes. Returns only what changed; unchanged objects are
-    # omitted. When max_group_match is set, identical-hash groups larger than
-    # it skip pairwise matching and report plain appeared/disappeared entries
-    # (guards against O(n^3) assignment on e.g. hundreds of identical pixels).
-    # Cropped grids are local; node coordinates include their original-frame origin.
-    changed = set()
-    for r, (row_a, row_b) in enumerate(zip(grid_a, grid_b)):
-        if row_a == row_b:
-            continue
-        for c, (va, vb) in enumerate(zip(row_a, row_b)):
-            if va != vb:
-                changed.add((r + origin[0], c + origin[1]))
+    """Compare same-bounds grids and nodes; coordinates retain the crop origin.
+
+    Hungarian assignment maximizes valid pair count, then minimizes distance.
+    Each pair gets one change. Exact candidates must verify against masks;
+    unmatched same-color geometry can use the documented resize heuristic.
+    max_group_match bounds matching within large identical-form groups.
+    """
+    changed = sum(va != vb for ra, rb in zip(grid_a, grid_b) for va, vb in zip(ra, rb))
+    result = {"changed_cell_count": changed, **{key: [] for key in (
+        "moved", "rotated", "mirrored", "scaled", "changed_color", "resized", "appeared", "disappeared")}}
     if not changed:
-        return {"changed_cell_count": 0, "moved": [], "rotated": [],
-                "appeared": [], "disappeared": [],
-                "changed_color": [], "resized": []}
-
-    def touched_nodes(nodes):
-        touched = []
-        for node in nodes:
-            points = node.get("boundary") or []
-            if not points:
-                continue
-            r0 = min(p[0] for p in points); r1 = max(p[0] for p in points)
-            c0 = min(p[1] for p in points); c1 = max(p[1] for p in points)
-            # dilate by 1 so objects that shrank/grew still register as
-            # touched by the cells they vacated/claimed
-            if any(r0 - 1 <= r <= r1 + 1 and c0 - 1 <= c <= c1 + 1 for (r, c) in changed):
-                touched.append(node)
-        return touched
-
-    before_nodes = touched_nodes(nodes_a)
-    after_nodes = touched_nodes(nodes_b)
-
-    moved, appeared, disappeared = [], [], []
-    rotated = []
-
-    def _classify_match(node_a, node_b):
-        rot_a = node_a.get("rotation")
-        rot_b = node_b.get("rotation")
-        symmetry = node_a.get("rotational_symmetry") or 1
-        rotated_by = None
-        if rot_a is not None and rot_b is not None:
-            modulus = 180 if symmetry == 2 else 360
-            delta = (rot_b - rot_a) % modulus
-            if delta:
-                rotated_by = delta
-        pa, pb = _node_topleft(node_a), _node_topleft(node_b)
-        base_entry = {"color": node_a.get("color"),
-                      "pixels": node_a.get("pixels"),
-                      "hash": node_a.get("hash")}
-        if rotated_by is not None:
-            ca, cb = _node_center2(node_a), _node_center2(node_b)
-            in_place = (abs(ca[0] - cb[0]) <= 2 and abs(ca[1] - cb[1]) <= 2)
-            base_entry["rotated_by"] = rotated_by
-            if in_place:
-                base_entry["at"] = list(pb)
-                rotated.append(base_entry)
-            else:
-                base_entry["from"] = list(pa); base_entry["to"] = list(pb)
-                moved.append(base_entry)
-        elif pa != pb:
-            base_entry["from"] = list(pa); base_entry["to"] = list(pb)
-            moved.append(base_entry)
-        # same hash, same position, same rotation: unchanged -> omit
-
-    # Reflected chiral poses cannot be classified by rotation subtraction.
-    # Keep them unmatched until the mirrored diff bucket is implemented.
-    masks_a = {id(n): _node_mask(grid_a, n, origin) for n in before_nodes}
-    masks_b = {id(n): _node_mask(grid_b, n, origin) for n in after_nodes}
-    groups_before = {}
-    for node in before_nodes:
-        groups_before.setdefault((node.get("hash"), node.get("mirrored")), []).append(node)
-    groups_after = {}
-    for node in after_nodes:
-        groups_after.setdefault((node.get("hash"), node.get("mirrored")), []).append(node)
-
-    for key, group_a in groups_before.items():
-        group_b = groups_after.pop(key, [])
-        if (
-            max_group_match is not None
-            and max(len(group_a), len(group_b)) > max_group_match
-        ):
-            # too many identical objects to match affordably
-            for node_a in group_a:
-                disappeared.append({"color": node_a.get("color"),
-                                    "pixels": node_a.get("pixels"),
-                                    "hash": node_a.get("hash"),
-                                    "shape_hash": node_a.get("shape_hash"),
-                                    "_mask": masks_a[id(node_a)],
-                                    "at": list(_node_topleft(node_a)),
-                                    "bbox": list(_node_bbox(node_a))})
-            for node_b in group_b:
-                appeared.append({"color": node_b.get("color"),
-                                 "pixels": node_b.get("pixels"),
-                                 "hash": node_b.get("hash"),
-                                 "shape_hash": node_b.get("shape_hash"),
-                                 "_mask": masks_b[id(node_b)],
-                                 "at": list(_node_topleft(node_b)),
-                                 "bbox": list(_node_bbox(node_b))})
-            continue
-        if not group_b:
-            for node_a in group_a:
-                disappeared.append({"color": node_a.get("color"),
-                                    "pixels": node_a.get("pixels"),
-                                    "hash": node_a.get("hash"),
-                                    "shape_hash": node_a.get("shape_hash"),
-                                    "_mask": masks_a[id(node_a)],
-                                    "at": list(_node_topleft(node_a)),
-                                    "bbox": list(_node_bbox(node_a))})
-            continue
-        # optimal assignment over bbox-center distances; rows = smaller side
-        transposed = len(group_a) > len(group_b)
-        rows, cols = (group_b, group_a) if transposed else (group_a, group_b)
-        cost = []
-        for row_node in rows:
-            cr = _node_center2(row_node)
-            cost.append([
-                abs(cr[0] - _node_center2(col_node)[0])
-                + abs(cr[1] - _node_center2(col_node)[1])
-                for col_node in cols
-            ])
-        assignment = _hungarian(cost)
-        matched_cols = set()
-        for row_index, col_index in enumerate(assignment):
-            if col_index < 0:
-                continue
-            matched_cols.add(col_index)
-            if transposed:
-                _classify_match(cols[col_index], rows[row_index])
-            else:
-                _classify_match(rows[row_index], cols[col_index])
-        if transposed:
-            for col_index, node_a in enumerate(cols):
-                if col_index not in matched_cols:
-                    disappeared.append({"color": node_a.get("color"),
-                                        "pixels": node_a.get("pixels"),
-                                        "hash": node_a.get("hash"),
-                                    "shape_hash": node_a.get("shape_hash"),
-                                    "_mask": masks_a[id(node_a)],
-                                        "at": list(_node_topleft(node_a)),
-                                        "bbox": list(_node_bbox(node_a))})
-        else:
-            for col_index, node_b in enumerate(cols):
-                if col_index not in matched_cols:
-                    appeared.append({"color": node_b.get("color"),
-                                     "pixels": node_b.get("pixels"),
-                                     "hash": node_b.get("hash"),
-                             "shape_hash": node_b.get("shape_hash"),
-                                 "_mask": masks_b[id(node_b)],
-                                     "at": list(_node_topleft(node_b)),
-                                     "bbox": list(_node_bbox(node_b))})
-            continue
-        # transposed: every after-node (a row) got matched; nothing appeared
-    for group_b in groups_after.values():
-        for node_b in group_b:
-            appeared.append({"color": node_b.get("color"),
-                             "pixels": node_b.get("pixels"),
-                             "hash": node_b.get("hash"),
-                             "shape_hash": node_b.get("shape_hash"),
-                                 "_mask": masks_b[id(node_b)],
-                             "at": list(_node_topleft(node_b)),
-                             "bbox": list(_node_bbox(node_b))})
-    # Phase A - changed_color: EXACT pairs only. Same position, byte-
-    # identical shape (color-independent pose signature), different
-    # color. This asserts "these exact cells changed color" and nothing
-    # more; fuzzy transformation claims are deliberately not made.
-    changed_color = []
-    used_gone, used_new = set(), set()
-    for gi, gone in enumerate(disappeared):
-        for ni, new in enumerate(appeared):
-            if ni in used_new:
-                continue
-            if (gone["at"] == new["at"]
-                    and gone.get("shape_hash")
-                    and gone.get("shape_hash") == new.get("shape_hash")
-                    and gone["bbox"] == new["bbox"]
-                    and gone["_mask"] == new["_mask"]
-                    and gone["color"] != new["color"]):
-                changed_color.append({"at": gone["at"],
-                                      "pixels": gone["pixels"],
-                                      "before_color": gone["color"],
-                                      "after_color": new["color"],
-                                      "before_hash": gone.get("hash"),
-                                      "after_hash": new.get("hash")})
-                used_gone.add(gi); used_new.add(ni)
+        return result
+    masks_a = [_node_mask(grid_a, n, origin) for n in nodes_a]
+    masks_b = [_node_mask(grid_b, n, origin) for n in nodes_b]
+    used_a, used_b = set(), set()
+    # Remove unchanged nodes before matching duplicate shapes at other positions.
+    unchanged = {}
+    for j, b in enumerate(nodes_b):
+        unchanged.setdefault((tuple(b["bbox"]), b["pose_hash"], b["color"]), []).append(j)
+    for i, a in enumerate(nodes_a):
+        key = (tuple(a["bbox"]), a["pose_hash"], a["color"])
+        for j in unchanged.get(key, []):
+            if j not in used_b and masks_a[i] == masks_b[j]:
+                used_a.add(i)
+                used_b.add(j)
                 break
-    disappeared = [entry for index, entry in enumerate(disappeared) if index not in used_gone]
-    appeared = [entry for index, entry in enumerate(appeared) if index not in used_new]
 
-    # Phase B - resized: same-color pairs whose bboxes substantially
-    # overlap (overlap area / smaller bbox area >= 0.5); greedy
-    # one-to-one by descending overlap then size similarity.
-    resized = []
+    def record(i, j, change):
+        bucket, fields = change
+        a, b = nodes_a[i], nodes_b[j]
+        result[bucket].append({"before_id": a["id"], "after_id": b["id"],
+                               "before_bbox": tuple(a["bbox"]), "after_bbox": tuple(b["bbox"]),
+                               **fields})
+        used_a.add(i)
+        used_b.add(j)
 
-    def _bbox_area(b):
-        return max(0, b[2] - b[0] + 1) * max(0, b[3] - b[1] + 1)
-
-    def _overlap_ratio(b1, b2):
-        inter_r = min(b1[2], b2[2]) - max(b1[0], b2[0]) + 1
-        inter_c = min(b1[3], b2[3]) - max(b1[1], b2[1]) + 1
-        if inter_r <= 0 or inter_c <= 0:
-            return 0.0
-        smaller = min(_bbox_area(b1), _bbox_area(b2))
-        return (inter_r * inter_c) / smaller if smaller else 0.0
-
-    candidates = []
-    for gi, gone in enumerate(disappeared):
-        for ni, new in enumerate(appeared):
-            if gone["color"] != new["color"] or gone.get("hash") == new.get("hash"):
-                continue
-            bg = gone.get("bbox") or (0, 0, -1, -1)
-            bn = new.get("bbox") or (0, 0, -1, -1)
-            ratio = _overlap_ratio(bg, bn)
-            if ratio >= 0.5:
-                area_g, area_n = _bbox_area(bg), _bbox_area(bn)
-                similarity = (min(area_g, area_n) / max(area_g, area_n)) if max(area_g, area_n) else 0.0
-                candidates.append((ratio, similarity, gi, ni))
-    candidates.sort(key=lambda item: (-item[0], -item[1]))
-    used_gone, used_new = set(), set()
-    for ratio, similarity, gi, ni in candidates:
-        if gi in used_gone or ni in used_new:
+    groups_a, groups_b = {}, {}
+    for i, a in enumerate(nodes_a):
+        if i not in used_a:
+            groups_a.setdefault(a["form_hash"], []).append(i)
+    for j, b in enumerate(nodes_b):
+        if j not in used_b:
+            groups_b.setdefault(b["form_hash"], []).append(j)
+    blocked_a, blocked_b = set(), set()
+    for form, group_a in groups_a.items():
+        group_b = groups_b.get(form, [])
+        if max_group_match is not None and max(len(group_a), len(group_b)) > max_group_match:
+            blocked_a.update(group_a)
+            blocked_b.update(group_b)
             continue
-        used_gone.add(gi); used_new.add(ni)
-        gone, new = disappeared[gi], appeared[ni]
-        resized.append({"at_before": gone["at"], "at_after": new["at"],
-                        "color": gone["color"],
-                        "before_pixels": gone["pixels"],
-                        "after_pixels": new["pixels"],
-                        "before_hash": gone.get("hash"),
-                        "after_hash": new.get("hash")})
-    disappeared = [entry for index, entry in enumerate(disappeared) if index not in used_gone]
-    appeared = [entry for index, entry in enumerate(appeared) if index not in used_new]
-    for entry in appeared + disappeared:
-        entry.pop("_mask", None)
-    return {"changed_cell_count": len(changed), "moved": moved,
-            "rotated": rotated,
-            "appeared": appeared, "disappeared": disappeared,
-            "changed_color": changed_color, "resized": resized}
+        candidates = []
+        for i in group_a:
+            for j in group_b:
+                change = _single_change(nodes_a[i], nodes_b[j], masks_a[i], masks_b[j])
+                if change is not None:
+                    distance = sum(abs(x - y) for x, y in zip(_center2(nodes_a[i]), _center2(nodes_b[j])))
+                    candidates.append((distance, i, j, change))
+        accepted = _hungarian_candidates(candidates)
+        matched_a = {i for i, _, _ in accepted}
+        matched_b = {j for _, j, _ in accepted}
+        blocked_a.update(i for _, i, _, _ in candidates if i not in matched_a)
+        blocked_b.update(j for _, _, j, _ in candidates if j not in matched_b)
+        for i, j, change in accepted:
+            record(i, j, change)
+
+    # Geometry-change fallback, excluding uniform-form transforms/combinations.
+    candidates = []
+    for i, a in enumerate(nodes_a):
+        if i in used_a or i in blocked_a:
+            continue
+        for j, b in enumerate(nodes_b):
+            if j in used_b or j in blocked_b or a["color"] != b["color"] or a["form_hash"] == b["form_hash"]:
+                continue
+            ba, bb = a["bbox"], b["bbox"]
+            height = max(0, min(ba[2], bb[2]) - max(ba[0], bb[0]) + 1)
+            width = max(0, min(ba[3], bb[3]) - max(ba[1], bb[1]) + 1)
+            area_a, area_b = _bbox_area(ba), _bbox_area(bb)
+            overlap = height * width / min(area_a, area_b)
+            if overlap >= 0.5:
+                similarity = min(area_a, area_b) / max(area_a, area_b)
+                candidates.append(((-overlap, -similarity), i, j))
+    # Greedy by overlap, then area similarity; tied candidates sharing a node
+    # remain ambiguous instead of depending on list order.
+    candidates.sort()
+    index = 0
+    while index < len(candidates):
+        end = index + 1
+        while end < len(candidates) and candidates[end][0] == candidates[index][0]:
+            end += 1
+        tied = [(rank, i, j, None) for rank, i, j in candidates[index:end]
+                if i not in used_a and j not in used_b and i not in blocked_a and j not in blocked_b]
+        accepted = _unique_nearest(tied)
+        matched_a = {i for i, _, _ in accepted}
+        matched_b = {j for _, j, _ in accepted}
+        blocked_a.update(i for _, i, _, _ in tied if i not in matched_a)
+        blocked_b.update(j for _, _, j, _ in tied if j not in matched_b)
+        for i, j, _ in accepted:
+            a, b = nodes_a[i], nodes_b[j]
+            record(i, j, ("resized", {"color": a["color"],
+                                    "before_pixels": a["pixels"], "after_pixels": b["pixels"]}))
+        index = end
+    for bucket, nodes, used in (("appeared", nodes_b, used_b), ("disappeared", nodes_a, used_a)):
+        result[bucket] = [{"id": n["id"], "color": n["color"], "hash": n["hash"],
+                           "bbox": tuple(n["bbox"]), "pixels": n["pixels"]}
+                          for i, n in enumerate(nodes) if i not in used]
+    return result
