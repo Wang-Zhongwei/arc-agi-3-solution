@@ -228,16 +228,13 @@ PYTHON_ADDENDUM_TAIL = (
 )
 
 FRAME_DIFF_HINT_ADDENDUM = (
-    "- `frame_diff(before=None, after=None)` compares two frames. Omitted arguments default to `previous_frame` and `current_frame`, respectively.\n"
-    "- Matching crops are supported: `frame_diff(previous_frame[1:2, 2:3], current_frame[1:2, 2:3])`. Use the same original-frame bounds; returned coordinates remain in the original frame.\n"
-    "- It returns a dictionary containing `changed_cell_count` (an integer) and lists named `moved`, `rotated`, `appeared`, `disappeared`, `changed_color`, and `resized`. Unchanged objects are omitted.\n"
-    "- Object-level changes are inferred by matching same-color, 4-connected components between frames: cells connect through shared edges, not diagonally. A game object may therefore be split into several components, or touching same-color objects may form one component.\n"
-    "- `moved` describes components matched at different positions. Matching does not establish persistent object identity: with multiple similar components, the reported correspondence may be ambiguous or incorrect. Movement combined with rotation includes `rotated_by` in degrees clockwise; `rotated` describes rotation in place.\n"
-    "- `changed_color` requires identical occupied cells with a different color. Entries contain `at`, `pixels`, `before_color`, `after_color`, `before_hash`, and `after_hash`.\n"
-    "- `resized` describes same-color components with overlapping footprints whose size changed. This can include backgrounds and budget bars. `at_before` and `at_after` can differ.\n"
-    "- `appeared` and `disappeared` entries include `bbox` in `[r0, c0, r1, c1]` order. Object hashes use the same rotation- and reflection-invariant shape-and-color representation as segmentation; they are not unique object identities, and multiple objects can share a hash.\n"
-    "- Examples: `frame_diff()` compares the latest action’s before/after frames; `frame_diff(history[-3].frame, history[-2].frame)` compares two explicitly selected historical frames, when available.\n"
+    "- `frame_diff(before=None, after=None)` defaults to `previous_frame` and `current_frame`. Matching crops work: `frame_diff(previous_frame[1:2, 2:3], current_frame[1:2, 2:3])`. Use the same original-frame bounds.\n"
+    "- Returns `changed_cell_count` and lists `moved`, `rotated`, `mirrored`, `scaled`, `changed_color`, `resized`, `appeared`, `disappeared`. Matched entries give `before_id`, `after_id`, `before_bbox`, `after_bbox`; appearance/disappearance entries give `id`, `bbox`, `color`, `hash`, `pixels`. Bboxes are inclusive `(r0, c0, r1, c1)` in original-frame coordinates; IDs belong to the supplied frame/crop.\n"
+    "- `moved` means position only; `rotated_by` is clockwise degrees. `mirrored.axis`: `-` reverses rows, `|` reverses columns, `/` transposes then reverses both axes, and `\\` transposes. Rotation/reflection/scaling allow bbox centers to differ by at most one pixel per axis.\n"
+    "- `scaled` gives `form_hash`, `before_scale`, `after_scale`, and verified `scale_factor=after_scale/before_scale`. Recolor requires the same occupied cells and bbox, and gives `shape_hash`, `before_color`, `after_color`. `resized` is a same-color overlap heuristic with `before_pixels` and `after_pixels`; it can describe geometry changes with equal pixel counts.\n"
+    "- Matching uses same-color, 4-connected components, which can split or merge game objects. Unchanged nodes are omitted; unsupported combinations remain unmatched. With multiple similar components, correspondence may be ambiguous or incorrect. Hashes describe appearance, not persistent tracking IDs.\n"
 )
+
 
 STEP_VERIFICATION_ADDENDUM = (
     "- During a multi-action plan, verify important effects by comparing the actual game "

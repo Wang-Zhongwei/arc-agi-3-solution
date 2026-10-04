@@ -76,9 +76,11 @@ def test_chiral_reflection_is_not_dropped_or_called_rotation_or_resize():
     mask = [[1, 0, 0], [1, 1, 1]]
     result = diff(grid(mask), grid([row[::-1] for row in mask]))
     for bucket in ('rotated', 'moved', 'resized'):
-        assert not any(n['color'] == 'B' for n in result[bucket])
-    assert any(n['color'] == 'B' for n in result['appeared'])
-    assert any(n['color'] == 'B' for n in result['disappeared'])
+        assert not any(n['before_id'] == 1 for n in result[bucket])
+    entry = next(n for n in result['mirrored'] if n['before_id'] == 1)
+    assert entry['axis'] == '|'
+    assert not any(n['id'] == 1 for n in result['appeared'])
+    assert not any(n['id'] == 1 for n in result['disappeared'])
     assert all('_mask' not in n for bucket in result.values() if isinstance(bucket, list) for n in bucket)
 
 
@@ -93,7 +95,7 @@ def test_rotations_work_in_both_reflection_classes():
     mask = [[1, 0, 0], [1, 1, 1]]
     for reflected in (mask, [row[::-1] for row in mask]):
         result = diff(grid(reflected), grid(rotate(reflected)))
-        entry = next(n for n in result['rotated'] if n['color'] == 'B')
+        entry = next(n for n in result['rotated'] if n['before_id'] == 1)
         assert entry['rotated_by'] == 90
 
 
