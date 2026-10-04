@@ -41,4 +41,6 @@ The cap is not extended, because the hidden run has no slack: 4 × 132 min plus 
 
 ## Results
 
-Version 1 was pushed on 2026-10-04 from commit `458e575` (clean tree), with 28 lanes and a 132-min per-game cap. It was QUEUED at the time of writing. Record its scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=1`.
+Version 1 was pushed on 2026-10-04 from commit `458e575` (clean tree), with 28 lanes, a 132-min per-game cap and a 150-min public run. It was cancelled while queued, because its public run would not finish in time to submit that day.
+
+Version 2 was pushed the same day from `eea6f57`, with `MAX_EXPERIMENT_RUNTIME_MINUTES=30` added to the command above. That makes the public run a quick health check: it stops 20 min after notebook start, which is about 10 min of play after server startup. It cannot be compared with v3's 150-min public run. The competition run ignores this soft end, so the hidden set still plays 28 lanes × 132 min in four waves. Record scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=2`.
