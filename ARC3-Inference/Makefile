@@ -297,6 +297,9 @@ endif
 ifeq ($(origin ARC3_PERSISTENT_FUNCTIONS),undefined)
 ARC3_PERSISTENT_FUNCTIONS := $(shell $(CONFIG_VALUE) analyzer.persistent_functions false)
 endif
+ifeq ($(origin ARC3_API_SIGNATURES),undefined)
+ARC3_API_SIGNATURES := $(shell $(CONFIG_VALUE) analyzer.api_signatures false)
+endif
 ifeq ($(origin ARC3_HUD_DISPLAY),undefined)
 ARC3_HUD_DISPLAY := $(shell $(CONFIG_VALUE) analyzer.hud_display false)
 endif
@@ -388,6 +391,7 @@ export LOCAL_ANALYZER_SITE_URL
 export LOCAL_ANALYZER_APP_NAME
 export ARC3_PERSISTENT_FUNCTIONS
 export ARC3_HUD_DISPLAY
+export ARC3_API_SIGNATURES
 export MULTIMODAL_CONTEXT
 export ARC3_HARNESS_ENV_JSON
 export ARC3_KAGGLE_JSON

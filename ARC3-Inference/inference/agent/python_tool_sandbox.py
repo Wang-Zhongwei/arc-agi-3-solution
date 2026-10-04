@@ -205,10 +205,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     class HistoryEntryView:
-        def __init__(self, *, action, frame, result=None):
+        def __init__(self, *, action, frame):
             self.action = action
             self.frame = frame
-            self.result = dict(result) if isinstance(result, dict) else {}
 
         def __str__(self):
             return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
@@ -256,15 +255,15 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 HistoryEntryView(
                     action=str(entry.get("action", "")),
                     frame=_frame_from_payload(entry.get("frame")),
-                    result=entry.get("result"),
                 )
             )
         return items
 
 
-    def _transitions_from_history(history):
+    def _transitions_from_history(history, payload):
         transitions = []
-        for index, entry in enumerate(history):
+        records = [entry for entry in payload or [] if isinstance(entry, dict)]
+        for index, (entry, record) in enumerate(zip(history, records)):
             action = str(getattr(entry, "action", "") or "").strip()
             if not action:
                 continue
@@ -274,7 +273,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     action=action,
                     before_frame=before_frame,
                     after_frame=entry.frame,
-                    result=entry.result,
+                    # Read old saved snapshots without restoring history.result.
+                    result=record.get("transition_result", record.get("result")),
                 )
             )
         return transitions
@@ -464,7 +464,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             # action_echo is printed by action(), then removed from its return value.
             # Keep the exposed call result identical across subsequent inspections.
             action_result.pop("action_echo", None)
-            transitions = _transitions_from_history(history)
+            transitions = _transitions_from_history(history, state_payload.get("history"))
             last_transition = transitions[-1] if transitions else None
 
             runtime_globals["current_frame"] = current_frame

@@ -148,7 +148,7 @@ def describe_animation(
 ) -> str:
     """The opener line, or "" when there is nothing worth saying.
 
-    Silent unless cells changed and changed back. Where every cell changed at
+    Silent unless cells changed at least twice. Where every cell changed at
     most once the final frame already shows the outcome, and a line saying so
     would spend tokens to report that nothing is missing.
     """
@@ -158,8 +158,8 @@ def describe_animation(
     if transient <= 0:
         return ""
     frames = summary.get("frames")
-    cells = "1 cell changed and changed back" if transient == 1 else (
-        f"{transient} cells changed and changed back"
+    cells = "1 cell changed at least twice" if transient == 1 else (
+        f"{transient} cells changed at least twice"
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
@@ -172,12 +172,11 @@ def describe_animation(
 
     if game_over:
         # Follows the BAR RULE block, which has just walked the model through
-        # history[-3] and history[-2]. This says what those two frames cannot
-        # contain, which is precisely what "transient" means.
+        # history[-3] and history[-2]. Point out potentially missing intermediate values.
         return (
             f"That fatal action animated over {frames} frames, and inside it "
-            f"{cells}{where}. Those cells are in neither "
-            f"`history[-3].frame` nor `history[-2].frame` - read {where_to_look} to see "
+            f"{cells}{where}. Intermediate values may be absent from "
+            f"`history[-3].frame` and `history[-2].frame` - read {where_to_look} to see "
             "what happened between them."
         )
     if gameplay_changed is False:

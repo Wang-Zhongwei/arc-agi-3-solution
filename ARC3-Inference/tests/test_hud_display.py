@@ -169,20 +169,22 @@ def test_system_guidance_matches_effective_enablement(monkeypatch, option, reten
 @pytest.mark.parametrize("enabled,override", [(False, None), (True, None), (True, "false")])
 def test_json_config_reaches_make_and_kaggle_setup(tmp_path, monkeypatch, enabled, override):
     config = tmp_path / "hud.json"
-    config.write_text(json.dumps({"analyzer": {"persistent_functions": enabled, "hud_display": enabled}}))
+    config.write_text(json.dumps({"analyzer": {"persistent_functions": enabled, "hud_display": enabled, "api_signatures": enabled}}))
     env = dict(os.environ)
-    for name in ("ARC3_HUD_DISPLAY", "ARC3_PERSISTENT_FUNCTIONS"):
+    for name in ("ARC3_HUD_DISPLAY", "ARC3_PERSISTENT_FUNCTIONS", "ARC3_API_SIGNATURES"):
         env.pop(name, None)
     if override is not None:
         env["ARC3_HUD_DISPLAY"] = override
+        env["ARC3_API_SIGNATURES"] = override
     result = subprocess.run(
         ["make", "--no-print-directory", "-s", "-f", "Makefile", "-f", "-", "hud-config", f"CONFIG_PATH={config}"],
         cwd=Path(__file__).resolve().parents[1], env=env, text=True, capture_output=True, check=True,
-        input="hud-config:\n\t@python3 -c 'import os,json; print(json.dumps({k:os.environ[k] for k in (\"ARC3_PERSISTENT_FUNCTIONS\",\"ARC3_HUD_DISPLAY\")}))'\n",
+        input="hud-config:\n\t@python3 -c 'import os,json; print(json.dumps({k:os.environ[k] for k in (\"ARC3_PERSISTENT_FUNCTIONS\",\"ARC3_HUD_DISPLAY\",\"ARC3_API_SIGNATURES\")}))'\n",
     )
     exported = json.loads(result.stdout)
     assert exported["ARC3_PERSISTENT_FUNCTIONS"] == str(enabled).lower()
     assert exported["ARC3_HUD_DISPLAY"] == (override or str(enabled).lower())
+    assert exported["ARC3_API_SIGNATURES"] == (override or str(enabled).lower())
     monkeypatch.setenv("LOCAL_ANALYZER_PROVIDER", "vllm")
     for name, value in exported.items():
         monkeypatch.setenv(name, value)
@@ -194,3 +196,19 @@ def test_json_config_reaches_make_and_kaggle_setup(tmp_path, monkeypatch, enable
     actual = {key.value: ast.literal_eval(value) for key, value in zip(setup.keys, setup.values)
               if isinstance(key, ast.Constant) and key.value in exported}
     assert actual == exported
+
+
+@pytest.mark.parametrize("enabled", [None, "false", "true"])
+@pytest.mark.parametrize("animation", [False, True])
+def test_api_reference_precedes_runtime_explanation(monkeypatch, enabled, animation):
+    from inference.agent.prompts import API_SIGNATURES_ADDENDUM, ANIMATION_API_SIGNATURES_ADDENDUM
+
+    monkeypatch.delenv("ARC3_API_SIGNATURES", raising=False)
+    if enabled is not None:
+        monkeypatch.setenv("ARC3_API_SIGNATURES", enabled)
+    monkeypatch.setenv("ARC3_ANIMATION", str(animation).lower())
+    prompt = tool_agent._build_system_prompt(tool_output_tokens=1024)
+    assert prompt.count(API_SIGNATURES_ADDENDUM) == (enabled == "true")
+    assert prompt.count(ANIMATION_API_SIGNATURES_ADDENDUM) == (animation and enabled == "true")
+    if enabled == "true":
+        assert prompt.index(API_SIGNATURES_ADDENDUM) < prompt.index("Runtime variables inside every")

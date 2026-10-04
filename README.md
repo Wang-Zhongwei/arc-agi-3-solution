@@ -21,7 +21,7 @@ For building the offline SGLang runtime and details of the serving patches, see 
 - **Model and serving:** Qwen3.8-Flash-Next with an optimized SGLang runtime. Serving work makes long contexts practical while maintaining throughput, including changes to Mamba prefix-cache retention and checkpoint prefetching.
 - **Context management:** calibrated text-token estimates, image-size-aware token accounting, and blockwise history trimming. Evicting a larger block at once lets the retained prefix be reused for more requests before the next trim.
 - **Compute allocation:** bounded concurrent admission reduces cache pressure. Priority scheduling allocates compute using current progress, actions and tokens spent, and continuation value. Cached continuations receive priority; tail fade shifts emphasis toward immediate level completions near the deadline.
-- **Perception and feedback:** larger board images, board-difference and death images, animation frames and timelines accessible in Python, and clearer action-result history.
+- **Perception and feedback:** larger board images, board-difference and death images, animation frames and timelines accessible in Python, and clearer per-action transition results.
 - **Agent tools and prompts:** executable undo, optional reset, guidance for transferring knowledge across levels, and retention of eligible Python functions and supported imports.
 - **Execution safeguards:** guards for stale-state actions and no-op batches, protection at level boundaries, and clearer tool output with action echo and optional middle truncation.
 

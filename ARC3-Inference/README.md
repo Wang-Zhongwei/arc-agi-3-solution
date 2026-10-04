@@ -85,7 +85,7 @@ plan, and execute real game actions with `action(...)`.
 | --- | --- |
 | `current_frame` | Latest board, exposing `.ascii`, `.segmentation`, `.shape`, `.step`, and `.level`. `.shape` is `(rows, cols)`. |
 | `previous_frame` | Board before the most recent recorded action, when available. |
-| `history` | Recorded states and actions. `history[-1].frame` is the current, post-action board. |
+| `history` | Chronological entries exposing only `.action` and `.frame`. `history[-1].frame` is the current, post-action board. |
 | `transitions` | Individual executed actions, each with `.action`, `.before_frame`, `.after_frame`, and retained `.result` metadata. |
 | `last_transition` | Most recent transition, or `None`. |
 | `last_action_call_result` | Result of the latest model-issued `action(...)` call, including batch totals, executed/skipped actions, and stop reasons. |
@@ -100,7 +100,8 @@ grid and `.segmentation` provides objects, boundaries, containment, and adjacenc
 `action(...)` returns `last_action_call_result` and refreshes the provided
 runtime state before the next Python statement. Inspection-only calls retain
 the last action-call result. Each transition's `.result` describes one action,
-whereas `last_action_call_result` describes the whole model-issued call.
+whereas `last_action_call_result` describes the whole model-issued call. History
+entries and frames, including `current_frame` and `previous_frame`, have no `.result`.
 
 After death followed by automatic reset, the fatal action and reset are
 separate transitions. `current_frame` shows the restarted level;

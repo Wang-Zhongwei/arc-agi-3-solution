@@ -80,6 +80,25 @@ The current contract and prompt guidance are defined in [Implementation](#implem
 
 # Implementation
 
+## Runtime results
+
+`history` entries expose only `.action` and `.frame`; frames, including `current_frame` and `previous_frame`, have no `.result`.
+
+```python
+class TransitionView:
+    action: str
+    before_frame: FrameView | None
+    after_frame: FrameView
+    frame: FrameView  # alias of after_frame
+    result: dict     # outcome of this individual action
+
+transitions: list[TransitionView]  # executed actions; excludes the initial frame
+last_transition: TransitionView | None
+last_action_call_result: dict  # latest action(...) call, including batch/refusal metadata
+```
+
+Refused actions add no transition. Automatic RESET has its own transition with `result["automatic"] = True` and leaves `last_action_call_result` describing the model's fatal call. `frame_diff(...)` returns a separate comparison dictionary; the snippet variable `result` is only chosen tool output.
+
 ## Node
 Implemented node contract. Nodes remain same-color, 4-connected components with containment; compare explicitly selected parts when a pattern spans multiple nodes.
 

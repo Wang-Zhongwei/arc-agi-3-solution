@@ -51,6 +51,8 @@ from inference.agent.prompts import (
     PYTHON_ADDENDUM_HEAD,
     PYTHON_ADDENDUM_TAIL,
     GAMEPLAY_CHANGED_ADDENDUM,
+    API_SIGNATURES_ADDENDUM,
+    ANIMATION_API_SIGNATURES_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
@@ -304,15 +306,18 @@ _DIFF_IMAGE = _get_env_bool("ARC3_DIFF_IMAGE", False)
 _RESPONSE_META_MAX_CHARS = 4000
 
 _PYTHON_TOOL_DESCRIPTION = (
-    "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
+    "Run one Python snippet against preloaded structured game state. Available globals: "
     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
     "`valid_actions`, `last_action_call_result`, "
+    "`frame_diff(before=None, after=None)`, "
     "and `action(actions)` for executing one or more real environment actions. "
-    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
+    "`current_frame` and each `history[*].frame` provide `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
+    "`frame[r0:r1, c0:c1]` returns a cropped frame with half-open bounds. "
     "`history[-1].frame` is the current post-action frame, not the previous frame. "
+    "History entries expose only `.action` and `.frame`; individual action outcomes are on `transitions[i].result` or `last_transition.result`. "
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
-    "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
+    "Use `.segmentation` as the primary view, cropping the frame for a specific region. "
     "Use `print(...)` for compact output or assign final data to `result`."
 )
 
@@ -2738,7 +2743,7 @@ def _render_auto_frame_diff(
         remaining = len(entries) - shown - sum(swarm.values())
         if remaining > 0:
             lines.append(f"- {bucket}: +{remaining} more")
-    lines.append("(call frame_diff() in python for the full object list)")
+    lines.append("(call frame_diff(before, after) on the displayed frames for full details)")
     if _estimate_diff_tokens("\n".join(lines)) <= budget_tokens:
         return lines
     # rung 3: counts only, cannot be large
@@ -2748,7 +2753,7 @@ def _render_auto_frame_diff(
         if diff.get(bucket)
     ]
     return [
-        header + " " + ", ".join(parts) + " (details omitted; call frame_diff() in python)."
+        header + " " + ", ".join(parts) + " (details omitted; call frame_diff(before, after) on the displayed frames)."
     ]
 
 
@@ -2762,6 +2767,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     if _prefix:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
+    if _get_env_bool("ARC3_API_SIGNATURES", False):
+        prompt += API_SIGNATURES_ADDENDUM
+        if _animation_enabled():
+            prompt += ANIMATION_API_SIGNATURES_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
@@ -2775,15 +2784,16 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += MULTIMODAL_CONTEXT_ADDENDUM
     if _AUTO_FRAME_DIFF:
         prompt += (
-            " Each turn's message includes an 'Auto frame diff' section summarizing "
+            " User messages may include an 'Auto frame diff' section summarizing "
             "object-level changes since your previous analyzer turn (it spans all "
             "actions executed in between, not just the last one). Use it as a summary "
-            "of candidate object changes, consult it before acting, and call `frame_diff()` "
-            "in python when you need per-action or full object detail."
+            "of candidate object changes. For full details over that span, pass the "
+            "corresponding history frames to `frame_diff(before, after)`; `frame_diff()` "
+            "compares only the latest action's before/after frames.\n"
         )
     if _DIFF_IMAGE and current_grid_image_enabled():
         prompt += (
-            " Alongside the current grid image you receive a diff image: cells that "
+            " A diff image may accompany the current grid image: cells that "
             "changed since your previous analyzer turn are shown in their new true "
             "color; unchanged cells are dimmed to a dark navy that is not a game "
             "color. Use it to locate change at a glance."
@@ -2812,9 +2822,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     )
     prompt += PYTHON_ADDENDUM_TAIL
     if _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
-        # documents `frame_diff(before, after)`. The function stays callable
-        # either way - this only controls whether the model is told about it,
-        # so the arm measures whether knowing costs more than it returns.
+        # Optional detailed guidance; frame_diff stays callable either way.
         prompt += FRAME_DIFF_HINT_ADDENDUM
     if _get_env_bool("ARC3_HUD_DISPLAY", False) and _persistent_functions():
         prompt += (
@@ -2835,6 +2843,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     # mechanism the model may never meet is prompt weight spent on nothing.
     prompt += COMPACT_TOOL_SESSION_ADDENDUM.format(
         tool_output_tokens=tool_output_tokens,
+        python_timeout=min(30, max(1, _LOCAL_ANALYZER_TOOL_TIMEOUT)),
         prefer_tool_calls=PREFER_TOOL_CALLS_LINE if _prefer_tool_calls() else "",
         persistent_functions=(
             PERSISTENT_FUNCTIONS_LINE.format(lifetime=(
@@ -2903,7 +2912,6 @@ class _AsciiFrameView:
 class _AsciiHistoryEntryView:
     action: str
     frame: _AsciiFrameView
-    result: dict[str, Any]
 
     def __str__(self) -> str:
         return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
@@ -2930,7 +2938,6 @@ def _to_ascii_history_views(history_entries: list[HistoryEntry]) -> list[_AsciiH
             continue
         views.append(_AsciiHistoryEntryView(
             action=entry.action, frame=frame_view,
-            result=dict(getattr(entry, "result", {}) or {}),
         ))
     return views
 
@@ -2956,7 +2963,7 @@ def _ascii_history_view_payload(history_entries: list[HistoryEntry]) -> list[dic
             continue
         payload.append({
             "action": entry.action, "frame": frame_payload,
-            "result": dict(getattr(entry, "result", {}) or {}),
+            "transition_result": dict(entry._transition_result),
         })
     return payload
 
@@ -4986,7 +4993,7 @@ class ToolAgent:
         previous_step_summary: dict[str, Any] | None = None,
     ) -> str:
         history_entries = history_entries or []
-        current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
+        current_step = current_frame.step if current_frame is not None else max(0, action_num)
         current_level = current_frame.level if current_frame is not None else 1
         summary_level = None
         if previous_step_summary is not None:
@@ -5162,7 +5169,9 @@ class ToolAgent:
                     "collecting an item that refills it). If the bar clearly had budget "
                     "remaining: the fatal action itself caused the death (hazard or "
                     "forbidden move) — do NOT retry the same path; a DIFFERENT approach "
-                    "must be tried. Record the diagnosed cause in your world model."
+                    "must be tried."
+                    + (" Record the diagnosed cause in your world model."
+                       if not _memory_sections_disabled() else "")
                 )
                 if _animation_enabled():
                     # after the BAR RULE, which tells the model how to read
@@ -5213,8 +5222,9 @@ class ToolAgent:
                     "will kill you again. Change the plan BEFORE the fatal point - a "
                     "different route, action, or timing. If you believe the same "
                     "moves 'should' work, that belief is exactly what this death "
-                    "falsified; record the correction in your world model instead "
-                    "of retesting it."
+                    "falsified; revise your understanding instead of retesting it."
+                    + (" Record the correction in your world model."
+                       if not _memory_sections_disabled() else "")
                 )
         elif (current_frame is not None and current_frame.step > 0) or action_num > 0:
             lines.append("No previous action sequence was captured.")
@@ -5273,13 +5283,23 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
-        # The tool mechanics this opener used to repeat every turn - the tool and
-        # its globals, no numeric grid, compact output, how to diff the latest
-        # change, call and batch action(), the tool-call format, MOUSE row/col -
-        # are all in the system prompt (runtime state, visual game, Python tool
-        # and tool session sections), so they are not restated here. The
-        # methodology lines (inspect and score candidates, ground on turn one,
-        # then focus on the latest change) stay as a per-turn nudge.
+        # Keep this API comparison branch's explicit per-turn runtime guidance.
+        lines.extend(
+            [
+                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_call_result`, `frame_diff(before, after)`, and `action(actions)`.",
+                "Board objects use ARC color characters and lightweight metadata.",
+                "Keep tool output compact: use `current_frame.segmentation` as the primary view, or `current_frame[r0:r1, c0:c1].segmentation` for a region; never print full boards.",
+                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
+            ]
+        )
+        # Upstream states four things about the world model here, and with
+        # ARC3_MEMORY_SECTIONS=off three of them are false or unanswerable: the
+        # block they refer to is suppressed, so "Below you are provided with the
+        # current world model" is followed by nothing, and the model is told in
+        # capitals to always give a revised version with nowhere to put it.
+        # Observed as a drop in replies carrying any assistant text at all,
+        # 76% to 43% - a broken instruction, not an absent one, which is why
+        # `off` was never a clean control.
         #
         # The world-model lines stay too: they introduce the memory block that
         # follows in this message. With ARC3_MEMORY_SECTIONS=off that block is
@@ -5296,7 +5316,7 @@ class ToolAgent:
                 [
                     "Use Python to inspect the evidence, refine that world model from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it.",
                     "Maintain a compact working world model of what the current level seems to contain, what actions appear to do, what the goal seems to be, what is still uncertain, and what plan currently looks best.",
-                    "Below you are provided with the current world model from the previous turn. The default behavior is to copy it and add or remove things based on the evidence that you gathered. BEFORE EXECUTING NEW ACTIONS YOU MUST ALWAYS GIVE THE REVISED VERSION OF THE WORLD MODEL.",
+                    "Use the saved memory below when present, updating it from the evidence you gathered. Before executing new actions, provide your current world model.",
                 ]
             )
         if not _dedupe_multicall_line():
@@ -5344,7 +5364,7 @@ class ToolAgent:
                             "code": {
                                 "type": "string",
                                 "description": (
-                                    "Python code to run. The snippet is ephemeral and is not saved across tool calls."
+                                    "Python code to run against the supplied runtime state."
                                 ),
                             },
                         },
@@ -7363,20 +7383,25 @@ class ToolAgent:
                         # dropped; keep the contrast, drop the destination
                         else ", not current positions or what just happened. "
                     )
-                    followup_prompt = (
-                        f"{followup_prefix}"
-                        "Then investigate and revise your working world model of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
+                    memory_update_guidance = ""
+                    if not _memory_sections_disabled():
                         # the same narrowing the opener applies: advertising a section a
                         # restricted mode drops invites the model to write
                         # where it will never read it back
-                        f"If helpful, include memory update lines such as "
-                        f"{_section_list_phrase(_advertised_section_labels(), 'or')}. "
-                        "`World model:` holds durable environment rules"
-                        + (" only" if "Recent findings" in _advertised_section_labels() else "")
-                        + f"{_transient_clause}"
-                        "Each section you write replaces the stored one entirely, "
-                        "so restate what is still true, not only what is new. "
-                        "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, and `.ascii` only for a small specific region -- "
+                        memory_update_guidance = (
+                            "If helpful, include memory update lines such as "
+                            f"{_section_list_phrase(_advertised_section_labels(), 'or')}. "
+                            "`World model:` holds durable environment rules"
+                            + (" only" if "Recent findings" in _advertised_section_labels() else "")
+                            + f"{_transient_clause}"
+                            "Each section you write replaces the stored one entirely, "
+                            "so restate what is still true, not only what is new. "
+                        )
+                    followup_prompt = (
+                        f"{followup_prefix}"
+                        "Then investigate and revise your understanding of what the level contains, what actions appear to do, what the current goal seems to be, and what plan looks best. "
+                        f"{memory_update_guidance}"
+                        "Call the `python` tool with code that inspects `current_frame`, `previous_frame`, `last_transition`, `history`, or `valid_actions` -- use `current_frame.segmentation` as the primary view, or crop the frame for a specific region -- "
                         "compare `previous_frame` to `current_frame` for the most recent change, "
                         "derives a compact board summary, programs a small search or scorer over candidate actions or short sequences, "
                         "then call `action(actions)` inside Python with the best valid action or ordered batch that your code selected. "

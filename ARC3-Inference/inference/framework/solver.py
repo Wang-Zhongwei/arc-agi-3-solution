@@ -1342,7 +1342,8 @@ class _HarnessGameSession:
         )
         individual_result = copy.deepcopy({k: payload[k] for k in result_keys if k in payload})
         self.history_entries.append(
-            HistoryEntry(action=action_display, frame=current_frame, result=individual_result)
+            HistoryEntry(action=action_display, frame=current_frame,
+                         _transition_result=individual_result)
         )
         self.write_runtime_state()
         self._append_action_viewer_event(payload, current_frame)

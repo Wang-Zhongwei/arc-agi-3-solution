@@ -1,10 +1,11 @@
 import pytest
 
 from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.utils.animation import build_animation_frames
 from inference.utils.grid_utils import ARC_COLOR_CHARS, format_grid_ascii
 
 
-def _run(code, before, after=None):
+def _run(code, before, after=None, *, animation_record=None):
     def payload(grid, step):
         return {"grid": grid, "ascii": format_grid_ascii(grid),
                 "shape": [len(grid), len(grid[0]) if grid else 0],
@@ -23,6 +24,8 @@ def _run(code, before, after=None):
             "current_frame": payload(before if after is None else after, 5),
         },
         action_handler=no_action,
+        animation_handler=(lambda _: build_animation_frames(animation_record))
+        if animation_record is not None else None,
     )
 
 
@@ -30,6 +33,47 @@ def _result(code, before, after=None):
     response = _run(code, before, after)
     assert response["error"] == "", response
     return response["result"]
+
+
+def test_animation_frames_support_crops_segmentation_and_frame_diff():
+    before = [[0] * 7 for _ in range(7)]
+    after = [
+        [0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 1, 0],
+        [0, 1, 2, 2, 2, 1, 0],
+        [0, 1, 2, 3, 2, 1, 0],
+        [0, 1, 2, 2, 2, 1, 0],
+        [0, 1, 1, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0],
+    ]
+    intermediate = [row[:] for row in after]
+    intermediate[3][3] = 4
+    record = {"chain": [before, intermediate, after], "step": 5, "level": 2}
+    response = _run("""
+assert len(last_animation_frames) == 2
+frame = last_animation_frames[1]
+original = frame.segmentation
+for r0, r1, c0, c1 in [(1, 6, 1, 6), (1, 4, 1, 6), (2, 5, 2, 5)]:
+    crop = last_animation_frames[1][r0:r1, c0:c1]
+    current_crop = current_frame[r0:r1, c0:c1]
+    assert crop.segmentation == current_crop.segmentation
+    assert (crop.shape, crop.step, crop.level) == (current_crop.shape, current_crop.step, current_crop.level)
+assert frame.segmentation is original
+assert last_animation_frames[1][0:7, 0:7][1:6, 1:6].segmentation == frame[1:6, 1:6].segmentation
+result = {
+    'closed': frame[1:6, 1:6].segmentation['nodes'],
+    'clipped': frame[1:4, 1:6].segmentation['nodes'],
+    'diff': frame_diff(last_animation_frames[0][1:6, 1:6], last_animation_frames[1][1:6, 1:6]),
+}
+""", before, after, animation_record=record)
+    assert response["error"] == "", response
+    result = response["result"]
+    assert [n["id"] for n in result["closed"]] == [0, 1, 2]
+    assert [n["parent"] for n in result["closed"]] == [None, 0, 1]
+    assert [n["bbox"] for n in result["closed"]] == [[1, 1, 5, 5], [2, 2, 4, 4], [3, 3, 3, 3]]
+    assert [n["parent"] for n in result["clipped"]] == [None, None, None]
+    assert result["diff"]["changed_cell_count"] == 1
+    assert result["diff"]["changed_color"][0]["before_bbox"] == [3, 3, 3, 3]
 
 
 def test_nested_crops_preserve_coordinates_metadata_and_parent_frame():
