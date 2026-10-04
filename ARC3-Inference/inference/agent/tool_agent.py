@@ -6,6 +6,7 @@ import heapq
 import threading
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -1979,6 +1980,7 @@ def _priority_refresh_enabled() -> bool:
     # Yield-UCB's bonus moves with the shared clock, so it always refreshes.
     return _scheduler() == "ucb" or any(_get_env_bool(name, False) for name in (
         "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
+        "ARC3_PRIORITY_THINKING",
     ))
 
 
@@ -2011,6 +2013,19 @@ def _ucb_c() -> float:
 
 def _ucb_recent_weight() -> float:
     return min(1.0, max(0.0, _get_env_float("ARC3_UCB_RECENT_WEIGHT", 0.5)))
+
+
+def _usage_reasoning_tokens(usage: dict[str, Any]) -> int | None:
+    """Reasoning tokens from a response's usage, top-level (sglang) or under
+    completion_tokens_details (OpenAI); None when the server reports neither."""
+    details = usage.get("completion_tokens_details")
+    for raw in (usage.get("reasoning_tokens"),
+                details.get("reasoning_tokens") if isinstance(details, dict) else None):
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _priority_action_count(summary: dict[str, Any]) -> int:
@@ -2119,6 +2134,7 @@ class _PriorityGate:
             human_actions=_priority_human_actions(), action_scale=_priority_action_scale(),
             token_scale=_priority_token_scale(), action_weight=_priority_action_weight(),
             tail_base=_priority_tail_base(), tail_cap=_priority_tail_cap(),
+            thinking_reference=_priority_thinking_reference(),
             **_priority_level_options(),
         )
 
@@ -2245,6 +2261,18 @@ def _priority_action_scale() -> float:
 
 def _priority_token_scale() -> float:
     return max(1.0, _get_env_float("ARC3_PRIORITY_TOKEN_SCALE", 62000.0))
+
+
+def _priority_thinking_reference() -> float:
+    """Reference for the thinking multiplier: reasoning tokens of a typical
+    action-emitting call. 0 when ARC3_PRIORITY_THINKING is off. Like pace, it
+    also enables refreshed ranking, since the multiplier travels on the snapshot."""
+    if not _get_env_bool("ARC3_PRIORITY_THINKING", False):
+        return 0.0
+    value = _get_env_float("ARC3_PRIORITY_THINKING_REF", 2048.0)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("ARC3_PRIORITY_THINKING_REF must be finite and > 0")
+    return value
 
 
 def _priority_action_weight() -> float:
@@ -3657,6 +3685,7 @@ class ToolAgent:
         self._session_runtime_dir: Path | None = None
         self._session_total_tokens = 0
         self._session_generated_tokens = 0
+        self._last_call_reasoning_tokens: int | None = None
         self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self._current_valid_actions: list[str] = []
         self._last_step_summary: dict[str, Any] | None = None
@@ -3690,6 +3719,7 @@ class ToolAgent:
             self._history_messages = []
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
+            self._last_call_reasoning_tokens = None
             self._summary_context_tokens_since_attempt = 0
             self._last_step_summary = None
             self._last_action_call_result = None
@@ -3732,6 +3762,9 @@ class ToolAgent:
         self._session_generated_tokens += generated_token_count
         if count_toward_turn:
             self._turn_generated_tokens += generated_token_count
+            # the last such call before a handover is the one that emitted the
+            # previous turn's action; rolling summaries are not deliberation
+            self._last_call_reasoning_tokens = _usage_reasoning_tokens(usage)
 
         total_tokens = usage.get("total_tokens")
         try:
@@ -6581,7 +6614,10 @@ class ToolAgent:
         )
         if gate is not None and _priority_refresh_enabled():
             pace = self._progress_pace.cost_multiplier() if _get_env_bool("ARC3_PRIORITY_PACE", False) else 1.0
-            snapshot = PrioritySnapshot(level, actions, tokens, pace, total_levels)
+            snapshot = PrioritySnapshot(
+                level, actions, tokens, pace, total_levels,
+                getattr(self, "_last_call_reasoning_tokens", None),
+            )
             estimate = gate._snapshot_priority(snapshot, time.monotonic())
         else:
             estimate = _game_priority(
