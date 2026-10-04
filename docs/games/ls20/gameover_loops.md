@@ -214,6 +214,8 @@ Use a short field guide alongside the schema:
 
 **Pending behavioral prompt edit:** retain observed control effects; check each action when searching for a state and stop when the property being changed matches; if a budget or lives indicator is identified, read it with an agent-written `hud(frame)` helper and compare readings before retrying after a restart. Replace conflicting bar/batching guidance in place.
 
+Direct runtime-name defaults refresh after actions and when retained definitions are restored for another call; explicit historical-frame defaults and copies stay fixed.
+
 ## Frame_diff
 
 ```python

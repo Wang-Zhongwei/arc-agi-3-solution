@@ -8,6 +8,30 @@ import sys
 import types
 
 
+RUNTIME_STATE_NAMES = frozenset({
+    'current_frame', 'latest_frame', 'previous_frame', 'last_action_frame',
+    'history', 'transitions', 'last_transition', 'last_action', 'valid_actions',
+    'death_ledger', 'last_action_call_result',
+})
+
+
+def runtime_default_bindings(tree, filename):
+    """Identify direct runtime-name defaults without evaluating expressions."""
+    bindings = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            def runtime_name(default):
+                return (default.id if isinstance(default, ast.Name)
+                        and default.id in RUNTIME_STATE_NAMES else None)
+
+            bindings[filename, node.name, node.lineno] = (
+                [runtime_name(default) for default in node.args.defaults],
+                {arg.arg: runtime_name(default) for arg, default in
+                 zip(node.args.kwonlyargs, node.args.kw_defaults)},
+            )
+    return bindings
+
+
 def _import_statements(nodes):
     """One explicit absolute import per binding; never replay wildcard imports."""
     statements = {}
@@ -51,17 +75,21 @@ def _function_record(source, retain_imports=False):
     args += [a for a in (node.args.vararg, node.args.kwarg) if a is not None]
     if node.returns is not None or any(a.annotation is not None for a in args):
         raise ValueError('use an unannotated definition for retention')
-    # Restoration must never evaluate model calls or snapshot a frame via defaults.
+    # Restoration may read provided runtime state, but must never call model code.
+    default_reads = set()
     for default in [*node.args.defaults, *node.args.kw_defaults]:
         if default is not None:
+            if isinstance(default, ast.Name) and default.id in RUNTIME_STATE_NAMES:
+                default_reads.add(default.id)
+                continue
             try:
                 ast.literal_eval(default)
             except Exception:
-                raise ValueError('defaults must be literals; pass changing data as arguments') from None
+                raise ValueError('defaults must be literals or provided runtime state names') from None
     tree = ast.Module(body=[node], type_ignores=[])
     code = next(c for c in compile(tree, '<retained>', 'exec').co_consts
                 if isinstance(c, types.CodeType))
-    reads = set()
+    reads = set(default_reads)
     pending = [code]
     while pending:
         current = pending.pop()
@@ -87,7 +115,7 @@ def _validation_hint(reason):
     if 'annotat' in reason:
         return 'Remove parameter and return annotations if you want to retain this function.'
     if 'default' in reason:
-        return 'Use literal defaults and pass changing values explicitly as arguments.'
+        return 'Use literal defaults or provided runtime state names, such as current_frame.'
     if 'global variables' in reason:
         return 'Return updated values instead of assigning global variables.'
     if 'import' in reason:

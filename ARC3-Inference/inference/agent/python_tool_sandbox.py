@@ -402,6 +402,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         }
         runtime_globals["__builtins__"]["__import__"] = _safe_import
         _animation_views = []
+        _runtime_defaults = {}
 
         def frame_diff(before=None, after=None):
             # Object-level diff between two frames. Defaults: previous_frame -> current_frame.
@@ -425,7 +426,35 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 origin=before._origin,
             )
 
+        def _refresh_captured_defaults(previous_values):
+            # Like duck-harness 211e10d: rebind captured defaults rather than
+            # mutating snapshots. Source bindings also distinguish an initial
+            # previous_frame=None from an ordinary literal None default.
+            for candidate in tuple(runtime_globals.values()):
+                if (type(candidate) is not types.FunctionType
+                        or candidate.__globals__ is not runtime_globals):
+                    continue
+                code = candidate.__code__
+                positional, keywords = _runtime_defaults.get(
+                    (code.co_filename, code.co_name, code.co_firstlineno), ([], {}))
+
+                def replace(value, name):
+                    if name in previous_values and value is previous_values[name]:
+                        return runtime_globals[name]
+                    return value
+
+                defaults = candidate.__defaults__
+                if defaults and len(defaults) == len(positional):
+                    candidate.__defaults__ = tuple(
+                        replace(value, name) for value, name in zip(defaults, positional))
+                if candidate.__kwdefaults__:
+                    candidate.__kwdefaults__ = {
+                        key: replace(value, keywords.get(key))
+                        for key, value in candidate.__kwdefaults__.items()}
+
         def _refresh_state(state_payload):
+            previous_values = {name: runtime_globals[name] for name in RUNTIME_STATE_NAMES
+                               if name in runtime_globals}
             current_frame = _frame_from_payload(state_payload.get("current_frame"))
             history = _history_from_payload(state_payload.get("history"))
             last_action_call_result = state_payload.get("last_action_call_result")
@@ -454,6 +483,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["death_ledger"] = state_payload.get("death_ledger") or {"attempts": []}
             runtime_globals["last_action_call_result"] = action_result
+            _refresh_captured_defaults(previous_values)
 
         # Both refusals derive from BaseException, not Exception, so a
         # defensive `except Exception:` around action(...) - which models write
@@ -706,6 +736,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 _kept_pool = {}
                 _retention_rejected = [{"name": "all", "reason": "restoration failed; redefine needed functions"}]
 
+            for source in _kept_pool.values():
+                _runtime_defaults.update(runtime_default_bindings(ast.parse(source), "<retained>"))
+
         def _collect_retention_payload():
             if not _persistence_enabled:
                 return {}
@@ -726,6 +759,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         try:
             _code_text = str(initial.get("code", ""))
             _tree = ast.parse(_code_text, "<python_tool>")
+            _runtime_defaults.update(runtime_default_bindings(_tree, "<python_tool>"))
             _last_expr = None
             if _tree.body and isinstance(_tree.body[-1], ast.Expr):
                 _last_expr = ast.Expression(_tree.body[-1].value)
