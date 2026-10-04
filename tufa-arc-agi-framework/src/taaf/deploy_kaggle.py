@@ -460,9 +460,18 @@ def _kaggle_config_file() -> Path:
     return Path.home() / ".kaggle" / "kaggle.json"
 
 
+def _kaggle_access_token_file() -> str | None:
+    # kaggle CLI >= 2.x reads this fixed path (it ignores KAGGLE_CONFIG_DIR).
+    path = Path.home() / ".kaggle" / "access_token"
+    return path.read_text(encoding="utf-8").strip() if path.is_file() else None
+
+
 def _resolve_kaggle_credentials(configured_username: str | None) -> tuple[str, str | None]:
+    # Same precedence as kaggle CLI >= 2.x: $KAGGLE_API_TOKEN, ~/.kaggle/access_token,
+    # $KAGGLE_KEY, then kaggle.json. Preferring a legacy kaggle.json key over a
+    # valid access token would make _kaggle_env shadow the token and fail auth.
     username = configured_username or os.environ.get("KAGGLE_USERNAME")
-    key = os.environ.get("KAGGLE_KEY") or os.environ.get("KAGGLE_API_TOKEN")
+    key = os.environ.get("KAGGLE_API_TOKEN") or _kaggle_access_token_file() or os.environ.get("KAGGLE_KEY")
     config_file = _kaggle_config_file()
     if config_file.is_file():
         try:
@@ -482,9 +491,12 @@ def _kaggle_env(username: str, key: str) -> dict[str, str]:
     env = os.environ.copy()
     env["KAGGLE_USERNAME"] = username
     env["KAGGLE_KEY"] = key
-    # kaggle CLI >= 2.x authenticates with KAGGLE_API_TOKEN. Keep KAGGLE_KEY
-    # for older clients and set both so the deployment works across versions.
-    env["KAGGLE_API_TOKEN"] = key
+    # kaggle CLI >= 2.x checks KAGGLE_API_TOKEN first, so only API tokens
+    # (KGAT_...) go there; a legacy kaggle.json key there fails auth outright.
+    if key.startswith("KGAT_"):
+        env["KAGGLE_API_TOKEN"] = key
+    else:
+        env.pop("KAGGLE_API_TOKEN", None)
     return env
 
 
