@@ -15,7 +15,7 @@
 ## Submit to Kaggle
 
 - Use `make kaggle-duck CONFIG_PATH=configs/<experiment>.json` with the intended `KAGGLE_USERNAME`, `KAGGLE_KERNEL_SLUG`, and `KAGGLE_DATASET_REF`. Confirm the destination and effective settings before pushing.
-- Kaggle numbers notebook versions automatically; keep version numbers out of notebook slugs/titles and dataset slugs.
+- Kaggle numbers notebook versions automatically; keep version numbers out of notebook slugs/titles and dataset slugs. A version in a config path (`configs/scheduling/v1.json`) is the Kaggle notebook version only; one experiment is one notebook.
 - Keep credentials outside Git. If using a configured alternate profile, prefix the command with `kaggle-as <profile>` and ensure private input datasets are shared with that account.
 - Resolve both flat and namespaced Kaggle mounts for wheelhouses and datasets. Prefer this run's packaged TAAF source over a serving bundle's copy.
 - Record the pushed version. `QUEUED` or `RUNNING` means submitted, not evaluated; report results only from completed, exact-version artifacts.

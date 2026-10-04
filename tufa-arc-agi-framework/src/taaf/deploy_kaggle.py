@@ -254,6 +254,12 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             ]
             if str(value).strip()
         )
+        model_sources = _dedupe(
+            str(value).strip()
+            for value in _solver_iterable_attr(solver, "kaggle_model_sources")
+            if str(value).strip()
+        )
+        docker_image = str(getattr(solver, "kaggle_docker_image", None) or "").strip() or None
         setup_commands = _dedupe(
             [
                 *self.setup_commands,
@@ -289,6 +295,8 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             kernel_title=kernel_title,
             dataset_sources=_dedupe([dataset_ref, *dataset_sources]),
             kernel_sources=kernel_sources,
+            model_sources=model_sources,
+            docker_image=docker_image,
             private=not self.public,
             enable_gpu=not self.cpu_only,
             enable_internet=self.enable_internet,
@@ -593,6 +601,8 @@ def _write_kernel_bundle(
     dataset_sources: list[str],
     kernel_sources: list[str],
     private: bool,
+    model_sources: list[str] | None = None,
+    docker_image: str | None = None,
     enable_gpu: bool,
     enable_internet: bool,
     accelerator: str | None,
@@ -626,8 +636,10 @@ def _write_kernel_bundle(
         "competition_sources": [COMPETITION_SLUG],
         "dataset_sources": dataset_sources,
         "kernel_sources": kernel_sources,
-        "model_sources": [],
+        "model_sources": list(model_sources or []),
     }
+    if docker_image:
+        metadata["docker_image"] = docker_image
     if accelerator:
         metadata["machine_shape"] = accelerator
     (bundle_dir / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
