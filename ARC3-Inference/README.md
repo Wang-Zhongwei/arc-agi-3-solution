@@ -340,6 +340,11 @@ is averaged over logged prefill/decode samples; its prefill cache reuse is
 the ratio of logged cached tokens to cached plus new tokens. These are not
 whole-run throughput or vLLM sliding-window cache-hit measurements. Column
 tooltips describe the derived values; unavailable measurements remain blank.
+The curves table shows prompt/decode throughput in tok/s and token cache hit
+rate, with the 10th and 90th percentiles (P10–P90) below each mean. Quantiles
+use linear interpolation over logged samples and are shown separately per
+server. For SGLang, the cache mean is token-weighted while quantiles describe
+individual prefill-batch percentages. Startup samples are included.
 
 Start the viewer for a saved run on the port from `configs/inference.json`:
 
@@ -368,9 +373,14 @@ make view VIEW_RUN_DIR=/shared/arc_3_results/$USER/<run-name>
 The viewer shows run summaries, per-game progress, boards, actions, rewards,
 level transitions, and the duck's transcript.
 
-Game thumbnails are optional and require offline environments plus `arc_agi`.
-Pass `VIEW_ENVIRONMENTS_DIR=/path/to/environments` to enable them when those
-dependencies are available; saved boards and transcripts render independently.
+Hover a game name to preview its initial frame from the saved run. No game
+download is needed when the run includes its initial board. Offline environments
+plus `arc_agi` provide a fallback; pass `VIEW_ENVIRONMENTS_DIR=/path/to/environments`
+to use them for games without a saved initial frame.
+
+The viewer saves each preview as `runs/thumbnails/<game-id>.png` and reads that
+PNG first on later visits. These small files sync with the shared runs folder,
+so teammates can see previews without downloading game environments or traces.
 
 This fork corrects per-turn transcript display, includes all recorded attempts
 when an analysis step is retried, and distinguishes pending transcripts from

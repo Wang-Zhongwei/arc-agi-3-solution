@@ -14,7 +14,8 @@
   const SHOW_DELAY_MS = 120;
   const HIDE_DELAY_MS = 180;
   const CSS = `
-    .game-peek { position: fixed; z-index: 9999; width: 200px; padding: 10px; border-radius: 12px;
+    .game-peek { position: fixed; z-index: 9999; box-sizing: border-box; width: min(220px, calc(100vw - 16px));
+      max-height: calc(100vh - 16px); overflow: auto; padding: 10px; border-radius: 12px;
       background: #fffaf1; color: #18242d; border: 1px solid rgba(24, 36, 45, 0.14);
       box-shadow: 0 12px 30px rgba(24, 36, 45, 0.22); font: 500 0.74rem "IBM Plex Sans", system-ui, sans-serif;
       display: grid; gap: 7px; pointer-events: auto; }
@@ -26,8 +27,7 @@
     .game-peek .game-peek-id { font: 700 0.8rem "IBM Plex Mono", "SFMono-Regular", monospace; }
     .game-peek .game-peek-link { color: #c55d1f; font-weight: 700; text-decoration: none; }
     .game-peek .game-peek-link:hover { text-decoration: underline; }
-    [data-game-peek] { cursor: help; }
-    a[data-game-peek] { cursor: pointer; }
+    [data-game-peek] { cursor: pointer; }
   `;
 
   function baseId(gameId) {
@@ -41,7 +41,7 @@
   }
 
   function thumbnailUrl(gameId) {
-    return SCRIPT_ORIGIN + "/api/thumbnail?game=" + encodeURIComponent(baseId(gameId) || String(gameId || ""));
+    return SCRIPT_ORIGIN + "/api/thumbnail?game=" + encodeURIComponent(String(gameId || ""));
   }
 
   function install() {
@@ -79,9 +79,11 @@
       image.addEventListener("error", () => {
         const missing = document.createElement("div");
         missing.className = "game-peek-missing";
-        missing.textContent = "No thumbnail (offline env files unavailable)";
+        missing.textContent = "Game preview unavailable";
         image.replaceWith(missing);
+        if (!popover.hidden) position();
       });
+      image.addEventListener("load", () => { if (!popover.hidden) position(); });
       popover.replaceChildren(image, label, link);
     }
 
@@ -92,8 +94,9 @@
       const height = popover.offsetHeight || 260;
       let left = rect.right + 10;
       if (left + width > window.innerWidth - 8) left = Math.max(8, rect.left - width - 10);
+      left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
       let top = rect.top - 6;
-      if (top + height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - height - 8);
+      top = Math.max(8, Math.min(top, window.innerHeight - height - 8));
       popover.style.left = left + "px";
       popover.style.top = top + "px";
     }
@@ -111,6 +114,8 @@
     }
 
     function hide() {
+      clearTimeout(showTimer);
+      clearTimeout(hideTimer);
       popover.hidden = true;
       anchor = null;
     }

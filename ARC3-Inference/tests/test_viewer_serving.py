@@ -22,8 +22,12 @@ def test_sglang_serve_log_recovers_missing_metrics(tmp_path: Path) -> None:
     assert metrics["logs_found"] == 1
     assert server["sample_count"] == 2
     assert server["prompt_throughput_tokens_per_s"]["mean"] == 1000
+    assert server["prompt_throughput_tokens_per_s"]["p10"] == 1000
+    assert server["prompt_throughput_tokens_per_s"]["p90"] == 1000
     assert server["generation_throughput_tokens_per_s"]["mean"] == 800
     assert server["prefix_cache_hit_rate_pct"]["mean"] == 90
+    assert server["prefix_cache_hit_rate_pct"]["min"] == 90
+    assert server["prefix_cache_hit_rate_pct"]["max"] == 90
     assert server["gpu_kv_cache_usage_pct"]["mean"] == 37.5
     assert metrics["metric_labels"]["prefix_cache_hit_rate_pct"] == "Logged prefill cache reuse / %"
 
@@ -34,7 +38,24 @@ def test_cache_reuse_weights_tokens_and_missing_fields_stay_missing(tmp_path: Pa
     )
     server = serving_metrics(tmp_path, None)["per_server"][0]
     assert server["prefix_cache_hit_rate_pct"]["mean"] == 9
+    assert server["prefix_cache_hit_rate_pct"]["median"] == 45
+    assert server["prefix_cache_hit_rate_pct"]["min"] == 0
+    assert server["prefix_cache_hit_rate_pct"]["max"] == 90
+    assert server["prefix_cache_hit_rate_pct"]["p10"] == 9
+    assert server["prefix_cache_hit_rate_pct"]["p90"] == 81
     assert server["generation_throughput_tokens_per_s"] is None
+
+
+def test_throughput_quantiles_resist_isolated_extremes(tmp_path: Path) -> None:
+    values = [0, *([100] * 19), 1000000]
+    (tmp_path / "serve.log").write_text("".join(
+        DECODE.replace("800.00", str(value)) for value in values
+    ))
+    stats = serving_metrics(tmp_path, None)["per_server"][0]["generation_throughput_tokens_per_s"]
+    assert stats["p10"] == 100
+    assert stats["p90"] == 100
+    assert stats["min"] == 0 and stats["max"] == 1000000
+    assert stats["mean"] > 100
 
 
 def test_preserves_evaluated_metrics_and_handles_missing_logs(tmp_path: Path) -> None:
