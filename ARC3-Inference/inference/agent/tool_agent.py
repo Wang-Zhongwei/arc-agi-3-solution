@@ -202,6 +202,10 @@ _LOCAL_ANALYZER_YIELD_SECONDS = _get_env_float("LOCAL_ANALYZER_YIELD_SECONDS", 0
 # the turn.
 _LOCAL_ANALYZER_YIELD_TOKENS = _get_env_int("LOCAL_ANALYZER_YIELD_TOKENS", 0)
 _LOCAL_ANALYZER_ENABLE_THINKING = _get_env_bool("LOCAL_ANALYZER_ENABLE_THINKING", True)
+# Most thinking tokens a gameplay request may generate before the think block
+# is closed and the model must answer. Zero disables. See _thinking_budget_mode
+# for how it is enforced.
+_LOCAL_ANALYZER_THINKING_TOKEN_BUDGET = _get_env_int("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", 0)
 _LOCAL_ANALYZER_TEMPERATURE = _get_env_float("LOCAL_ANALYZER_TEMPERATURE", 0.6)
 _LOCAL_ANALYZER_TOP_P = _get_env_float("LOCAL_ANALYZER_TOP_P", 0.95)
 _LOCAL_ANALYZER_TOP_K = _get_env_int("LOCAL_ANALYZER_TOP_K", 20)
@@ -1300,6 +1304,27 @@ def _resume_diff_image_enabled() -> bool:
 
     Costs roughly one image per resumption. Off by default."""
     return _get_env_bool("ARC3_RESUME_DIFF_IMAGE", False)
+
+
+def _thinking_budget_mode() -> str:
+    """Which server enforces LOCAL_ANALYZER_THINKING_TOKEN_BUDGET: auto, vllm or sglang.
+
+    Both close the think block in the server, in the same request, and both
+    work with speculative decoding.
+
+    `vllm` sends `thinking_token_budget`.
+
+    `sglang` sends `custom_params.thinking_budget`, which its reasoner grammar
+    enforces once the server runs with --enable-strict-thinking: after the
+    budget the only allowed token is </think>, whose id comes from the model's
+    tokenizer. Grammar masks are applied per draft position during EAGLE
+    verification, so this holds under MTP. (sglang's ThinkingBudgetLogitProcessor
+    is no alternative: it hardcodes Qwen3's <think> ids - Flash Next uses
+    248068/248069 - and EAGLE verification skips custom logit processors.)
+
+    `auto` (default) asks /models who serves (owned_by)."""
+    mode = os.environ.get("ARC3_THINKING_BUDGET_MODE", "").strip().lower()
+    return mode if mode in ("vllm", "sglang") else "auto"
 
 
 def _reasoning_effort_ladder() -> list[str]:
@@ -5153,26 +5178,20 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
-        lines.extend(
-            [
-                "Only tool: `python`. It receives `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_call_result`, `frame_diff(before, after)`, and `action(actions)`.",
-                "Only letter-coded board views and lightweight metadata are exposed; raw numeric color IDs are not available.",
-                "Keep tool output compact: use `current_frame.segmentation` as the primary view, and `current_frame.ascii` only for a small specific region; never print full boards.",
-                "For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`; `history[-1].frame` is the current frame, not the previous one.",
-            ]
-        )
-        # Upstream states four things about the world model here, and with
-        # ARC3_MEMORY_SECTIONS=off three of them are false or unanswerable: the
-        # block they refer to is suppressed, so "Below you are provided with the
-        # current world model" is followed by nothing, and the model is told in
-        # capitals to always give a revised version with nowhere to put it.
-        # Observed as a drop in replies carrying any assistant text at all,
-        # 76% to 43% - a broken instruction, not an absent one, which is why
-        # `off` was never a clean control.
+        # The tool mechanics this opener used to repeat every turn - the tool and
+        # its globals, no numeric grid, compact output, how to diff the latest
+        # change, call and batch action(), the tool-call format, MOUSE row/col -
+        # are all in the system prompt (runtime state, visual game, Python tool
+        # and tool session sections), so they are not restated here. The
+        # methodology lines (inspect and score candidates, ground on turn one,
+        # then focus on the latest change) stay as a per-turn nudge.
         #
-        # The first sentence loses only its middle clause: "from the newest
-        # history" attaches to inspecting the evidence just as well, so the
-        # remainder still says use Python, inspect, and score against the goal.
+        # The world-model lines stay too: they introduce the memory block that
+        # follows in this message. With ARC3_MEMORY_SECTIONS=off that block is
+        # suppressed, and so are they - upstream's version told the model to
+        # revise a world model it was never shown, and replies carrying any
+        # assistant text dropped from 76% to 43%. That arm keeps the first
+        # sentence without its world-model clause.
         if _memory_sections_disabled():
             lines.append(
                 "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
@@ -5186,9 +5205,8 @@ class ToolAgent:
                 ]
             )
         if not _dedupe_multicall_line():
-            # kept mid-opener only for the upstream wording; the surviving copy
-            # in the closing block is where a note about calling action() twice
-            # belongs, next to the instruction to call it at all
+            # upstream wording, kept for the dedupe arm's control; the system
+            # prompt already says action() may be called more than once
             lines.append(
                 "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it, "
                 "but stop immediately if a result reports `game_over`, `run_complete`, `level_completed`, or `done`."
@@ -5205,16 +5223,7 @@ class ToolAgent:
             lines.append(
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )
-        lines.extend(
-            [
-                "When ready, call `action(actions)` from inside the `python` tool with the best valid action or ordered batch selected by your code. If your code has found a reliable short sequence, prefer batching it in one call.",
-                "You may call `action(actions)` more than once in one Python snippet if your search or control loop needs it.",
-                *self._memory_section_guidance(bool(knowledge_lines)),
-                TOOL_CALL_FORMAT_GUIDANCE,
-            ]
-        )
-        if "MOUSE" in _normalize_valid_actions(valid_actions):
-            lines.append("If you use MOUSE, include integer row and col arguments.")
+        lines.extend(self._memory_section_guidance(bool(knowledge_lines)))
         if _opener_commit_hint():
             # last line of the opener, where the resumption prompt sits relative
             # to the reply it influences
@@ -5268,6 +5277,81 @@ class ToolAgent:
             kwargs["reasoning_effort"] = ladder[rung]
         return kwargs
 
+    def _thinking_budget_fields(
+        self, *, max_tokens: int | None, enable_thinking: bool | None
+    ) -> dict[str, Any]:
+        """Request fields that cap this request's thinking, or {} if unbudgeted.
+
+        Not budgeted: side requests with their own max_tokens (the rolling
+        summary), requests without thinking, and any request whose output cap
+        already falls within the budget."""
+        budget = _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET
+        thinking = (
+            bool(_LOCAL_ANALYZER_ENABLE_THINKING) if enable_thinking is None else enable_thinking
+        )
+        output_cap = self._max_output_tokens
+        if (
+            budget <= 0
+            or not thinking
+            or max_tokens is not None
+            or (output_cap is not None and output_cap <= budget)
+        ):
+            return {}
+        server = self._thinking_budget_server()
+        if server == "vllm":
+            return {"thinking_token_budget": budget}
+        if server == "sglang":
+            return {"custom_params": {"thinking_budget": budget}}
+        return {}
+
+    def _thinking_budget_server(self) -> str:
+        """`vllm`, `sglang`, or "" when unknown (the request then goes unbudgeted).
+
+        Resolved once per agent. On sglang it also checks /server_info, because
+        without --enable-strict-thinking the budget is accepted and ignored."""
+        server = getattr(self, "_thinking_budget_server_name", None)
+        if server is not None:
+            return server
+        base = self._model.base_url.rstrip("/")
+        server = _thinking_budget_mode()
+        if server == "auto":
+            try:
+                cards = requests.get(
+                    f"{base}/models",
+                    headers=self._headers(),
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, 30),
+                ).json().get("data") or []
+            except Exception as exc:  # retried on the next request
+                log.warning("thinking budget: could not read /models (%s); request sent without it", exc)
+                return ""
+            owners = {str(card.get("owned_by", "")).lower() for card in cards}
+            server = "vllm" if "vllm" in owners else "sglang" if "sglang" in owners else ""
+            if not server:
+                log.error(
+                    "thinking budget: /models owned_by %s is neither vllm nor sglang; "
+                    "set ARC3_THINKING_BUDGET_MODE. Requests go without a budget.",
+                    sorted(owners),
+                )
+        if server == "sglang":
+            root = base[: -len("/v1")] if base.endswith("/v1") else base
+            try:
+                strict = requests.get(
+                    f"{root}/server_info",
+                    headers=self._headers(),
+                    timeout=(_CONNECT_TIMEOUT_SECONDS, 30),
+                ).json().get("enable_strict_thinking")
+            except Exception as exc:
+                strict = None
+                log.warning("thinking budget: could not read /server_info (%s)", exc)
+            if strict is False:
+                log.error(
+                    "thinking budget: sglang runs without --enable-strict-thinking, "
+                    "so custom_params.thinking_budget is ignored"
+                )
+        log.info("thinking budget %d sent as the %s field", _LOCAL_ANALYZER_THINKING_TOKEN_BUDGET, server or "(none)")
+        self._thinking_budget_server_name = server
+        return server
+
     def _chat_completion(
         self,
         messages: list[dict[str, Any]],
@@ -5297,6 +5381,9 @@ class ToolAgent:
         provider_prefs = _openrouter_provider_prefs(self._model.provider)
         if provider_prefs:
             payload["provider"] = provider_prefs
+        payload.update(
+            self._thinking_budget_fields(max_tokens=max_tokens, enable_thinking=enable_thinking)
+        )
         # merge rather than assign: the payload builder may already have set
         # chat_template_kwargs (enable_thinking), and replacing the dict would
         # drop it - as a request-level dict can also drop a server-side default
