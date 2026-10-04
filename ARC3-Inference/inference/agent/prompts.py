@@ -158,7 +158,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- Call `action(actions)` to execute one or more real environment actions from Python.\n"
     "- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.\n"
     "- One action usually returns one frame, but a single action can result in a short multi-frame animation.\n"
-    "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
+    "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed. Function defaults bound directly to these names, such as `f=current_frame`, follow the updates; explicit historical frames and copies stay fixed.\n"
 )
 
 ANIMATION_ADDENDUM_TIMELINE = (
@@ -308,7 +308,8 @@ PERSISTENT_FUNCTIONS_LINE = (
     "Pass snippet-specific data as arguments. You may use Python builtins, provided "
     "globals such as `current_frame`, and other retained functions. Provided globals "
     "are refreshed for each call. {import_guidance} Use plain "
-    "top-level definitions without decorators or annotations, and literal defaults. "
+    "top-level definitions without decorators or annotations, and defaults that are literals "
+    "or provided runtime state names such as `current_frame`. "
     "Tool results report which functions were retained and explain any rejection.\n"
 )
 
