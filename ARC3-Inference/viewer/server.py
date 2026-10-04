@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import re
 import subprocess
+from bisect import bisect_right
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from inference.tools.score_registry import load_score_registry
 from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
-from viewer.data import _run_key, list_run_dirs
+from viewer.data import _artifact_metadata, _run_key, _viewer_data_paths, list_run_dirs
 from viewer.data import load_game_payload, load_game_shell_payload, load_game_step_payload, load_run_summary
 from viewer.thumbnails import game_thumbnail_png
 from viewer.serving import serving_metrics
@@ -283,6 +284,68 @@ _CURVE_GAME_FIELDS = (
 )
 
 
+def _load_level_lanes(run_dir: Path, evaluation: dict) -> dict:
+    """Match saved level action counts to the evaluated score-curve knots.
+
+    Token and action lanes have one corresponding knot per level completion,
+    plus the final cost. Keep those exact costs; score is not proportional to
+    levels completed. Missing or inconsistent artifacts yield no level lane.
+    """
+    result = {"tokens": {}, "actions": {}}
+    score_lanes = evaluation.get("progression_lanes") or {}
+    if not score_lanes.get("actions") or not score_lanes.get("tokens"):
+        return result
+    for path in _viewer_data_paths(run_dir):
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        game_id = artifact.get("game_id")
+        game = evaluation["games"].get(game_id)
+        if not game:
+            continue
+        trials = list(game.get("trial_scores") or {})
+        if len(trials) == 1:
+            trial = trials[0]
+        else:
+            metadata = _artifact_metadata(run_dir, path)
+            pass_index = metadata.get("pass_index", artifact.get("pass_index"))
+            trial = f"{run_dir.name}/pass-{pass_index}"
+            if metadata.get("seed_label") is not None:
+                trial = f"{run_dir.name}/seed-{metadata['seed_label']}"
+            if trial not in trials:
+                continue
+        completed = (game.get("levels_completed") or {}).get(trial)
+        counts = artifact.get("actions_per_level")
+        if (not isinstance(completed, (int, float)) or completed < 0
+                or completed != artifact.get("levels_completed")
+                or not isinstance(counts, list) or completed > len(counts)
+                or completed != int(completed)
+                or any(not isinstance(n, int) or n < 0 for n in counts)):
+            continue
+        actions = score_lanes.get("actions", {}).get(game_id, {}).get(trial)
+        tokens = score_lanes.get("tokens", {}).get(game_id, {}).get(trial)
+        if (not actions or not tokens or len(actions) != len(tokens)
+                or actions[-1][0] != sum(counts)
+                or any(a[1] != t[1] for a, t in zip(actions, tokens))):
+            continue
+        thresholds = []
+        cost = 0
+        for count in counts[:int(completed)]:
+            cost += count
+            thresholds.append(cost)
+        if not set(thresholds).issubset({point[0] for point in actions}):
+            continue
+        levels = [bisect_right(thresholds, point[0]) for point in actions]
+        for axis, points in (("actions", actions), ("tokens", tokens)):
+            result[axis].setdefault(game_id, {})[trial] = [
+                [point[0], level] for point, level in zip(points, levels)
+            ]
+    return result
+
+
 def _load_curves_payload(runs_dir: Path) -> dict:
     """Score-vs-tokens/actions data for every evaluated run on disk.
 
@@ -318,6 +381,7 @@ def _load_curves_payload(runs_dir: Path) -> dict:
                 "actions": evaluation.get("action_progression"),
             },
             "lanes": evaluation.get("progression_lanes"),
+            "level_lanes": _load_level_lanes(run_dir, evaluation),
         })
     runs.sort(key=lambda run: run_dir_sort_key(run["run_id"]), reverse=True)
     return {"runs": runs}
@@ -503,7 +567,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         params = parse_qs(query)
         game_id = params.get("game", [""])[0]
         try:
-            png = game_thumbnail_png(game_id, environments_dir=self.environments_dir)
+            png = game_thumbnail_png(game_id, environments_dir=self.environments_dir, runs_dir=self.runs_dir)
         except Exception:
             log.warning("Thumbnail rendering failed for %r", game_id, exc_info=True)
             png = None
