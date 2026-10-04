@@ -682,14 +682,14 @@ chat:
 		$(if $(PROMPT),--prompt "$(PROMPT)")
 
 eval:
-	$(UV_RUN) inference-eval --config "$(EVAL_CONFIG_PATH)" $(if $(SCORE_OUTPUT_PATH),--score-output "$(SCORE_OUTPUT_PATH)")
+	$(UV_RUN) inference-eval --config "$(EVAL_CONFIG_PATH)" $(if $(SCORE_OUTPUT_PATH),--evaluation-output "$(SCORE_OUTPUT_PATH)")
 
 score_run:
 	@if [ -z "$(strip $(SCORE_RUN_DIR))" ]; then \
 		echo "SCORE_RUN_DIR is required."; \
 		exit 1; \
 	fi
-	$(UV_RUN) inference-eval "$(SCORE_RUN_DIR)" $(if $(SCORE_OUTPUT_PATH),--score-output "$(SCORE_OUTPUT_PATH)")
+	$(UV_RUN) inference-eval "$(SCORE_RUN_DIR)" $(if $(SCORE_OUTPUT_PATH),--evaluation-output "$(SCORE_OUTPUT_PATH)")
 
 significance:
 	$(UV_RUN) inference-significance \
