@@ -116,6 +116,24 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
+_ENV_PAIR = re.compile(r"""["']([A-Z][A-Z0-9_]*)["']\s*:\s*["']([^"']*)["']""")
+
+
+def _bundle_matches_run(bundle: Path, target: Path) -> bool | None:
+    """Whether the bundle's literal setup env agrees with the env the run applied.
+
+    Setup commands embed the harness env as literal 'KEY': 'value' pairs, and the
+    notebook saves what it applied as taaf_setup_env.json. None if either is missing.
+    """
+    try:
+        applied = json.loads((target / "taaf_setup_env.json").read_text())
+        commands = "\n".join(json.loads((bundle / "setup_commands.json").read_text()))
+    except (OSError, ValueError, TypeError):
+        return None
+    pairs = [(key, value) for key, value in _ENV_PAIR.findall(commands) if key in applied]
+    return all(str(applied[key]) == value for key, value in pairs) if pairs else None
+
+
 def _run_start(target: Path) -> datetime | None:
     try:
         return _utc(datetime.fromisoformat(json.loads((target / "benchmark.json").read_text())["start_time"]))
@@ -171,47 +189,55 @@ def fetch_source(
 
     start = _run_start(target)
     if dataset_version is not None:
-        selection = "explicit"
+        candidates, selection = [dataset_version], "explicit"
     elif start is None:
         print(f"[v{version}] no benchmark.json start_time in {target}; pass --dataset-version")
         return False
     else:
-        # A run mounts the dataset version that was current when it started. Kaggle
-        # lists only recent versions, so an older run needs --dataset-version.
-        earlier = [item for item in versions if _utc(item.creation_date) <= start]
+        # The kernel mounts its dataset at session start, minutes before benchmark.json's
+        # start_time, so a version pushed in between can postdate the mount. Try versions
+        # created before start_time, newest first, and keep the first whose setup env
+        # matches the run's. Kaggle lists only recent versions; older runs need --dataset-version.
+        earlier = sorted((item.version_number for item in versions if _utc(item.creation_date) <= start),
+                         reverse=True)
         if not earlier:
             print(f"[v{version}] no listed {refs[0]} version predates {start}; pass --dataset-version")
             return False
-        dataset_version = max(earlier, key=lambda item: item.version_number).version_number
-        selection = f"latest version created before run start {start.isoformat()}"
-    created = next((_utc(item.creation_date).isoformat() for item in versions
-                    if item.version_number == dataset_version), None)
+        candidates = earlier[:3]
+        selection = f"newest version before run start {start.isoformat()} whose setup env matches the run"
 
     if (target / "src").exists():
+        dataset_version = candidates[0]
         print(f"[v{version}] kept existing {target / 'src'}; remove it to download {refs[0]} v{dataset_version}")
         matches = None
     else:
-        staging = Path(tempfile.mkdtemp(prefix=".source-dataset-", dir=target))
-        try:
-            api.dataset_download_files(f"{refs[0]}/{dataset_version}", path=str(staging), unzip=True, quiet=True)
-            run_status, bundle_status = target / "git_status.txt", staging / "git_status.txt"
-            matches = (run_status.read_text() == bundle_status.read_text()
-                       if run_status.is_file() and bundle_status.is_file() else None)
-            # Source files sit at the top of the run folder, like a Slurm run. Files the
-            # notebook already wrote to its output (e.g. git_status.txt) are kept.
-            for entry in staging.iterdir():
-                if not (target / entry.name).exists():
-                    entry.rename(target / entry.name)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
+        matches = None
+        for dataset_version in candidates:
+            staging = Path(tempfile.mkdtemp(prefix=".source-dataset-", dir=target))
+            try:
+                api.dataset_download_files(f"{refs[0]}/{dataset_version}", path=str(staging), unzip=True, quiet=True)
+                matches = _bundle_matches_run(staging, target)
+                if matches is False and dataset_version != candidates[-1]:
+                    print(f"[v{version}] {refs[0]} v{dataset_version} setup env differs from the run; trying older")
+                    continue
+                # Source files sit at the top of the run folder, like a Slurm run. Files the
+                # notebook already wrote to its output (e.g. git_status.txt) are kept.
+                for entry in staging.iterdir():
+                    if not (target / entry.name).exists():
+                        entry.rename(target / entry.name)
+                break
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
         print(f"[v{version}] source dataset  {refs[0]} v{dataset_version} -> {target}")
-        print(f"[v{version}] bundle git_status.txt matches run output: {matches}")
+        print(f"[v{version}] bundle setup env matches run: {matches}")
+    created = next((_utc(item.creation_date).isoformat() for item in versions
+                    if item.version_number == dataset_version), None)
 
     (target / "source.json").write_text(json.dumps({
         "notebook": f"{owner}/{slug}", "notebook_version": version,
         "notebook_file": str(notebook.relative_to(target)),
         "dataset": refs[0], "dataset_version": dataset_version, "dataset_version_created": created,
-        "selection": selection, "git_status_matches_run": matches,
+        "selection": selection, "setup_env_matches_run": matches,
     }, indent=2) + "\n", encoding="utf-8")
     return matches is not False
 
