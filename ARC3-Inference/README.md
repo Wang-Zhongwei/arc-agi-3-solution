@@ -404,13 +404,15 @@ make eval
 Write a score file somewhere specific:
 
 ```bash
-make score_run SCORE_RUN_DIR=/path/to/run SCORE_OUTPUT_PATH=docs/candidate-score.json
+make score_run SCORE_RUN_DIR=/path/to/run SCORE_OUTPUT_PATH=docs/candidate-evaluation.json
 ```
 
 The scorer reads TAAF `benchmark.json`, uses persisted `final_score` values when
 present, and otherwise asks TAAF's `GameRun` scorer to compute the score from
-the saved state. It writes `evaluation.json` plus the lightweight `score.json`
-format used by significance checks.
+the saved state. It writes one `evaluation.json` with per-pass scores, token
+and action usage, and the score-progression curves (`progression_lanes`) that the
+score-curves page draws. Significance checks read it directly; older runs may
+still carry a `score.json`.
 
 ## Significance
 
