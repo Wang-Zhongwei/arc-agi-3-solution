@@ -54,6 +54,8 @@ from inference.agent.prompts import (
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
+    HISTORY_REVISIT_ADDENDUM,
+    VIEW_FRAMES_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
@@ -68,6 +70,7 @@ from inference.agent.vision_context import (
     animation_image_mode,
     animation_peak_part,
     current_grid_image_enabled,
+    frame_to_png_data_url,
     current_grid_image_part,
 )
 
@@ -2476,6 +2479,31 @@ def _persistent_functions() -> bool:
     return _get_env_bool("ARC3_PERSISTENT_FUNCTIONS", False)
 
 
+def _history_revisit_hint() -> bool:
+    """Whether the API reference says history survives conversation trimming.
+
+    Off by default. The lists were always complete; the model rarely went back
+    to them for a level-up or a death once the turn that saw it was drained."""
+    return _get_env_bool("ARC3_HISTORY_REVISIT_HINT", False)
+
+
+def _view_frames_limit() -> int:
+    """Images per python call for `view_frames`; 0 (default) hides the helper."""
+    return max(0, _get_env_int("ARC3_VIEW_FRAMES", 0))
+
+
+def _view_frames_turn_limit() -> int:
+    """Images per analyzer turn, across every python call in it."""
+    return max(0, _get_env_int("ARC3_VIEW_FRAMES_TURN_LIMIT", 8))
+
+
+def _view_frames_upscale() -> int:
+    """Pixels per cell for `view_frames` images, independent of
+    MULTIMODAL_UPSCALE: 4 renders a 64-cell board at 256px, about 66 vision
+    tokens against 402 at 10."""
+    return max(1, _get_env_int("ARC3_VIEW_FRAMES_UPSCALE", 4))
+
+
 def _animation_enabled() -> bool:
     """Whether intermediate animation frames are captured and offered.
 
@@ -2764,6 +2792,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
+    if _history_revisit_hint():
+        prompt += HISTORY_REVISIT_ADDENDUM
+    if _view_frames_limit() > 0:
+        prompt += VIEW_FRAMES_ADDENDUM.format(limit=_view_frames_limit())
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
@@ -2878,6 +2910,9 @@ class _ToolDispatchResult:
     # and resetting on it lets the model oscillate between truncating at full
     # effort and acting inertly at reduced effort, never settling.
     made_progress: bool = False
+    # (label, image part) pairs requested through view_frames, attached in a
+    # user message once every tool message of the assistant turn is in place
+    images: tuple[tuple[str, dict[str, Any]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -6072,6 +6107,7 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             animation_handler=_handle_animation if _animation_enabled() else None,
+            view_frames_limit=_view_frames_limit(),
             kept_functions=self._retained_sources(),
             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
@@ -6124,7 +6160,39 @@ class ToolAgent:
             self._render_tool_payload(payload, truncate_fields=("stdout", "error", "result")),
             step_executed=step_executed,
             made_progress=made_progress,
+            images=self._view_frames_images(state_path, sandbox_result.get("view_frames")),
         )
+
+    def _view_frames_images(
+        self, state_path: Path, indices: Any
+    ) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """Render the boards a snippet asked for with `view_frames`.
+
+        Indices follow the sandbox's `history`, which skips entries without a
+        frame; the same filter keeps them aligned. Read after the snippet ran,
+        so boards from actions it executed are included.
+        """
+        if _view_frames_limit() <= 0 or not indices:
+            return ()
+        _, history_entries = load_runtime_state(state_path)
+        entries = [entry for entry in history_entries if entry.frame is not None]
+        images: list[tuple[str, dict[str, Any]]] = []
+        for index in indices:
+            if not isinstance(index, int) or not 0 <= index < len(entries):
+                continue
+            entry = entries[index]
+            label = (
+                f"history[{index}]: board after {entry.action or 'start'}, "
+                f"level {entry.frame.level}, step {entry.frame.step}"
+            )
+            part = {
+                "type": "image_url",
+                "image_url": {
+                    "url": frame_to_png_data_url(entry.frame, upscale=_view_frames_upscale()),
+                },
+            }
+            images.append((label, part))
+        return tuple(images)
 
     def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
@@ -6985,6 +7053,7 @@ class ToolAgent:
         )
         step_executed = False
         turn_tool_call_count = 0
+        turn_view_frames = 0
         captured_reasoning = ""
         latest_request_messages: list[dict[str, Any]] | None = None
         latest_request_tools: list[dict[str, Any]] | None = None
@@ -7334,6 +7403,7 @@ class ToolAgent:
                 turn_tool_call_count += len(tool_calls)
                 self._append_context_message(messages, assistant_message)
 
+                pending_view_images: list[tuple[str, dict[str, Any]]] = []
                 for tool_index, tool_call in enumerate(tool_calls):
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
                     tool_name = str(function.get("name", "")).strip()
@@ -7372,6 +7442,7 @@ class ToolAgent:
                             "content": dispatch.content,
                         }
                     )
+                    pending_view_images.extend(dispatch.images)
                     if dispatch.step_executed:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
@@ -7381,6 +7452,29 @@ class ToolAgent:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
                         break
+                if pending_view_images:
+                    # after the last tool message: a user message between two
+                    # tool results of one assistant turn breaks the pairing
+                    room = max(0, _view_frames_turn_limit() - turn_view_frames)
+                    shown = pending_view_images[:room]
+                    turn_view_frames += len(shown)
+                    note = (
+                        f"view_frames images ({len(shown)}), each a past board at "
+                        f"{_view_frames_upscale()}x scale:"
+                    )
+                    if len(pending_view_images) > len(shown):
+                        note += (
+                            f" {len(pending_view_images) - len(shown)} more not shown; "
+                            f"at most {_view_frames_turn_limit()} images per turn."
+                        )
+                    content: list[dict[str, Any]] = [{"type": "text", "text": note}]
+                    for label, part in shown:
+                        content.append({"type": "text", "text": label})
+                        content.append(part)
+                    append_transcript(
+                        "VIEW FRAMES", "\n".join([note, *(label for label, _ in shown)])
+                    )
+                    self._append_context_message(messages, {"role": "user", "content": content})
                 if yielded_control_reason is not None:
                     break
                 if step_executed:

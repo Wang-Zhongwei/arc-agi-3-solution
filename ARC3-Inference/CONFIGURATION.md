@@ -93,6 +93,17 @@ Added images that show changed cells in their true palette colors while dimming 
 | `MULTIMODAL_RESAMPLE` | `nearest` | Selects the image resize filter: nearest, bilinear, bicubic, or lanczos. |
 | `ARC3_HISTORY_IMAGE_KEEP` | Unset: unlimited | Optionally retains images only in the latest N image-bearing messages sent to the model. Zero strips all such images. This filters outgoing context and its estimate rather than deleting stored history. |
 
+### Revisiting past boards
+
+`history` and `transitions` always hold the whole game; these settings tell the model so and let it look at past boards. See [docs/levelups](../docs/levelups/README.md).
+
+| Setting | Default | Change |
+|---|---|---|
+| `ARC3_HISTORY_REVISIT_HINT` | Off | Adds one API-reference line: history survives conversation trimming, so the model can revisit what led to a level-up or game over; also states the level-up and final-win frame semantics. |
+| `ARC3_VIEW_FRAMES` | `0` (hidden) | Images per python call for the `view_frames(indices)` helper, which shows past boards by `history` index. Images arrive in a user message after the turn's tool results. |
+| `ARC3_VIEW_FRAMES_TURN_LIMIT` | `8` | Images per analyzer turn across all python calls. |
+| `ARC3_VIEW_FRAMES_UPSCALE` | `4` | Pixels per cell for those images, independent of `MULTIMODAL_UPSCALE`: a 64-cell board is 256px, about 66 vision tokens. |
+
 The original `MULTIMODAL_CONTEXT=current_grid` and `MULTIMODAL_UPSCALE` settings remain the basic image controls. The latter’s source default is 16; running at 10× is a notebook configuration choice, not a new fixed default. Filtering historical images changes request prefixes and can affect prefix reuse.
 
 ### Intermediate animation frames

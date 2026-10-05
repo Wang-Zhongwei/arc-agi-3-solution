@@ -605,6 +605,51 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             ]
 
         runtime_globals["action"] = action
+        # History indices whose boards the host attaches as images after this
+        # call. The sandbox only validates and labels; rendering stays on the
+        # host, which holds the full colour grids.
+        _viewed_frames = []
+        _view_limit = int(initial.get("view_frames_limit") or 0)
+        if _view_limit > 0:
+            def view_frames(indices):
+                history = runtime_globals.get("history") or []
+                if isinstance(indices, int):
+                    indices = [indices]
+                picked = []
+                for raw in list(indices):
+                    index = int(raw)
+                    if index < 0:
+                        index += len(history)
+                    if not 0 <= index < len(history):
+                        raise IndexError(
+                            f"view_frames: history index {raw} is out of range "
+                            f"(0..{len(history) - 1})"
+                        )
+                    if index not in picked and index not in _viewed_frames:
+                        picked.append(index)
+                room = max(0, _view_limit - len(_viewed_frames))
+                shown, skipped = picked[:room], picked[room:]
+                for index in shown:
+                    entry = history[index]
+                    flags = [
+                        name
+                        for name in ("level_completed", "run_complete", "game_over")
+                        if (entry.result or {}).get(name)
+                    ]
+                    print(
+                        f"[view_frames] image of history[{index}]: board after "
+                        f"{entry.action or 'start'}, level {entry.frame.level}, "
+                        f"step {entry.frame.step}"
+                        + (f" ({', '.join(flags)})" if flags else "")
+                    )
+                if skipped:
+                    print(
+                        f"[view_frames] skipped history{skipped}: at most "
+                        f"{_view_limit} images per python call."
+                    )
+                _viewed_frames.extend(shown)
+
+            runtime_globals["view_frames"] = view_frames
         if initial.get("animation_enabled"):
             # Globals rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
@@ -719,6 +764,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "stdout": stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
+                    "view_frames": list(_viewed_frames),
                 }
             )
         except MemoryError:
@@ -771,6 +817,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "error": _sanitize_exception(exc),
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
+                    "view_frames": list(_viewed_frames),
                 }
             )
 
@@ -876,6 +923,7 @@ def run_sandboxed_python(
     initial_state: dict[str, Any],
     action_handler: Callable[..., dict[str, Any]],
     animation_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    view_frames_limit: int = 0,
     kept_functions: list[str] | None = None,
     retain_imports: bool = False,
     repair_hints: bool = False,
@@ -923,6 +971,7 @@ def run_sandboxed_python(
                 "retain_imports": retain_imports,
                 "repair_hints": repair_hints,
                 "animation_enabled": animation_handler is not None,
+                "view_frames_limit": max(0, int(view_frames_limit)),
                 "timeout_seconds": timeout_seconds,
                 "memory_limit_bytes": memory_limit_bytes,
                 "sandbox_cwd": sandbox_dir,
@@ -1040,6 +1089,10 @@ def run_sandboxed_python(
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "keepable_functions": list(message.get("keepable_functions") or []),
+                    "view_frames": [
+                        int(index) for index in message.get("view_frames") or []
+                        if isinstance(index, int)
+                    ],
                     **({"retention_rejected": message.get("retention_rejected", [])}
                        if kept_functions is not None else {}),
                 }

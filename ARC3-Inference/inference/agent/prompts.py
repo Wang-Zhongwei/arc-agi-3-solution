@@ -160,6 +160,17 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
 )
 
+HISTORY_REVISIT_ADDENDUM = (
+    "- `history` and `transitions` RETAIN earlier actions and boards even after "
+    "conversation trimming, so you can REVISIT what led to a level-up or game over.\n"
+)
+
+VIEW_FRAMES_ADDENDUM = (
+    "- `view_frames(indices)` displays past boards by `history` index as images "
+    "attached after this tool call's result; index 0 is the initial board, and index "
+    "n is the board after action n. At most {limit} images per call.\n"
+)
+
 ANIMATION_ADDENDUM_TIMELINE = (
     "- `last_animation_timeline` is a diff timeline of those frames: it "
     "shows which cells changed at each step. It is a dict with `action`, `frames` and "
