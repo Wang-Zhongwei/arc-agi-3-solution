@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import arcengine
 import taaf.game
+from taaf.deploy_kaggle import KaggleTarget
 from taaf.solver import Solver
 
 from inference.utils.animation import (
@@ -52,6 +53,8 @@ from inference.framework.kaggle import (
     pennyroyal_model_sources,
     pennyroyal_setup_command,
     pennyroyal_teardown_command,
+    lordhansolo_setup_command,
+    lordhansolo_teardown_command,
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
     DEFAULT_VLLM_MAX_MODEL_LEN,
@@ -575,7 +578,12 @@ class _HarnessGameSession:
         # a plain dict update - it applies no dataclass defaults. A bare access
         # would raise AttributeError here on the first turn of every game, since
         # should_stop() runs this every time.
-        limit = getattr(self.solver, "max_generated_tokens_per_game", None)
+        runtime = getattr(self.solver, "runtime_environment", None)
+        if not isinstance(runtime, KaggleTarget):
+            return False
+        if runtime.is_competition_rerun or runtime.actual_run_as_submission:
+            return False
+        limit = getattr(self.solver, "public_max_generated_tokens_per_game", None)
         if limit is None or limit <= 0:
             return False
         spent = _analyzer_reported_tokens(self.analyzer) - self.game_token_baseline
@@ -1360,12 +1368,9 @@ class HarnessSolver(Solver):
     analyzer_timeout: float | None = 120.0
     max_actions_per_game: int | None = None
     max_runtime_s_per_game: float | None = None
-    # Generated tokens a game may spend before it gives up, counted from the
-    # analyzer's own accumulator so it measures what the model produced rather
-    # than what was billed. A wall-clock limit means something different on
-    # every backend - and on a hosted API it moves hour to hour - so this is
-    # what makes an offline run comparable with a Kaggle one. None disables.
-    max_generated_tokens_per_game: int | None = None
+    # Public Kaggle per-game output budget. Private reruns and local runs
+    # ignore it; None disables it. Counted from the analyzer's accumulator.
+    public_max_generated_tokens_per_game: int | None = None
     concurrency: int = 16
     save_request_logs: bool = False
     start_local_server: bool = False
@@ -1481,17 +1486,20 @@ class HarnessSolver(Solver):
     def _kaggle_pennyroyal(self) -> bool:
         return self.kaggle_enable_vllm and kaggle_serving_config()["serving"] == "pennyroyal"
 
+    def _kaggle_lordhansolo(self) -> bool:
+        return self.kaggle_enable_vllm and kaggle_serving_config()["serving"] == "lordhansolo"
+
     @property
     def kaggle_dataset_sources(self) -> list[str]:
         if not self.kaggle_enable_vllm:
             return []
-        if self._kaggle_pennyroyal():
+        if self._kaggle_pennyroyal() or self._kaggle_lordhansolo():
             return pennyroyal_dataset_sources()
         return duck_kaggle_dataset_sources(self._kaggle_vllm_config())
 
     @property
     def kaggle_model_sources(self) -> list[str]:
-        return pennyroyal_model_sources() if self._kaggle_pennyroyal() else []
+        return pennyroyal_model_sources() if self._kaggle_pennyroyal() or self._kaggle_lordhansolo() else []
 
     @property
     def kaggle_docker_image(self) -> str | None:
@@ -1505,6 +1513,8 @@ class HarnessSolver(Solver):
             return []
         if self._kaggle_pennyroyal():
             return [pennyroyal_setup_command()]
+        if self._kaggle_lordhansolo():
+            return [lordhansolo_setup_command()]
         return [duck_kaggle_setup_command(self._kaggle_vllm_config())]
 
     @property
@@ -1513,6 +1523,8 @@ class HarnessSolver(Solver):
             return []
         if self._kaggle_pennyroyal():
             return [pennyroyal_teardown_command()]
+        if self._kaggle_lordhansolo():
+            return [lordhansolo_teardown_command()]
         return [duck_kaggle_teardown_command()]
 
     def _kaggle_vllm_config(self) -> DuckKaggleVllmConfig:

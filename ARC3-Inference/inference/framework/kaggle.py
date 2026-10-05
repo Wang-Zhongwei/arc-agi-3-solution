@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
 
 from inference.utils.openai_compat import normalize_provider
 
@@ -111,12 +112,12 @@ def kaggle_serving_config() -> dict:
     if not isinstance(data, dict):
         raise ValueError("kaggle config section must be a JSON object")
     serving = data.get("serving", "vllm")
-    if serving not in ("vllm", "pennyroyal"):
-        raise ValueError(f"kaggle.serving must be 'vllm' or 'pennyroyal', got {serving!r}")
-    if serving == "pennyroyal":
+    if serving not in ("vllm", "pennyroyal", "lordhansolo"):
+        raise ValueError(f"kaggle.serving must be 'vllm', 'pennyroyal', or 'lordhansolo', got {serving!r}")
+    if serving in ("pennyroyal", "lordhansolo"):
         for key in ("wheelhouse_dataset_source", "model_source"):
             if not data.get(key):
-                raise ValueError(f"kaggle.serving=pennyroyal requires kaggle.{key}")
+                raise ValueError(f"kaggle.serving={serving} requires kaggle.{key}")
     return {**data, "serving": serving}
 
 
@@ -148,6 +149,55 @@ def pennyroyal_teardown_command() -> str:
         'pid_file="$TAAF_KAGGLE_WORKING_DIR/sglang-server.pid"; '
         '[ -f "$pid_file" ] && kill "$(cat "$pid_file")" 2>/dev/null; rm -f "$pid_file"; true'
     )
+
+
+def lordhansolo_setup_command() -> str:
+    """Use Lord's pinned serving runtime with this config's harness settings."""
+    from inference.framework.lordhansolo import kaggle as runtime
+
+    cfg = kaggle_serving_config()
+    runtime.PROJECT_DIR = Path(__file__).resolve().parents[2]
+    server = runtime.DuckKaggleVllmConfig(
+        runtime_dataset_source=cfg["wheelhouse_dataset_source"],
+        model_source=cfg["model_source"],
+        served_model_name=cfg.get("served_model_name", "flashnext"),
+        vllm_port=int(cfg.get("port", 8001)),
+        **cfg.get("vllm", {}),
+    )
+    command = runtime.duck_kaggle_setup_command(server)
+    # Lord's source hardcodes xhigh reasoning in the server template. Keep this
+    # harness's template settings when swapping engines.
+    original = '\'{"preserve_thinking": true, "reasoning_effort": "xhigh"}\''
+    template = json.dumps(cfg.get("default_chat_template_kwargs", {"preserve_thinking": True}))
+    if command.count(original) != 1:
+        raise ValueError("Lord Hansolo launcher template changed; review the adapter")
+    command = command.replace(original, repr(template))
+    # The upstream launcher hands off its own analyzer defaults. Override them
+    # with our complete harness_env before the benchmark imports the agent.
+    marker = "setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])"
+    if command.count(marker) != 1:
+        raise ValueError("Lord Hansolo launcher handoff changed; review the adapter")
+    overrides = harness_env()
+    overrides["ARC3_KAGGLE_PRIVATE_WAVES"] = str(cfg.get("private_waves", 1))
+    overrides["ARC3_KAGGLE_PRIVATE_RUNTIME_MINUTES"] = str(cfg.get("private_runtime_minutes", 532))
+    handoff = f"setup_env.update({overrides!r})\n"
+    for key in ("LOCAL_ANALYZER_REASONING_EFFORT", "LOCAL_ANALYZER_TARGET_CONTEXT"):
+        if key not in overrides:
+            handoff += f"setup_env.pop({key!r}, None)\n"
+    # Preserve the configured prompt window even if the upstream renderer would
+    # clamp it. Reject a server window that cannot hold a full response instead.
+    context = int(overrides.get("LOCAL_ANALYZER_CONTEXT_WINDOW", os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW", 131072)))
+    output = int(overrides.get("LOCAL_ANALYZER_MAX_OUTPUT", os.environ.get("LOCAL_ANALYZER_MAX_OUTPUT", 12288)))
+    if context + output > server.max_model_len:
+        raise ValueError("Lord Hansolo max_model_len must fit the harness context window plus output budget")
+    handoff += f"setup_env['LOCAL_ANALYZER_CONTEXT_WINDOW'] = {str(context)!r}\n"
+    return command.replace(marker, handoff + marker)
+
+
+def lordhansolo_teardown_command() -> str:
+    from inference.framework.lordhansolo import kaggle as runtime
+
+    return runtime.duck_kaggle_teardown_command()
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:

@@ -160,6 +160,11 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
 )
 
+HISTORY_REVISIT_ADDENDUM = (
+    "- `history` and `transitions` RETAIN earlier actions and boards even after "
+    "conversation trimming, so you can REVISIT what led to a level-up or game over.\n"
+)
+
 ANIMATION_ADDENDUM_TIMELINE = (
     "- `last_animation_timeline` is a diff timeline of those frames: it "
     "shows which cells changed at each step. It is a dict with `action`, `frames` and "
@@ -173,9 +178,9 @@ ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
     "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
-    "changed and then changed BACK during the animation, so they appear in no frame "
-    "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
-    "in `history`.\n"
+    "changed more than once during the animation, not necessarily back to their "
+    "original color. Their intermediate changes are not fully captured by "
+    "`current_frame`, `previous_frame`, or `history`.\n"
     "- `last_animation_frames` is the frames of the last executed action that "
     "animated, as views with "
     "`.ascii`, `.shape` and `.segmentation`, the same as `current_frame`. Index 0 is "

@@ -445,7 +445,7 @@ def _make_solver(
         analyzer_timeout=getattr(args, "analyzer_timeout", 120),
         max_actions_per_game=args.max_actions,
         max_runtime_s_per_game=max_runtime_minutes_per_game * 60.0,
-        max_generated_tokens_per_game=args.max_generated_tokens_per_game,
+        public_max_generated_tokens_per_game=args.public_max_generated_tokens_per_game,
         concurrency=effective_concurrency,
         save_request_logs=bool(args.analyzer_save_request_logs),
         start_local_server=start_local_server,
@@ -1327,13 +1327,11 @@ def main() -> None:
     parser.add_argument("--max-actions", type=int, default=None)
     parser.add_argument("--max-runtime-minutes", type=float, default=None)
     parser.add_argument(
-        "--max-generated-tokens-per-game",
+        "--public-max-generated-tokens-per-game",
         type=int,
         default=None,
-        help="Give up on a game once it has generated this many tokens. A "
-             "wall-clock limit means something different on every backend and "
-             "moves hour to hour on a hosted API; this is what makes an "
-             "offline run comparable with a Kaggle one.",
+        help="Limit generated tokens per game in public Kaggle runs only; "
+             "private competition reruns and local runs ignore this limit.",
     )
     parser.add_argument("--max-experiment-runtime-minutes", type=float, default=None)
     parser.add_argument("--max-experiment-runtime-hours", type=float, default=None)
