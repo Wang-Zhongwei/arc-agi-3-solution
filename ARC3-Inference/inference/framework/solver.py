@@ -27,7 +27,9 @@ from taaf.solver import Solver
 from inference.utils.animation import (
     collapse_frames,
     normalize_frames,
+    pack_chain,
     summarize_animation,
+    unpack_chain,
 )
 from inference.agent.action_names import (
     reset_exposed,
@@ -121,6 +123,13 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "yes",
     "on",
 )
+# Keep every animated step's frames rather than only the last executed
+# action's, so the model can read `transitions[i].animation_frames` for any
+# past action. Off by default: it changes what the prompt offers, and memory
+# grows with the number of animated actions in a game.
+ANIMATION_HISTORY_ENABLED = os.environ.get(
+    "ARC3_ANIMATION_HISTORY", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
@@ -492,10 +501,12 @@ class _HarnessGameSession:
     # engine can be told what that step cost, and so cannot answer "how much
     # has this game spent". This one is captured once and never moved.
     game_token_baseline: int = 0
-    # The last executed action's animation, or None. One record, not a
-    # history: the model reads it via animation() in the turn that follows,
-    # and older animations are almost never what it is asking about.
-    animation_record: dict[str, Any] | None = None
+    # Animation records keyed by the step the action produced (its
+    # `action_num`, which is also `transitions[i].result['action_num']`). Steps
+    # never repeat within a game, so a record is never overwritten. Without
+    # ARC3_ANIMATION_HISTORY this holds at most the last executed action's
+    # record, which is all `last_animation_*` reads.
+    animation_records: dict[int, dict[str, Any]] = field(default_factory=dict)
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -1000,10 +1011,19 @@ class _HarnessGameSession:
         if str(arguments.get("query") or "").strip() == "animation":
             # Routed through step_env so no analyzer-protocol signature has to
             # change. Executes nothing and spends no action budget.
+            record = None
+            try:
+                step = int(arguments.get("step"))
+            except (TypeError, ValueError):
+                step = None
+            if ANIMATION_ENABLED and step is not None:
+                stored = self.animation_records.get(step)
+                if stored:
+                    record = {**stored, "chain": unpack_chain(stored["chain"])}
             return {
                 "executed": False,
                 "query": "animation",
-                "record": self.animation_record if ANIMATION_ENABLED else None,
+                "record": record,
             }
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
@@ -1282,21 +1302,21 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
-            # ONE record, replaced by every executed action - animated or not.
-            # A no-op that animated is the case this exists for, and the guards
-            # refuse the NEXT action without executing it, so the record still
-            # describes the animated one when the model reads the opener.
-            self.animation_record = (
-                {
+            # Without ARC3_ANIMATION_HISTORY, ONE record, replaced by every
+            # executed action - animated or not. A no-op that animated is the
+            # case this exists for, and the guards refuse the NEXT action
+            # without executing it, so the record still describes the animated
+            # one when the model reads the opener.
+            if not ANIMATION_HISTORY_ENABLED:
+                self.animation_records.clear()
+            if animation_summary:
+                self.animation_records[self.action_count] = {
                     "action_display": action_display,
-                    "chain": chain,
+                    "chain": pack_chain(chain),
                     "summary": animation_summary,
                     "step": self.action_count,
                     "level": _level_number(self.game),
                 }
-                if animation_summary
-                else None
-            )
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )

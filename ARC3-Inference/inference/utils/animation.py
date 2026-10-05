@@ -70,6 +70,24 @@ def collapse_frames(before: Grid | None, frames: Sequence[Grid]) -> list[Grid]:
     return collapsed
 
 
+def pack_chain(chain: Sequence[Grid]) -> list[Any]:
+    """A chain with each row as bytes, for retention past the next action.
+
+    A 64x64 tuple grid costs ~37 KB; as bytes rows ~7 KB. Kept per animated
+    step for the whole game, that difference is the bulk of the feature's
+    memory. Cells outside 0-255 cannot pack, and that chain is kept as is.
+    """
+    try:
+        return [tuple(bytes(row) for row in grid) for grid in chain]
+    except (ValueError, TypeError):
+        return list(chain)
+
+
+def unpack_chain(packed: Sequence[Any]) -> list[Grid]:
+    """Inverse of `pack_chain`; tuple grids pass through unchanged."""
+    return [tuple(tuple(row) for row in grid) for grid in packed]
+
+
 def _transient_cells(chain: Sequence[Grid]) -> list[tuple[int, int]]:
     """Cells whose value changes two or more times across the chain.
 

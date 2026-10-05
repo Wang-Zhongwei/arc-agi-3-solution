@@ -103,12 +103,13 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
+| `ARC3_ANIMATION_HISTORY` | Off, under animation support | Keeps every animated step's frames for the whole game, so `transitions[i].animation_frames` and `transitions[i].animation_timeline` work for any past action, and tells the model so. Off keeps only the last executed action's animation. Frames are stored as byte rows (~7 KB per 64x64 frame). |
 | `ARC3_ANIMATION_IMAGE` | `off` | `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Ordinary animation imagery is attached for transient activity when the gameplay area did not change. |
 | `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `peak`/`composite` option for the fatal action’s animation. |
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 
-The model can inspect `last_animation_frames` and `last_animation_timeline`. These are loaded lazily through a read-only environment query, without spending a game action. The prompt points out transient activity so that the model knows intermediate information is available.
+The model can inspect `last_animation_frames` and `last_animation_timeline`, and every transition exposes `.animation_frames` and `.animation_timeline` for its own action. `last_animation_*` reads the latest transition that is not a RESET, so it equals `transitions[-1]` except right after a reset. These are loaded lazily through a read-only environment query, without spending a game action. The prompt points out transient activity so that the model knows intermediate information is available.
 
 A composite is explicitly not a real single board state. It retains the last non-final transient colors, with brightness encoding duration. A peak image is an actual intermediate frame, which avoids combining moments but may omit important parts of a longer animation.
 

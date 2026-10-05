@@ -54,6 +54,7 @@ from inference.agent.prompts import (
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
+    ANIMATION_HISTORY_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
@@ -2484,6 +2485,14 @@ def _animation_enabled() -> bool:
     return _get_env_bool("ARC3_ANIMATION", False)
 
 
+def _animation_history_enabled() -> bool:
+    """Whether every past animation stays readable through
+    `transitions[i].animation_frames`, not only the last one. Read by the
+    solver as ARC3_ANIMATION_HISTORY too; this gate only decides whether the
+    prompt says so."""
+    return _animation_enabled() and _get_env_bool("ARC3_ANIMATION_HISTORY", False)
+
+
 def _report_gameplay_changed() -> bool:
     """Tell the model WHICH kind of change an action produced.
 
@@ -2772,6 +2781,14 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt += ANIMATION_ADDENDUM
         if _animation_timeline_enabled():
             prompt += ANIMATION_ADDENDUM_TIMELINE
+        if _animation_history_enabled():
+            prompt += ANIMATION_HISTORY_ADDENDUM.format(
+                timeline=(
+                    " and `.animation_timeline`"
+                    if _animation_timeline_enabled()
+                    else ""
+                )
+            )
     if current_grid_image_enabled():
         prompt += MULTIMODAL_CONTEXT_ADDENDUM
     if _AUTO_FRAME_DIFF:
@@ -5938,7 +5955,9 @@ class ToolAgent:
         def _handle_animation(request: dict[str, Any]) -> dict[str, Any]:
             if self._step_env_callback is None:
                 return {"error": "Animation frames are not available in this session."}
-            raw = self._step_env_callback({"query": "animation"})
+            raw = self._step_env_callback(
+                {"query": "animation", "step": request.get("step")}
+            )
             record = raw.get("record") if isinstance(raw, dict) else None
             record = record if isinstance(record, dict) else None
             if str(request.get("kind") or "") == "frames":

@@ -192,12 +192,36 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     class TransitionView:
+        # Set by the runtime when animation is enabled: (kind, step) -> payload.
+        animation_source = None
+
         def __init__(self, *, action, before_frame, after_frame, result):
             self.action = action
             self.before_frame = before_frame
             self.after_frame = after_frame
             self.frame = after_frame
             self.result = dict(result) if isinstance(result, dict) else {}
+
+        def _animation(self, kind, empty):
+            # `result['animation']` is present exactly when the action animated
+            # and its record was kept, so a still action costs no round trip.
+            source = TransitionView.animation_source
+            if source is None or not self.result.get("animation"):
+                return empty
+            payload = source(kind, self.result.get("action_num"))
+            # an error payload means the record was not kept (no
+            # ARC3_ANIMATION_HISTORY and this is not the latest action)
+            if not payload or (isinstance(payload, dict) and "error" in payload):
+                return empty
+            return payload
+
+        @property
+        def animation_frames(self):
+            return self._animation("frames", [])
+
+        @property
+        def animation_timeline(self):
+            return self._animation("timeline", {})
 
         def __str__(self):
             return (
@@ -376,7 +400,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             "result": None,
         }
         runtime_globals["__builtins__"]["__import__"] = _safe_import
-        _animation_views = []
 
         def frame_diff(before=None, after=None):
             # Object-level diff between two frames. Defaults: previous_frame -> current_frame.
@@ -521,10 +544,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 raise RuntimeError("Invalid action response from sandbox host.")
             action_result = reply.get("action_result") or {}
             action_results.append(action_result)
-            # Cached animations describe the previous action. Invalidate the
-            # existing views so aliases also refresh, even if a guard raises.
-            for view in _animation_views:
-                view.invalidate()
             _refresh_state(reply.get("state") or {})
             if action_result.get("stop_reason") == "reset_not_first":
                 raise RuntimeError(str(action_result.get("stop_detail")))
@@ -583,8 +602,18 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     _stale_state.append(str(_name))
             return action_result
 
-        def _animation_fetch(kind):
-            _send({"type": "animation", "request": {"kind": kind}})
+        # Keyed by (kind, step). A step's animation never changes once
+        # recorded, so entries stay valid across action() calls.
+        _animation_cache = {}
+
+        def _animation_fetch(kind, step):
+            key = (kind, step)
+            if key not in _animation_cache:
+                _animation_cache[key] = _animation_request(kind, step)
+            return _animation_cache[key]
+
+        def _animation_request(kind, step):
+            _send({"type": "animation", "request": {"kind": kind, "step": step}})
             reply = _recv()
             if reply.get("type") == "animation_error":
                 raise RuntimeError(str(reply.get("error", "animation failed")))
@@ -606,25 +635,31 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
         runtime_globals["action"] = action
         if initial.get("animation_enabled"):
-            # Globals rather than attributes on last_transition: after a death
-            # the harness appends a RESET entry, so last_transition is the
-            # reset and not the action that animated. The record is simply
-            # "the last executed action that animated", and naming it that way
-            # removes the mismatch. Empty when the last executed action
-            # returned a single frame.
+            TransitionView.animation_source = _animation_fetch
+
+            # Globals rather than plain aliases of last_transition: after a
+            # death the harness appends a RESET entry, so last_transition is
+            # the reset and not the action that animated. These read the last
+            # transition that is not a RESET - the action the solver last
+            # recorded an animation for. Empty when that action returned a
+            # single frame. Resolved on every access, so they follow action().
+            def _last_animated_transition():
+                for transition in reversed(runtime_globals.get("transitions") or []):
+                    if transition.result.get("action_name") != "RESET":
+                        return transition
+                return None
+
             class _LazyAnimation:
                 def __init__(self, kind, empty):
                     self._kind = kind
                     self._empty = empty
-                    self._value = None
 
                 def _get(self):
-                    if self._value is None:
-                        self._value = _animation_fetch(self._kind) or self._empty
-                    return self._value
-
-                def invalidate(self):
-                    self._value = None
+                    # Asks even when the action did not animate, so the
+                    # timeline keeps its explanatory error in that case.
+                    transition = _last_animated_transition()
+                    step = transition.result.get("action_num") if transition else None
+                    return _animation_fetch(self._kind, step) or self._empty
 
                 def __len__(self):
                     return len(self._get())
@@ -652,8 +687,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
             runtime_globals["last_animation_frames"] = _LazyAnimation("frames", [])
             runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", {})
-            _animation_views.extend((runtime_globals["last_animation_frames"],
-                                     runtime_globals["last_animation_timeline"]))
 
         _refresh_state(initial.get("state") or {})
 

@@ -187,6 +187,16 @@ ANIMATION_ADDENDUM = (
     "in-game action.\n"
 )
 
+ANIMATION_HISTORY_ADDENDUM = (
+    "- Every past animation stays readable: each transition in `transitions` "
+    "exposes `.animation_frames`{timeline}, the same as "
+    "`last_animation_*` but for that action. They are empty for an action that "
+    "did not animate; `.result.get('animation')` says whether it did without "
+    "fetching anything. `last_animation_frames` is "
+    "`transitions[-1].animation_frames`, except right after a RESET, when it is "
+    "still the animation of the action before it.\n"
+)
+
 MULTIMODAL_CONTEXT_ADDENDUM = (
     "\n\nMultimodal context:\n"
     "- User turns include an attached image of the current ARC grid.\n"
