@@ -6,7 +6,8 @@ library only, because it runs before the bundle's dependencies are installed.
 
 1. Rebuild ``/kaggle/input`` from the bundled ``kernel/kernel-metadata.json``:
    competition files and datasets through the Kaggle API; models from Hugging
-   Face when ``hf_models`` maps them, otherwise from Kaggle.
+   Face when ``hf_models`` maps them, otherwise from Kaggle. The Kaggle inputs
+   and the models download at the same time.
 2. Install the bundled projects' PyPI dependencies.
 3. Execute the rendered notebook's code cells, as Kaggle would.
 4. Upload ``/kaggle/working`` as a private Kaggle dataset (``working.tar.gz``).
@@ -28,6 +29,7 @@ import tarfile
 import time
 import tomllib
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 INPUT = Path("/kaggle/input")
@@ -165,6 +167,32 @@ def install_requirements(bundle: Path) -> None:
             run([*pip, "--ignore-installed", "--find-links", str(wheels), requirement])
 
 
+def stage_inputs(bundle: Path, metadata: dict, hf_models: dict[str, str]) -> None:
+    """Fetch Kaggle inputs and models at the same time.
+
+    The two lanes hit different servers: Kaggle serves datasets at ~40 MB/s,
+    Hugging Face at ~1.6 GB/s, so neither saturates the pod's link and staging
+    takes the longer lane instead of their sum. pip needs the competition
+    wheels, so it stays in the Kaggle lane.
+    """
+
+    def kaggle_lane() -> None:
+        for slug in metadata.get("competition_sources", []):
+            stage_competition(slug)
+        for ref in metadata.get("dataset_sources", []):
+            stage_dataset(ref)
+        install_requirements(bundle)
+
+    def model_lane() -> None:
+        for ref in metadata.get("model_sources", []):
+            stage_model(ref, hf_models)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        lanes = [pool.submit(kaggle_lane), pool.submit(model_lane)]
+        for lane in lanes:
+            lane.result()  # re-raise the first lane failure
+
+
 def run_notebook(bundle: Path, notebook_path: Path) -> int:
     code_path = WORKING / "runpod_notebook.py"
     code_path.write_text(notebook_code(notebook_path), encoding="utf-8")
@@ -229,14 +257,7 @@ def main() -> int:
         metadata = json.loads((bundle / "kernel" / "kernel-metadata.json").read_text(encoding="utf-8"))
         if metadata.get("kernel_sources"):
             raise RuntimeError(f"Kaggle utility-script sources are not available on RunPod: {metadata['kernel_sources']}")
-        # Small, failure-prone steps first so a broken setup fails before the model downloads.
-        for slug in metadata.get("competition_sources", []):
-            stage_competition(slug)
-        for ref in metadata.get("dataset_sources", []):
-            stage_dataset(ref)
-        install_requirements(bundle)
-        for ref in metadata.get("model_sources", []):
-            stage_model(ref, spec.get("hf_models", {}))
+        stage_inputs(bundle, metadata, spec.get("hf_models", {}))
         summary["stage"] = "notebook"
         summary["staging_seconds"] = round(time.time() - started)
         exit_code = run_notebook(bundle, bundle / "kernel" / metadata["code_file"])

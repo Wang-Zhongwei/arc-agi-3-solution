@@ -174,7 +174,7 @@ class RunPodTarget(taaf.deploy_kaggle.KaggleTarget):
     data_center_ids: list[str] = field(default_factory=lambda: list[str]())
     hf_models: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     hard_limit_s: float | None = None
-    startup_timeout_s: float = 900.0
+    startup_timeout_s: float = 180.0
     ssh: bool = True
 
     pod_id: str = field(default="", init=False)

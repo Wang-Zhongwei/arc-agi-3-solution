@@ -77,6 +77,41 @@ def test_pull_output_accepts_kaggle_expanded_archive(tmp_path, monkeypatch):
     assert taaf.deploy_runpod.pull_output("me/x-rp-p", tmp_path, timeout_s=0) == tmp_path
 
 
+def test_stage_inputs_runs_kaggle_and_model_lanes_concurrently(monkeypatch, tmp_path):
+    import threading
+
+    both_started = threading.Barrier(2, timeout=5)
+    calls = []
+
+    def kaggle_step(*args):
+        calls.append(("kaggle", args))
+        both_started.wait()  # deadlocks (BrokenBarrierError) if the lanes ran one after another
+
+    def model_step(ref, hf_models):
+        calls.append(("model", ref))
+        both_started.wait()
+
+    monkeypatch.setattr(pod, "stage_competition", kaggle_step)
+    monkeypatch.setattr(pod, "stage_dataset", lambda ref: calls.append(("dataset", ref)))
+    monkeypatch.setattr(pod, "install_requirements", lambda bundle: calls.append(("pip", bundle)))
+    monkeypatch.setattr(pod, "stage_model", model_step)
+    metadata = {"competition_sources": ["comp"], "dataset_sources": ["a/b"], "model_sources": ["o/m/f/v/1"]}
+    pod.stage_inputs(tmp_path, metadata, {})
+    kaggle_order = [name for name, _ in calls if name != "model"]
+    assert kaggle_order == ["kaggle", "dataset", "pip"]
+    assert ("model", "o/m/f/v/1") in calls
+
+
+def test_stage_inputs_reraises_a_lane_failure(monkeypatch, tmp_path):
+    def broken(*args):
+        raise RuntimeError("hf down")
+
+    monkeypatch.setattr(pod, "stage_model", broken)
+    monkeypatch.setattr(pod, "install_requirements", lambda bundle: None)
+    with pytest.raises(RuntimeError, match="hf down"):
+        pod.stage_inputs(tmp_path, {"model_sources": ["o/m/f/v/1"]}, {})
+
+
 @pytest.mark.parametrize("share", [False, True])
 def test_rendered_notebooks_run_as_plain_python(tmp_path, share):
     template = taaf.deploy_kaggle._SHARE_NOTEBOOK_TEMPLATE if share else taaf.deploy_kaggle._NOTEBOOK_TEMPLATE
