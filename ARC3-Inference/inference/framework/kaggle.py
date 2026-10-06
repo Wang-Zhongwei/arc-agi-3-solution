@@ -126,7 +126,10 @@ def pennyroyal_dataset_sources() -> list[str]:
 
 def pennyroyal_model_sources() -> list[str]:
     cfg = kaggle_serving_config()
-    return [ref for ref in (cfg["model_source"], cfg.get("draft_model_source")) if ref]
+    return [
+        ref for ref in (cfg["model_source"], cfg.get("draft_model_source"), cfg.get("ple_fp8_model_source"))
+        if ref
+    ]
 
 
 def pennyroyal_setup_command() -> str:
@@ -135,7 +138,7 @@ def pennyroyal_setup_command() -> str:
     spec = {
         key: cfg[key] for key in (
             "wheelhouse_dataset_source", "model_source", "draft_model_source",
-            "served_model_name", "port", "server_startup_timeout_s", "sglang",
+            "ple_fp8_model_source", "served_model_name", "port", "server_startup_timeout_s", "sglang",
         ) if key in cfg
     }
     spec["env"] = harness_env()

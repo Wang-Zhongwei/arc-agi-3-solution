@@ -488,6 +488,21 @@ These changes do not increase the server’s true context limit. Correctly match
 
 Every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
 
+### Kaggle Pennyroyal serving
+
+With `kaggle.serving: "pennyroyal"`, [`pennyroyal_launch.py`](inference/framework/pennyroyal_launch.py) starts Daniel's SGLang build. These `kaggle` keys choose what it serves:
+
+| Setting | Behavior |
+|---|---|
+| `wheelhouse_dataset_source` | Offline Pennyroyal bundle (wheels, FR-Spec map). |
+| `model_source` | Target model, `owner/model/framework/variation/version`. AutoRound INT4 (Intel) or compressed-tensors (lordhansolo's mixed NVFP4/FP8). |
+| `draft_model_source` | Separate INT4 MTP draft (Albucino). Omit it to draft with the target's embedded MTP head; the launcher then serves a view of only the MTP, embedding and LM-head shards. |
+| `ple_fp8_model_source` | Optional checkpoint whose FP8 PLE table (`model-plefp8-*` + `weight_scale`) replaces the target's BF16 table in a symlink view. Shapes must match 1:1; GPU tensors are unchanged. |
+| `sglang.WINDOW_PREFETCH` | `false` by default. `true` uses lordhansolo's loader-following prefetch (4 threads, 8 GiB window: `WINDOW_PREFETCH_THREADS`, `WINDOW_PREFETCH_GIB`) and turns off Daniel's one-shard lookahead and the whole-directory precache. Writes `pennyroyal-shard-prefetch.json`. |
+| `sglang.<KEY>` | Any other launcher setting (`MEMFRAC`, `SPEC_STEPS`, ...). |
+
+Every Pennyroyal run writes `pennyroyal-startup.json` with stage times from launcher start (`bundle_installed`, `views_ready`, `server_launched`, `server_ready`).
+
 ## 14. Diagnostics, transcript viewer, and build plumbing
 
 ### Viewer and request accounting — unconditional
