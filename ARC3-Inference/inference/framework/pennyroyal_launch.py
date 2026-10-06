@@ -210,10 +210,9 @@ CFG = dict(
     # If the tuned server exits before it is ready (a failed self-check, a
     # kernel that does not compile), relaunch once with the tuning off.
     TUNEUP_FALLBACK=True,
-    # Periodic Python stack dumps of the server processes (stackdump/), to
-    # find what the weight loader spends its time on.
-    STACK_DUMP=False,
-    STACK_DUMP_INTERVAL_S=15,
+    # Run pennyroyal_marlin_debug.py on the GPU, write marlin-debug.json, and
+    # stop before starting a server (the notebook then fails at setup).
+    MARLIN_DEBUG_ONLY=False,
 )
 CFG.update(SPEC.get("sglang", {}))
 if CFG["WINDOW_PREFETCH"]: CFG["PREFETCH_CHECKPOINTS"] = False
@@ -391,7 +390,7 @@ TUNEUP_ENV = {
 }
 TUNEUP_ENV = {k: v for k, v in TUNEUP_ENV.items() if v}
 TUNEUP = {"requested": sorted(TUNEUP_ENV), "low_m_max": int(CFG["LOWM_MAX_M"]), "patched": [], "fallback": None}
-if TUNEUP_ENV or int(CFG["LOWM_MAX_M"]) != 32:
+if TUNEUP_ENV or int(CFG["LOWM_MAX_M"]) != 32 or CFG["MARLIN_DEBUG_ONLY"]:
     import pennyroyal_patches
     site_packages = sorted(Path(VENV).glob("lib/python*/site-packages"))
     try:
@@ -553,15 +552,23 @@ if CFG["SPEC"]:
         assert sha256(Path(SERVE_DIR, "tokenizer.json")) in TOKENIZER_SHAS, "Tokenizer differs from the FR-Spec map; set CFG['FRSPEC']=False"
         args += ["--speculative-token-map", str(tok)]
 
+# ---- optional: NVFP4 Marlin bisect on the free GPU, then stop ----
+if CFG["MARLIN_DEBUG_ONLY"]:
+    report = Path(WORKING_DIR, "marlin-debug.json")
+    script = Path(__file__).resolve().parent / "pennyroyal_marlin_debug.py"
+    try:
+        # -I: keep this directory's modules (kaggle.py, run.py, ...) off sys.path.
+        result = subprocess.run([PYTHON, "-I", str(script), MODEL_DIR, str(report)], env=env, timeout=1800)
+        print(f"Marlin debug exited {result.returncode}")
+    except subprocess.TimeoutExpired:
+        print("Marlin debug timed out after 1800 s")
+    mark_startup("marlin_debug_done")
+    Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
+        {"seconds_from_launcher_start": STARTUP_TIMES, "marlin_debug_only": True, "tuneup": TUNEUP}, indent=1))
+    raise SystemExit(f"MARLIN_DEBUG_ONLY: results in {report}; not starting the server")
+
 # ---- launch detached and wait for health ----
 print("\n" + shlex.join(args) + "\n")
-if CFG["STACK_DUMP"]:
-    env.update({
-        "PYTHONPATH": str(Path(__file__).resolve().parent / "stackdump"),
-        "ARC3_STACK_DUMP_DIR": str(Path(WORKING_DIR, "stack-dumps")),
-        "ARC3_STACK_DUMP_INTERVAL": str(CFG["STACK_DUMP_INTERVAL_S"]),
-        "ARC3_STACK_DUMP_SECONDS": str(SERVER_STARTUP_TIMEOUT),
-    })
 
 
 def launch(server_env, prefetch_report):
@@ -646,6 +653,9 @@ Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
      "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"]), "server_status": status,
      "max_running_requests": CFG["MAXREQ"], "cuda_graph_bs": graph_bs, "mem_fraction_static": CFG["MEMFRAC"],
      "tuneup": TUNEUP}, indent=1))
+if status == "exited":
+    # Games against a dead endpoint only burn the session; fail the setup step.
+    raise SystemExit(f"SGLang server exited before it was ready; see {LOG}")
 
 # ---- hand the endpoint and analyzer settings to the run ----
 base_url = f"http://127.0.0.1:{SERVED_MODEL_PORT}/v1"

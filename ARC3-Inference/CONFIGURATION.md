@@ -581,7 +581,7 @@ With `kaggle.serving: "pennyroyal"`, [`pennyroyal_launch.py`](inference/framewor
 | `sglang.LOWM_FP8` | `false` by default. `true` sends FP8 channelwise linears with at most `LOWM_MAX_M` rows to a weight-only split-K Triton GEMM. Each shape is checked once against a dense reference; one that fails keeps the stock path. |
 | `sglang.LOWM_MAX_M` | `32` (Daniel's). Row limit for that FP8 path and Daniel's low-M BF16 GEMM; `56` covers 14 streams × 4 verify tokens. |
 | `sglang.TUNEUP_FALLBACK` | `true` by default. If a server started with the three flags above exits before it is ready, relaunch once without them. `pennyroyal-startup.json` records it under `tuneup.fallback`. |
-| `sglang.STACK_DUMP` | `false` by default. `true` makes every server process write its Python stacks to `stack-dumps/` every `STACK_DUMP_INTERVAL_S` (15) seconds until the startup timeout. Used to find the slow step in weight loading. |
+| `sglang.MARLIN_DEBUG_ONLY` | `false` by default. `true` runs `pennyroyal_marlin_debug.py` on the GPU (dense and MoE NVFP4 Marlin against a dequantized reference, synthetic and layer 0 of the target), writes `marlin-debug.json`, and stops before starting a server, so the notebook fails at setup. |
 | `sglang.<KEY>` | Any other launcher setting (`MEMFRAC`, `MAXREQ`, `CUDAGRAPH_MAXBS`, `SPEC_STEPS`, ...). Setting `MAXREQ` also adds a CUDA graph at that batch size. |
 
 Every Pennyroyal run writes `pennyroyal-startup.json` with stage times from launcher start (`bundle_installed`, `views_ready`, `server_launched`, `server_ready`).

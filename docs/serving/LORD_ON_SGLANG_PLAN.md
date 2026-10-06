@@ -40,6 +40,21 @@ The launcher patches the installed wheel ([`pennyroyal_patches.py`](../../ARC3-I
 | 1. KV room | `EMBED_TOKENS_HOST`, `MEMFRAC` 0.97, `MAXREQ`/`CUDAGRAPH_MAXBS` 14, `ARC3_MAX_ACTIVE_STREAMS` 14 | `embed_tokens` goes into pinned host memory and is read by the PLE gather kernel; the draft shares it. Frees ~1.2 GiB, plus ~1 GiB from the memory fraction. CUDA graphs: 1, 2, 4, 7, 8, 9, 10, 14. |
 | 2. Experts on Marlin | `MOE_MARLIN` | The compressed-tensors NVFP4 MoE scheme gets a Marlin branch: gate/up loaded gate-first, global scale inverted to ModelOpt's `weight_scale_2`, then the fork's `prepare_moe_nvfp4_layer_for_marlin`. The first MoE layer is checked against a dequantized reference (two experts); a mismatch stops the server. |
 | 3. Small batches | `LOWM_FP8`, `LOWM_MAX_M` 56 | FP8 attention and linear-attention projections with ≤ 56 rows use a new weight-only split-K Triton GEMM (BF16 activations, FP8 weights widened in registers, per-row scale). This skips the per-token quant kernel. Daniel's BF16 path goes up to 56 with 64-wide tiles above 32 rows. Each shape bucket is checked once against a dense reference outside graph capture; a bucket that fails uses the stock path. |
-| 4. Loading | `server_startup_timeout_s` 3600, `STACK_DUMP` | Games start only when the server is ready (v1 released them at 720 s, and loading slowed to ~60 s per shard). Expert names are looked up by key instead of scanning 1,536 mapping entries per tensor. The slow step is still unknown, so stack dumps every 15 s (`stack-dumps/`) will show it. |
+| 4. Loading | `server_startup_timeout_s` 3600 | Games start only when the server is ready (v1 released them at 720 s, and loading slowed to ~60 s per shard). If no server came up, the setup step fails instead of starting games. Expert names are looked up by key instead of scanning 1,536 mapping entries per tensor. |
 
-What the logs show about loading: an expert shard (1.3 GiB, 6,144 tensors) takes ~14 s even when its prefetch finished long before. That is ~84 MB/s against Daniel's ~0.7 GB/s, so the cost is per tensor and on the CPU. Reading the loader code did not explain 2 ms per tensor.
+What the logs show about loading: an expert shard (1.3 GiB, 6,144 tensors) takes ~14 s even when its prefetch finished long before. That is ~84 MB/s against Daniel's ~0.7 GB/s, so the cost is per tensor and on the CPU.
+
+## Tuned v1 result (2026-10-06)
+
+Kaggle `lord-nvfp4-pennyroyal-tuned` v1 (commit 61be503) never served a request:
+
+1. **Marlin self-check failed.** After the full load (1,389 s, no faster than v1), the first MoE layer's Marlin output was effectively zero against the dequantized reference (relative error 1.0). The server stopped as designed. The cause is not yet known; the scale handling matches both the fork's dense NVFP4 Marlin test and ModelOpt's Marlin path.
+2. **The untuned fallback segfaulted** (exit -11) 2 minutes into its load, while the stack-dump watchdog was writing (the dump ends mid-frame). `faulthandler.dump_traceback_later` reads other threads' frames without the GIL; the option is removed.
+3. **The launcher still released the games**, which all failed to connect; the notebook was cancelled.
+
+The stack dumps (94 samples over the tuned load) located the slow loading steps: ~47% in per-expert host-to-GPU copies (`FusedMoE._load_w13` / `_load_w2`), ~34% in copying FP8 PLE rows into the pinned table (`copy_ple_rows_to_tp_embedding`). The expert-name lookup was not the bottleneck.
+
+## Next runs
+
+- **Tuned v2** ([`v2.json`](../../ARC3-Inference/configs/lord-nvfp4-pennyroyal-tuned/v2.json)): v1 with `MOE_MARLIN` off and without stack dumps. Measures steps 1 and 3 at 14 streams.
+- **Marlin bisect** ([`nvfp4-marlin-debug/v1.json`](../../ARC3-Inference/configs/nvfp4-marlin-debug/v1.json), `MARLIN_DEBUG_ONLY`): runs [`pennyroyal_marlin_debug.py`](../../ARC3-Inference/inference/framework/pennyroyal_marlin_debug.py) and stops. It checks the tested dense NVFP4 Marlin kernel on synthetic and real weights, then MoE-prepared experts through the dense kernel (prep vs. MoE kernel), then the full MoE expert at M = 1, 8, 56, then the server's own conversion. Marlin returns once its case passes.
