@@ -215,7 +215,7 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
     actual_run_as_submission: bool = field(default=False, init=False)
     is_competition_rerun: bool = field(default=False, init=False)
 
-    async def deploy(self, benchmark: taaf.benchmark.Benchmark) -> KaggleHandle:
+    async def deploy(self, benchmark: taaf.benchmark.Benchmark) -> taaf.deploy.DeploymentHandle:
         if benchmark.job_dir is None:
             raise ValueError("KaggleTarget requires benchmark.job_dir to be set for local staging (R2.34).")
         job_dir = benchmark.job_dir.resolve()
@@ -319,24 +319,40 @@ class KaggleTarget(taaf.deploy.DeploymentTarget):
             _check_kaggle_auth(username, key)
             with tempfile.TemporaryDirectory() as tmp:
                 source_bundle = Path(tmp) / "source-dataset"
-                _copy_entries(source_entries, source_bundle)
+                _copy_entries([*source_entries, *self._extra_source_entries(kernel_bundle)], source_bundle)
                 _ensure_dataset(source_bundle, dataset_ref, self.dataset_version_message, username, key)
-            self.kernel_version = _push_kernel(
-                kernel_bundle,
-                accelerator=None if self.cpu_only else self.accelerator,
-                timeout=self.kernel_push_timeout_s,
-                username=username,
-                key=key,
-            )
+            self._launch_notebook(kernel_bundle, username=username, key=key)
             self.uploaded = True
 
+        handle = self._make_handle(job_dir=job_dir, dataset_ref=dataset_ref)
         taaf.deploy.write_deploy_meta(
             job_dir=job_dir,
             target=self,
-            handle_class=KaggleHandle,
+            handle_class=type(handle),
             benchmark=benchmark,
-            job_id=self.kernel_id,
+            job_id=self._job_id(),
         )
+        return handle
+
+    # Hooks for targets that run this same notebook somewhere other than Kaggle
+    # (``taaf.deploy_runpod``): what else the source dataset carries, how the
+    # rendered notebook starts, and the handle that tracks it.
+    def _extra_source_entries(self, kernel_bundle: Path) -> list[Path]:
+        return []
+
+    def _launch_notebook(self, kernel_bundle: Path, *, username: str, key: str) -> None:
+        self.kernel_version = _push_kernel(
+            kernel_bundle,
+            accelerator=None if self.cpu_only else self.accelerator,
+            timeout=self.kernel_push_timeout_s,
+            username=username,
+            key=key,
+        )
+
+    def _job_id(self) -> str:
+        return self.kernel_id
+
+    def _make_handle(self, *, job_dir: Path, dataset_ref: str) -> taaf.deploy.DeploymentHandle:
         return KaggleHandle(
             job_dir=job_dir,
             kernel_id=self.kernel_id,

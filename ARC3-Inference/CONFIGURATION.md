@@ -488,6 +488,39 @@ These changes do not increase the server’s true context limit. Correctly match
 
 Every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
 
+### RunPod runs
+
+`make runpod-duck CONFIG_PATH=...` runs the same notebook as `make kaggle-duck`, on a RunPod GPU pod instead of Kaggle. Every `kaggle` setting above applies unchanged. The pod rebuilds `/kaggle/input` from the notebook's sources:
+
+| Input | Size | Comes from |
+|---|---|---|
+| Models (`kaggle.model_source`, `kaggle.draft_model_source`) | ~185 GB for Flash Next | Hugging Face, where `runpod.hf_models` maps them; otherwise Kaggle |
+| Competition files (`arc_agi_3_wheels`, offline `environment_files`) | ~50 MB | Kaggle; they exist only there |
+| Serving wheelhouse (`kaggle.wheelhouse_dataset_source`) | 6.6 GB for Pennyroyal | Kaggle; it exists only there |
+| Source bundle (code snapshot, pickled benchmark, rendered notebook) | under 1 MB | Kaggle: `make runpod-duck` uploads it as the private source dataset, as `kaggle-duck` does |
+
+The pod needs Kaggle credentials for the competition files and wheelhouse anyway, so Kaggle also carries the small source bundle in and the outputs back; no other storage service is involved. After the notebook finishes, the pod uploads `/kaggle/working` as the private Kaggle dataset `<owner>/<slug>-rp-<pod-id>` and deletes itself.
+
+It needs `RUNPOD_API_KEY` and Kaggle credentials (`KAGGLE_API_TOKEN`, `KAGGLE_USERNAME`) in the environment or a `.env` file; both are passed to the pod so it can download inputs, upload outputs and delete itself. Set `HF_TOKEN` for gated or private models. The run folder is `runs/runpod/<owner>/<slug>/<pod-id>/`. Fetch outputs with `make pull-runpod RUN_DIR=<run folder>` once the pod is gone (`WAIT=true` waits; `STOP=true` deletes the pod early).
+
+The config's `runpod` section sets the pod:
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `hf_models` | `{}` | Kaggle model ref → `repo[@revision][:subdir]` on Hugging Face. Mapped models download from Hugging Face into the model's Kaggle mount path; `:subdir` keeps one folder of the repo. Pin `@revision` for reproducible weights. |
+| `gpu_type_ids` | RTX PRO 6000 Blackwell Server, then Workstation | RunPod GPU types, tried in order. |
+| `cloud_type` | `SECURE` | `SECURE` or `COMMUNITY`. |
+| `container_disk_gb` | `400` | Local disk for models, wheels and the serving venv. Flash Next is 181 GB on Hugging Face. |
+| `min_ram_per_gpu_gb` | `160` | Host RAM. Pennyroyal keeps Flash Next's BF16 PLE table (about 100 GB) in host memory. |
+| `min_vcpu_per_gpu` | `8` | Host CPUs. |
+| `min_download_mbps` | unset | Skip hosts with slower links. |
+| `allowed_cuda_versions` | `["13.0"]` | Host driver CUDA versions; the Pennyroyal wheelhouse ships a CUDA 13 toolchain. |
+| `data_center_ids` | `[]` | Restrict to these RunPod data centers. |
+| `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | Pod image. Needs Python 3.12, `curl` and a C++ compiler; the notebook installs the serving stack itself. |
+| `hard_limit_s` | notebook budget + 90 min | The pod deletes itself after this long, whatever state the run is in. |
+| `startup_timeout_s` | `180` | `make runpod-duck` waits this long for the pod's container to start, then deletes the pod and fails. Healthy pods start in about 30 s; a broken host can hang before the start command runs, which the in-pod limit cannot catch, and RunPod bills that time. |
+| `ssh` | `true` | Expose port 22 with a public IP and start `sshd` with the RunPod account's SSH key. The deploy prints the `ssh` command; the pod's log is `/kaggle/working/runpod_bootstrap.log`. |
+
 ## 14. Diagnostics, transcript viewer, and build plumbing
 
 ### Viewer and request accounting — unconditional

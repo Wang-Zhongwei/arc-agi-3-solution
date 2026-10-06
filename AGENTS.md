@@ -20,6 +20,12 @@
 - Resolve both flat and namespaced Kaggle mounts for wheelhouses and datasets. Prefer this run's packaged TAAF source over a serving bundle's copy.
 - Record the pushed version. `QUEUED` or `RUNNING` means submitted, not evaluated; report results only from completed, exact-version artifacts.
 
+## Run on RunPod
+
+- `make runpod-duck CONFIG_PATH=configs/<experiment>.json` runs the same notebook bundle as `kaggle-duck` on a RunPod GPU pod; the config's `runpod` section maps Kaggle models to Hugging Face. See [CONFIGURATION.md](ARC3-Inference/CONFIGURATION.md#runpod-runs).
+- Needs `RUNPOD_API_KEY` (repo-root `.env`) plus the Kaggle credentials above. The pod uploads `/kaggle/working` as the private dataset `<owner>/<slug>-rp-<pod-id>` and deletes itself; fetch it with `make pull-runpod RUN_DIR=runs/runpod/<owner>/<slug>/<pod-id>`.
+- RunPod runs prove the bundle works but are not Kaggle scores; keep them out of Kaggle A/B comparisons.
+
 ## Fetch from Kaggle
 
 - From `ARC3-Inference/`, run `make pull-kaggle NOTEBOOK=[<username>/]<notebook-name> VERSION=<n>`. It saves that exact version's output and log to `runs/kaggle/<username>/<notebook-name>/vNN/`; the username defaults to your Kaggle credentials.

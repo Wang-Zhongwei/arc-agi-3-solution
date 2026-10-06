@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import getpass
 import hashlib
 import inspect
@@ -24,6 +25,7 @@ import taaf.benchmark
 import taaf.deploy
 import taaf.deploy_inline
 import taaf.deploy_kaggle
+import taaf.deploy_runpod
 import taaf.deploy_slurm
 import taaf.game
 import taaf.game_api
@@ -263,6 +265,20 @@ def _default_kaggle_kernel_title(args: argparse.Namespace, *, kernel_slug: str) 
     return kernel_slug
 
 
+def _runpod_settings() -> dict[str, Any]:
+    """The config's `runpod` section, exported by the Makefile as ARC3_RUNPOD_JSON."""
+    raw = os.environ.get("ARC3_RUNPOD_JSON", "").strip()
+    data = json.loads(raw) if raw else {}
+    if not isinstance(data, dict):
+        raise ValueError("runpod config section must be a JSON object")
+    fields = {f.name for f in dataclasses.fields(taaf.deploy_runpod.RunPodTarget) if f.init}
+    kaggle_fields = {f.name for f in dataclasses.fields(taaf.deploy_kaggle.KaggleTarget) if f.init}
+    unknown = sorted(set(data) - (fields - kaggle_fields))
+    if unknown:
+        raise ValueError(f"unknown runpod config keys {unknown}; see CONFIGURATION.md")
+    return data
+
+
 def _make_deployment_target(
     args: argparse.Namespace,
     *,
@@ -285,7 +301,7 @@ def _make_deployment_target(
         return taaf.deploy_inline.InlineTarget(
             max_runtime_s=float(resolved_max_runtime_s)
         )
-    if target_name == "kaggle":
+    if target_name in ("kaggle", "runpod"):
         source_repos = _resolve_repo_paths(
             getattr(args, "deployment_source_repos", ""),
             option_name="--deployment-source-repos",
@@ -323,6 +339,8 @@ def _make_deployment_target(
         }
         if resolved_max_runtime_s is not None:
             target_kwargs["max_runtime_s"] = float(resolved_max_runtime_s)
+        if target_name == "runpod":
+            return taaf.deploy_runpod.RunPodTarget(**target_kwargs, **_runpod_settings())
         return taaf.deploy_kaggle.KaggleTarget(**target_kwargs)
     if target_name != "slurm":
         raise ValueError(f"Unsupported deployment target: {args.deployment_target}")
@@ -513,14 +531,14 @@ def _run_root_for_target(args: argparse.Namespace) -> Path:
     """
     root = _experiments_dir(args)
     target = str(getattr(args, "deployment_target", "") or "").strip().lower()
-    if target != "kaggle":
+    if target not in ("kaggle", "runpod"):
         return root / "local"
     slug = _default_kaggle_kernel_slug(args)
     owner, _ = taaf.deploy_kaggle._resolve_kaggle_credentials(
         str(getattr(args, "kaggle_username", "") or "").strip() or None
     )
     bucket = "dry-runs" if bool(getattr(args, "kaggle_dry_run", False)) else "_pending"
-    return root / "kaggle" / taaf.deploy_kaggle.slugify(owner) / slug / bucket
+    return root / target / taaf.deploy_kaggle.slugify(owner) / slug / bucket
 
 
 def _promote_kaggle_run_dir(run_dir: Path, kernel_version: int | None) -> Path:
@@ -543,6 +561,19 @@ def _promote_kaggle_run_dir(run_dir: Path, kernel_version: int | None) -> Path:
         return run_dir
     run_dir.rename(target)
     print(f"deploy.kaggle: run dir -> {target}", flush=True)
+    return target
+
+
+def _promote_runpod_run_dir(run_dir: Path, pod_id: str) -> Path:
+    """Rename runs/runpod/<owner>/<slug>/_pending/<timestamp>/ to .../<pod_id>/."""
+    if run_dir.parent.name != "_pending":
+        return run_dir
+    target = run_dir.parent.parent / pod_id
+    if target.exists():
+        print(f"deploy.runpod: {target} already exists; leaving {run_dir} in _pending", flush=True)
+        return run_dir
+    run_dir.rename(target)
+    print(f"deploy.runpod: run dir -> {target}", flush=True)
     return target
 
 
@@ -1232,7 +1263,17 @@ def _run(args: argparse.Namespace) -> None:
                 run_dir = promoted
                 with contextlib.suppress(Exception):
                     handle.job_dir = run_dir
-        if kernel_id:
+        pod_id = getattr(handle, "pod_id", "")
+        if pod_id:
+            promoted = _promote_runpod_run_dir(run_dir, pod_id)
+            if promoted != run_dir:
+                run_dir = promoted
+                with contextlib.suppress(Exception):
+                    handle.job_dir = run_dir
+            print(f"RunPod pod: {pod_id} (https://console.runpod.io/pods?id={pod_id})")
+            print(f"RunPod output dataset: {getattr(handle, 'output_dataset', '')}")
+            print(f"Fetch when done: make pull-runpod RUN_DIR={run_dir}")
+        if kernel_id and not pod_id:
             print(f"Kaggle kernel: {kernel_id}")
             print(f"Kaggle notebook: https://www.kaggle.com/code/{kernel_id}")
             dataset_ref = getattr(handle, "dataset_ref", "")
@@ -1240,7 +1281,7 @@ def _run(args: argparse.Namespace) -> None:
                 print(f"Kaggle source dataset: {dataset_ref}")
             if not uploaded:
                 print(f"Kaggle dry-run bundles: {run_dir}")
-        elif job_id:
+        elif job_id and not pod_id:
             print(f"Slurm job id: {job_id}")
             print(f"Slurm stdout: {run_dir / 'stdout.log'}")
             print(f"Slurm stderr: {run_dir / 'stderr.log'}")
@@ -1319,7 +1360,7 @@ def main() -> None:
         default=120,
     )
     parser.add_argument(
-        "--deployment-target", choices=["inline", "slurm", "kaggle"], default="inline"
+        "--deployment-target", choices=["inline", "slurm", "kaggle", "runpod"], default="inline"
     )
     parser.add_argument(
         "--deployment-wait",
