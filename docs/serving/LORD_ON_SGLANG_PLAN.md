@@ -12,7 +12,7 @@ The engine is fine; its tuning is for Daniel's model. Daniel's patches speed up 
 
 | # | Patch | Targets | Daniel's model | Lord's model | What to do |
 |---|---|---|---|---|---|
-| 1 | Low-M BF16 GEMM | Small BF16 matmuls (≤ 32 tokens) | Speeds up all attention projections | Mostly bypassed: attention is FP8 | Give FP8 attention a small-batch path; widen the BF16 path to 64 for the layers still in BF16 |
+| 1 | Low-M BF16 GEMM | Small BF16 matmuls (≤ 32 tokens) | Speeds up all attention projections | Mostly bypassed: attention is FP8 | Give FP8 attention a small-batch path; widen the BF16 path to 56 for the layers still in BF16 |
 | 2 | Spec-state memory budget | Draft-head memory | Applies | Applies | Keep |
 | 3 | Marlin scale dtype | Marlin expert loading | Experts on Marlin W4A16 | Experts on FlashInfer CUTLASS NVFP4 | Run NVFP4 experts on Marlin (the fork has it, but not for Lord's file format) |
 | 4 | Prefix-cache retention | Cache policy | Works (94.5% hit) | Works (93.3% hit) | Keep |
@@ -22,9 +22,12 @@ The engine is fine; its tuning is for Daniel's model. Daniel's patches speed up 
 
 Fix the target at **14 streams**, as Lord runs. His model's real advantage is KV capacity: 1.42M tokens on vLLM against Daniel's 1.01M. On SGLang it got only 0.92M so far, because `embed_tokens` stays on the GPU and memory is budgeted Daniel's way. So KV room comes first, then every patch is tuned for 14 streams. With 4 verify tokens per stream, small batches now reach 56 tokens, above the current 32-token limit.
 
-1. **KV room for 14 streams.** Move `embed_tokens` to host memory (Lord's trick) and retune the memory fraction and CUDA-graph sizes for 14 streams.
+1. **KV room for 14 streams.** Move `embed_tokens` to host memory (Lord's trick) and retune the memory fraction. Raise the stream count from 10 to 14 everywhere it is set: the harness gate (`ARC3_MAX_ACTIVE_STREAMS`) and the server (`MAXREQ`, `CUDAGRAPH_MAXBS`).
 2. **Experts on Marlin** (replaces what patch 3 did for Daniel). Experts are most of the weights read per step.
 3. **Small-batch paths for 14 streams** (patch 1, retuned): an FP8 path for attention, and the BF16 path widened for the layers still in BF16. Raise the limit from 32 to 56 tokens and tune tile settings for 56 only (all 14 streams verifying). Capture a CUDA graph at 14 so batches aren't padded to 16. Smaller batch sizes (48, 52) and larger concurrency come later, if 56 pays off.
 4. **Loading** (patch 5, retuned): fix the slow step, and start games only after the server is ready.
 
 One change per run, all at 14 streams, compared against the v1 numbers. Run on RunPod (no queue). Confirm the final setup on Kaggle.
+
+
+
