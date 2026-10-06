@@ -40,6 +40,7 @@ import taaf.deploy_kaggle
 from taaf.runpod_pod import output_dataset_ref
 
 RUNPOD_REST_URL = "https://rest.runpod.io/v1"
+RUNPOD_GRAPHQL_URL = "https://api.runpod.io/graphql"
 DEFAULT_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
 DEFAULT_GPU_TYPE_IDS: tuple[str, ...] = (
     "NVIDIA RTX PRO 6000 Blackwell Server Edition",
@@ -54,6 +55,12 @@ _BOOTSTRAP = r"""
 set -uo pipefail
 mkdir -p /kaggle/working
 exec > >(tee -a /kaggle/working/runpod_bootstrap.log) 2>&1
+# SSH for debugging a live run: RunPod injects the account's PUBLIC_KEY.
+if [ -n "${PUBLIC_KEY:-}" ] && [ -x /usr/sbin/sshd ]; then
+  mkdir -p ~/.ssh /run/sshd && chmod 700 ~/.ssh
+  echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+  ssh-keygen -A >/dev/null 2>&1; /usr/sbin/sshd || echo "taaf.runpod: sshd failed to start"
+fi
 delete_pod() {
   echo "taaf.runpod: deleting pod $RUNPOD_POD_ID ($1)"
   curl -sS -X DELETE -H "Authorization: Bearer $TAAF_RUNPOD_API_KEY" \
@@ -148,6 +155,11 @@ class RunPodTarget(taaf.deploy_kaggle.KaggleTarget):
       model's Kaggle mount path; unmapped ones come from Kaggle.
     - ``hard_limit_s``: the pod deletes itself after this long. Defaults to
       ``max_runtime_s`` plus 90 minutes of staging and startup.
+    - ``startup_timeout_s``: ``deploy()`` waits this long for the container to
+      start, then deletes the pod and fails (a host can hang before the start
+      command ever runs, which the in-pod watchdog cannot catch).
+    - ``ssh``: expose port 22 with a public IP and start ``sshd`` with the
+      account's SSH key, for inspecting a live run.
     """
 
     gpu_type_ids: list[str] = field(default_factory=lambda: list(DEFAULT_GPU_TYPE_IDS))
@@ -162,6 +174,8 @@ class RunPodTarget(taaf.deploy_kaggle.KaggleTarget):
     data_center_ids: list[str] = field(default_factory=lambda: list[str]())
     hf_models: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     hard_limit_s: float | None = None
+    startup_timeout_s: float = 900.0
+    ssh: bool = True
 
     pod_id: str = field(default="", init=False)
     output_dataset: str = field(default="", init=False)
@@ -188,8 +202,17 @@ class RunPodTarget(taaf.deploy_kaggle.KaggleTarget):
         pod = create_pod(self.pod_payload(name=f"taaf-{slug}", env=env), api_key=api_key)
         self.pod_id = str(pod["id"])
         self.output_dataset = output_dataset_ref(owner, slug, self.pod_id)
-        print(f"deploy.runpod: pod {self.pod_id} created ({pod.get('machine', {}).get('gpuTypeId') or self.gpu_type_ids[0]})")
-        print(f"deploy.runpod: output dataset will be {self.output_dataset}")
+        print(f"deploy.runpod: pod {self.pod_id} created; waiting for its container to start")
+        if not wait_for_container(self.pod_id, timeout_s=self.startup_timeout_s, api_key=api_key):
+            delete_pod(self.pod_id, api_key=api_key)
+            raise RuntimeError(
+                f"RunPod pod {self.pod_id} did not start its container within {self.startup_timeout_s:.0f}s; "
+                "deleted it. Retry (another host) or widen gpu_type_ids / data_center_ids."
+            )
+        print(f"deploy.runpod: container running; output dataset will be {self.output_dataset}")
+        ssh = ssh_command(self.pod_id, api_key=api_key) if self.ssh else None
+        if ssh:
+            print(f"deploy.runpod: inspect with `{ssh}` (log: /kaggle/working/runpod_bootstrap.log)")
 
     def _job_id(self) -> str:
         return self.pod_id
@@ -224,7 +247,8 @@ class RunPodTarget(taaf.deploy_kaggle.KaggleTarget):
             "minRAMPerGPU": int(self.min_ram_per_gpu_gb),
             "minVCPUPerGPU": int(self.min_vcpu_per_gpu),
             "allowedCudaVersions": list(self.allowed_cuda_versions),
-            "ports": [],
+            "ports": ["22/tcp"] if self.ssh else [],
+            "supportPublicIp": bool(self.ssh),
             "env": env,
             "dockerEntrypoint": ["bash", "-c"],
             "dockerStartCmd": [_BOOTSTRAP],
@@ -277,6 +301,48 @@ def get_pod(pod_id: str, *, api_key: str | None = None) -> dict[str, Any] | None
         if exc.code == 404:
             return None
         raise
+
+
+def pod_runtime(pod_id: str, *, api_key: str | None = None) -> dict[str, Any] | None:
+    """The pod's live container runtime (uptime, ports), or None until the container runs.
+
+    Only RunPod's GraphQL API reports this; the REST pod record does not.
+    """
+    query = (
+        "query($id: String!) { pod(input: {podId: $id}) { runtime { uptimeInSeconds "
+        "ports { ip isIpPublic privatePort publicPort type } } } }"
+    )
+    request = urllib.request.Request(
+        RUNPOD_GRAPHQL_URL,
+        data=json.dumps({"query": query, "variables": {"id": pod_id}}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key or runpod_api_key()}",
+            "Content-Type": "application/json",
+            "User-Agent": "taaf-runpod/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        pod = (json.load(response).get("data") or {}).get("pod") or {}
+    return cast(dict[str, Any] | None, pod.get("runtime"))
+
+
+def wait_for_container(pod_id: str, *, timeout_s: float, api_key: str | None = None, poll_s: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            if pod_runtime(pod_id, api_key=api_key):
+                return True
+        except (urllib.error.URLError, TimeoutError) as exc:
+            print(f"deploy.runpod: runtime poll failed ({exc!r}); retrying")
+        time.sleep(poll_s)
+    return False
+
+
+def ssh_command(pod_id: str, *, api_key: str | None = None) -> str | None:
+    for port in (pod_runtime(pod_id, api_key=api_key) or {}).get("ports") or []:
+        if port.get("privatePort") == 22 and port.get("isIpPublic"):
+            return f"ssh -i ~/.ssh/id_ed25519 -p {port['publicPort']} root@{port['ip']}"
+    return None
 
 
 def delete_pod(pod_id: str, *, api_key: str | None = None) -> None:

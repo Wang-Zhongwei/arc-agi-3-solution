@@ -509,6 +509,8 @@ The config's `runpod` section sets the pod:
 | `data_center_ids` | `[]` | Restrict to these RunPod data centers. |
 | `image` | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` | Pod image. Needs Python 3.12, `curl` and a C++ compiler; the notebook installs the serving stack itself. |
 | `hard_limit_s` | notebook budget + 90 min | The pod deletes itself after this long, whatever state the run is in. |
+| `startup_timeout_s` | `900` | `make runpod-duck` waits this long for the pod's container to start, then deletes the pod and fails. A host can hang before the start command runs, which the in-pod limit cannot catch. |
+| `ssh` | `true` | Expose port 22 with a public IP and start `sshd` with the RunPod account's SSH key. The deploy prints the `ssh` command; the pod's log is `/kaggle/working/runpod_bootstrap.log`. |
 
 ## 14. Diagnostics, transcript viewer, and build plumbing
 

@@ -85,7 +85,26 @@ def test_pod_payload_requests_rtx_pro_6000_with_cuda13_and_bootstrap():
     assert payload["dockerEntrypoint"] == ["bash", "-c"]
     assert "runpod_pod.py" in payload["dockerStartCmd"][0]
     assert payload["env"] == {"A": "1"}
+    assert payload["ports"] == ["22/tcp"] and payload["supportPublicIp"] is True
     assert "dataCenterIds" not in payload
+    no_ssh = taaf.deploy_runpod.RunPodTarget(ssh=False).pod_payload(name="x", env={})
+    assert no_ssh["ports"] == [] and no_ssh["supportPublicIp"] is False
+
+
+def test_ssh_command_uses_public_port_22(monkeypatch):
+    ports = [
+        {"ip": "10.0.0.1", "isIpPublic": False, "privatePort": 22, "publicPort": 22, "type": "tcp"},
+        {"ip": "203.0.113.7", "isIpPublic": True, "privatePort": 22, "publicPort": 40123, "type": "tcp"},
+    ]
+    monkeypatch.setattr(taaf.deploy_runpod, "pod_runtime", lambda pod_id, api_key=None: {"ports": ports})
+    assert taaf.deploy_runpod.ssh_command("p") == "ssh -i ~/.ssh/id_ed25519 -p 40123 root@203.0.113.7"
+
+
+def test_wait_for_container_gives_up_when_runtime_never_appears(monkeypatch):
+    monkeypatch.setattr(taaf.deploy_runpod, "pod_runtime", lambda pod_id, api_key=None: None)
+    assert taaf.deploy_runpod.wait_for_container("p", timeout_s=0.05, poll_s=0.01) is False
+    monkeypatch.setattr(taaf.deploy_runpod, "pod_runtime", lambda pod_id, api_key=None: {"uptimeInSeconds": 3})
+    assert taaf.deploy_runpod.wait_for_container("p", timeout_s=1, poll_s=0.01) is True
 
 
 def test_rest_requests_send_a_user_agent(monkeypatch):
