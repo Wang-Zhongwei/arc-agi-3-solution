@@ -1,15 +1,20 @@
 """Pennyroyal SGLang server for Qwen3.8 Flash Next on Kaggle, as a TAAF setup command.
 
 The serving logic is the launcher cell of dfranzen's milestone-2 notebook (as run
-in arc3-v207), unchanged. Only the notebook globals it expects are derived here
-from ARC3_PENNYROYAL_SPEC, which inference.framework.kaggle embeds from the
-config's kaggle section. Run by the TAAF notebook before the benchmark loads;
+in arc3-v207). The notebook globals it expects are derived here from
+ARC3_PENNYROYAL_SPEC, which inference.framework.kaggle embeds from the config's
+kaggle section. Beyond Daniel's AutoRound target + separate INT4 draft, it also
+serves a compressed-tensors target with an embedded MTP head (lordhansolo's mixed
+NVFP4/FP8 model), optionally with an FP8 PLE table swapped in
+(`ple_fp8_model_source`) and lordhansolo's shard window prefetch
+(`sglang.WINDOW_PREFETCH`); see pennyroyal_views.py. Run by the TAAF notebook before the benchmark loads;
 the server outlives this process (new session), and the analyzer settings plus
 the endpoint are handed to the run through TAAF_KAGGLE_SETUP_ENV.
 """
 import glob
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -47,6 +52,17 @@ def _model_dir(ref: str) -> str:
 WHEELHOUSE_DIR = _dataset_dir(SPEC["wheelhouse_dataset_source"])
 MODEL_DIR = _model_dir(SPEC["model_source"])
 DRAFT_MODEL_DIR = _model_dir(SPEC["draft_model_source"]) if SPEC.get("draft_model_source") else ""
+PLE_FP8_DIR = _model_dir(SPEC["ple_fp8_model_source"]) if SPEC.get("ple_fp8_model_source") else ""
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pennyroyal_views as views
+
+STARTUP_TIMES = {}
+
+
+def mark_startup(stage: str) -> None:
+    """Seconds from launcher start, written to pennyroyal-startup.json at the end."""
+    STARTUP_TIMES[stage] = round(time.time() - NOTEBOOK_START_TIME, 1)
+    print(f"[startup] {stage} at {STARTUP_TIMES[stage]}s", flush=True)
 
 from concurrent.futures import as_completed, ThreadPoolExecutor
 
@@ -115,6 +131,7 @@ def precache(*paths, times=1, delay=0, threads=16) -> None:
 precache_wheels_thread = threading.Thread(target=precache, args=(WHEELHOUSE_DIR,))
 precache_wheels_thread.start()
 precache_wheels_thread.join()
+mark_startup("wheels_precached")
 
 # Model read tuning from kaggle.sglang. 6 precache + 8 prefetch threads load about
 # 20% faster than Daniel's cell's 3 + 4; see docs/serving/startup-read-threads.md.
@@ -176,14 +193,27 @@ CFG = dict(
     # by sglang's reasoner grammar, which only filters tokens in strict mode.
     # Strict mode also keeps tool-call and end-of-turn tokens out of thinking.
     STRICT_THINKING=int(SPEC.get("env", {}).get("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET") or 0) > 0,
+    # lordhansolo's loader-following prefetch window (pennyroyal_views). It
+    # replaces both the in-process lookahead (PREFETCH_CHECKPOINTS) and the
+    # whole-directory precache, which would also read shards the view leaves out.
+    WINDOW_PREFETCH=False,
+    WINDOW_PREFETCH_GIB=8,
+    WINDOW_PREFETCH_THREADS=4,
 )
 CFG.update(SPEC.get("sglang", {}))
-CFG["SPEC"] = CFG["SPEC"] and bool(DRAFT_MODEL_DIR)
+if CFG["WINDOW_PREFETCH"]: CFG["PREFETCH_CHECKPOINTS"] = False
+CFG["SPEC"] = CFG["SPEC"] and (bool(DRAFT_MODEL_DIR) or views.has_embedded_mtp(MODEL_DIR))
 VENV = f"{PREFIX}/venv"
 PYTHON = f"{VENV}/bin/python"
 SGLANG = f"{VENV}/bin/sglang"
 TOKEN_MAP_SHA = "becfa41d394b86c26c632bea8f3c6ea64bbb76d7b238d8673c06afae21269f25"
-TOKENIZER_SHA = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+# Intel's tokenizer, and primitive-ai's (lordhansolo's model, RadixArk): the latter
+# re-serializes merges and adds \p{M} to the pre-tokenizer split, but its vocab
+# and added tokens are id-for-id identical, so the 64K map applies to both.
+TOKENIZER_SHAS = {
+    "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+}
 EXPERT_TARGET = r"re:^mtp\.layers\.0\.mlp\.experts\.[0-9]+\.(gate_proj|up_proj|down_proj)$"
 DENSE_IGNORE = r"re:^(?!mtp\.layers\.0\.mlp\.experts(?:\.|$)).*"
 
@@ -336,6 +366,7 @@ if not Path(SGLANG).exists() or not install_marker.is_file():
     install_marker.write_text('install')
 else:
     print(f"Matching offline bundle already installed at {VENV}")
+mark_startup("bundle_installed")
 
 # ---- bundled CUDA toolkit and linker symlinks ----
 cu13 = sorted(Path(VENV).glob("lib/python*/site-packages/nvidia/cu13"))
@@ -414,25 +445,39 @@ assert torch.cuda.is_available(), "CUDA unavailable"
 print("GPU:", torch.cuda.get_device_name(0), "capability:", torch.cuda.get_device_capability(0))
 '''], env=env)
 
-# ---- validate target and create the read-only draft's SGLang view ----
+# ---- validate target and create the read-only views SGLang serves ----
 target_cfg = json.loads(Path(MODEL_DIR, "config.json").read_text())
 q = target_cfg.get("quantization_config", {})
-assert q.get("quant_method") == "auto-round" and q.get("bits") == 4, "MODEL_DIR must be the Intel/albucino AutoRound INT4 checkpoint"
-_, target_shards = indexed_shards(MODEL_DIR)
-print("Target:", MODEL_DIR, "| shards:", len(target_shards), "| PLE dtype:", target_cfg.get("text_config", {}).get("ple_embedding_dtype", "checkpoint default (typically BF16)"))
+QUANT = q.get("quant_method")
+if QUANT == "auto-round":
+    assert q.get("bits") == 4, "AutoRound MODEL_DIR must be the Intel/albucino INT4 checkpoint"
+elif QUANT == "compressed-tensors":
+    print("Compressed-tensors target, format:", q.get("format"), "| groups:",
+          {k: g.get("format") for k, g in q.get("config_groups", {}).items()})
+else:
+    raise RuntimeError(f"Unsupported target quantization {QUANT!r}; expected auto-round or compressed-tensors")
+SERVE_DIR = str(views.build_target_view(MODEL_DIR, PLE_FP8_DIR, PREFIX)) if PLE_FP8_DIR else MODEL_DIR
+serve_cfg = json.loads(Path(SERVE_DIR, "config.json").read_text())
+_, target_shards = indexed_shards(SERVE_DIR)
+print("Target:", SERVE_DIR, "| shards:", len(target_shards), "| PLE dtype:", serve_cfg.get("text_config", {}).get("ple_embedding_dtype", "checkpoint default (typically BF16)"))
 DRAFT_VIEW = None
-if CFG["SPEC"]:
+if CFG["SPEC"] and DRAFT_MODEL_DIR:
     assert Path(DRAFT_MODEL_DIR).is_dir(), f"draft dir not found: {DRAFT_MODEL_DIR}"
-    DRAFT_VIEW = prepare_draft_view(MODEL_DIR, DRAFT_MODEL_DIR, PREFIX)
+    DRAFT_VIEW = prepare_draft_view(SERVE_DIR, DRAFT_MODEL_DIR, PREFIX)
+elif CFG["SPEC"]:
+    # The target's own MTP head; its experts are quantized under the target's
+    # compressed-tensors config, which the draft view keeps.
+    DRAFT_VIEW = views.build_mtp_draft_view(SERVE_DIR, PREFIX)
+mark_startup("views_ready")
 
 # ---- assemble Pennyroyal / AutoRound launch arguments ----
 graph_bs = sorted({1, 2, 4, 7, 8, 9, 10, CFG["MAXREQ"], CFG["CUDAGRAPH_MAXBS"]})
 graph_bs = [n for n in graph_bs if n <= CFG["CUDAGRAPH_MAXBS"]]
-args = [SGLANG, "serve", "--model-path", MODEL_DIR, "--load-format", "safetensors",
+args = [SGLANG, "serve", "--model-path", SERVE_DIR, "--load-format", "safetensors",
     "--model-loader-extra-config", '{"enable_multithread_load":false}',
     "--served-model-name", str(CFG["SERVED_NAME"]), "--host", "127.0.0.1",
     "--port", str(SERVED_MODEL_PORT), "--tensor-parallel-size", "1",
-    "--dtype", "bfloat16", "--quantization", "auto-round",
+    "--dtype", "bfloat16", "--quantization", QUANT,
     "--kv-cache-dtype", CFG["KVDTYPE"], "--mem-fraction-static", str(CFG["MEMFRAC"]),
     "--context-length", str(CFG["CTX"]), "--page-size", "64",
     "--max-running-requests", str(CFG["MAXREQ"]), "--chunked-prefill-size", str(CFG["CHUNK"]),
@@ -453,7 +498,7 @@ args = [SGLANG, "serve", "--model-path", MODEL_DIR, "--load-format", "safetensor
 if CFG["PREFETCH_CHECKPOINTS"]: args += ["--weight-loader-prefetch-checkpoints"]
 if CFG["DROP_CACHE_AFTER_LOAD"]: args += ["--weight-loader-drop-cache-after-load"]
 args += ["--weight-loader-prefetch-num-threads", str(int(CFG["PREFETCH_THREADS"]))]
-tmpl = Path(MODEL_DIR, "chat_template.jinja")
+tmpl = Path(SERVE_DIR, "chat_template.jinja")
 if tmpl.is_file(): args += ["--chat-template", str(tmpl)]
 if not CFG["AUTOTUNE"]: args += ["--disable-flashinfer-autotune"]
 if CFG["GDN_MTP_CACHE_MODE"]: args += ["--gdn-mtp-cache-mode", CFG["GDN_MTP_CACHE_MODE"]]
@@ -470,18 +515,29 @@ if CFG["SPEC"]:
         tok = find_unique(WHEELHOUSE_DIR, "hot_tokens_64k.pt", required=False)
         if tok is None: tok = find_unique(WHEELHOUSE_DIR, "flash-next-64k.pt")
         assert sha256(tok) == TOKEN_MAP_SHA, "Wrong FR-Spec map; use the map from the pinned Pennyroyal bundle"
-        assert sha256(Path(MODEL_DIR, "tokenizer.json")) == TOKENIZER_SHA, "Tokenizer differs from the FR-Spec map; set CFG['FRSPEC']=False"
+        assert sha256(Path(SERVE_DIR, "tokenizer.json")) in TOKENIZER_SHAS, "Tokenizer differs from the FR-Spec map; set CFG['FRSPEC']=False"
         args += ["--speculative-token-map", str(tok)]
 
 # ---- launch detached and wait for health ----
-if precache_model_thread and not MODEL_PRECACHE_EARLY:
-    precache_model_thread.start()
 print("\n" + shlex.join(args) + "\n")
 log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
+window_prefetch = None
+if CFG["WINDOW_PREFETCH"]:
+    phases = [("target", views.loader_shard_order(SERVE_DIR))]
+    if DRAFT_VIEW is not None:
+        phases.append(("draft", views.loader_shard_order(DRAFT_VIEW)))
+    window_prefetch = views.ShardWindowPrefetcher(
+        phases, LOG, Path(WORKING_DIR, "pennyroyal-shard-prefetch.json"), log_offset=log_offset,
+        threads=int(CFG["WINDOW_PREFETCH_THREADS"]), window_bytes=int(float(CFG["WINDOW_PREFETCH_GIB"]) * 1024**3),
+        deadline_seconds=SERVER_STARTUP_TIMEOUT)
+    window_prefetch.start()
+elif precache_model_thread and not MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
 with open(LOG, "ab", buffering=0) as logf:
     proc = subprocess.Popen(args, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
 print(f"pid {proc.pid} -> {LOG}")
 Path(WORKING_DIR, "sglang-server.pid").write_text(str(proc.pid))
+mark_startup("server_launched")
 
 def show_log_tail():
     with open(LOG, "rb") as f:
@@ -499,6 +555,7 @@ while time.time() - NOTEBOOK_START_TIME < SERVER_STARTUP_TIMEOUT:
         with urllib.request.urlopen(url, timeout=5) as r:
             if r.status == 200:
                 print(f"\nREADY after {int(time.time()-t0)}s -> {url.replace('/health','/v1')}")
+                mark_startup("server_ready")
                 break
     except Exception:
         pass
@@ -509,6 +566,14 @@ while time.time() - NOTEBOOK_START_TIME < SERVER_STARTUP_TIMEOUT:
 else:
     print(f"\nDEADLINE at {int(time.time()-NOTEBOOK_START_TIME)}s from notebook start; "
           f"releasing the benchmark with the server still loading")
+
+if window_prefetch is not None:
+    window_prefetch.stop()
+    window_prefetch.join(timeout=5)
+Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
+    {"seconds_from_launcher_start": STARTUP_TIMES, "target": SERVE_DIR, "draft": str(DRAFT_VIEW or ""),
+     "quantization": QUANT, "ple_fp8_source": PLE_FP8_DIR, "window_prefetch": bool(CFG["WINDOW_PREFETCH"]),
+     "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"])}, indent=1))
 
 # ---- hand the endpoint and analyzer settings to the run ----
 base_url = f"http://127.0.0.1:{SERVED_MODEL_PORT}/v1"
