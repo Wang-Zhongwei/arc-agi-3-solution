@@ -551,7 +551,7 @@ The config's `runpod` section sets the pod:
 
 | Setting | Default | Behavior |
 |---|---|---|
-| `hf_models` | `{}` | Kaggle model ref → `repo[@revision][:subdir]` on Hugging Face. Mapped models download from Hugging Face into the model's Kaggle mount path; `:subdir` keeps one folder of the repo. Pin `@revision` for reproducible weights. |
+| `hf_models` | `{}` | Kaggle model ref → `repo[@revision][:subdir][+overlay]` on Hugging Face. Mapped models download from Hugging Face into the model's Kaggle mount path; `:subdir` keeps one folder of the repo. `+overlay` mounts a symlink view of the model root in which that folder's files take precedence: `+mtp_nvfp4` rebuilds lordhansolo's Kaggle package from primitive-ai's repo. Pin `@revision` for reproducible weights. |
 | `gpu_type_ids` | RTX PRO 6000 Blackwell Server, then Workstation | RunPod GPU types, tried in order. |
 | `cloud_type` | `SECURE` | `SECURE` or `COMMUNITY`. |
 | `container_disk_gb` | `400` | Local disk for models, wheels and the serving venv. Flash Next is 181 GB on Hugging Face. |

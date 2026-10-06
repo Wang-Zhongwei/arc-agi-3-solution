@@ -39,6 +39,35 @@ def test_parse_hf_source(source, expected):
     assert pod.parse_hf_source(source) == expected
 
 
+def test_split_overlay():
+    assert pod.split_overlay("org/repo@rev+mtp_nvfp4/") == ("org/repo@rev", "mtp_nvfp4")
+    assert pod.split_overlay("org/repo@rev:sub") == ("org/repo@rev:sub", "")
+
+
+def test_overlay_view_replaces_and_adds_files(tmp_path):
+    base = tmp_path / "repo"
+    (base / "mtp_nvfp4").mkdir(parents=True)
+    (base / "assets").mkdir()
+    for name, text in {"config.json": "root", "shard-1.safetensors": "root", ".gitattributes": "x"}.items():
+        (base / name).write_text(text)
+    for name in ("config.json", "mtp-experts.safetensors"):
+        (base / "mtp_nvfp4" / name).write_text("overlay")
+    dest = tmp_path / "view"
+    pod.link_overlay_view(base, base / "mtp_nvfp4", dest)
+    assert sorted(p.name for p in dest.iterdir()) == [
+        "assets", "config.json", "mtp-experts.safetensors", "shard-1.safetensors",
+    ]
+    assert (dest / "config.json").read_text() == "overlay"
+    assert (dest / "shard-1.safetensors").read_text() == "root"
+    assert (dest / "assets").is_dir()
+
+
+def test_overlay_view_requires_the_overlay_folder(tmp_path):
+    (tmp_path / "repo").mkdir()
+    with pytest.raises(FileNotFoundError):
+        pod.link_overlay_view(tmp_path / "repo", tmp_path / "repo" / "missing", tmp_path / "view")
+
+
 def test_bundle_requirements_drop_bundled_projects_and_competition_wheels(tmp_path):
     for name, deps in {
         "ARC3-Inference": ['"arcengine==0.9.3"', '"tufa-arc-agi-framework"', '"requests==2.32.5"'],
