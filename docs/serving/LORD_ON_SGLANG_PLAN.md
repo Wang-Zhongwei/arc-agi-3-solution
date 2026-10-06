@@ -24,7 +24,7 @@ Fix the target at **14 streams**, as Lord runs. His model's real advantage is KV
 
 1. **KV room for 14 streams.** Move `embed_tokens` to host memory (Lord's trick) and retune the memory fraction and CUDA-graph sizes for 14 streams.
 2. **Experts on Marlin** (replaces what patch 3 did for Daniel). Experts are most of the weights read per step.
-3. **Small-batch paths for 14 streams** (patch 1, retuned): an FP8 path for attention, and the BF16 path widened for the layers still in BF16. Raise the limit from 32 to 64 tokens. Tune tile settings for 56 first (all 14 streams verifying), then 48 and 52 (12–13 streams). 64 only needs to not be slow; capture a CUDA graph at 14 so batches aren't padded to 16. Streams never exceed 14, so nothing above 64 is needed unless concurrency is raised later.
+3. **Small-batch paths for 14 streams** (patch 1, retuned): an FP8 path for attention, and the BF16 path widened for the layers still in BF16. Raise the limit from 32 to 56 tokens and tune tile settings for 56 only (all 14 streams verifying). Capture a CUDA graph at 14 so batches aren't padded to 16. Smaller batch sizes (48, 52) and larger concurrency come later, if 56 pays off.
 4. **Loading** (patch 5, retuned): fix the slow step, and start games only after the server is ready.
 
 One change per run, all at 14 streams, compared against the v1 numbers. Run on RunPod (no queue). Confirm the final setup on Kaggle.
