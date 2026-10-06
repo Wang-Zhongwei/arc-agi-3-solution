@@ -232,7 +232,7 @@ def real_layer(model_dir):
     return (w13, s13, g13, w2, s2, g2)
 
 
-def server_path(tensors):
+def server_path(tensors, name="server-path"):
     """The patched scheme's own conversion + self-check, as the server ran it."""
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
         compressed_tensors_w4a4_nvfp4_moe as scheme,
@@ -240,7 +240,39 @@ def server_path(tensors):
 
     scheme._marlin_checked = False
     scheme._process_nvfp4_moe_for_marlin(moe_layer(*tensors))
-    RESULTS.append({"case": "server-path", "ok": True})
+    RESULTS.append({"case": name, "ok": True})
+
+
+def server_path_bf16_default(tensors):
+    """The loader runs process_weights_after_loading under set_default_torch_dtype(bf16)."""
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        server_path(tensors, "server-path-bf16-default")
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def bf16_topk_repro(tensors):
+    """v1's failure: BF16 top-k weights, which Marlin reads as float32."""
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+
+    layer = moe_layer(*tensors)
+    prepare_moe(layer)
+    m, e = 8, 0
+    x = torch.randn((m, tensors[3].shape[1]), device=DEVICE).to(DTYPE)
+    want, _ = expert_reference(tensors, e, x)
+    got = fused_marlin_moe(
+        hidden_states=x, w1=layer.w13_weight, w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale,
+        gating_output=torch.zeros((m, tensors[0].shape[0]), device=DEVICE),
+        topk_weights=torch.ones((m, 1), dtype=torch.bfloat16, device=DEVICE),
+        topk_ids=torch.full((m, 1), e, dtype=torch.int32, device=DEVICE),
+        w1_global_scale=layer.w13_weight_scale_2, w2_global_scale=layer.w2_weight_scale_2,
+        num_bits=4,
+    )
+    # Expected to fail; recorded so the cause is on file.
+    compare("repro-bf16-topk-weights", got, want, expert=e, m=m, expect_fail=True)
 
 
 def main():
@@ -266,6 +298,8 @@ def main():
             last = tensors["real"][0].shape[0] - 1
             run_case("moe-real", lambda: moe_cases("moe-real", tensors["real"], experts=(0, 1, last)))
             run_case("server-path", lambda: server_path(tensors["real"]))
+            run_case("server-path-bf16-default", lambda: server_path_bf16_default(tensors["real"]))
+            run_case("repro-bf16-topk-weights", lambda: bf16_topk_repro(tensors["real"]))
     finally:
         out.write_text(json.dumps(RESULTS, indent=1))
         print(f"wrote {out}: {sum(1 for r in RESULTS if r.get('ok'))} ok, "
