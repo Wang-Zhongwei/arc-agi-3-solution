@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := interactive
 
-.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck run _taaf-run chat eval score_run significance view pull-kaggle trace traces zip clean cluster_view_queue
+.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval score_run significance view pull-kaggle pull-runpod trace traces zip clean cluster_view_queue
 
 -include .env
 
@@ -310,6 +310,8 @@ DEPLOYMENT_SLURM_LOCAL_SERVER_CONFIG ?= $(CONFIG_PATH)
 ARC3_HARNESS_ENV_JSON := $(shell $(CONFIG_VALUE) harness_env {})
 # Kaggle serving (kaggle.serving = vllm | pennyroyal, model/wheel sources, image).
 ARC3_KAGGLE_JSON := $(shell $(CONFIG_VALUE) kaggle {})
+# RunPod pod shape and Hugging Face model sources for make runpod-duck.
+ARC3_RUNPOD_JSON := $(shell $(CONFIG_VALUE) runpod {})
 ifeq ($(origin MULTIMODAL_CONTEXT),undefined)
 MULTIMODAL_CONTEXT := $(shell $(CONFIG_VALUE) multimodal.context)
 endif
@@ -383,6 +385,7 @@ export LOCAL_ANALYZER_APP_NAME
 export MULTIMODAL_CONTEXT
 export ARC3_HARNESS_ENV_JSON
 export ARC3_KAGGLE_JSON
+export ARC3_RUNPOD_JSON
 export MULTIMODAL_UPSCALE
 export CHAT_PROVIDER
 export OPENROUTER_API_KEY
@@ -568,17 +571,17 @@ sbatch: install-local-sources
 sbatch: _taaf-run
 
 kaggle-duck: DEPLOYMENT_TARGET = kaggle
-kaggle-duck: KAGGLE_DUCK_PUBLIC_HARNESS = true
-kaggle-duck: AGENT = duck-harness
-kaggle-duck: GAME =
-kaggle-duck: DATASET =
-kaggle-duck: GAME_TAGS =
-kaggle-duck: EXCLUDE_GAME_TAGS =
-kaggle-duck: MODEL = local
-kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
+kaggle-duck runpod-duck: KAGGLE_DUCK_PUBLIC_HARNESS = true
+kaggle-duck runpod-duck: AGENT = duck-harness
+kaggle-duck runpod-duck: GAME =
+kaggle-duck runpod-duck: DATASET =
+kaggle-duck runpod-duck: GAME_TAGS =
+kaggle-duck runpod-duck: EXCLUDE_GAME_TAGS =
+kaggle-duck runpod-duck: MODEL = local
+kaggle-duck runpod-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
 # Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments;
-# the runner adds kaggle/<owner>/<slug>/.
-kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
+# the runner adds kaggle/ or runpod/<owner>/<slug>/.
+kaggle-duck runpod-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
 # Both runs play every game in one wave, as in dfranzen's Milestone 2 notebook:
 # every game is live from the start (CONCURRENT_JOBS at least the game count; the
 # notebook raises it if not) and the priority or UCB gate (ARC3_MAX_ACTIVE_STREAMS)
@@ -588,13 +591,19 @@ kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
 # play time; it ignores the soft end.
 # Public run: plays kaggle.public_games and stops at its soft end,
 # kaggle.public_runtime_minutes after notebook start.
-kaggle-duck: MAX_RUNTIME_MINUTES = $(KAGGLE_PRIVATE_RUNTIME_MINUTES)
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = $(KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES)
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
-kaggle-duck: N_PASSES = 1
-kaggle-duck: CONCURRENT_JOBS = $(KAGGLE_CONCURRENT_JOBS)
-kaggle-duck: ANALYZER_TIMEOUT = 900
+kaggle-duck runpod-duck: MAX_RUNTIME_MINUTES = $(KAGGLE_PRIVATE_RUNTIME_MINUTES)
+kaggle-duck runpod-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = $(KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES)
+kaggle-duck runpod-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
+kaggle-duck runpod-duck: N_PASSES = 1
+kaggle-duck runpod-duck: CONCURRENT_JOBS = $(KAGGLE_CONCURRENT_JOBS)
+kaggle-duck runpod-duck: ANALYZER_TIMEOUT = 900
 kaggle-duck: _taaf-run
+
+# Same notebook bundle as kaggle-duck, run on a RunPod GPU pod instead of Kaggle.
+# The pod stages /kaggle/input itself (models from Hugging Face per runpod.hf_models),
+# uploads /kaggle/working as a private Kaggle dataset and deletes itself.
+runpod-duck: DEPLOYMENT_TARGET = runpod
+runpod-duck: _taaf-run
 
 _taaf-run:
 	@if [ -z "$(strip $(MODEL))" ]; then \
@@ -712,6 +721,16 @@ view:
 		--runs-dir "$(VIEW_RUNS_DIR)" \
 		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)") \
 		$(if $(VIEW_ENVIRONMENTS_DIR),--environments-dir "$(VIEW_ENVIRONMENTS_DIR)")
+
+pull-runpod:
+	@if [ -z "$(RUN_DIR)" ]; then \
+		echo "Usage: make pull-runpod RUN_DIR=runs/runpod/<owner>/<slug>/<pod-id> [WAIT=true] [STOP=true]"; \
+		exit 1; \
+	fi
+	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src:$$PYTHONPATH" $(UV_RUN) python -m inference.tools.pull_runpod \
+		"$(RUN_DIR)" \
+		$(if $(filter true TRUE 1 yes YES on ON,$(WAIT)),--wait) \
+		$(if $(filter true TRUE 1 yes YES on ON,$(STOP)),--stop)
 
 pull-kaggle:
 	@if [ -z "$(NOTEBOOK)" ] || [ -z "$(VERSION)" ]; then \
