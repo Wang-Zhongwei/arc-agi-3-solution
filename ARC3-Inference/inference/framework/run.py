@@ -1281,7 +1281,7 @@ def _run(args: argparse.Namespace) -> None:
                 print(f"Kaggle source dataset: {dataset_ref}")
             if not uploaded:
                 print(f"Kaggle dry-run bundles: {run_dir}")
-        elif job_id:
+        elif job_id and not pod_id:
             print(f"Slurm job id: {job_id}")
             print(f"Slurm stdout: {run_dir / 'stdout.log'}")
             print(f"Slurm stderr: {run_dir / 'stderr.log'}")
