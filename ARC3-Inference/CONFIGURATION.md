@@ -576,7 +576,13 @@ With `kaggle.serving: "pennyroyal"`, [`pennyroyal_launch.py`](inference/framewor
 | `draft_model_source` | Separate INT4 MTP draft (Albucino). Omit it to draft with the target's embedded MTP head; the launcher then serves a view of only the MTP, embedding and LM-head shards. |
 | `ple_fp8_model_source` | Optional checkpoint whose FP8 PLE table (`model-plefp8-*` + `weight_scale`) replaces the target's BF16 table in a symlink view. Shapes must match 1:1; GPU tensors are unchanged. |
 | `sglang.WINDOW_PREFETCH` | `false` by default. `true` uses lordhansolo's loader-following prefetch (4 threads, 8 GiB window: `WINDOW_PREFETCH_THREADS`, `WINDOW_PREFETCH_GIB`) and turns off Daniel's one-shard lookahead and the whole-directory precache. Writes `pennyroyal-shard-prefetch.json`. |
-| `sglang.<KEY>` | Any other launcher setting (`MEMFRAC`, `SPEC_STEPS`, ...). |
+| `sglang.EMBED_TOKENS_HOST` | `false` by default. `true` keeps `embed_tokens` in pinned host memory, gathered by the PLE kernel (lordhansolo's trick); the MTP draft shares the table. Frees about 1.2 GiB of GPU for KV. |
+| `sglang.MOE_MARLIN` | `false` by default. `true` runs compressed-tensors NVFP4 experts on Marlin W4A16 instead of FlashInfer CUTLASS. The first MoE layer is checked against a dequantized reference at load; a mismatch stops the server. |
+| `sglang.LOWM_FP8` | `false` by default. `true` sends FP8 channelwise linears with at most `LOWM_MAX_M` rows to a weight-only split-K Triton GEMM. Each shape is checked once against a dense reference; one that fails keeps the stock path. |
+| `sglang.LOWM_MAX_M` | `32` (Daniel's). Row limit for that FP8 path and Daniel's low-M BF16 GEMM; `56` covers 14 streams × 4 verify tokens. |
+| `sglang.TUNEUP_FALLBACK` | `true` by default. If a server started with the three flags above exits before it is ready, relaunch once without them. `pennyroyal-startup.json` records it under `tuneup.fallback`. |
+| `sglang.STACK_DUMP` | `false` by default. `true` makes every server process write its Python stacks to `stack-dumps/` every `STACK_DUMP_INTERVAL_S` (15) seconds until the startup timeout. Used to find the slow step in weight loading. |
+| `sglang.<KEY>` | Any other launcher setting (`MEMFRAC`, `MAXREQ`, `CUDAGRAPH_MAXBS`, `SPEC_STEPS`, ...). Setting `MAXREQ` also adds a CUDA graph at that batch size. |
 
 Every Pennyroyal run writes `pennyroyal-startup.json` with stage times from launcher start (`bundle_installed`, `views_ready`, `server_launched`, `server_ready`).
 

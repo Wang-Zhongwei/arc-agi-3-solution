@@ -7,7 +7,9 @@ kaggle section. Beyond Daniel's AutoRound target + separate INT4 draft, it also
 serves a compressed-tensors target with an embedded MTP head (lordhansolo's mixed
 NVFP4/FP8 model), optionally with an FP8 PLE table swapped in
 (`ple_fp8_model_source`) and lordhansolo's shard window prefetch
-(`sglang.WINDOW_PREFETCH`); see pennyroyal_views.py. Run by the TAAF notebook before the benchmark loads;
+(`sglang.WINDOW_PREFETCH`); see pennyroyal_views.py. Tuning flags for that model
+(`sglang.EMBED_TOKENS_HOST`, `MOE_MARLIN`, `LOWM_FP8`, `LOWM_MAX_M`) patch the installed
+SGLang first; see pennyroyal_patches.py. Run by the TAAF notebook before the benchmark loads;
 the server outlives this process (new session), and the analyzer settings plus
 the endpoint are handed to the run through TAAF_KAGGLE_SETUP_ENV.
 """
@@ -199,6 +201,19 @@ CFG = dict(
     WINDOW_PREFETCH=False,
     WINDOW_PREFETCH_GIB=8,
     WINDOW_PREFETCH_THREADS=4,
+    # Tuning for lordhansolo's model (pennyroyal_patches.py). Off by default;
+    # any of the first three installs the source patches before launch.
+    EMBED_TOKENS_HOST=False,
+    MOE_MARLIN=False,
+    LOWM_FP8=False,
+    LOWM_MAX_M=32,
+    # If the tuned server exits before it is ready (a failed self-check, a
+    # kernel that does not compile), relaunch once with the tuning off.
+    TUNEUP_FALLBACK=True,
+    # Periodic Python stack dumps of the server processes (stackdump/), to
+    # find what the weight loader spends its time on.
+    STACK_DUMP=False,
+    STACK_DUMP_INTERVAL_S=15,
 )
 CFG.update(SPEC.get("sglang", {}))
 if CFG["WINDOW_PREFETCH"]: CFG["PREFETCH_CHECKPOINTS"] = False
@@ -368,6 +383,26 @@ else:
     print(f"Matching offline bundle already installed at {VENV}")
 mark_startup("bundle_installed")
 
+# ---- tuning patches for lordhansolo's model (no-ops unless their env flags are set) ----
+TUNEUP_ENV = {
+    "SGLANG_QWEN4_EXP_HOST_EMBED_TOKENS": "1" if CFG["EMBED_TOKENS_HOST"] else "",
+    "SGLANG_CT_NVFP4_MOE_MARLIN": "1" if CFG["MOE_MARLIN"] else "",
+    "SGLANG_SM120_LOWM_FP8_GEMM": "1" if CFG["LOWM_FP8"] else "",
+}
+TUNEUP_ENV = {k: v for k, v in TUNEUP_ENV.items() if v}
+TUNEUP = {"requested": sorted(TUNEUP_ENV), "low_m_max": int(CFG["LOWM_MAX_M"]), "patched": [], "fallback": None}
+if TUNEUP_ENV or int(CFG["LOWM_MAX_M"]) != 32:
+    import pennyroyal_patches
+    site_packages = sorted(Path(VENV).glob("lib/python*/site-packages"))
+    try:
+        TUNEUP["patched"] = pennyroyal_patches.apply(site_packages[0])
+        print("Tuning patches applied:", TUNEUP["patched"] or "already present")
+    except Exception as exc:
+        print(f"Tuning patches not applied, serving untuned: {exc}")
+        TUNEUP["fallback"] = f"patch: {exc}"
+        TUNEUP_ENV, CFG["LOWM_MAX_M"] = {}, 32
+mark_startup("patches_applied")
+
 # ---- bundled CUDA toolkit and linker symlinks ----
 cu13 = sorted(Path(VENV).glob("lib/python*/site-packages/nvidia/cu13"))
 if not cu13 or not (cu13[0] / "bin/nvcc").is_file():
@@ -520,60 +555,97 @@ if CFG["SPEC"]:
 
 # ---- launch detached and wait for health ----
 print("\n" + shlex.join(args) + "\n")
-log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
-window_prefetch = None
-if CFG["WINDOW_PREFETCH"]:
-    phases = [("target", views.loader_shard_order(SERVE_DIR))]
-    if DRAFT_VIEW is not None:
-        phases.append(("draft", views.loader_shard_order(DRAFT_VIEW)))
-    window_prefetch = views.ShardWindowPrefetcher(
-        phases, LOG, Path(WORKING_DIR, "pennyroyal-shard-prefetch.json"), log_offset=log_offset,
-        threads=int(CFG["WINDOW_PREFETCH_THREADS"]), window_bytes=int(float(CFG["WINDOW_PREFETCH_GIB"]) * 1024**3),
-        deadline_seconds=SERVER_STARTUP_TIMEOUT)
-    window_prefetch.start()
-elif precache_model_thread and not MODEL_PRECACHE_EARLY:
-    precache_model_thread.start()
-with open(LOG, "ab", buffering=0) as logf:
-    proc = subprocess.Popen(args, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
-print(f"pid {proc.pid} -> {LOG}")
-Path(WORKING_DIR, "sglang-server.pid").write_text(str(proc.pid))
-mark_startup("server_launched")
+if CFG["STACK_DUMP"]:
+    env.update({
+        "PYTHONPATH": str(Path(__file__).resolve().parent / "stackdump"),
+        "ARC3_STACK_DUMP_DIR": str(Path(WORKING_DIR, "stack-dumps")),
+        "ARC3_STACK_DUMP_INTERVAL": str(CFG["STACK_DUMP_INTERVAL_S"]),
+        "ARC3_STACK_DUMP_SECONDS": str(SERVER_STARTUP_TIMEOUT),
+    })
 
-def show_log_tail():
+
+def launch(server_env, prefetch_report):
+    """Start the server detached; return (process, log offset, window prefetcher)."""
+    log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
+    window_prefetch = None
+    if CFG["WINDOW_PREFETCH"]:
+        phases = [("target", views.loader_shard_order(SERVE_DIR))]
+        if DRAFT_VIEW is not None:
+            phases.append(("draft", views.loader_shard_order(DRAFT_VIEW)))
+        window_prefetch = views.ShardWindowPrefetcher(
+            phases, LOG, Path(WORKING_DIR, prefetch_report), log_offset=log_offset,
+            threads=int(CFG["WINDOW_PREFETCH_THREADS"]), window_bytes=int(float(CFG["WINDOW_PREFETCH_GIB"]) * 1024**3),
+            deadline_seconds=SERVER_STARTUP_TIMEOUT)
+        window_prefetch.start()
+    with open(LOG, "ab", buffering=0) as logf:
+        proc = subprocess.Popen(args, env=server_env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    print(f"pid {proc.pid} -> {LOG}")
+    Path(WORKING_DIR, "sglang-server.pid").write_text(str(proc.pid))
+    return proc, log_offset, window_prefetch
+
+
+def show_log_tail(log_offset):
     with open(LOG, "rb") as f:
         f.seek(0, 2)
         f.seek(max(log_offset, f.tell()-20000))
         print(f.read().decode(errors="replace"))
 
-url, t0 = f"http://127.0.0.1:{SERVED_MODEL_PORT}/health", time.time()
-last_report = -30
-while time.time() - NOTEBOOK_START_TIME < SERVER_STARTUP_TIMEOUT:
-    if proc.poll() is not None:
-        show_log_tail()
-        break
-    try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            if r.status == 200:
-                print(f"\nREADY after {int(time.time()-t0)}s -> {url.replace('/health','/v1')}")
-                mark_startup("server_ready")
-                break
-    except Exception:
-        pass
-    elapsed = int(time.time()-t0)
-    if elapsed-last_report >= 30:
-        print(f"  {elapsed}s ...", flush=True); last_report=elapsed
-    time.sleep(3)
-else:
+
+def wait_ready(proc, log_offset):
+    """'ready', 'exited' (server died) or 'deadline' (still loading at the timeout)."""
+    url, t0 = f"http://127.0.0.1:{SERVED_MODEL_PORT}/health", time.time()
+    last_report = -30
+    while time.time() - NOTEBOOK_START_TIME < SERVER_STARTUP_TIMEOUT:
+        if proc.poll() is not None:
+            show_log_tail(log_offset)
+            return "exited"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                if r.status == 200:
+                    print(f"\nREADY after {int(time.time()-t0)}s -> {url.replace('/health','/v1')}")
+                    mark_startup("server_ready")
+                    return "ready"
+        except Exception:
+            pass
+        elapsed = int(time.time()-t0)
+        if elapsed-last_report >= 30:
+            print(f"  {elapsed}s ...", flush=True); last_report=elapsed
+        time.sleep(3)
     print(f"\nDEADLINE at {int(time.time()-NOTEBOOK_START_TIME)}s from notebook start; "
           f"releasing the benchmark with the server still loading")
+    return "deadline"
 
-if window_prefetch is not None:
-    window_prefetch.stop()
-    window_prefetch.join(timeout=5)
+
+def stop_prefetch(window_prefetch):
+    if window_prefetch is not None:
+        window_prefetch.stop()
+        window_prefetch.join(timeout=5)
+
+
+if not CFG["WINDOW_PREFETCH"] and precache_model_thread and not MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
+tuned_env = dict(env, **TUNEUP_ENV)
+if int(CFG["LOWM_MAX_M"]) != 32:
+    tuned_env["SGLANG_SM120_LOWM_MAX_M"] = str(int(CFG["LOWM_MAX_M"]))
+print("Tuning env:", {k: v for k, v in tuned_env.items() if k not in env} or "none")
+proc, log_offset, window_prefetch = launch(tuned_env, "pennyroyal-shard-prefetch.json")
+mark_startup("server_launched")
+status = wait_ready(proc, log_offset)
+stop_prefetch(window_prefetch)
+if status == "exited" and tuned_env != env and CFG["TUNEUP_FALLBACK"]:
+    TUNEUP["fallback"] = "tuned server exited before ready; relaunched untuned"
+    print(f"\n{TUNEUP['fallback']}\n", flush=True)
+    proc, log_offset, window_prefetch = launch(env, "pennyroyal-shard-prefetch-untuned.json")
+    mark_startup("server_relaunched_untuned")
+    status = wait_ready(proc, log_offset)
+    stop_prefetch(window_prefetch)
+
 Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
     {"seconds_from_launcher_start": STARTUP_TIMES, "target": SERVE_DIR, "draft": str(DRAFT_VIEW or ""),
      "quantization": QUANT, "ple_fp8_source": PLE_FP8_DIR, "window_prefetch": bool(CFG["WINDOW_PREFETCH"]),
-     "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"])}, indent=1))
+     "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"]), "server_status": status,
+     "max_running_requests": CFG["MAXREQ"], "cuda_graph_bs": graph_bs, "mem_fraction_static": CFG["MEMFRAC"],
+     "tuneup": TUNEUP}, indent=1))
 
 # ---- hand the endpoint and analyzer settings to the run ----
 base_url = f"http://127.0.0.1:{SERVED_MODEL_PORT}/v1"
