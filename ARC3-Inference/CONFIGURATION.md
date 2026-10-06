@@ -490,7 +490,16 @@ Every game runs in one wave: all games start together and the admission gate (`A
 
 ### RunPod runs
 
-`make runpod-duck CONFIG_PATH=...` builds the same source dataset and notebook as `make kaggle-duck`, uploads the dataset to Kaggle (private), and runs the notebook on a RunPod GPU pod instead of pushing it to Kaggle. Every `kaggle` setting above applies unchanged. The pod rebuilds `/kaggle/input` from the notebook's sources: competition files and datasets through the Kaggle API, models from Hugging Face where `runpod.hf_models` maps them and from Kaggle otherwise. It then runs the notebook, uploads `/kaggle/working` as the private Kaggle dataset `<owner>/<slug>-rp-<pod-id>`, and deletes itself.
+`make runpod-duck CONFIG_PATH=...` runs the same notebook as `make kaggle-duck`, on a RunPod GPU pod instead of Kaggle. Every `kaggle` setting above applies unchanged. The pod rebuilds `/kaggle/input` from the notebook's sources:
+
+| Input | Size | Comes from |
+|---|---|---|
+| Models (`kaggle.model_source`, `kaggle.draft_model_source`) | ~185 GB for Flash Next | Hugging Face, where `runpod.hf_models` maps them; otherwise Kaggle |
+| Competition files (`arc_agi_3_wheels`, offline `environment_files`) | ~50 MB | Kaggle; they exist only there |
+| Serving wheelhouse (`kaggle.wheelhouse_dataset_source`) | 6.6 GB for Pennyroyal | Kaggle; it exists only there |
+| Source bundle (code snapshot, pickled benchmark, rendered notebook) | under 1 MB | Kaggle: `make runpod-duck` uploads it as the private source dataset, as `kaggle-duck` does |
+
+The pod needs Kaggle credentials for the competition files and wheelhouse anyway, so Kaggle also carries the small source bundle in and the outputs back; no other storage service is involved. After the notebook finishes, the pod uploads `/kaggle/working` as the private Kaggle dataset `<owner>/<slug>-rp-<pod-id>` and deletes itself.
 
 It needs `RUNPOD_API_KEY` and Kaggle credentials (`KAGGLE_API_TOKEN`, `KAGGLE_USERNAME`) in the environment or a `.env` file; both are passed to the pod so it can download inputs, upload outputs and delete itself. Set `HF_TOKEN` for gated or private models. The run folder is `runs/runpod/<owner>/<slug>/<pod-id>/`. Fetch outputs with `make pull-runpod RUN_DIR=<run folder>` once the pod is gone (`WAIT=true` waits; `STOP=true` deletes the pod early).
 
