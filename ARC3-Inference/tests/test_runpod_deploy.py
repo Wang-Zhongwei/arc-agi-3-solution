@@ -60,6 +60,23 @@ def test_bundle_requirements_drop_bundled_projects_and_competition_wheels(tmp_pa
     ]
 
 
+def test_competition_arc_agi_requirement_pins_the_bundled_wheel(tmp_path):
+    assert pod.competition_arc_agi_requirement(tmp_path) is None
+    (tmp_path / "arc_agi-0.9.8-py3-none-any.whl").touch()
+    (tmp_path / "arcengine-0.9.3-py3-none-any.whl").touch()
+    assert pod.competition_arc_agi_requirement(tmp_path) == "arc-agi==0.9.8"
+
+
+def test_pull_output_accepts_kaggle_expanded_archive(tmp_path, monkeypatch):
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["kaggle", "datasets", "download"]:
+            (tmp_path / "runpod_summary.json").write_text("{}")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(taaf.deploy_runpod.subprocess, "run", fake_run)
+    assert taaf.deploy_runpod.pull_output("me/x-rp-p", tmp_path, timeout_s=0) == tmp_path
+
+
 @pytest.mark.parametrize("share", [False, True])
 def test_rendered_notebooks_run_as_plain_python(tmp_path, share):
     template = taaf.deploy_kaggle._SHARE_NOTEBOOK_TEMPLATE if share else taaf.deploy_kaggle._NOTEBOOK_TEMPLATE

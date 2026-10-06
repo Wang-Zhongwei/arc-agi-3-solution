@@ -373,6 +373,9 @@ def pull_output(output_dataset: str, dest_dir: Path, *, timeout_s: float = 1800.
             subprocess.run(["tar", "-xzf", str(archive), "-C", str(dest_dir)], check=True)
             archive.unlink()
             return dest_dir
+        # Kaggle usually expands the uploaded archive into the dataset's own files.
+        if result.returncode == 0 and (dest_dir / "runpod_summary.json").is_file():
+            return dest_dir
         if time.monotonic() > deadline:
             raise RuntimeError(f"Could not download {output_dataset}:\n{result.stdout}\n{result.stderr}")
         time.sleep(30)

@@ -142,12 +142,27 @@ def stage_model(ref: str, hf_models: dict[str, str]) -> None:
     dest.symlink_to(local_dir / subdir if subdir else local_dir, target_is_directory=True)
 
 
+def competition_arc_agi_requirement(wheels: Path) -> str | None:
+    """``arc-agi==<version>`` of the competition's bundled wheel, if there is one."""
+    found = sorted(wheels.glob("arc_agi-*.whl"))
+    return f"arc-agi=={found[-1].name.split('-')[1]}" if found else None
+
+
 def install_requirements(bundle: Path) -> None:
     if not shutil.which("g++"):
         # Pennyroyal JIT-compiles kernels with the host C++ compiler.
         run(["apt-get", "update", "-q"])
         run(["apt-get", "install", "-y", "-q", "build-essential"])
-    run([sys.executable, "-m", "pip", "install", "-q", *bundle_requirements(bundle)])
+    pip = [sys.executable, "-m", "pip", "install", "-q"]
+    run([*pip, *bundle_requirements(bundle)])
+    # The notebook installs arc-agi offline from the competition wheelhouse. Over
+    # the image's apt-managed Python packages that fails (pip cannot uninstall
+    # them: uninstall-no-record-file), so install the same wheel here with
+    # --ignore-installed; the notebook's install then finds it satisfied.
+    for wheels in sorted(INPUT.glob("competitions/*/arc_agi_3_wheels")):
+        requirement = competition_arc_agi_requirement(wheels)
+        if requirement:
+            run([*pip, "--ignore-installed", "--find-links", str(wheels), requirement])
 
 
 def run_notebook(bundle: Path, notebook_path: Path) -> int:
