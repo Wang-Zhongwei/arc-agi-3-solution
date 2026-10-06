@@ -88,6 +88,29 @@ def test_pod_payload_requests_rtx_pro_6000_with_cuda13_and_bootstrap():
     assert "dataCenterIds" not in payload
 
 
+def test_rest_requests_send_a_user_agent(monkeypatch):
+    seen = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"id": "pod1"}'
+
+    def fake_urlopen(request, timeout):
+        seen.update(request.header_items())
+        return _Response()
+
+    monkeypatch.setattr(taaf.deploy_runpod.urllib.request, "urlopen", fake_urlopen)
+    assert taaf.deploy_runpod.create_pod({}, api_key="k") == {"id": "pod1"}
+    assert seen["User-agent"].startswith("taaf-runpod")
+    assert seen["Authorization"] == "Bearer k"
+
+
 def test_bootstrap_is_valid_bash():
     subprocess.run(["bash", "-n", "-c", taaf.deploy_runpod._BOOTSTRAP], check=True)
 

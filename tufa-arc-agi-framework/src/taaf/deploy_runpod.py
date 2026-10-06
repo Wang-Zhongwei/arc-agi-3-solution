@@ -250,7 +250,12 @@ def _request(method: str, path: str, *, api_key: str, payload: dict[str, Any] | 
         f"{RUNPOD_REST_URL}{path}",
         data=data,
         method=method,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        # Cloudflare in front of the API rejects urllib's default User-Agent (error 1010).
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "taaf-runpod/1.0",
+        },
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         body = response.read().decode("utf-8")
