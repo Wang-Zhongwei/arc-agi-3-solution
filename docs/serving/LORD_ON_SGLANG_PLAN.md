@@ -18,21 +18,13 @@ The engine is fine; its tuning is for Daniel's model. Daniel's patches speed up 
 | 4 | Prefix-cache retention | Cache policy | Works (94.5% hit) | Works (93.3% hit) | Keep |
 | 5 | Prefetch lookahead | Startup loading | On | Off; Lord's prefetch window used instead | Loading looks CPU-bound, not disk-bound: find the slow step; start games only after the server is ready |
 
-Not a patch, but also needed: free GPU memory for the KV cache (Lord's model had 9% less; Lord moves `embed_tokens` to host memory), so more streams fit.
-
 ## Order of work
 
-0. **Measure once.** One profiling run of Lord's model at 1, 4, 10 and 16 streams, plus stack samples while it loads. This shows where each step's time goes and how far each part is from its memory-bandwidth limit. Use it to confirm or reorder steps 1–5.
-1. **Experts on Marlin.** Expected to be the biggest win: experts are most of the weights read per step.
-2. **FP8 attention small-batch path.**
-3. **Widen the small-batch BF16 path to 64.**
-4. **Loading.** Fix the slow step; never release games before the server is ready.
-5. **KV room, then more streams** (Lord ran 14).
+Fix the target at **14 streams**, as Lord runs. His model's real advantage is KV capacity: 1.42M tokens on vLLM against Daniel's 1.01M. On SGLang it got only 0.92M so far, because `embed_tokens` stays on the GPU and memory is budgeted Daniel's way. So KV room comes first, then every patch is tuned for 14 streams. With 4 verify tokens per stream, small batches now reach 56 tokens, above the current 32-token limit.
 
-One change per run, compared against the v1 tok/s table at the same stream counts. Run on RunPod (no queue). Confirm the final setup on Kaggle.
+1. **KV room for 14 streams.** Move `embed_tokens` to host memory (Lord's trick) and retune the memory fraction and CUDA-graph sizes for 14 streams.
+2. **Experts on Marlin** (replaces what patch 3 did for Daniel). Experts are most of the weights read per step.
+3. **Small-batch paths up to 56 tokens** (patch 1, retuned): an FP8 path for attention, and the BF16 path widened for the layers still in BF16.
+4. **Loading** (patch 5, retuned): fix the slow step, and start games only after the server is ready.
 
-## What to expect
-
-Lord's expert weights are about 8% larger than Daniel's, and his attention weights are about half the size. Fully tuned, Lord's model should match Daniel's speed per stream, not beat it clearly. Lord's higher vLLM throughput came from running 14 streams (about 68 tok/s per stream vs Daniel's 81). So the real gain is from steps 3 and 5, which would also help Daniel's model.
-
-Stop rule: if step 0 shows that fixing every untuned path would still leave Lord's model behind Daniel's, skip steps 1–2 and go straight to more streams.
+One change per run, all at 14 streams, compared against the v1 numbers. Run on RunPod (no queue). Confirm the final setup on Kaggle.
