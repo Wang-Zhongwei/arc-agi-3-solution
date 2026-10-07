@@ -116,3 +116,23 @@ At FP8 KV, 1.5M SGLang tokens would need 19.75 GiB for KV alone, more than remai
   - Restores his checkpoints and keeps everything else.
   - Decodes 17% faster than Daniel's 10-stream baseline at 10 running.
   - Reaches 86–96% of lordhansolo's vLLM at 13–14 running, with the same KV + Mamba memory.
+
+## v7–v10: more KV without losing speed? (RunPod, 30-minute game window)
+
+Each run changes v6 as listed; every number covers the first 14 minutes of games, with 1.25–1.27 GB free after graph capture.
+
+| | v6 | v7 | v8 | v9 | v10 |
+|---|---|---|---|---|---|
+| FP8 QSA index | | yes | yes | yes | yes |
+| Skip-decode-lock, 60 Mamba slots | | yes | yes | | |
+| Online MXFP8 (`ONLINE_MXFP8`) | | | yes | yes | |
+| KV tokens | 1,150,336 | 1,254,016 | 1,327,936 | 1,259,392 | 1,185,216 |
+| Prefix hit | 94% | 48% | 45% | 94% | 95% |
+| Median tok/s at 14 running | 825 | 513 | 538 | 566 | 795 |
+| Decode, seconds without prefill, 400–700K tokens | ~850 | ~630 | ~515 | ~580 | ~820 |
+
+- **Skip-decode-lock with 60 slots breaks prefix reuse.** v7 and v8 re-prefilled whole conversations (0 cached tokens on >15K prompts, 4–13 a minute) while the KV pool was under half full: the one Mamba checkpoint per prefill was evicted. v9 restored v6's settings and the misses went to zero.
+- **Online MXFP8 costs ~30% decode** (v9 vs v10) for +74K tokens. Don't use it.
+- **The FP8 QSA index costs ~4% decode for +3% KV** (v10 vs v6, different hosts). It pays only once the KV pool is full, as in v6's second half.
+- 0.972 with MXFP8 left 0.51 GB after graphs and OOMed on the first prefill; keep ≥1.2 GB free.
+- 1.5M SGLang KV tokens is not reachable on this path without losing speed. v10 is the best KV/speed trade so far; v6 stays the fastest.
