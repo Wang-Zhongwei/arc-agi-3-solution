@@ -1,8 +1,15 @@
-275 trajectories, 11 runs, 14 slots, γ = 35k. Uniform: β=100k: 24.6, β=150k: 37.3.
+275 trajectories, 11 runs, 14 slots. Uniform: β=100k: 24.6 (γ=35k), β=100k: 24.3 (γ=15k), β=150k: 37.3 (γ=35k), β=150k: 37.2 (γ=15k).
 
-Mean score, difference vs uniform ± SE (runs better)
-| policy | β = 100k, γ = 35k | β = 150k, γ = 35k |
+## Table 1. γ = 35k: mean score, difference vs uniform ± SE (runs better)
+| policy | β = 100k | β = 150k |
 |---|---|---|
 | current: (A+B)·C | 27.6, +3.01 ± 0.40 (11/11) | 39.2, +1.88 ± 0.42 (9/11) |
 | B = 0: v·e·C | 29.5, +4.95 ± 0.86 (10/11) | 39.9, +2.64 ± 0.56 (9/11) |
 | B = 0, no efficiency: v·C | 29.4, +4.84 ± 0.91 (11/11) | 40.3, +3.03 ± 0.84 (9/11) |
+
+## Table 2. Grant size: mean score at γ = 35k and 15k, difference 15k − 35k ± SE (runs better)
+| policy | β=100k, 35k | β=100k, 15k | β=100k, Δ | β=150k, 35k | β=150k, 15k | β=150k, Δ |
+|---|---|---|---|---|---|---|
+| current: (A+B)·C | 27.6 | 27.0 | -0.58 ± 0.47 (4/11) | 39.2 | 38.3 | -0.91 ± 0.46 (2/11) |
+| B = 0: v·e·C | 29.5 | 29.6 | +0.12 ± 0.65 (5/11) | 39.9 | 40.3 | +0.32 ± 0.33 (6/11) |
+| B = 0, no efficiency: v·C | 29.4 | 32.0 | +2.54 ± 0.68 (11/11) | 40.3 | 41.5 | +1.13 ± 0.35 (9/11) |

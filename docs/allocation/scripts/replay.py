@@ -1,7 +1,7 @@
 """Offline replay of token allocation policies on recorded game trajectories.
 
-Notation follows ../priority-replay.md. Prints the table of that report and
-writes it to data/results.md:
+Notation follows ../priority-replay.md. Prints both tables of that report and
+writes them to data/results.md:
 
   python docs/allocation/scripts/replay.py
 """
@@ -21,7 +21,7 @@ from inference.agent.scheduling.priority import PrioritySnapshot, priority_value
 
 SLOTS = 14                    # ARC3_MAX_ACTIVE_STREAMS
 BUDGETS = (100_000, 150_000)  # tokens per game
-GRANT = 35_000               # tokens per slot grant (median between context trims)
+GRANTS = (35_000, 15_000)     # tokens per slot grant
 
 
 class Traj:
@@ -122,16 +122,22 @@ def table(header: list[str], rows: list[list[str]]) -> str:
 def main() -> None:
     raw = json.loads((DATA / "trajectories.json").read_text())
     runs = {run: [Traj(rec) for rec in games.values()] for run, games in raw.items()}
-    S = {(p, b): [replay(trs, f, b, GRANT) for trs in runs.values()]
-         for p, f in POLICIES.items() for b in BUDGETS}
-    rows = [[p] + [f"{st.mean(S[p, b]):.1f}, {paired(S[p, b], S['uniform', b])}" for b in BUDGETS]
-            for p in POLICIES if p != "uniform"]
-    uni = ", ".join(f"β={b // 1000}k: {st.mean(S['uniform', b]):.1f}" for b in BUDGETS)
+    S = {(p, b, g): [replay(trs, f, b, g) for trs in runs.values()]
+         for p, f in POLICIES.items() for b in BUDGETS for g in GRANTS}
+    names = [p for p in POLICIES if p != "uniform"]
+
+    t1 = [[p] + [f"{st.mean(S[p, b, 35_000]):.1f}, {paired(S[p, b, 35_000], S['uniform', b, 35_000])}"
+                 for b in BUDGETS] for p in names]
+    t2 = [[p] + [c for b in BUDGETS for c in (f"{st.mean(S[p, b, 35_000]):.1f}", f"{st.mean(S[p, b, 15_000]):.1f}",
+                                              paired(S[p, b, 15_000], S[p, b, 35_000]))] for p in names]
+    uni = ", ".join(f"β={b // 1000}k: {st.mean(S['uniform', b, g]):.1f} (γ={g // 1000}k)"
+                    for b in BUDGETS for g in GRANTS)
     text = "\n".join([
-        f"{sum(map(len, runs.values()))} trajectories, {len(runs)} runs, {SLOTS} slots, γ = {GRANT // 1000}k. "
-        f"Uniform: {uni}.",
-        "\nMean score, difference vs uniform ± SE (runs better)",
-        table(["policy"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
+        f"{sum(map(len, runs.values()))} trajectories, {len(runs)} runs, {SLOTS} slots. Uniform: {uni}.",
+        "\n## Table 1. γ = 35k: mean score, difference vs uniform ± SE (runs better)",
+        table(["policy"] + [f"β = {b // 1000}k" for b in BUDGETS], t1),
+        "\n## Table 2. Grant size: mean score at γ = 35k and 15k, difference 15k − 35k ± SE (runs better)",
+        table(["policy"] + [h for b in BUDGETS for h in (f"β={b // 1000}k, 35k", f"β={b // 1000}k, 15k", f"β={b // 1000}k, Δ")], t2),
     ]) + "\n"
     (DATA / "results.md").write_text(text)
     print(text)
