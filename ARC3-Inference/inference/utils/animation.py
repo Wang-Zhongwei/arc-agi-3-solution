@@ -7,8 +7,8 @@ was discarded before the agent could see it. On some games the whole effect of
 an action lives there: the board before and the board after are identical, and
 reading the final frame cannot possibly reveal what happened.
 
-Two shapes occur. Where cells change and change BACK, the information is
-genuinely hidden and worth spending prompt tokens on. Where every cell changes
+Two shapes occur. Where cells change more than once, the intermediate changes
+are not fully captured by the endpoint frames. Where every cell changes
 at most once, the frames are motion interpolation toward a state the final
 frame already shows, and there is nothing to find - those animations are
 reported nowhere, because a line about them would cost tokens to say that
@@ -75,9 +75,8 @@ def _transient_cells(chain: Sequence[Grid]) -> list[tuple[int, int]]:
 
     A cell that changes once and stays changed is visible in the final frame,
     so the agent loses nothing by never seeing the frames between. A cell that
-    changes twice has shown something that is no longer there - a rejected
-    click, a consumed attempt, a sprite crossing a background cell. Those are
-    exactly the pixels no frame the agent can reach will ever contain.
+    changes more than once has intermediate changes that the endpoint frames
+    do not fully capture. It need not return to its original color.
     """
     changes: defaultdict[tuple[int, int], int] = defaultdict(int)
     for before, after in zip(chain, chain[1:]):
@@ -148,7 +147,7 @@ def describe_animation(
 ) -> str:
     """The opener line, or "" when there is nothing worth saying.
 
-    Silent unless cells changed and changed back. Where every cell changed at
+    Silent unless cells changed more than once. Where every cell changed at
     most once the final frame already shows the outcome, and a line saying so
     would spend tokens to report that nothing is missing.
     """
@@ -158,8 +157,8 @@ def describe_animation(
     if transient <= 0:
         return ""
     frames = summary.get("frames")
-    cells = "1 cell changed and changed back" if transient == 1 else (
-        f"{transient} cells changed and changed back"
+    cells = "1 cell changed more than once" if transient == 1 else (
+        f"{transient} cells changed more than once"
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
@@ -172,12 +171,12 @@ def describe_animation(
 
     if game_over:
         # Follows the BAR RULE block, which has just walked the model through
-        # history[-3] and history[-2]. This says what those two frames cannot
-        # contain, which is precisely what "transient" means.
+        # history[-3] and history[-2]. The endpoints alone do not fully show
+        # the changes during the animation.
         return (
             f"That fatal action animated over {frames} frames, and inside it "
-            f"{cells}{where}. Those cells are in neither "
-            f"`history[-3].frame` nor `history[-2].frame` - read {where_to_look} to see "
+            f"{cells}{where}. Those intermediate changes are not fully captured by "
+            f"`history[-3].frame` or `history[-2].frame` - read {where_to_look} to see "
             "what happened between them."
         )
     if gameplay_changed is False:

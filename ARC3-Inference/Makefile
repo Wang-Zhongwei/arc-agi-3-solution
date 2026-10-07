@@ -67,6 +67,9 @@ endif
 ifeq ($(origin MAX_GENERATED_TOKENS_PER_GAME),undefined)
 MAX_GENERATED_TOKENS_PER_GAME := $(shell $(CONFIG_VALUE) environment.max_generated_tokens_per_game)
 endif
+ifeq ($(origin PUBLIC_MAX_GENERATED_TOKENS_PER_GAME),undefined)
+PUBLIC_MAX_GENERATED_TOKENS_PER_GAME := $(shell $(CONFIG_VALUE) kaggle.public_max_generated_tokens_per_game)
+endif
 ifeq ($(origin MAX_EXPERIMENT_RUNTIME_HOURS),undefined)
 MAX_EXPERIMENT_RUNTIME_HOURS := $(shell $(CONFIG_VALUE) environment.max_experiment_runtime_hours)
 endif
@@ -638,6 +641,7 @@ _taaf-run:
 		$(if $(strip $(MAX_ACTIONS)),--max-actions $(MAX_ACTIONS),) \
 		$(if $(strip $(MAX_RUNTIME_MINUTES)),--max-runtime-minutes $(MAX_RUNTIME_MINUTES),) \
 		$(if $(strip $(MAX_GENERATED_TOKENS_PER_GAME)),--max-generated-tokens-per-game $(MAX_GENERATED_TOKENS_PER_GAME),) \
+		$(if $(strip $(PUBLIC_MAX_GENERATED_TOKENS_PER_GAME)),--public-max-generated-tokens-per-game $(PUBLIC_MAX_GENERATED_TOKENS_PER_GAME),) \
 		$(MAX_EXPERIMENT_RUNTIME_ARGS) \
 		--n-passes $(N_PASSES) \
 		--concurrent-jobs $(CONCURRENT_JOBS) \

@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import arcengine
 import taaf.game
+from taaf.deploy_kaggle import KaggleTarget
 from taaf.solver import Solver
 
 from inference.utils.animation import (
@@ -575,7 +576,15 @@ class _HarnessGameSession:
         # a plain dict update - it applies no dataclass defaults. A bare access
         # would raise AttributeError here on the first turn of every game, since
         # should_stop() runs this every time.
-        limit = getattr(self.solver, "max_generated_tokens_per_game", None)
+        runtime = getattr(self.solver, "runtime_environment", None)
+        if isinstance(runtime, KaggleTarget):
+            if runtime.is_competition_rerun or runtime.actual_run_as_submission:
+                return False
+            limit = getattr(self.solver, "public_max_generated_tokens_per_game", None)
+            if limit is None:
+                limit = getattr(self.solver, "max_generated_tokens_per_game", None)
+        else:
+            limit = getattr(self.solver, "max_generated_tokens_per_game", None)
         if limit is None or limit <= 0:
             return False
         spent = _analyzer_reported_tokens(self.analyzer) - self.game_token_baseline
@@ -1366,6 +1375,9 @@ class HarnessSolver(Solver):
     # every backend - and on a hosted API it moves hour to hour - so this is
     # what makes an offline run comparable with a Kaggle one. None disables.
     max_generated_tokens_per_game: int | None = None
+    # Public Kaggle cap; private reruns ignore both generated-token budgets.
+    # None falls back to the legacy budget for existing configs and pickles.
+    public_max_generated_tokens_per_game: int | None = None
     concurrency: int = 16
     save_request_logs: bool = False
     start_local_server: bool = False

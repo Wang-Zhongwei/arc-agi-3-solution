@@ -469,7 +469,7 @@ Additional recovery work:
 - Preserves usable analysis/tool history across retries and timeout yields, and avoids treating a new unrelated prompt as the continuation of a failed call.
 - Separates transient HTTP retries from context-overflow recovery and read-timeout handling.
 - Passes the available timeout into summary generation and provides a finite 8192-token fallback where an unlimited output setting would otherwise make summary generation unbounded.
-- Adds a per-game generated-token budget through `--max-generated-tokens-per-game`, the solver’s `max_generated_tokens_per_game`, and Makefile/config plumbing via `MAX_GENERATED_TOKENS_PER_GAME` / `environment.max_generated_tokens_per_game`.
+- Adds a per-game generated-token budget through `--max-generated-tokens-per-game`, the solver’s `max_generated_tokens_per_game`, and Makefile/config plumbing via `MAX_GENERATED_TOKENS_PER_GAME` / `environment.max_generated_tokens_per_game`. This legacy cap applies to local and public Kaggle runs. Public Kaggle runs can override it through `--public-max-generated-tokens-per-game`, configured by `PUBLIC_MAX_GENERATED_TOKENS_PER_GAME` / `kaggle.public_max_generated_tokens_per_game`. Private competition reruns and emulated submissions ignore both caps.
 - Uses compatibility fallbacks for newly optional solver state, allowing older pickled solver objects to run without assuming newly added attributes already exist.
 - Releases admission resources on completion/failure and supplies the scheduler’s shared deadline information from the solver.
 
@@ -483,6 +483,7 @@ These changes do not increase the server’s true context limit. Correctly match
 |---|---|---|
 | `public_games` | `[]` | Games the public (offline, non-rerun) notebook plays, in this order. Each entry is an exact game id or its prefix before `-` (`ar25`); an entry matching no game, or several, fails the run. Empty plays all bundled offline games. Competition reruns always play the gateway's full list. |
 | `public_runtime_minutes` | `140` | Minutes after notebook start at which the public run stops play (its soft end). Server startup takes about 9 of them; draining, diagnostics and teardown add about 2–3 minutes after it. The notebook budget is this plus 10. |
+| `public_max_generated_tokens_per_game` | `null` | Generated-token cap per public game across all levels. `null` uses the legacy `environment.max_generated_tokens_per_game` cap if configured; zero disables it. Private competition reruns, emulated submissions, and local runs ignore this option. |
 | `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
 | `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
 
