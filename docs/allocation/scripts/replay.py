@@ -18,12 +18,18 @@ HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"
 sys.path.insert(0, str(HERE.parents[2] / "ARC3-Inference"))
 from inference.agent.scheduling.priority import ProgressPace, PrioritySnapshot, priority_value  # noqa: E402
+from inference.agent.scheduling.ucb import (  # noqa: E402
+    UCB_DEFAULT_C, YieldProgress, YieldSnapshot, ucb_value, weighted_levels,
+)
 
 PACE_REF = json.loads((HERE.parents[2] / "ARC3-Inference/inference/agent/scheduling/priority_pace_reference.json").read_text())
 
 SLOTS = 14                    # ARC3_MAX_ACTIVE_STREAMS
 BUDGETS = (100_000, 150_000)  # tokens per game
 GRANT = 35_000               # tokens per slot grant (median between context trims)
+TOKENS_PER_MINUTE = 52_000   # v07: 25 games x 218k generated tokens in ~105 min; the UCB clock
+UCB_SCALES = (0.25, 1, 4, 16)  # multiples of UCB_DEFAULT_C
+CLOCK = {"spent": 0.0}       # tokens spent so far in the replayed run
 
 
 class Traj:
@@ -107,6 +113,26 @@ def thinking_multiplier(t: float | None, ref: float = 2048.0) -> float:
     return 1.0 if t is None else min(2.0, max(0.5, (ref / max(1.0, t)) ** 0.5))
 
 
+def ucb(tr: Traj, t: float, denominator: str, c: float) -> float:
+    """Yield-UCB (scheduling/ucb.py): observed weighted-level yield + exploration bonus.
+    Elapsed minutes come from the run's tokens spent at TOKENS_PER_MINUTE."""
+    progress = YieldProgress()
+    progress.observe(0, 0.0)
+    for L, u in enumerate(tr.ups[:bisect_right(tr.ups, t + 1e-9)], start=1):
+        progress.observe(int(u), weighted_levels(L))
+    count = int(t) if denominator == "tokens" else int(round(tr.actions(t)))
+    snap = YieldSnapshot(rate=progress.rate(int(t), 0.5), count=count, c=c)
+    return ucb_value(snap, CLOCK["spent"] / TOKENS_PER_MINUTE)
+
+
+UCB_POLICIES = {"yield only (c = 0)": lambda tr, t: ucb(tr, t, "actions", 0.0)}
+for _den in ("actions", "tokens"):
+    for _k in UCB_SCALES:
+        _c = UCB_DEFAULT_C[_den] * _k
+        UCB_POLICIES[f"{_den}, c = {_c:g} ({_k:g}x default)"] = (
+            lambda tr, t, d=_den, c=_c: ucb(tr, t, d, c))
+
+
 POLICIES = {
     "uniform": lambda tr, t: -t,
     "current: (A+B)·C": current,
@@ -131,6 +157,7 @@ def replay(trajs: list[Traj], rank, budget: float, grant: float) -> float:
         live = [t for t in trajs if not t.finished(pos[id(t)]) and pos[id(t)] < t.end - 1]
         if not live:
             break
+        CLOCK["spent"] = spent
         live.sort(key=lambda t: (1, 0.0) if pos[id(t)] == 0 else (0, rank(t, pos[id(t)])), reverse=True)
         for t in live[:SLOTS]:
             g = min(grant, total - spent)
@@ -170,6 +197,16 @@ def main() -> None:
         f"{sum(map(len, runs.values()))} trajectories, {len(runs)} runs, {SLOTS} slots, γ = {GRANT // 1000}k. "
         f"Uniform: {uni}.",
         "\nMean score, difference vs uniform ± SE (runs better)",
+        table(["policy"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
+    ]) + "\n"
+    U = {(p, b): [replay(trs, f, b, GRANT) for trs in runs.values()]
+         for p, f in UCB_POLICIES.items() for b in BUDGETS}
+    rows = [["uniform (baseline)"] + [f"{st.mean(S['uniform', b]):.1f}" for b in BUDGETS]]
+    rows += [[p] + [f"{st.mean(U[p, b]):.1f}, {paired(U[p, b], S['uniform', b])}" for b in BUDGETS]
+             for p in UCB_POLICIES]
+    text += "\n".join([
+        f"\nYield-UCB, elapsed minutes = tokens spent / {TOKENS_PER_MINUTE}. "
+        "Mean score, difference vs uniform ± SE (runs better)",
         table(["policy"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
     ]) + "\n"
     (DATA / "results.md").write_text(text)

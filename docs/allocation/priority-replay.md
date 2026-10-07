@@ -132,6 +132,48 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
   level; by the next ranking the game is on a fresh level, where $C = 1$
   already ranks it high.
 
+## Yield-UCB
+
+`ARC3_SCHEDULER=ucb` (`ARC3-Inference/inference/agent/scheduling/ucb.py`)
+ranks by observed yield plus an exploration bonus. With $W(L) = L(L+1)/2$ the
+unnormalized weight of $L$ completed levels, $W_{32}$ the weight $32\text{k}$
+tokens ago, and $N$ the game's total actions (`ARC3_UCB_DENOMINATOR=actions`)
+or total tokens (`tokens`),
+
+$$
+\text{rate} = \tfrac12\,\frac{W(L)}{\tau} + \tfrac12\,\frac{W(L) - W_{32}}{\min(\tau, 32\text{k})},\qquad
+R = \text{rate} + c\,\sqrt{\frac{\log(1 + t_{\min})}{N}},
+$$
+
+where $t_{\min}$ is wall-clock minutes since the run started. The replay has
+no clock, so $t_{\min}$ = tokens spent in the run $/\ 52\text{k}$ (v07: 25 games ×
+$218\text{k}$ tokens in about 105 minutes). The bonus depends on it only through
+$\sqrt{\log(1 + t_{\min})}$. Defaults: $c = 0.0002$ for actions, $0.005$ for tokens.
+
+Mean $\bar S$, then the paired difference vs the uniform baseline ($\gamma = 35\text{k}$):
+
+| Policy | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
+|---|---|---|
+| uniform (baseline) | 24.6 | 37.3 |
+| yield only ($c = 0$) | 29.1, +4.52 ± 0.67 (11/11) | 38.3, +0.99 ± 0.61 (6/11) |
+| actions, $c = 0.00005$ (¼× default) | 29.3, +4.72 ± 0.52 (11/11) | 39.0, +1.70 ± 0.56 (7/11) |
+| actions, $c = 0.0002$ (default) | 28.2, +3.64 ± 0.48 (11/11) | 39.1, +1.80 ± 0.73 (7/11) |
+| actions, $c = 0.0008$ (4×) | 27.1, +2.52 ± 0.35 (11/11) | 38.1, +0.77 ± 0.44 (6/11) |
+| actions, $c = 0.0032$ (16×) | 24.4, −0.22 ± 0.49 (4/11) | 36.7, −0.57 ± 0.56 (3/11) |
+| tokens, $c = 0.00125$ (¼×) | 29.1, +4.52 ± 0.67 (11/11) | 38.6, +1.31 ± 0.49 (7/11) |
+| tokens, $c = 0.005$ (default) | 28.9, +4.37 ± 0.73 (11/11) | 40.0, +2.68 ± 0.85 (8/11) |
+| tokens, $c = 0.02$ (4×) | 27.8, +3.24 ± 0.59 (10/11) | 38.8, +1.48 ± 0.39 (8/11) |
+| tokens, $c = 0.08$ (16×) | 26.9, +2.34 ± 0.55 (10/11) | 38.4, +1.08 ± 0.31 (9/11) |
+
+- Yield alone works at $100\text{k}$ but not at $150\text{k}$: a game that has not
+  levelled up recently has rate near $0$ and is starved, even when it is about
+  to level up.
+- A small bonus fixes that. The token-count default reaches $+4.4$ / $+2.7$,
+  level with $B = 0$ ($+5.0$ / $+2.6$). The action-count default, used in the
+  1001 and 1003 submissions, reaches $+3.6$ / $+1.8$, level with current.
+- Large $c$ lets the bonus dominate and the ranking drifts toward
+  fewest-actions-first; at 16× the action default it falls below uniform.
+
 ## Limitations
 
 The replay ignores wall-clock throughput, prefill, prefix caching, per-game
