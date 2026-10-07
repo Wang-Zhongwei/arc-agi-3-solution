@@ -29,6 +29,7 @@ BUDGETS = (100_000, 150_000)  # tokens per game
 GRANT = 35_000               # tokens per slot grant (median between context trims)
 TOKENS_PER_MINUTE = 52_000   # v07: 25 games x 218k generated tokens in ~105 min; the UCB clock
 UCB_SCALES = (0.25, 1, 4, 16)  # multiples of UCB_DEFAULT_C
+CONCURRENCY = (7, 10, 14, 20, 25)  # slots K for the concurrency study (25 = every game)
 CLOCK = {"spent": 0.0}       # tokens spent so far in the replayed run
 
 
@@ -149,7 +150,7 @@ EXTRA = {  # printed for reference, not in the report table
 }
 
 
-def replay(trajs: list[Traj], rank, budget: float, grant: float) -> float:
+def replay(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SLOTS) -> float:
     """Each round the SLOTS best-ranked live games get `grant` tokens; unstarted games first."""
     pos = {id(t): 0.0 for t in trajs}
     total, spent = budget * len(trajs), 0.0
@@ -159,7 +160,7 @@ def replay(trajs: list[Traj], rank, budget: float, grant: float) -> float:
             break
         CLOCK["spent"] = spent
         live.sort(key=lambda t: (1, 0.0) if pos[id(t)] == 0 else (0, rank(t, pos[id(t)])), reverse=True)
-        for t in live[:SLOTS]:
+        for t in live[:slots]:
             g = min(grant, total - spent)
             if g <= 0:
                 break
@@ -198,6 +199,15 @@ def main() -> None:
         f"Uniform: {uni}.",
         "\nMean score, difference vs uniform ± SE (runs better)",
         table(["policy"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
+    ]) + "\n"
+    K = {(k, b): [replay(trs, b0_no_eff, b, GRANT, k) for trs in runs.values()]
+         for k in CONCURRENCY for b in BUDGETS}
+    rows = [[f"K = {k}" + (" (control)" if k == SLOTS else "")]
+            + [f"{st.mean(K[k, b]):.1f}" + ("" if k == SLOTS else f", {paired(K[k, b], K[SLOTS, b])}")
+               for b in BUDGETS] for k in CONCURRENCY]
+    text += "\n".join([
+        "\nConcurrency, B = 0 with efficiency ablated: mean score, difference vs K = 14 ± SE (runs better)",
+        table(["slots"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
     ]) + "\n"
     U = {(p, b): [replay(trs, f, b, GRANT) for trs in runs.values()]
          for p, f in UCB_POLICIES.items() for b in BUDGETS}

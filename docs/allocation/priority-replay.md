@@ -132,6 +132,34 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
   level; by the next ranking the game is on a fresh level, where $C = 1$
   already ranks it high.
 
+## Concurrency
+
+Same replay with our choice ($B = 0$, efficiency ablated, $R = v\,C$) and
+$K$ concurrent slots. The control is $K = 14$, used in every table above.
+The total token budget $G\beta$ is the same for every $K$, so this measures
+only how $K$ changes which games receive the tokens. It does not model the
+higher batch throughput of larger $K$, nor its KV- and prefix-cache costs.
+
+Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
+
+| Slots | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
+|---|---|---|
+| $K = 7$ | 30.3, +0.91 ± 0.54 (6/11) | 41.3, +0.96 ± 0.33 (9/11) |
+| $K = 10$ | 30.1, +0.70 ± 0.53 (5/11) | 40.6, +0.23 ± 0.26 (4/11) |
+| $K = 14$ (control) | 29.4 | 40.3 |
+| $K = 20$ | 29.0, −0.44 ± 0.91 (4/11) | 39.2, −1.14 ± 0.58 (4/11) |
+| $K = 25$ | 25.1, −4.34 ± 0.87 (1/11) | 38.2, −2.15 ± 0.75 (2/11) |
+
+- Higher concurrency lowers the score. With $K$ slots, at most $G - K$ games
+  can be held back, so the ranking has less to decide. At $K = G = 25$ every
+  live game gets a grant each round, and the result is close to uniform
+  ($24.6$ / $37.3$).
+- $K = 10$ is level with $K = 14$ ($+0.7$ / $+0.2$, within one SE).
+  Below 14 the gain is at most about $+1$ point.
+- Fewer slots only pays if the server keeps its total generation rate. With
+  fewer concurrent sequences it usually generates fewer tokens per second,
+  which costs budget $\beta$ directly; this replay cannot weigh that.
+
 ## Yield-UCB
 
 `ARC3_SCHEDULER=ucb` (`ARC3-Inference/inference/agent/scheduling/ucb.py`)

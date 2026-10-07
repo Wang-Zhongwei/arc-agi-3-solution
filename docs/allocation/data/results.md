@@ -10,6 +10,15 @@ Mean score, difference vs uniform ± SE (runs better)
 | B = 0 + pace: v·e·C(p)/p | 29.3, +4.72 ± 0.88 (11/11) | 40.0, +2.73 ± 0.55 (9/11) |
 | B = 0 + thinking: v·e·C·m | 29.7, +5.08 ± 0.74 (11/11) | 39.8, +2.52 ± 0.59 (8/11) |
 
+Concurrency, B = 0 with efficiency ablated: mean score, difference vs K = 14 ± SE (runs better)
+| slots | β = 100k, γ = 35k | β = 150k, γ = 35k |
+|---|---|---|
+| K = 7 | 30.3, +0.91 ± 0.54 (6/11) | 41.3, +0.96 ± 0.33 (9/11) |
+| K = 10 | 30.1, +0.70 ± 0.53 (5/11) | 40.6, +0.23 ± 0.26 (4/11) |
+| K = 14 (control) | 29.4 | 40.3 |
+| K = 20 | 29.0, -0.44 ± 0.91 (4/11) | 39.2, -1.14 ± 0.58 (4/11) |
+| K = 25 | 25.1, -4.34 ± 0.87 (1/11) | 38.2, -2.15 ± 0.75 (2/11) |
+
 Yield-UCB, elapsed minutes = tokens spent / 52000. Mean score, difference vs uniform ± SE (runs better)
 | policy | β = 100k, γ = 35k | β = 150k, γ = 35k |
 |---|---|---|
