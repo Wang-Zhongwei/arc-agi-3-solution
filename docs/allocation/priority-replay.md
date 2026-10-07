@@ -15,6 +15,12 @@ v07, v08, v09; `jonathanwang2022/persistent-animations` v01;
 of its own generated tokens and of its own actions, with one knot per level-up.
 Extracted to [`data/trajectories.json`](data/trajectories.json).
 
+Thinking per turn comes from the transcripts: the `reasoning_chars` of each
+turn's last model call (the call that emitted its actions), at 4 characters
+per token, placed on the game's token axis with `benchmark.json`
+`history[].generated_tokens`. Extracted to
+[`data/thinking.json`](data/thinking.json) (14,883 turns).
+
 ## Model
 
 For game $g$ with $n$ levels, $S_g(\tau)$ is the recorded score after the game
@@ -44,6 +50,7 @@ $$
 | $B = 0$ | $v\,e\,C \ \propto A\,C$ |
 | $B = 0$, efficiency ablated | $v\,C$ |
 | $B = 0$ + pace | $v\,e\,C_p / p$ |
+| $B = 0$ + thinking | $v\,e\,C\,m$ |
 | uniform (baseline) | $-\tau$ |
 
 **Pace** (`ARC3_PRIORITY_PACE`, `ProgressPace` in `priority.py`). When the
@@ -67,6 +74,19 @@ $$
 On these runs $p$ has median $0.80$ (10th–90th percentile $0.50$–$1.06$; 18% at
 the $0.5$ clip): recent games clear levels faster than the reference, so pace
 mostly raises their value and shortens their falloff.
+
+**Thinking** (`ARC3_PRIORITY_THINKING`, `thinking_multiplier` in
+`priority.py`). With $t$ the reasoning tokens of the game's most recent call
+and reference $2048$,
+
+$$
+m = \operatorname{clip}\!\left(\sqrt{2048 / t},\ \tfrac12,\ 2\right),
+$$
+
+so $m = 2$ at $t = 512$, $1$ at $2048$, $\tfrac12$ at $8192$ ($m = 1$ before the
+first call). On these runs the median $t$ is $709$, and 42% of calls are at
+or below $512$ ($m = 2$). Turns that complete a level have median $t = 162$
+against $788$ for other turns.
 
 "current" calls `priority_value` from
 `ARC3-Inference/inference/agent/scheduling/priority.py` with the Lord Hansolo
@@ -98,6 +118,7 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
 | $B = 0$ | 29.5, +4.95 ± 0.86 (10/11) | 39.9, +2.64 ± 0.56 (9/11) |
 | $B = 0$, efficiency ablated | 29.4, +4.84 ± 0.91 (11/11) | 40.3, +3.03 ± 0.84 (9/11) |
 | $B = 0$ + pace | 29.3, +4.72 ± 0.88 (11/11) | 40.0, +2.73 ± 0.55 (9/11) |
+| $B = 0$ + thinking | 29.7, +5.08 ± 0.74 (11/11) | 39.8, +2.52 ± 0.59 (8/11) |
 
 - $B$ is nearly constant ($8$ while three or more levels remain) and larger
   than $A$, so the current ranking is close to $8\,C$ and the level value
@@ -106,6 +127,10 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
   actions accumulate on a stuck level, which repeats the stall signal in $C$.
 - Pace ties $B = 0$ ($-0.2$ / $+0.1$). It rescales every game by its own
   speed, and $C$ already demotes games that are slow on the current level.
+- Thinking ties $B = 0$ ($+0.1$ / $-0.1$; with the reference set to the data
+  median $709$: $+0.2$ / $0.0$). Low thinking marks the turn that completes a
+  level; by the next ranking the game is on a fresh level, where $C = 1$
+  already ranks it high.
 
 ## Limitations
 
@@ -121,5 +146,6 @@ what the replay can rank.
 ```sh
 # from the main checkout, where ARC3-Inference/runs/ exists
 python docs/allocation/scripts/extract_trajectories.py --runs-root ARC3-Inference/runs
+python docs/allocation/scripts/extract_thinking.py --runs-root ARC3-Inference/runs
 python docs/allocation/scripts/replay.py   # writes data/results.md
 ```

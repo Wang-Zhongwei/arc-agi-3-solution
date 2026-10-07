@@ -29,8 +29,10 @@ GRANT = 35_000               # tokens per slot grant (median between context tri
 class Traj:
     """Recorded score as a step function of the game's own generated tokens."""
 
-    def __init__(self, rec: dict):
+    def __init__(self, rec: dict, thinking: list | None = None):
         self.n, self.won = rec["n"], rec["won"]
+        self.think_x = [x for x, _ in thinking or []]
+        self.think_t = [r for _, r in thinking or []]
         self.tx = [p[0] for p in rec["tokens"]]
         self.y = [p[1] for p in rec["tokens"]]
         self.ax = [p[0] for p in rec["actions"]]
@@ -61,6 +63,11 @@ class Traj:
             pace.record_completion(u - prev, PACE_REF["by_level"].get(str(j), PACE_REF["fallback_tokens"]))
             prev = u
         return min(2.0, max(0.5, pace.cost_multiplier()))
+
+    def thinking(self, t: float) -> float | None:
+        """Reasoning tokens of the last call of the latest turn finished by t (None before the first)."""
+        i = bisect_right(self.think_x, t + 1e-9) - 1
+        return self.think_t[i] if i >= 0 else None
 
     def state(self, t: float) -> tuple[int, float, float]:
         """(L levels completed, s tokens since last level-up, a actions since last level-up)."""
@@ -95,16 +102,24 @@ def b0_no_eff(tr: Traj, t: float, pace: bool = False) -> float:
     return value(tr, L) * hazard(s, a, p) / p
 
 
+def thinking_multiplier(t: float | None, ref: float = 2048.0) -> float:
+    """m = clip((ref / t)^(1/2), 1/2, 2); 1 before the first call (ARC3_PRIORITY_THINKING)."""
+    return 1.0 if t is None else min(2.0, max(0.5, (ref / max(1.0, t)) ** 0.5))
+
+
 POLICIES = {
     "uniform": lambda tr, t: -t,
     "current: (A+B)·C": current,
     "B = 0: v·e·C": b0,
     "B = 0, no efficiency: v·C": b0_no_eff,
     "B = 0 + pace: v·e·C(p)/p": lambda tr, t: b0(tr, t, pace=True),
+    "B = 0 + thinking: v·e·C·m": lambda tr, t: b0(tr, t) * thinking_multiplier(tr.thinking(t)),
 }
 EXTRA = {  # printed for reference, not in the report table
     "current + pace": lambda tr, t: current(tr, t, pace=True),
     "B = 0, no efficiency + pace": lambda tr, t: b0_no_eff(tr, t, pace=True),
+    "B = 0 + thinking, ref = data median": lambda tr, t: b0(tr, t) * thinking_multiplier(tr.thinking(t), THINK_MEDIAN),
+    "current + thinking": lambda tr, t: current(tr, t) * thinking_multiplier(tr.thinking(t)),
 }
 
 
@@ -137,8 +152,14 @@ def table(header: list[str], rows: list[list[str]]) -> str:
 
 
 def main() -> None:
+    global THINK_MEDIAN
     raw = json.loads((DATA / "trajectories.json").read_text())
-    runs = {run: [Traj(rec) for rec in games.values()] for run, games in raw.items()}
+    think = json.loads((DATA / "thinking.json").read_text())
+    runs = {run: [Traj(rec, think[run][game]) for game, rec in games.items()] for run, games in raw.items()}
+    all_t = sorted(r for g in think.values() for s in g.values() for _, r in s)
+    THINK_MEDIAN = st.median(all_t)
+    print(f"last-call thinking: median {THINK_MEDIAN:.0f} tokens; <=512: {sum(x <= 512 for x in all_t) / len(all_t):.0%}, "
+          f">=8192: {sum(x >= 8192 for x in all_t) / len(all_t):.0%}")
     S = {(p, b): [replay(trs, f, b, GRANT) for trs in runs.values()]
          for p, f in POLICIES.items() for b in BUDGETS}
     rows = [["uniform (baseline)"] + [f"{st.mean(S['uniform', b]):.1f}" for b in BUDGETS]]
