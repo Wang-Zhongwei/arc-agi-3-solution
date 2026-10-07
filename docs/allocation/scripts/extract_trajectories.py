@@ -1,10 +1,8 @@
-"""Extract per-game score trajectories and human baselines from evaluated runs.
+"""Extract per-game score trajectories from evaluated runs.
 
-Reads `<runs-root>/kaggle/<run>/evaluation.json` (progression lanes) and
-`benchmark.json` (base_actions_per_level). Writes:
+Reads `<runs-root>/kaggle/<run>/evaluation.json` (progression lanes). Writes:
 
   data/trajectories.json  {run: {game: {n, won, tokens: [[x, score]...], actions: [[x, score]...]}}}
-  data/baselines.json     {game: [human actions per level]}
 
 Usage (from the repository root of the main checkout, where runs/ exists):
   python docs/allocation/scripts/extract_trajectories.py --runs-root ARC3-Inference/runs
@@ -38,7 +36,6 @@ def main() -> None:
     args = ap.parse_args()
 
     trajectories: dict = {}
-    baselines: dict = {}
     for run in RUNS:
         folder = args.runs_root / "kaggle" / run
         ev = json.loads((folder / "evaluation.json").read_text())
@@ -56,17 +53,11 @@ def main() -> None:
                     "actions": act[game][trial],
                 }
         trajectories[run] = games
-        bench = folder / "benchmark.json"
-        if bench.exists():
-            for gr in json.loads(bench.read_text()).get("game_runs", []):
-                if gr.get("base_actions_per_level"):
-                    baselines.setdefault(gr["game_id"], gr["base_actions_per_level"])
 
     DATA.mkdir(parents=True, exist_ok=True)
     (DATA / "trajectories.json").write_text(json.dumps(trajectories, separators=(",", ":")))
-    (DATA / "baselines.json").write_text(json.dumps(dict(sorted(baselines.items())), indent=1))
     n = sum(len(g) for g in trajectories.values())
-    print(f"{len(trajectories)} runs, {n} trajectories, {len(baselines)} games with baselines -> {DATA}")
+    print(f"{len(trajectories)} runs, {n} trajectories -> {DATA}")
 
 
 if __name__ == "__main__":
