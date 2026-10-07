@@ -218,6 +218,9 @@ CFG = dict(
     # QSA compressed index keys in plain e4m3, as vLLM's indexer_kv_dtype=fp8
     # (384 instead of 768 B per KV token); probed at startup, else BF16.
     QSA_INDEX_FP8=False,
+    # Pennyroyal's online weight-only FP8: lm_head and HyperConnection mixes
+    # rowwise FP8, other large BF16 linears MXFP8 (SGLANG_SM120_ONLINE_MXFP8).
+    ONLINE_MXFP8=False,
     # Serve the checkpoint's own BF16 PLE table even if its config declares FP8
     # (lordhansolo's checkpoint does; his vLLM run kept BF16).
     PLE_BF16=False,
@@ -402,6 +405,7 @@ TUNEUP_ENV = {
     "SGLANG_SM120_LOWM_FP8_GEMM": "1" if CFG["LOWM_FP8"] else "",
     "SGLANG_QWEN4_EXP_MTP_SHARED_HEAD": "1" if CFG["MTP_SHARED_HEAD"] else "",
     "SGLANG_QSA_INDEX_FP8": "1" if CFG["QSA_INDEX_FP8"] else "",
+    "SGLANG_SM120_ONLINE_MXFP8": "1" if CFG["ONLINE_MXFP8"] else "",
 }
 TUNEUP_ENV = {k: v for k, v in TUNEUP_ENV.items() if v}
 TUNEUP = {"requested": sorted(TUNEUP_ENV), "low_m_max": int(CFG["LOWM_MAX_M"]), "patched": [], "fallback": None}
