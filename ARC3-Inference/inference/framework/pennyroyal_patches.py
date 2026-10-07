@@ -470,7 +470,17 @@ EDITS += [
         "                quant_config=quant_config,\n"
         '                prefix=add_prefix("model.shared_head.head", prefix),\n'
         "                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,\n"
-        "            )\n",
+        "            )\n"
+        '        if get_bool_env_var("SGLANG_QWEN4_EXP_MTP_SHARED_HEAD"):\n'
+        "            # Post-load staging refuses meta tensors: give the head an empty real\n"
+        "            # weight (no rows, no memory) that the worker later replaces.\n"
+        "            placeholder = nn.Parameter(\n"
+        "                torch.empty((0, config.hidden_size), dtype=self.lm_head.weight.dtype),\n"
+        "                requires_grad=False,\n"
+        "            )\n"
+        "            for key, value in vars(self.lm_head.weight).items():\n"
+        "                setattr(placeholder, key, value)\n"
+        "            self.lm_head.weight = placeholder\n",
     ),
 ]
 
