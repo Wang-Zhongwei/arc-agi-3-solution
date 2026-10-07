@@ -248,8 +248,11 @@ and its share goes to the other games. Share of games affected ($\gamma = 35\tex
   partly an artifact: the top games run out of data, and the true effect of
   very low $K$ could be larger or smaller.
 - How long each game was recorded was decided by the original run's own
-  scheduler. Real runs spend about $220\text{k}$ tokens per game, beyond what
-  the replay can rank.
+  scheduler.
+- The private run's budget is beyond what the replay can rank: at about
+  $800$ generated tokens/s for $530$ minutes over $110$ games,
+  $\beta \approx 800 \times 530 \times 60 / 110 \approx 231\text{k}$ tokens per
+  game, where the recorded data cover less than the budget.
 
 **2. No throughput.** Every policy and every $K$ gets the same token budget
 $G\beta$. The replay ignores that fewer concurrent streams generate fewer
