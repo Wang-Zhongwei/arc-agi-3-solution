@@ -174,6 +174,15 @@ Mean $\bar S$, then the paired difference vs the uniform baseline ($\gamma = 35\
 - Large $c$ lets the bonus dominate and the ranking drifts toward
   fewest-actions-first; at 16× the action default it falls below uniform.
 
+## Decision
+
+Use $B = 0$ with the efficiency term ablated, $R = v\,C$. I think this is
+probably as far as allocation can take us.
+
+Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
+`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep
+`ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$).
+
 ## Limitations
 
 The replay ignores wall-clock throughput, prefill, prefix caching, per-game
