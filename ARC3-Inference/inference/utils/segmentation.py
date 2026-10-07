@@ -135,6 +135,8 @@ def segment_layer(layer, color_chars):
         hash regardless of position (lets objects be matched across frames, or when
         several similar objects appear in one frame).
       - ``pixels``: number of cells in the component.
+      - ``bbox``: ``[r0, c0, r1, c1]`` -- the component's inclusive bounding box. It
+        spans enclosed children, though ``pixels`` does not count them.
       - ``boundary``: the component's outer perimeter as an ordered, clockwise list of
         ``[row, col]`` corner points -- a Moore-neighbour trace reduced to only the
         vertices where the contour changes direction (enclosed holes are not traced).
@@ -234,6 +236,8 @@ def segment_layer(layer, color_chars):
         color = color_chars[max(0, min(15, comp["value"]))]
         boundary = _corner_points(_trace_outer_contour(comp["cells"], comp["start"]))
         signature = _object_signature(comp["cells"], color)
+        rows = [r for r, _ in comp["cells"]]
+        cols = [c for _, c in comp["cells"]]
         nodes.append(
             {
                 "id": cid,
@@ -244,6 +248,7 @@ def segment_layer(layer, color_chars):
                 "pose_hash": signature[3],
                 "shape_hash": signature[4],
                 "pixels": len(comp["cells"]),
+                "bbox": [min(rows), min(cols), max(rows), max(cols)],
                 "boundary": [[r, c] for r, c in boundary],
                 "children": children[cid],
             }
