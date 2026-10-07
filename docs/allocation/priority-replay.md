@@ -135,24 +135,25 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
 ## Concurrency
 
 Same replay with our choice ($B = 0$, efficiency ablated, $R = v\,C$) and
-$K$ concurrent slots. The control is $K = 14$, used in every table above.
+$K$ concurrent slots. The active fraction $K/G$ is the share of the games in a
+wave ($G$) that can generate at once. The control is $K = 14$, used in every table above.
 The total token budget $G\beta$ is the same for every $K$, so this measures
 only how $K$ changes which games receive the tokens. It does not model the
 higher batch throughput of larger $K$, nor its KV- and prefix-cache costs.
 
 Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
 
-| Slots | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
-|---|---|---|
-| $K = 1$ | 30.4, +0.93 ± 0.84 (7/11) | 41.3, +0.98 ± 0.34 (9/11) |
-| $K = 2$ | 30.7, +1.30 ± 0.83 (7/11) | 41.4, +1.05 ± 0.29 (9/11) |
-| $K = 3$ | 30.5, +1.03 ± 0.74 (7/11) | 41.6, +1.24 ± 0.39 (9/11) |
-| $K = 5$ | 30.5, +1.07 ± 0.57 (7/11) | 41.2, +0.84 ± 0.31 (8/11) |
-| $K = 7$ | 30.3, +0.91 ± 0.54 (6/11) | 41.3, +0.96 ± 0.33 (9/11) |
-| $K = 10$ | 30.1, +0.70 ± 0.53 (5/11) | 40.6, +0.23 ± 0.26 (4/11) |
-| $K = 14$ (control) | 29.4 | 40.3 |
-| $K = 20$ | 29.0, −0.44 ± 0.91 (4/11) | 39.2, −1.14 ± 0.58 (4/11) |
-| $K = 25$ | 25.1, −4.34 ± 0.87 (1/11) | 38.2, −2.15 ± 0.75 (2/11) |
+| Slots | $K/G$ | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
+|---|---|---|---|
+| $K = 1$ | 0.04 | 30.4, +0.93 ± 0.84 (7/11) | 41.3, +0.98 ± 0.34 (9/11) |
+| $K = 2$ | 0.08 | 30.7, +1.30 ± 0.83 (7/11) | 41.4, +1.05 ± 0.29 (9/11) |
+| $K = 3$ | 0.12 | 30.5, +1.03 ± 0.74 (7/11) | 41.6, +1.24 ± 0.39 (9/11) |
+| $K = 5$ | 0.20 | 30.5, +1.07 ± 0.57 (7/11) | 41.2, +0.84 ± 0.31 (8/11) |
+| $K = 7$ | 0.28 | 30.3, +0.91 ± 0.54 (6/11) | 41.3, +0.96 ± 0.33 (9/11) |
+| $K = 10$ | 0.40 | 30.1, +0.70 ± 0.53 (5/11) | 40.6, +0.23 ± 0.26 (4/11) |
+| $K = 14$ (control) | 0.56 | 29.4 | 40.3 |
+| $K = 20$ | 0.80 | 29.0, −0.44 ± 0.91 (4/11) | 39.2, −1.14 ± 0.58 (4/11) |
+| $K = 25$ | 1.00 | 25.1, −4.34 ± 0.87 (1/11) | 38.2, −2.15 ± 0.75 (2/11) |
 
 - Higher concurrency lowers the score. With $K$ slots, at most $G - K$ games
   can be held back, so the ranking has less to decide. At $K = G = 25$ every
@@ -212,9 +213,17 @@ Mean $\bar S$, then the paired difference vs the uniform baseline ($\gamma = 35\
 Use $B = 0$ with the efficiency term ablated, $R = v\,C$. I think this is
 probably as far as allocation can take us.
 
+A lower active fraction $K/G$ is better for allocation. $K = 2$ of $25$
+($K/G = 0.08$) scored highest at $\beta = 100\text{k}$ ($K = 3$ at $150\text{k}$),
+although every $K/G \le 0.28$ is within noise of it (about $+1$ point over $K = 14$). On the roughly 110-game private pool,
+$0.08$ corresponds to about $8.8$ active games, at a cost in throughput. So
+14 concurrent streams with 1 wave ($K/G = 14/110 \approx 0.13$) looks like the
+best choice; 4 waves gives $14/28 = 0.5$, near the control.
+
 Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
 `ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep
-`ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$).
+`ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$),
+`ARC3_MAX_ACTIVE_STREAMS=14`, and `kaggle.private_waves: 1`.
 
 ## Limitations
 
