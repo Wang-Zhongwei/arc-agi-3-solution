@@ -2,6 +2,10 @@
 
 import ast
 import json
+import os
+import shlex
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,17 +17,39 @@ from inference.framework.solver import HarnessSolver
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / "configs/1006-prompt-cleaning-engine-swap/lordhansolo.json"
+CONFIG = ROOT / "configs/lordhansolo/v11.json"
 NOTEBOOK = ROOT.parent / "tufa-arc-agi-framework/src/taaf/kaggle/taaf_kaggle_run.ipynb"
 
 
+@pytest.fixture(scope="module")
+def config_environment():
+    # Use Make's real exports: copying harness_env into the process here masked
+    # a mismatch between the build-time image cap and runtime image upscale.
+    keys = [
+        "ARC3_KAGGLE_JSON", "ARC3_HARNESS_ENV_JSON",
+        "LOCAL_ANALYZER_CONTEXT_WINDOW", "LOCAL_ANALYZER_MAX_OUTPUT",
+        "LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", "LOCAL_ANALYZER_TEMPERATURE",
+        "LOCAL_ANALYZER_TOP_P", "LOCAL_ANALYZER_TOP_K", "LOCAL_ANALYZER_APP_NAME",
+        "LOCAL_ANALYZER_TOOL_TIMEOUT", "LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS",
+        "LOCAL_ANALYZER_TOOL_STEPS", "LOCAL_ANALYZER_YIELD_SECONDS",
+        "LOCAL_ANALYZER_ENABLE_THINKING", "MULTIMODAL_CONTEXT", "MULTIMODAL_UPSCALE",
+    ]
+    code = f"import json, os; print(json.dumps({{k: os.environ[k] for k in {keys!r}}}))"
+    recipe = "print-test-env:\n\t@" + shlex.join([sys.executable, "-c", code]) + "\n"
+    result = subprocess.run(
+        ["make", "--no-print-directory", "-s", "-f", "Makefile", "-f", "-",
+         f"CONFIG_PATH={CONFIG}", f"PYTHON={sys.executable}", "print-test-env"],
+        cwd=ROOT, input=recipe, text=True, capture_output=True, check=True,
+        env={key: value for key, value in os.environ.items() if key not in keys},
+    )
+    return json.loads(result.stdout)
+
+
 @pytest.fixture
-def rendered(monkeypatch, tmp_path):
+def rendered(monkeypatch, tmp_path, config_environment):
     config = json.loads(CONFIG.read_text())
-    monkeypatch.setenv("ARC3_KAGGLE_JSON", json.dumps(config["kaggle"]))
-    monkeypatch.setenv("ARC3_HARNESS_ENV_JSON", json.dumps(config["harness_env"]))
-    for key, value in config["harness_env"].items():
-        monkeypatch.setenv(key, str(value))
+    for key, value in config_environment.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setenv("TAAF_KAGGLE_WORKING_DIR", str(tmp_path))
     monkeypatch.setenv("TAAF_KAGGLE_BUNDLE_DIR", str(tmp_path))
     monkeypatch.setenv("TAAF_KAGGLE_SETUP_ENV", str(tmp_path / "setup_env.json"))
@@ -60,7 +86,13 @@ def test_server_uses_lord_runtime_and_preserves_request_settings(rendered):
     for key, value in config["harness_env"].items():
         assert handoff[key] == str(value)
     assert handoff["LOCAL_ANALYZER_MODEL_ID"] == "flashnext"
-    assert handoff["ARC3_KAGGLE_PRIVATE_WAVES"] == "2"
+    assert handoff["ARC3_KAGGLE_PRIVATE_WAVES"] == "4"
+    assert handoff["MULTIMODAL_UPSCALE"] == "10"
+    assert handoff["LOCAL_ANALYZER_MAX_OUTPUT"] == "12288"
+    assert handoff["LOCAL_ANALYZER_THINKING_TOKEN_BUDGET"] == "8192"
+    assert handoff["LOCAL_ANALYZER_TEMPERATURE"] == "0.7"
+    assert handoff["LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS"] == "3072"
+    assert handoff["LOCAL_ANALYZER_YIELD_SECONDS"] == "0"
     assert "LOCAL_ANALYZER_REASONING_EFFORT" not in handoff
     assert "LOCAL_ANALYZER_TARGET_CONTEXT" not in handoff
 

@@ -178,6 +178,10 @@ def lordhansolo_setup_command() -> str:
     if command.count(marker) != 1:
         raise ValueError("Lord Hansolo launcher handoff changed; review the adapter")
     overrides = harness_env()
+    overrides.setdefault(
+        "LOCAL_ANALYZER_THINKING_TOKEN_BUDGET",
+        os.environ.get("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", "0"),
+    )
     overrides["ARC3_KAGGLE_PRIVATE_WAVES"] = str(cfg.get("private_waves", 1))
     overrides["ARC3_KAGGLE_PRIVATE_RUNTIME_MINUTES"] = str(cfg.get("private_runtime_minutes", 532))
     handoff = f"setup_env.update({overrides!r})\n"
