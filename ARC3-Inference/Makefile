@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := interactive
 
-.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval score_run significance view pull-kaggle pull-runpod trace traces zip clean cluster_view_queue
+.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval evaluate_run score_run significance view pull-kaggle pull-runpod trace traces zip clean cluster_view_queue
 
 -include .env
 
@@ -346,6 +346,8 @@ CHAT_SYSTEM ?=
 PROMPT ?=
 
 EVAL_CONFIG_PATH ?= configs/eval.json
+EVALUATION_OUTPUT_PATH ?=
+EVALUATE_RUN_DIR ?=
 SCORE_OUTPUT_PATH ?=
 SCORE_RUN_DIR ?=
 SIGNIFICANCE_CONFIG_PATH ?= configs/significance.json
@@ -696,6 +698,13 @@ chat:
 
 eval:
 	$(UV_RUN) inference-eval --config "$(EVAL_CONFIG_PATH)" $(if $(SCORE_OUTPUT_PATH),--evaluation-output "$(SCORE_OUTPUT_PATH)")
+
+evaluate_run:
+	@if [ -z "$(strip $(EVALUATE_RUN_DIR))" ]; then \
+		echo "EVALUATE_RUN_DIR is required."; \
+		exit 1; \
+	fi
+	$(UV_RUN) inference-eval "$(EVALUATE_RUN_DIR)" $(if $(EVALUATION_OUTPUT_PATH),--evaluation-output "$(EVALUATION_OUTPUT_PATH)")
 
 score_run:
 	@if [ -z "$(strip $(SCORE_RUN_DIR))" ]; then \
