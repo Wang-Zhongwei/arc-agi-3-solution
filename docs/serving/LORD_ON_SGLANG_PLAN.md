@@ -99,3 +99,20 @@ At FP8 KV, 1.5M SGLang tokens would need 19.75 GiB for KV alone, more than remai
 - QSA index in FP8, as his indexer is: ~0.54 GiB at 1.5M; needs kernel changes.
 - Smaller CUDA graphs: 1.28 GiB vs his 0.46.
 - An NVFP4 KV cache: about 2M tokens. It changes numerics, and QSA support is unverified.
+
+## v5 and v6 results (RunPod, 2 passes over the public games)
+
+| | v5 | v6 | lordhansolo, vLLM |
+|---|---|---|---|
+| Mamba strategy | `extra_buffer_lazy` + skip-decode-lock, 48 slots | `extra_buffer`, 76 slots | one shared pool |
+| KV tokens | 1,266,816 | 1,150,336 | 1,417,100 (pool also holds Mamba) |
+| Draft weights | 1.51 GiB | 1.51 GiB | (in 71.94 total) |
+| Free after graphs | 1.26 GB | 1.26 GB | 1.90 GB |
+| Prefix hit, first 12–22 min | 32% | 93% | 92% |
+| Decode tok/s at 13 / 14 running | 461 / 511 | 892 / 817 | 933 / 951 |
+
+- **v5's prefix cache collapsed.** `extra_buffer_lazy` turns off Daniel's sparse-prefill checkpoints: `unified_radix_cache` sets `mamba_prefill_final_only` only for non-lazy `extra_buffer`. So every turn re-prefilled its history (4.17M new tokens in 22 minutes). Don't combine lazy with his bundle.
+- **v6:**
+  - Restores his checkpoints and keeps everything else.
+  - Decodes 17% faster than Daniel's 10-stream baseline at 10 running.
+  - Reaches 86–96% of lordhansolo's vLLM at 13–14 running, with the same KV + Mamba memory.
