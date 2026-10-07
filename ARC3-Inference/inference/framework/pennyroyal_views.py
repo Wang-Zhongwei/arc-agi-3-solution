@@ -6,6 +6,8 @@ of symlinks plus a rewritten config/index, so nothing is copied.
 - `build_target_view` swaps a checkpoint's BF16 PLE table for a matching FP8 one
   (RadixArk's `model-plefp8-*` shards and their global `weight_scale`). Every
   GPU-resident tensor stays the original checkpoint's.
+- `build_ple_dtype_view` serves a checkpoint as is but sets its declared PLE
+  dtype, e.g. BF16 for lordhansolo's shards, whose config says FP8.
 - `build_mtp_draft_view` keeps only the shards holding the embedded MTP head
   (plus the embedding and LM head), so the NEXTN draft load does not read the
   whole target checkpoint a second time.
@@ -158,6 +160,30 @@ def build_target_view(target, ple_fp8, work_root) -> Path:
     dropped = sorted(set(target_map.values()) - set(weight_map.values()))
     print(f"Target view: {view} ({len(sources)} shards; FP8 PLE from {ple_fp8}; "
           f"{len(dropped)} BF16-only PLE shards left out)")
+    return view
+
+
+def build_ple_dtype_view(target, work_root, ple_dtype: str) -> Path:
+    """`target` unchanged except for `text_config.ple_embedding_dtype`.
+
+    lordhansolo's mixed checkpoint ships BF16 PLE shards but declares
+    `ple_embedding_dtype: float8_e4m3fn`, so Pennyroyal would allocate an FP8 host
+    table and downcast the shards. `ple_dtype="bfloat16"` keeps his BF16 table, as
+    his vLLM run did.
+    """
+    target = Path(target)
+    target_map = read_index(target)["weight_map"]
+    ple_tensors = sorted(k for k in target_map if PLE_TABLE_MARKER in k)
+    if not ple_tensors:
+        raise RuntimeError(f"No PLE table tensors in {target}")
+    shard_dtypes = {h["dtype"] for h in _headers_for(target, target_map, ple_tensors).values()}
+    if ple_dtype == "bfloat16" and shard_dtypes != {"BF16"}:
+        raise RuntimeError(f"PLE shards in {target} are {sorted(shard_dtypes)}, not BF16")
+    config = json.loads((target / "config.json").read_text())
+    config.get("text_config", config)["ple_embedding_dtype"] = ple_dtype
+    sources = {f: target for f in set(target_map.values())}
+    view = _materialize_view(work_root, "target-view", sources, config, target_map, _extra_files(target))
+    print(f"Target view: {view} ({len(sources)} shards; PLE kept {ple_dtype}, {len(ple_tensors)} tensors)")
     return view
 
 

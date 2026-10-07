@@ -97,6 +97,27 @@ def test_target_view_rejects_non_fp8_table(checkpoints, tmp_path):
         views.build_target_view(target, radix, work)
 
 
+def test_ple_dtype_view_keeps_every_shard_and_rewrites_only_the_dtype(checkpoints):
+    target, _, work = checkpoints
+    config = json.loads((target / "config.json").read_text())
+    config["text_config"]["ple_embedding_dtype"] = "float8_e4m3fn"  # lordhansolo's hint
+    (target / "config.json").write_text(json.dumps(config))
+    view = views.build_ple_dtype_view(target, work, "bfloat16")
+    assert views.read_index(view)["weight_map"] == views.read_index(target)["weight_map"]
+    for shard in set(views.read_index(target)["weight_map"].values()):
+        assert (view / shard).resolve() == (target / shard).resolve()
+    served = json.loads((view / "config.json").read_text())
+    assert served["text_config"]["ple_embedding_dtype"] == "bfloat16"
+    assert served["quantization_config"] == config["quantization_config"]
+    assert views.build_ple_dtype_view(target, work, "bfloat16") == view
+
+
+def test_ple_dtype_view_refuses_bfloat16_for_fp8_shards(checkpoints):
+    _, radix, work = checkpoints
+    with pytest.raises(RuntimeError, match="not BF16"):
+        views.build_ple_dtype_view(radix, work, "bfloat16")
+
+
 def test_draft_view_keeps_mtp_embedding_and_head_shards(checkpoints):
     target, radix, work = checkpoints
     view = views.build_mtp_draft_view(views.build_target_view(target, radix, work), work)

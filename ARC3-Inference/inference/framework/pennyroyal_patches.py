@@ -17,6 +17,9 @@ set (see docs/serving/LORD_ON_SGLANG_PLAN.md):
   limit use a weight-only split-K Triton GEMM (pennyroyal_overlay).
 - SGLANG_SM120_LOWM_MAX_M: low-M limit for that path and Daniel's BF16 one
   (default 32, his value).
+- SGLANG_QWEN4_EXP_MTP_SHARED_HEAD=1: the MTP draft builds its LM head on the
+  meta device. It never loads that head (only mtp.* tensors) and uses the
+  target's, so this frees 1.18 GiB before the KV pool is sized.
 
 Always on once applied: an O(1) expert-name lookup in Qwen4-Exp load_weights,
 which otherwise scans all 3 x num_experts mapping entries per tensor.
@@ -33,6 +36,7 @@ CT_FP8 = "sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_t
 CT_NVFP4_MOE = "sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4_moe.py"
 MARLIN_FP4 = "sglang/srt/layers/quantization/marlin_utils_fp4.py"
 QWEN4_EXP = "sglang/srt/models/qwen4_exp.py"
+QWEN4_EXP_MTP = "sglang/srt/models/qwen4_exp_mtp.py"
 
 # (file relative to site-packages, exact anchor, replacement). The replacement
 # keeps the anchor text where code is only inserted, so the "already applied"
@@ -432,6 +436,41 @@ EDITS: list[tuple[str, str, str]] = [
         "                        if expert_key is not None\n"
         "                        else ()\n"
         "                    )\n",
+    ),
+]
+
+
+EDITS += [
+    # ---- Qwen4-Exp MTP draft: no private LM head (it is never loaded) ----
+    (
+        QWEN4_EXP_MTP,
+        "        self.lm_head = ParallelLMHead(\n"
+        "            config.vocab_size,\n"
+        "            config.hidden_size,\n"
+        "            quant_config=quant_config,\n"
+        '            prefix=add_prefix("model.shared_head.head", prefix),\n'
+        "            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,\n"
+        "        )\n",
+        "        # Pennyroyal tuning (SGLANG_QWEN4_EXP_MTP_SHARED_HEAD=1): load_weights keeps\n"
+        "        # only mtp.* tensors, so this head is never loaded; the speculative worker\n"
+        "        # swaps in the target's head (or its hot-vocab rows) after the KV pool is\n"
+        "        # sized. On meta it stops costing that pool 1.18 GiB of dead weight.\n"
+        "        from contextlib import nullcontext\n"
+        "\n"
+        "        from sglang.srt.utils import get_bool_env_var\n"
+        "\n"
+        "        with (\n"
+        '            torch.device("meta")\n'
+        '            if get_bool_env_var("SGLANG_QWEN4_EXP_MTP_SHARED_HEAD")\n'
+        "            else nullcontext()\n"
+        "        ):\n"
+        "            self.lm_head = ParallelLMHead(\n"
+        "                config.vocab_size,\n"
+        "                config.hidden_size,\n"
+        "                quant_config=quant_config,\n"
+        '                prefix=add_prefix("model.shared_head.head", prefix),\n'
+        "                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,\n"
+        "            )\n",
     ),
 ]
 

@@ -54,7 +54,48 @@ Kaggle `lord-nvfp4-pennyroyal-tuned` v1 (commit 61be503) never served a request:
 
 The stack dumps (94 samples over the tuned load) located the slow loading steps: ~47% in per-expert host-to-GPU copies (`FusedMoE._load_w13` / `_load_w2`), ~34% in copying FP8 PLE rows into the pinned table (`copy_ple_rows_to_tp_embedding`). The expert-name lookup was not the bottleneck.
 
-## Next runs
+## Marlin root cause
 
-- **Tuned v2** ([`v2.json`](../../ARC3-Inference/configs/lord-nvfp4-pennyroyal-tuned/v2.json)): v1 with `MOE_MARLIN` off and without stack dumps. Measures steps 1 and 3 at 14 streams.
-- **Marlin bisect** ([`nvfp4-marlin-debug/v1.json`](../../ARC3-Inference/configs/nvfp4-marlin-debug/v1.json), `MARLIN_DEBUG_ONLY`): runs [`pennyroyal_marlin_debug.py`](../../ARC3-Inference/inference/framework/pennyroyal_marlin_debug.py) and stops. It checks the tested dense NVFP4 Marlin kernel on synthetic and real weights, then MoE-prepared experts through the dense kernel (prep vs. MoE kernel), then the full MoE expert at M = 1, 8, 56, then the server's own conversion. Marlin returns once its case passes.
+The bisect ([`pennyroyal_marlin_debug.py`](../../ARC3-Inference/inference/framework/pennyroyal_marlin_debug.py), RunPod) passed all 23 cases: dense and MoE NVFP4 Marlin, synthetic and layer 0 of the real checkpoint, M = 1, 8, 56. The bug was the self-check. SGLang runs weight post-processing under `set_default_torch_dtype(bf16)`, so the check's `torch.ones()` top-k weights were BF16. Marlin reads them as float32, which zeroed half the rows. Fixed in 03ad1a4 (explicit float32); serving was never affected.
+
+## RunPod v3 and v4
+
+Model mounts come from Hugging Face. `primitive-ai@07915ee+mtp_nvfp4` rebuilds lordhansolo's package (a new `+overlay` mapping).
+
+- **v3:** all self-checks passed in-server, with a KV pool of 1,156,544 tokens. SGLang capped requests at 12 (60 Mamba slots at 5 per request). At `MEMFRAC` 0.97 the first image prefill ran out of memory.
+- **v4** (`MEMFRAC` 0.955, `MAMBA_CACHE` 80): ran cleanly at 14 slots with 965,888 KV tokens. Decode was 15–35% above v1 at up to 7 running requests, but about 25% below at 9–10. Those batches exceed 32 tokens and use the new 64-wide tiles, whose sizes were never timed.
+
+## Memory compared with lordhansolo
+
+From his vLLM log (notebook v293) and the [Milestone 2 comparison](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/discussion/744792):
+
+| GiB | lordhansolo, vLLM | v4, SGLang |
+|---|---|---|
+| Weights (target + draft) | 71.94 | 69.95 + 2.68 (the draft carries a 1.18 GiB LM head it never loads) |
+| KV + Mamba | 19.69, one shared pool | 11.98 KV + 0.69 QSA index + 4.50 Mamba |
+| CUDA graphs | 0.46 | 1.28 |
+| Left free | 1.90 | 3.41 |
+| Tokens | 1,417,100 | 965,888 |
+
+vLLM sizes Mamba pages to match attention pages and serves both from that 19.69 GiB pool, so its token count is a pool size. SGLang reports KV only and keeps Mamba separate. SGLang costs 14,140 B per KV token: 12,288 target KV (FP8), 1,024 draft KV, and about 768 for the BF16 QSA index (vLLM keeps the indexer in FP8).
+
+## v5: lordhansolo's exact model and drafter
+
+[`v5.json`](../../ARC3-Inference/configs/lord-nvfp4-pennyroyal-tuned/v5.json) differs from v4 as follows:
+
+- **Model:** his BF16 PLE table (`PLE_BF16`; v1–v4 used RadixArk's FP8 table).
+- **Drafter:** his 32K draft vocabulary (`DRAFT_VOCAB: configs/draft_vocab_32k.json`, from his source) with the embedded NVFP4 MTP head and 3 draft tokens.
+- **Memory, with no numerics change:**
+  - `MTP_SHARED_HEAD`: +1.18 GiB.
+  - Mamba at 3 slots per request: `extra_buffer_lazy` + `MAMBA_SKIP_DECODE_LOCK`, `MAMBA_CACHE` 48.
+  - His 2,048-token prefill chunk, so `MEMFRAC` can rise to 0.967.
+- **Speed:** `LOWM_MAX_M` back to 32.
+- **Load:** 2 passes over the 10 public games, so 14 streams fill.
+
+Expected: about 1.27M KV tokens plus 2.7 GiB of Mamba. That is 19.5 GiB of KV + Mamba, the same as his 19.69 GiB pool.
+
+At FP8 KV, 1.5M SGLang tokens would need 19.75 GiB for KV alone, more than remains after weights, Mamba, graphs and headroom. Options beyond v5:
+
+- QSA index in FP8, as his indexer is: ~0.54 GiB at 1.5M; needs kernel changes.
+- Smaller CUDA graphs: 1.28 GiB vs his 0.46.
+- An NVFP4 KV cache: about 2M tokens. It changes numerics, and QSA support is unverified.

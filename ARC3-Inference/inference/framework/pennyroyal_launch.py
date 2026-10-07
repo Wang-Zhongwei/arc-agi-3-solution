@@ -213,6 +213,16 @@ CFG = dict(
     # Run pennyroyal_marlin_debug.py on the GPU, write marlin-debug.json, and
     # stop before starting a server (the notebook then fails at setup).
     MARLIN_DEBUG_ONLY=False,
+    # The MTP draft's never-loaded LM head goes on the meta device (+1.18 GiB KV).
+    MTP_SHARED_HEAD=False,
+    # Serve the checkpoint's own BF16 PLE table even if its config declares FP8
+    # (lordhansolo's checkpoint does; his vLLM run kept BF16).
+    PLE_BF16=False,
+    # Draft vocabulary as a JSON of half-open token_ranges, relative to
+    # ARC3-Inference/ (lordhansolo's configs/draft_vocab_32k.json). Replaces FRSPEC.
+    DRAFT_VOCAB="",
+    # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK: one Mamba slot less per running request.
+    MAMBA_SKIP_DECODE_LOCK=False,
 )
 CFG.update(SPEC.get("sglang", {}))
 if CFG["WINDOW_PREFETCH"]: CFG["PREFETCH_CHECKPOINTS"] = False
@@ -387,6 +397,7 @@ TUNEUP_ENV = {
     "SGLANG_QWEN4_EXP_HOST_EMBED_TOKENS": "1" if CFG["EMBED_TOKENS_HOST"] else "",
     "SGLANG_CT_NVFP4_MOE_MARLIN": "1" if CFG["MOE_MARLIN"] else "",
     "SGLANG_SM120_LOWM_FP8_GEMM": "1" if CFG["LOWM_FP8"] else "",
+    "SGLANG_QWEN4_EXP_MTP_SHARED_HEAD": "1" if CFG["MTP_SHARED_HEAD"] else "",
 }
 TUNEUP_ENV = {k: v for k, v in TUNEUP_ENV.items() if v}
 TUNEUP = {"requested": sorted(TUNEUP_ENV), "low_m_max": int(CFG["LOWM_MAX_M"]), "patched": [], "fallback": None}
@@ -470,6 +481,8 @@ if CFG["OFFLOAD_EMBED_TOKENS"] or CFG["WIDE_BF16_GEMM"]:
     if CFG["WIDE_BF16_GEMM"]:
         patch_args.append("--wide-gemm")
     run(patch_args, env=env)
+if CFG["MAMBA_SKIP_DECODE_LOCK"]:
+    env["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"] = "1"
 run([str(Path(CUDA_HOME) / "bin/nvcc"), "--version"], env=env)
 print("Host compiler:", CXX)
 # Report the installed engine and device before loading weights.
@@ -490,7 +503,12 @@ elif QUANT == "compressed-tensors":
           {k: g.get("format") for k, g in q.get("config_groups", {}).items()})
 else:
     raise RuntimeError(f"Unsupported target quantization {QUANT!r}; expected auto-round or compressed-tensors")
-SERVE_DIR = str(views.build_target_view(MODEL_DIR, PLE_FP8_DIR, PREFIX)) if PLE_FP8_DIR else MODEL_DIR
+if PLE_FP8_DIR:
+    SERVE_DIR = str(views.build_target_view(MODEL_DIR, PLE_FP8_DIR, PREFIX))
+elif CFG["PLE_BF16"]:
+    SERVE_DIR = str(views.build_ple_dtype_view(MODEL_DIR, PREFIX, "bfloat16"))
+else:
+    SERVE_DIR = MODEL_DIR
 serve_cfg = json.loads(Path(SERVE_DIR, "config.json").read_text())
 _, target_shards = indexed_shards(SERVE_DIR)
 print("Target:", SERVE_DIR, "| shards:", len(target_shards), "| PLE dtype:", serve_cfg.get("text_config", {}).get("ple_embedding_dtype", "checkpoint default (typically BF16)"))
@@ -545,7 +563,23 @@ if CFG["SPEC"]:
         "--speculative-draft-kv-cache-dtype", CFG["KVDTYPE"],
         "--speculative-accept-threshold-single", str(CFG["SPEC_ACCEPT_SINGLE"]),
         "--speculative-accept-threshold-acc", str(CFG["SPEC_ACCEPT_ACC"])]
-    if CFG["FRSPEC"]:
+    if CFG["DRAFT_VOCAB"]:
+        # lordhansolo's draft vocabulary: half-open [start, end) id ranges built
+        # for primitive-ai's tokenizer, saved as the id list SGLang's token map loads.
+        vocab_path = Path(__file__).resolve().parents[2] / CFG["DRAFT_VOCAB"]
+        vocab = json.loads(vocab_path.read_text())
+        if vocab.get("tokenizer_sha256") != sha256(Path(SERVE_DIR, "tokenizer.json")):
+            raise RuntimeError(f"{vocab_path} was built for another tokenizer")
+        draft_ids = sorted({i for start, end in vocab["token_ranges"] for i in range(start, end)})
+        ids_json = Path(PREFIX, f"{vocab_path.stem}-ids.json")
+        ids_json.write_text(json.dumps(draft_ids))
+        token_map = Path(PREFIX, f"{vocab_path.stem}-{len(draft_ids)}.pt")
+        run([PYTHON, "-c", "import json, sys, torch; "
+             "torch.save(torch.tensor(json.load(open(sys.argv[1])), dtype=torch.int64), sys.argv[2])",
+             ids_json, token_map], env=env)
+        print(f"Draft vocabulary: {len(draft_ids)} ids from {vocab_path}")
+        args += ["--speculative-token-map", str(token_map)]
+    elif CFG["FRSPEC"]:
         tok = find_unique(WHEELHOUSE_DIR, "hot_tokens_64k.pt", required=False)
         if tok is None: tok = find_unique(WHEELHOUSE_DIR, "flash-next-64k.pt")
         assert sha256(tok) == TOKEN_MAP_SHA, "Wrong FR-Spec map; use the map from the pinned Pennyroyal bundle"
@@ -649,7 +683,12 @@ if status == "exited" and tuned_env != env and CFG["TUNEUP_FALLBACK"]:
 
 Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
     {"seconds_from_launcher_start": STARTUP_TIMES, "target": SERVE_DIR, "draft": str(DRAFT_VIEW or ""),
-     "quantization": QUANT, "ple_fp8_source": PLE_FP8_DIR, "window_prefetch": bool(CFG["WINDOW_PREFETCH"]),
+     "quantization": QUANT, "ple_fp8_source": PLE_FP8_DIR,
+     "ple_dtype": serve_cfg.get("text_config", serve_cfg).get("ple_embedding_dtype"),
+     "draft_vocab": CFG["DRAFT_VOCAB"] or ("fr-spec-64k" if CFG["FRSPEC"] else "full"),
+     "mamba_cache": CFG["MAMBA_CACHE"], "mamba_radix": CFG["MAMBA_RADIX"],
+     "mamba_skip_decode_lock": bool(CFG["MAMBA_SKIP_DECODE_LOCK"]),
+     "chunked_prefill": CFG["CHUNK"], "window_prefetch": bool(CFG["WINDOW_PREFETCH"]),
      "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"]), "server_status": status,
      "max_running_requests": CFG["MAXREQ"], "cuda_graph_bs": graph_bs, "mem_fraction_static": CFG["MEMFRAC"],
      "tuneup": TUNEUP}, indent=1))
