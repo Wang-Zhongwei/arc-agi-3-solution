@@ -23,6 +23,12 @@ Concurrency, B = 0 with efficiency ablated: mean score, difference vs K = 14 ± 
 | K = 20 | 29.0, -0.44 ± 0.91 (4/11) | 39.2, -1.14 ± 0.58 (4/11) |
 | K = 25 | 25.1, -4.34 ± 0.87 (1/11) | 38.2, -2.15 ± 0.75 (2/11) |
 
+Truncation: share of games that reached their recorded end without winning
+| β | uniform, K = 14 | v·C, K = 1 | v·C, K = 2 | v·C, K = 7 | v·C, K = 14 | v·C, K = 25 |
+|---|---|---|---|---|---|---|
+| 100k | 8% | 12% | 12% | 9% | 5% | 8% |
+| 150k | 25% | 36% | 35% | 33% | 31% | 24% |
+
 Yield-UCB, elapsed minutes = tokens spent / 52000. Mean score, difference vs uniform ± SE (runs better)
 | policy | β = 100k, γ = 35k | β = 150k, γ = 35k |
 |---|---|---|

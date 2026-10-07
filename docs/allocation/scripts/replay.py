@@ -150,7 +150,7 @@ EXTRA = {  # printed for reference, not in the report table
 }
 
 
-def replay(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SLOTS) -> float:
+def allocate(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SLOTS) -> dict[int, float]:
     """Each round the SLOTS best-ranked live games get `grant` tokens; unstarted games first."""
     pos = {id(t): 0.0 for t in trajs}
     total, spent = budget * len(trajs), 0.0
@@ -166,7 +166,18 @@ def replay(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SL
                 break
             pos[id(t)] += g
             spent += g
+    return pos
+
+
+def replay(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SLOTS) -> float:
+    pos = allocate(trajs, rank, budget, grant, slots)
     return st.mean(t.score(pos[id(t)]) for t in trajs)
+
+
+def truncated(trajs: list[Traj], rank, budget: float, grant: float, slots: int = SLOTS) -> float:
+    """Share of games that reached their recorded end T_g without winning."""
+    pos = allocate(trajs, rank, budget, grant, slots)
+    return sum(pos[id(t)] >= t.end - 1 and not t.finished(pos[id(t)]) for t in trajs) / len(trajs)
 
 
 def paired(x: list[float], y: list[float]) -> str:
@@ -208,6 +219,13 @@ def main() -> None:
     text += "\n".join([
         "\nConcurrency, B = 0 with efficiency ablated: mean score, difference vs K = 14 ± SE (runs better)",
         table(["slots"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
+    ]) + "\n"
+    cols = [("uniform, K = 14", lambda tr, t: -t, SLOTS)] + [(f"v·C, K = {k}", b0_no_eff, k) for k in (1, 2, 7, 14, 25)]
+    rows = [[f"{b // 1000}k"] + [f"{st.mean(truncated(trs, f, b, GRANT, k) for trs in runs.values()):.0%}"
+                                  for _, f, k in cols] for b in BUDGETS]
+    text += "\n".join([
+        "\nTruncation: share of games that reached their recorded end without winning",
+        table(["β"] + [c for c, _, _ in cols], rows),
     ]) + "\n"
     U = {(p, b): [replay(trs, f, b, GRANT) for trs in runs.values()]
          for p, f in UCB_POLICIES.items() for b in BUDGETS}

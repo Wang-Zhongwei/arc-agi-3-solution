@@ -227,12 +227,40 @@ Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
 
 ## Limitations
 
-The replay ignores wall-clock throughput, prefill, prefix caching, per-game
-time caps and waves. Rounds are synchronous, while the real gate switches one
-game at a time. Actions are interpolated linearly in tokens within a level.
-A game cannot receive tokens beyond $T_g$, which understates rankings that
-concentrate tokens. Real runs spend about $220\text{k}$ tokens per game, beyond
-what the replay can rank.
+Two caveats matter most.
+
+**1. No extrapolation past the recording.** A game that reaches its recorded
+end $T_g$ without winning has no data beyond it, so it receives no more tokens
+and its share goes to the other games. Share of games affected ($\gamma = 35\text{k}$):
+
+| $\beta$ | uniform, $K = 14$ | $v\,C$, $K = 1$ | $v\,C$, $K = 2$ | $v\,C$, $K = 7$ | $v\,C$, $K = 14$ | $v\,C$, $K = 25$ |
+|---|---|---|---|---|---|---|
+| 100k | 8% | 12% | 12% | 9% | 5% | 8% |
+| 150k | 25% | 36% | 35% | 33% | 31% | 24% |
+
+- At $\beta = 100\text{k}$ this is infrequent (5–12% of games), so the results
+  there remain mostly valid. At $150\text{k}$ it reaches a quarter to a third of
+  the games; read that column as indicative.
+- Truncation is within a few points across rankings at the same $K$, so
+  comparisons between rankings are less affected than absolute scores.
+- It grows as tokens are concentrated (36% at $K = 1$ against 31% at
+  $K = 14$). The flat gain below $K = 7$ in the concurrency study is therefore
+  partly an artifact: the top games run out of data, and the true effect of
+  very low $K$ could be larger or smaller.
+- How long each game was recorded was decided by the original run's own
+  scheduler. Real runs spend about $220\text{k}$ tokens per game, beyond what
+  the replay can rank.
+
+**2. No throughput.** Every policy and every $K$ gets the same token budget
+$G\beta$. The replay ignores that fewer concurrent streams generate fewer
+tokens per second, that switching a game mid-context costs a re-prefill, and
+prefix caching, per-game time caps and waves. This matters most for the
+concurrency conclusion.
+
+Smaller simplifications: the trajectory $S_g(\tau)$ is assumed not to depend on
+when the tokens are generated; rounds are synchronous, while the real gate
+switches one game at a time; actions are interpolated linearly in tokens within
+a level.
 
 ## Reproduce
 
