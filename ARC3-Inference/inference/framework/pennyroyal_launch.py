@@ -215,6 +215,9 @@ CFG = dict(
     MARLIN_DEBUG_ONLY=False,
     # The MTP draft's never-loaded LM head goes on the meta device (+1.18 GiB KV).
     MTP_SHARED_HEAD=False,
+    # QSA compressed index keys in plain e4m3, as vLLM's indexer_kv_dtype=fp8
+    # (384 instead of 768 B per KV token); probed at startup, else BF16.
+    QSA_INDEX_FP8=False,
     # Serve the checkpoint's own BF16 PLE table even if its config declares FP8
     # (lordhansolo's checkpoint does; his vLLM run kept BF16).
     PLE_BF16=False,
@@ -398,6 +401,7 @@ TUNEUP_ENV = {
     "SGLANG_CT_NVFP4_MOE_MARLIN": "1" if CFG["MOE_MARLIN"] else "",
     "SGLANG_SM120_LOWM_FP8_GEMM": "1" if CFG["LOWM_FP8"] else "",
     "SGLANG_QWEN4_EXP_MTP_SHARED_HEAD": "1" if CFG["MTP_SHARED_HEAD"] else "",
+    "SGLANG_QSA_INDEX_FP8": "1" if CFG["QSA_INDEX_FP8"] else "",
 }
 TUNEUP_ENV = {k: v for k, v in TUNEUP_ENV.items() if v}
 TUNEUP = {"requested": sorted(TUNEUP_ENV), "low_m_max": int(CFG["LOWM_MAX_M"]), "patched": [], "fallback": None}

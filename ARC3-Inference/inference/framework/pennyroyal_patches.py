@@ -20,6 +20,10 @@ set (see docs/serving/LORD_ON_SGLANG_PLAN.md):
 - SGLANG_QWEN4_EXP_MTP_SHARED_HEAD=1: the MTP draft builds its LM head on the
   meta device. It never loads that head (only mtp.* tensors) and uses the
   target's, so this frees 1.18 GiB before the KV pool is sized.
+- SGLANG_QSA_INDEX_FP8=1: the QSA compressed index keys are stored in plain e4m3,
+  like vLLM's indexer_kv_dtype=fp8: 384 instead of 768 B per KV token over the
+  12 full-attention layers. A startup probe checks the FP8 decode kernel
+  against the torch reference first; if it fails, the cache stays BF16.
 
 Always on once applied: an O(1) expert-name lookup in Qwen4-Exp load_weights,
 which otherwise scans all 3 x num_experts mapping entries per tensor.
@@ -37,6 +41,9 @@ CT_NVFP4_MOE = "sglang/srt/layers/quantization/compressed_tensors/schemes/compre
 MARLIN_FP4 = "sglang/srt/layers/quantization/marlin_utils_fp4.py"
 QWEN4_EXP = "sglang/srt/models/qwen4_exp.py"
 QWEN4_EXP_MTP = "sglang/srt/models/qwen4_exp_mtp.py"
+QSA_POOL = "sglang/srt/mem_cache/qsa_kv_pool.py"
+QSA_INDEXER = "sglang/srt/layers/attention/qsa/qsa_indexer.py"
+QSA_MQA = "sglang/srt/layers/attention/qsa/mqa.py"
 
 # (file relative to site-packages, exact anchor, replacement). The replacement
 # keeps the anchor text where code is only inserted, so the "already applied"
@@ -481,6 +488,303 @@ EDITS += [
         "            for key, value in vars(self.lm_head.weight).items():\n"
         "                setattr(placeholder, key, value)\n"
         "            self.lm_head.weight = placeholder\n",
+    ),
+]
+
+
+EDITS += [
+    # ---- QSA index keys in plain e4m3, as vLLM's indexer_kv_dtype=fp8 ----
+    (
+        QSA_POOL,
+        "def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:\n"
+        "    return kv_heads * head_dim * dtype.itemsize\n",
+        "def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:\n"
+        "    return kv_heads * head_dim * dtype.itemsize\n"
+        "\n"
+        "\n"
+        "def _qsa_compressed_dtype() -> torch.dtype:\n"
+        '    """Pennyroyal tuning (SGLANG_QSA_INDEX_FP8=1): the compressed index keys in\n'
+        "    plain e4m3 without scales, as vLLM's indexer_kv_dtype=fp8 (the keys are\n"
+        "    RMSNormed). Only when the FP8 decode kernel passes its startup probe;\n"
+        '    BF16 otherwise. The pending ring stays BF16, as in vLLM."""\n'
+        "    from sglang.srt.utils import get_bool_env_var\n"
+        "\n"
+        '    if not get_bool_env_var("SGLANG_QSA_INDEX_FP8"):\n'
+        "        return torch.bfloat16\n"
+        "    from sglang.srt.layers.attention.qsa.mqa import qsa_fp8_decode_dtype\n"
+        "\n"
+        "    return torch.float8_e4m3fn if qsa_fp8_decode_dtype() else torch.bfloat16\n",
+    ),
+    (
+        QSA_POOL,
+        "        index_k_bytes = _index_k_bytes(\n"
+        "            kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype\n"
+        "        )\n"
+        "        return index_k_bytes // compress_ratio * num_layers\n",
+        "        index_k_bytes = _index_k_bytes(\n"
+        "            kv_heads=kv_heads, head_dim=head_dim, dtype=_qsa_compressed_dtype()\n"
+        "        )\n"
+        "        return index_k_bytes // compress_ratio * num_layers\n",
+    ),
+    (
+        QSA_POOL,
+        "                * self.qsa_index_head_dim,\n"
+        "            ),\n"
+        "            dtype=self.index_state_dtype,\n",
+        "                * self.qsa_index_head_dim,\n"
+        "            ),\n"
+        "            dtype=_qsa_compressed_dtype(),\n",
+    ),
+    (
+        QSA_POOL,
+        "        buffer = self.get_qsa_compressed_k_buffer(layer_id)\n"
+        "        buffer[loc.long()] = compressed_k.to(buffer.dtype)\n",
+        "        buffer = self.get_qsa_compressed_k_buffer(layer_id)\n"
+        "        if buffer.dtype == torch.float8_e4m3fn:\n"
+        "            # Saturate instead of overflowing to NaN.\n"
+        "            compressed_k = compressed_k.float().clamp(-448.0, 448.0)\n"
+        "        buffer[loc.long()] = compressed_k.to(buffer.dtype)\n",
+    ),
+    (
+        QSA_INDEXER,
+        "        compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)\n"
+        "        qsa_index_k_compress_store(\n"
+        "            source_keys.reshape(source_keys.shape[0], -1)\n"
+        "            .contiguous()\n"
+        "            .to(pool.index_state_dtype),\n"
+        "            group_locs.to(torch.int32),\n"
+        "            source_rope,\n"
+        "            self.rotary_emb.cos_sin_cache,\n"
+        "            self._rope_axis_map(source_keys.device),\n"
+        "            self.k_layernorm.weight.data,\n"
+        "            write_locs.to(torch.int32),\n"
+        "            compressed_buffer.view(compressed_buffer.shape[0], -1),\n"
+        "            self.compress_ratio,\n"
+        "            self.rotary_emb.rotary_dim,\n"
+        "            self.k_layernorm.variance_epsilon,\n"
+        "            self.rotary_emb.is_neox_style,\n"
+        "        )\n",
+        "        compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)\n"
+        "        target = compressed_buffer.view(compressed_buffer.shape[0], -1)\n"
+        "        fp8_cache = target.dtype == torch.float8_e4m3fn\n"
+        "        if fp8_cache:\n"
+        "            # The fused kernel writes its source dtype (BF16): compress into one\n"
+        "            # scratch row per write, then cast (saturating) into the e4m3 cache.\n"
+        "            scratch = torch.empty(\n"
+        "                (write_locs.shape[0], target.shape[1]),\n"
+        "                dtype=pool.index_state_dtype,\n"
+        "                device=target.device,\n"
+        "            )\n"
+        "            kernel_locs = torch.arange(\n"
+        "                write_locs.shape[0], dtype=torch.int32, device=target.device\n"
+        "            )\n"
+        "        qsa_index_k_compress_store(\n"
+        "            source_keys.reshape(source_keys.shape[0], -1)\n"
+        "            .contiguous()\n"
+        "            .to(pool.index_state_dtype),\n"
+        "            group_locs.to(torch.int32),\n"
+        "            source_rope,\n"
+        "            self.rotary_emb.cos_sin_cache,\n"
+        "            self._rope_axis_map(source_keys.device),\n"
+        "            self.k_layernorm.weight.data,\n"
+        "            kernel_locs if fp8_cache else write_locs.to(torch.int32),\n"
+        "            scratch if fp8_cache else target,\n"
+        "            self.compress_ratio,\n"
+        "            self.rotary_emb.rotary_dim,\n"
+        "            self.k_layernorm.variance_epsilon,\n"
+        "            self.rotary_emb.is_neox_style,\n"
+        "        )\n"
+        "        if fp8_cache:\n"
+        "            target[write_locs.long()] = (\n"
+        "                scratch.float().clamp(-448.0, 448.0).to(target.dtype)\n"
+        "            )\n",
+    ),
+    (
+        QSA_MQA,
+        "                                Logits[bx, position] = reduced[token] / Scale\n"
+        "\n"
+        "        return kernel\n"
+        "\n"
+        "\n"
+        "def tilelang_qsa_mqa_prefill(\n",
+        "                                Logits[bx, position] = reduced[token] / Scale\n"
+        "\n"
+        "        return kernel\n"
+        "\n"
+        "    @tilelang.jit(\n"
+        "        pass_configs={\n"
+        "            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,\n"
+        "            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,\n"
+        "        }\n"
+        "    )\n"
+        "    def _tilelang_qsa_mqa_decode_fp8_kernel(\n"
+        "        heads: int,\n"
+        "        head_dim: int,\n"
+        "        k_dtype: str,\n"
+        "        page_size: int = 64,\n"
+        "        groups_per_cta: int = 1,\n"
+        "        num_stages: int = 3,\n"
+        "        threads: int = 128,\n"
+        "    ):\n"
+        '        """The decode kernel above over an FP8 (e4m3) compressed cache: T.copy\n'
+        "        widens each page to BF16 in shared memory (e4m3 values are exact in\n"
+        '        BF16), so the GEMM, ReLU and head sum are unchanged."""\n'
+        "        GROUP = 64\n"
+        "        assert GROUP % page_size == 0, page_size\n"
+        "        sub_pages = GROUP // page_size\n"
+        '        batch = T.dynamic("batch")\n'
+        '        pages = T.dynamic("pages")\n'
+        '        max_pages = T.dynamic("max_pages")\n'
+        '        max_model_len = T.dynamic("max_model_len")\n'
+        "\n"
+        "        @T.prim_func\n"
+        "        def kernel(\n"
+        "            Q: T.Tensor([batch, 1, heads, head_dim], T.bfloat16),  # type: ignore\n"
+        "            KCache: T.Tensor([pages, page_size, 1, head_dim], k_dtype),  # type: ignore\n"
+        "            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore\n"
+        "            ContextLens: T.Tensor([batch], T.int32),  # type: ignore\n"
+        "            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore\n"
+        "            Scale: T.float32,\n"
+        "        ):\n"
+        "            with T.Kernel(\n"
+        "                batch,\n"
+        "                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),\n"
+        "                threads=threads,\n"
+        "            ) as (bx, group_block):\n"
+        "                q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)\n"
+        "                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)\n"
+        "                scores = T.alloc_fragment([GROUP, heads], T.float32)\n"
+        "                reduced = T.alloc_fragment([GROUP], T.float32)\n"
+        "                T.copy(Q[bx, 0, :, :], q_shared)\n"
+        "                context_len = ContextLens[bx]\n"
+        "\n"
+        "                for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):\n"
+        "                    group = group_block * groups_per_cta + gi\n"
+        "                    if group * GROUP < context_len:\n"
+        "                        for sp in range(sub_pages):\n"
+        "                            if (group * sub_pages + sp) * page_size < context_len:\n"
+        "                                T.copy(\n"
+        "                                    KCache[\n"
+        "                                        PageTable[bx, group * sub_pages + sp],\n"
+        "                                        :,\n"
+        "                                        0,\n"
+        "                                        :,\n"
+        "                                    ],\n"
+        "                                    k_shared[sp * page_size : (sp + 1) * page_size, :],\n"
+        "                                )\n"
+        "                        T.gemm(\n"
+        "                            k_shared,\n"
+        "                            q_shared,\n"
+        "                            scores,\n"
+        "                            transpose_B=True,\n"
+        "                            clear_accum=True,\n"
+        "                            policy=T.GemmWarpPolicy.FullCol,\n"
+        "                        )\n"
+        "                        for token, head in T.Parallel(GROUP, heads):\n"
+        "                            scores[token, head] = T.max(scores[token, head], 0.0)\n"
+        "                        T.reduce_sum(scores, reduced, dim=1, clear=True)\n"
+        "                        for token in T.Parallel(GROUP):\n"
+        "                            position = group * GROUP + token\n"
+        "                            if position < context_len:\n"
+        "                                Logits[bx, position] = reduced[token] / Scale\n"
+        "\n"
+        "        return kernel\n"
+        "\n"
+        "\n"
+        "def tilelang_qsa_mqa_prefill(\n",
+    ),
+    (
+        QSA_MQA,
+        "    _tilelang_qsa_mqa_decode_kernel(\n"
+        "        heads=kernel_heads, head_dim=head_dim, page_size=page_size\n"
+        "    )(\n"
+        "        q_kernel.unsqueeze(1).contiguous(),\n"
+        "        k_cache.to(torch.bfloat16).contiguous(),\n",
+        "    if k_cache.dtype == torch.float8_e4m3fn:\n"
+        "        # Read the e4m3 cache in place; converting it whole would copy every\n"
+        "        # compressed key of the layer on each decode step.\n"
+        "        decode_kernel = _tilelang_qsa_mqa_decode_fp8_kernel(\n"
+        "            heads=kernel_heads,\n"
+        "            head_dim=head_dim,\n"
+        "            k_dtype=qsa_fp8_decode_dtype(),\n"
+        "            page_size=page_size,\n"
+        "        )\n"
+        "        k_kernel = k_cache\n"
+        "    else:\n"
+        "        decode_kernel = _tilelang_qsa_mqa_decode_kernel(\n"
+        "            heads=kernel_heads, head_dim=head_dim, page_size=page_size\n"
+        "        )\n"
+        "        k_kernel = k_cache.to(torch.bfloat16).contiguous()\n"
+        "    decode_kernel(\n"
+        "        q_kernel.unsqueeze(1).contiguous(),\n"
+        "        k_kernel,\n",
+    ),
+    (
+        QSA_MQA,
+        "def qsa_mqa_prefill(\n",
+        "_QSA_FP8_DECODE_DTYPE = None\n"
+        "\n"
+        "\n"
+        "def qsa_fp8_decode_dtype() -> str:\n"
+        '    """TileLang dtype name under which the FP8 decode kernel compiled and\n'
+        "    matched the torch reference on this GPU, or '' (keep the BF16 cache).\n"
+        '    Probed once per process, before the KV pool is sized."""\n'
+        "    global _QSA_FP8_DECODE_DTYPE\n"
+        "    if _QSA_FP8_DECODE_DTYPE is not None:\n"
+        "        return _QSA_FP8_DECODE_DTYPE\n"
+        "    import logging\n"
+        "\n"
+        "    log = logging.getLogger(__name__)\n"
+        '    _QSA_FP8_DECODE_DTYPE = ""\n'
+        "    if not (HAS_TILELANG and torch.cuda.is_available()):\n"
+        '        log.warning("QSA FP8 index: TileLang/CUDA unavailable; keeping BF16")\n'
+        "        return _QSA_FP8_DECODE_DTYPE\n"
+        '    gen = torch.Generator(device="cuda").manual_seed(3)\n'
+        "    heads, head_dim, page_size, max_len = 8, 128, 16, 64\n"
+        "    q = torch.randn(\n"
+        '        (3, heads, head_dim), generator=gen, device="cuda", dtype=torch.float32\n'
+        "    ).to(torch.bfloat16)\n"
+        "    k_cache = torch.randn(\n"
+        '        (6, page_size, 1, head_dim), generator=gen, device="cuda", dtype=torch.float32\n'
+        "    ).to(torch.float8_e4m3fn)\n"
+        "    table = torch.tensor(\n"
+        '        [[0, 1, 2, 3], [4, 5, 0, 0], [3, 1, 0, 0]], dtype=torch.int32, device="cuda"\n'
+        "    )\n"
+        '    lengths = torch.tensor([64, 20, 33], dtype=torch.int32, device="cuda")\n'
+        "    want = torch_qsa_mqa_decode(q, k_cache, table, lengths, max_len)\n"
+        '    for name in ("float8_e4m3", "float8_e4m3fn"):\n'
+        "        try:\n"
+        "            got = torch.full(\n"
+        "                (3, max_len), -float(\"inf\"), dtype=torch.float32, device=\"cuda\"\n"
+        "            )\n"
+        "            _tilelang_qsa_mqa_decode_fp8_kernel(\n"
+        "                heads=heads, head_dim=head_dim, k_dtype=name, page_size=page_size\n"
+        "            )(\n"
+        "                q.unsqueeze(1).contiguous(),\n"
+        "                k_cache,\n"
+        "                table,\n"
+        "                lengths,\n"
+        "                got,\n"
+        "                float(math.sqrt(head_dim)),\n"
+        "            )\n"
+        "            torch.cuda.synchronize()\n"
+        "            if torch.allclose(got, want, rtol=2e-3, atol=2e-3):\n"
+        "                _QSA_FP8_DECODE_DTYPE = name\n"
+        '                log.info("QSA FP8 index: decode kernel ok with %s", name)\n'
+        "                break\n"
+        "            log.warning(\n"
+        '                "QSA FP8 index: %s decode kernel mismatch (max err %.3g)",\n'
+        "                name,\n"
+        "                (got - want).nan_to_num(0.0, 0.0, 0.0).abs().max().item(),\n"
+        "            )\n"
+        "        except Exception as exc:  # compile or launch failure: try the next\n"
+        '            log.warning("QSA FP8 index: %s decode kernel failed: %s", name, exc)\n'
+        "    if not _QSA_FP8_DECODE_DTYPE:\n"
+        '        log.warning("QSA FP8 index: probe failed; keeping the BF16 cache")\n'
+        "    return _QSA_FP8_DECODE_DTYPE\n"
+        "\n"
+        "\n"
+        "def qsa_mqa_prefill(\n",
     ),
 ]
 
