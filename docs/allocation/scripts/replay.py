@@ -29,7 +29,7 @@ BUDGETS = (100_000, 150_000)  # tokens per game
 GRANT = 35_000               # tokens per slot grant (median between context trims)
 TOKENS_PER_MINUTE = 52_000   # v07: 25 games x 218k generated tokens in ~105 min; the UCB clock
 UCB_SCALES = (0.25, 1, 4, 16)  # multiples of UCB_DEFAULT_C
-CONCURRENCY = (7, 10, 14, 20, 25)  # slots K for the concurrency study (25 = every game)
+CONCURRENCY = (1, 2, 3, 5, 7, 10, 14, 20, 25)  # slots K for the concurrency study (25 = every game)
 CLOCK = {"spent": 0.0}       # tokens spent so far in the replayed run
 
 

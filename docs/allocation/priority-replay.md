@@ -144,6 +144,10 @@ Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
 
 | Slots | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
 |---|---|---|
+| $K = 1$ | 30.4, +0.93 ± 0.84 (7/11) | 41.3, +0.98 ± 0.34 (9/11) |
+| $K = 2$ | 30.7, +1.30 ± 0.83 (7/11) | 41.4, +1.05 ± 0.29 (9/11) |
+| $K = 3$ | 30.5, +1.03 ± 0.74 (7/11) | 41.6, +1.24 ± 0.39 (9/11) |
+| $K = 5$ | 30.5, +1.07 ± 0.57 (7/11) | 41.2, +0.84 ± 0.31 (8/11) |
 | $K = 7$ | 30.3, +0.91 ± 0.54 (6/11) | 41.3, +0.96 ± 0.33 (9/11) |
 | $K = 10$ | 30.1, +0.70 ± 0.53 (5/11) | 40.6, +0.23 ± 0.26 (4/11) |
 | $K = 14$ (control) | 29.4 | 40.3 |
@@ -154,8 +158,9 @@ Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
   can be held back, so the ranking has less to decide. At $K = G = 25$ every
   live game gets a grant each round, and the result is close to uniform
   ($24.6$ / $37.3$).
-- $K = 10$ is level with $K = 14$ ($+0.7$ / $+0.2$, within one SE).
-  Below 14 the gain is at most about $+1$ point.
+- $K = 10$ is level with $K = 14$ ($+0.7$ / $+0.2$, within one SE). From
+  $K = 7$ down to $K = 1$ the gain stays at about $+1$ point: once the ranking
+  can hold back most games, further restriction adds nothing.
 - Fewer slots only pays if the server keeps its total generation rate. With
   fewer concurrent sequences it usually generates fewer tokens per second,
   which costs budget $\beta$ directly; this replay cannot weigh that.
