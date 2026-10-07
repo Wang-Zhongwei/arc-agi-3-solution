@@ -133,6 +133,7 @@ def stage_model(ref: str, hf_models: dict[str, str]) -> None:
         dest.mkdir(exist_ok=True)
         run(["kaggle", "models", "instances", "versions", "download", ref, "-p", str(dest), "--untar", "-q"])
         return
+    source, overlay = split_overlay(source)
     repo, revision, subdir = parse_hf_source(source)
     local_dir = HF_CACHE / repo.replace("/", "--")
     cmd = ["hf", "download", repo, "--local-dir", str(local_dir)]
@@ -141,7 +142,29 @@ def stage_model(ref: str, hf_models: dict[str, str]) -> None:
     if subdir:
         cmd += ["--include", f"{subdir}/*"]
     run(cmd, env={**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"})
-    dest.symlink_to(local_dir / subdir if subdir else local_dir, target_is_directory=True)
+    base = local_dir / subdir if subdir else local_dir
+    if overlay:
+        link_overlay_view(base, base / overlay, dest)
+    else:
+        dest.symlink_to(base, target_is_directory=True)
+
+
+def split_overlay(source: str) -> tuple[str, str]:
+    """``source[+overlay]`` -> (source, overlay dir relative to the model root, or "")."""
+    source, _, overlay = source.partition("+")
+    return source.strip(), overlay.strip().strip("/")
+
+
+def link_overlay_view(base: Path, overlay: Path, dest: Path) -> None:
+    """A directory of symlinks: ``base``'s top-level entries, with ``overlay``'s files
+    taking their place (a checkpoint that ships a patch folder, e.g. an MTP head)."""
+    if not overlay.is_dir():
+        raise FileNotFoundError(f"overlay {overlay} not found in the downloaded model")
+    dest.mkdir()
+    entries = {item.name: item for item in base.iterdir() if item != overlay and not item.name.startswith(".")}
+    entries.update({item.name: item for item in overlay.iterdir()})
+    for name, target in sorted(entries.items()):
+        (dest / name).symlink_to(target.resolve(), target_is_directory=target.is_dir())
 
 
 def competition_arc_agi_requirement(wheels: Path) -> str | None:
