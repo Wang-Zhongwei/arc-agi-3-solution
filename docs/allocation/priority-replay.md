@@ -43,7 +43,30 @@ $$
 | current | $\lfloor 100\,(A + B)\,C \rfloor$, $A = k\,e\,\frac{55}{n(n+1)/2}$, $B = 8, 7, 5, 0$ for $n - k \ge 3, 2, 1, 0$ |
 | $B = 0$ | $v\,e\,C \ \propto A\,C$ |
 | $B = 0$, efficiency ablated | $v\,C$ |
+| $B = 0$ + pace | $v\,e\,C_p / p$ |
 | uniform (baseline) | $-\tau$ |
+
+**Pace** (`ARC3_PRIORITY_PACE`, `ProgressPace` in `priority.py`). When the
+game completes level $j$ after $t_j$ tokens on it, with reference cost $r_j$
+(`priority_pace_reference.json`: $27\text{k}$ for level 1, $49$–$67\text{k}$ for
+levels 2–6, $45.9\text{k}$ fallback),
+
+$$
+x_j = \log\frac{t_j}{r_j},\qquad
+\ell_1 = x_1,\quad \ell_j = 0.6\,\ell_{j-1} + 0.4\,x_j,\qquad
+p = \exp\!\Big(\operatorname{clip}\big(\tfrac{m}{m+3}\,\ell_m,\ \log\tfrac12,\ \log 2\big)\Big),
+$$
+
+with $m$ the levels completed so far ($p = 1$ before the first). A slow game
+($p > 1$) has its token falloff stretched and its value divided:
+
+$$
+C_p = 0.25 \cdot 2^{-(a/115)^2} + 0.75 \cdot 2^{-(s/(62000\,p))^2},\qquad R = v\,e\,C_p / p .
+$$
+
+On these runs $p$ has median $0.80$ (10th–90th percentile $0.50$–$1.06$; 18% at
+the $0.5$ clip): recent games clear levels faster than the reference, so pace
+mostly raises their value and shortens their falloff.
 
 "current" calls `priority_value` from
 `ARC3-Inference/inference/agent/scheduling/priority.py` with the Lord Hansolo
@@ -74,12 +97,15 @@ Mean $\bar S$, then the paired difference vs the uniform baseline.
 | current | 27.6, +3.01 ± 0.40 (11/11) | 39.2, +1.88 ± 0.42 (9/11) |
 | $B = 0$ | 29.5, +4.95 ± 0.86 (10/11) | 39.9, +2.64 ± 0.56 (9/11) |
 | $B = 0$, efficiency ablated | 29.4, +4.84 ± 0.91 (11/11) | 40.3, +3.03 ± 0.84 (9/11) |
+| $B = 0$ + pace | 29.3, +4.72 ± 0.88 (11/11) | 40.0, +2.73 ± 0.55 (9/11) |
 
 - $B$ is nearly constant ($8$ while three or more levels remain) and larger
   than $A$, so the current ranking is close to $8\,C$ and the level value
   barely matters. Removing it gains $+1.9$ / $+0.8$ points over current.
 - Ablating the efficiency term ties $B = 0$ ($-0.1$ / $+0.4$). $e$ falls as
   actions accumulate on a stuck level, which repeats the stall signal in $C$.
+- Pace ties $B = 0$ ($-0.2$ / $+0.1$). It rescales every game by its own
+  speed, and $C$ already demotes games that are slow on the current level.
 
 ## Limitations
 

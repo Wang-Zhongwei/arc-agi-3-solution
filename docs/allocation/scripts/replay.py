@@ -17,7 +17,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"
 sys.path.insert(0, str(HERE.parents[2] / "ARC3-Inference"))
-from inference.agent.scheduling.priority import PrioritySnapshot, priority_value  # noqa: E402
+from inference.agent.scheduling.priority import ProgressPace, PrioritySnapshot, priority_value  # noqa: E402
+
+PACE_REF = json.loads((HERE.parents[2] / "ARC3-Inference/inference/agent/scheduling/priority_pace_reference.json").read_text())
 
 SLOTS = 14                    # ARC3_MAX_ACTIVE_STREAMS
 BUDGETS = (100_000, 150_000)  # tokens per game
@@ -52,6 +54,14 @@ class Traj:
         x0, x1, a0, a1 = self.tx[i], self.tx[i + 1], self.ax[i], self.ax[i + 1]
         return a0 + (a1 - a0) * ((t - x0) / (x1 - x0) if x1 > x0 else 0.0)
 
+    def pace(self, t: float) -> float:
+        """ARC3_PRIORITY_PACE multiplier from the levels completed by t (tool_agent.py record_completion)."""
+        pace, prev = ProgressPace(), 0.0
+        for j, u in enumerate(self.ups[:bisect_right(self.ups, t + 1e-9)], start=1):
+            pace.record_completion(u - prev, PACE_REF["by_level"].get(str(j), PACE_REF["fallback_tokens"]))
+            prev = u
+        return min(2.0, max(0.5, pace.cost_multiplier()))
+
     def state(self, t: float) -> tuple[int, float, float]:
         """(L levels completed, s tokens since last level-up, a actions since last level-up)."""
         L = bisect_right(self.ups, t + 1e-9)
@@ -62,25 +72,27 @@ def value(tr: Traj, L: int) -> float:
     return 100.0 * (L + 1) / (tr.n * (tr.n + 1) / 2) if L < tr.n else 0.0
 
 
-def hazard(s: float, a: float) -> float:
-    return 0.25 * 0.5 ** ((a / 115) ** 2) + 0.75 * 0.5 ** ((s / 62_000) ** 2)
+def hazard(s: float, a: float, p: float = 1.0) -> float:
+    return 0.25 * 0.5 ** ((a / 115) ** 2) + 0.75 * 0.5 ** ((s / (62_000 * p)) ** 2)
 
 
-def current(tr: Traj, t: float) -> int:
+def current(tr: Traj, t: float, pace: bool = False) -> int:
     L, s, a = tr.state(t)
-    return priority_value(PrioritySnapshot(L + 1, int(a), s, 1.0, tr.n, None),
+    return priority_value(PrioritySnapshot(L + 1, int(a), s, tr.pace(t) if pace else 1.0, tr.n, None),
                           human_actions=25, action_scale=115, token_scale=62_000, action_weight=0.25,
                           tail_base=2, tail_cap=4, normalize_score=True, tail_lookup="remaining")
 
 
-def b0(tr: Traj, t: float) -> float:
+def b0(tr: Traj, t: float, pace: bool = False) -> float:
     L, s, a = tr.state(t)
-    return value(tr, L) * (25 / (25 + a)) ** 2 * hazard(s, a)
+    p = tr.pace(t) if pace else 1.0
+    return value(tr, L) * (25 / (25 + a)) ** 2 * hazard(s, a, p) / p
 
 
-def b0_no_eff(tr: Traj, t: float) -> float:
+def b0_no_eff(tr: Traj, t: float, pace: bool = False) -> float:
     L, s, a = tr.state(t)
-    return value(tr, L) * hazard(s, a)
+    p = tr.pace(t) if pace else 1.0
+    return value(tr, L) * hazard(s, a, p) / p
 
 
 POLICIES = {
@@ -88,6 +100,11 @@ POLICIES = {
     "current: (A+B)·C": current,
     "B = 0: v·e·C": b0,
     "B = 0, no efficiency: v·C": b0_no_eff,
+    "B = 0 + pace: v·e·C(p)/p": lambda tr, t: b0(tr, t, pace=True),
+}
+EXTRA = {  # printed for reference, not in the report table
+    "current + pace": lambda tr, t: current(tr, t, pace=True),
+    "B = 0, no efficiency + pace": lambda tr, t: b0_no_eff(tr, t, pace=True),
 }
 
 
@@ -136,6 +153,9 @@ def main() -> None:
     ]) + "\n"
     (DATA / "results.md").write_text(text)
     print(text)
+    for p, f in EXTRA.items():
+        sc = {b: [replay(trs, f, b, GRANT) for trs in runs.values()] for b in BUDGETS}
+        print(f"{p}: " + " | ".join(f"{st.mean(sc[b]):.1f}, {paired(sc[b], S['uniform', b])}" for b in BUDGETS))
 
 
 if __name__ == "__main__":
