@@ -1,8 +1,7 @@
 # Priority allocation: offline replay
 
 Question: with a fixed generated-token budget, does dropping the future-level
-tail $B$, or the efficiency term, improve the priority ranking? Does a finer
-switching grant help?
+tail $B$, or the efficiency term, improve the priority ranking?
 
 ## Data
 
@@ -44,7 +43,7 @@ $$
 | current | $\lfloor 100\,(A + B)\,C \rfloor$, $A = k\,e\,\frac{55}{n(n+1)/2}$, $B = 8, 7, 5, 0$ for $n - k \ge 3, 2, 1, 0$ |
 | $B = 0$ | $v\,e\,C \ \propto A\,C$ |
 | $B = 0$, efficiency ablated | $v\,C$ |
-| uniform (reference) | $-\tau$ |
+| uniform (baseline) | $-\tau$ |
 
 "current" calls `priority_value` from
 `ARC3-Inference/inference/agent/scheduling/priority.py` with the Lord Hansolo
@@ -67,35 +66,20 @@ $\bar d \pm \operatorname{sd}(d)/\sqrt{11}$ with the number of runs where $d_r >
 
 ## Results
 
-**Table 1.** $\gamma = 35\text{k}$. Mean $\bar S$, then the difference vs uniform
-($\bar S = 24.6$ at $100\text{k}$, $37.3$ at $150\text{k}$).
+Mean $\bar S$, then the paired difference vs the uniform baseline.
 
-| Policy | $\beta = 100\text{k}$ per game | $\beta = 150\text{k}$ per game |
+| Policy | $\beta = 100\text{k}$, $\gamma = 35\text{k}$ | $\beta = 150\text{k}$, $\gamma = 35\text{k}$ |
 |---|---|---|
+| uniform (baseline) | 24.6 | 37.3 |
 | current | 27.6, +3.01 ± 0.40 (11/11) | 39.2, +1.88 ± 0.42 (9/11) |
 | $B = 0$ | 29.5, +4.95 ± 0.86 (10/11) | 39.9, +2.64 ± 0.56 (9/11) |
 | $B = 0$, efficiency ablated | 29.4, +4.84 ± 0.91 (11/11) | 40.3, +3.03 ± 0.84 (9/11) |
 
-**Table 2.** Grant size. Mean $\bar S$ at $\gamma = 35\text{k}$ and $15\text{k}$, and
-the paired difference $\Delta = \bar S_{15\text{k}} - \bar S_{35\text{k}}$.
-
-| Policy | $100\text{k}$: 35k | $100\text{k}$: 15k | $100\text{k}$: $\Delta$ | $150\text{k}$: 35k | $150\text{k}$: 15k | $150\text{k}$: $\Delta$ |
-|---|---|---|---|---|---|---|
-| current | 27.6 | 27.0 | −0.58 ± 0.47 (4/11) | 39.2 | 38.3 | −0.91 ± 0.46 (2/11) |
-| $B = 0$ | 29.5 | 29.6 | +0.12 ± 0.65 (5/11) | 39.9 | 40.3 | +0.32 ± 0.33 (6/11) |
-| $B = 0$, efficiency ablated | 29.4 | 32.0 | +2.54 ± 0.68 (11/11) | 40.3 | 41.5 | +1.13 ± 0.35 (9/11) |
-
-Uniform: 24.6 → 24.3 at $100\text{k}$ and 37.3 → 37.2 at $150\text{k}$.
-
 - $B$ is nearly constant ($8$ while three or more levels remain) and larger
   than $A$, so the current ranking is close to $8\,C$ and the level value
   barely matters. Removing it gains $+1.9$ / $+0.8$ points over current.
-- The efficiency ablation ties $B = 0$ at $\gamma = 35\text{k}$ and is the only
-  ranking that gains from finer grants ($+2.5$ / $+1.1$). $e$ falls as actions
-  accumulate on a stuck level, which repeats the stall signal in $C$.
-- Table 2 ignores switching cost. Switching at a trim is free because the
-  prefix is already invalid; preempting at $\gamma = 15\text{k}$ inside a context
-  costs a re-prefill.
+- Ablating the efficiency term ties $B = 0$ ($-0.1$ / $+0.4$). $e$ falls as
+  actions accumulate on a stuck level, which repeats the stall signal in $C$.
 
 ## Limitations
 
