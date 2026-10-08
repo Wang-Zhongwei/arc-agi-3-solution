@@ -1,6 +1,6 @@
 """What frame_diff returns, and how much of its displayed output is hashes.
 
-usage: python -I frame_diff_contents.py RUN_DIR
+usage: python -I frame_diff_contents.py RUN_DIR...
 
 1. Recomputes frame_diff with this checkout's code for every consecutive pair
    of action boards in RUN_DIR/artifacts/*_events.jsonl, and reports how often
@@ -35,11 +35,11 @@ def boards(path):
             yield e["board"]
 
 
-def recompute(run):
+def recompute(runs):
     pairs = 0
     nonempty, entries, sizes = Counter(), Counter(), []
     hash_chars = total_chars = 0
-    for path in sorted(Path(run, "artifacts").glob("*_events.jsonl")):
+    for path in sorted(p for run in runs for p in Path(run, "artifacts").glob("*_events.jsonl")):
         prev = None
         for grid in boards(path):
             seg = segment_layer(grid, ARC_COLOR_CHARS)
@@ -66,11 +66,11 @@ def recompute(run):
               f"hash key/value share {hash_chars / max(total_chars, 1):.0%}")
 
 
-def displayed(run):
+def displayed(runs):
     fd = re.compile(r"\bframe_diff\s*\(")
     calls = shown = 0
     hash_chars = total = 0
-    for path in sorted(Path(run, "transcripts").glob("*.txt")):
+    for path in sorted(p for run in runs for p in Path(run, "transcripts").glob("*.txt")):
         text = path.read_text(encoding="utf-8", errors="replace")
         codes, results = CALL.findall(text), RESULT.findall(text)
         for code, res in zip(codes, results):
@@ -86,5 +86,5 @@ def displayed(run):
 
 
 if __name__ == "__main__":
-    recompute(sys.argv[1])
-    displayed(sys.argv[1])
+    recompute(sys.argv[1:])
+    displayed(sys.argv[1:])
