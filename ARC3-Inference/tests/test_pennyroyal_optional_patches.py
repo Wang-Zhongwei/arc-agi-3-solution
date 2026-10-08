@@ -77,7 +77,8 @@ def test_new_baseline_v3_differs_from_v2_only_in_startup_and_offload(monkeypatch
 @pytest.mark.parametrize("config,threads,early,prefetch", [
     ("new-baseline/v3", 3, False, None),
     ("startup-read-threads/v1", 12, True, None),
-    ("startup-read-threads/v2", 6, True, None),
+    ("startup-read-threads/v2", 6, False, "8"),
+    ("startup-read-threads/v3", 0, False, "16"),
 ])
 def test_model_read_threads_reach_the_launcher(config, threads, early, prefetch):
     sglang = json.loads((ROOT / f"configs/{config}.json").read_text())["kaggle"].get("sglang", {})
@@ -94,7 +95,7 @@ def test_model_read_threads_reach_the_launcher(config, threads, early, prefetch)
 
 def test_quick_read_runs_differ_from_v3_only_in_read_and_runtime():
     v3 = json.loads((ROOT / "configs/new-baseline/v3.json").read_text())
-    for name in ("v1", "v2"):
+    for name in ("v1", "v2", "v3"):
         quick = json.loads((ROOT / f"configs/startup-read-threads/{name}.json").read_text())
         assert quick["kaggle"]["public_runtime_minutes"] == 5
         for key in ("kernel_slug", "kernel_title", "dataset_slug", "public_runtime_minutes", "sglang"):

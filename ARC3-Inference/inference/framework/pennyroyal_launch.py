@@ -123,11 +123,12 @@ MODEL_PRECACHE_THREADS = int(_READ.get("MODEL_PRECACHE_THREADS", 3))
 MODEL_PRECACHE_EARLY = bool(_READ.get("MODEL_PRECACHE_EARLY", False))
 
 # Daemon: this process exits once the server is up, and must not wait on it.
+# MODEL_PRECACHE_THREADS = 0 leaves the read to sglang's own prefetch.
 precache_model_thread = threading.Thread(
     target=precache, args=(MODEL_DIR, *([DRAFT_MODEL_DIR] if DRAFT_MODEL_DIR else [])),
     kwargs={'delay': 0 if MODEL_PRECACHE_EARLY else 60, 'threads': MODEL_PRECACHE_THREADS}, daemon=True,
-)
-if MODEL_PRECACHE_EARLY:
+) if MODEL_PRECACHE_THREADS > 0 else None
+if precache_model_thread and MODEL_PRECACHE_EARLY:
     precache_model_thread.start()
 
 # Paste this entire file into the launcher cell.
@@ -471,7 +472,7 @@ if CFG["SPEC"]:
         args += ["--speculative-token-map", str(tok)]
 
 # ---- launch detached and wait for health ----
-if not MODEL_PRECACHE_EARLY:
+if precache_model_thread and not MODEL_PRECACHE_EARLY:
     precache_model_thread.start()
 print("\n" + shlex.join(args) + "\n")
 log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
