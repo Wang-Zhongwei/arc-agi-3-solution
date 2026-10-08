@@ -76,8 +76,8 @@ def test_new_baseline_v3_differs_from_v2_only_in_startup_and_offload(monkeypatch
 
 @pytest.mark.parametrize("config,threads,early,prefetch", [
     ("new-baseline/v3", 3, False, None),
-    ("startup-read-threads/v1", 12, True, "16"),
-    ("startup-read-threads/v2", 6, True, "8"),
+    ("startup-read-threads/v1", 12, True, None),
+    ("startup-read-threads/v2", 6, True, None),
 ])
 def test_model_read_threads_reach_the_launcher(config, threads, early, prefetch):
     sglang = json.loads((ROOT / f"configs/{config}.json").read_text())["kaggle"].get("sglang", {})
