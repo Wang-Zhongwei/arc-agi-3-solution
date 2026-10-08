@@ -99,6 +99,27 @@ def harness_env() -> dict[str, str]:
     }
 
 
+# Analyzer and image settings the Makefile exports from the config's analyzer,
+# multimodal and shared sections: the same set the vLLM setup script embeds.
+_CONFIG_ANALYZER_KEYS = (
+    "LOCAL_ANALYZER_APP_NAME", "LOCAL_ANALYZER_CONTEXT_WINDOW", "LOCAL_ANALYZER_MAX_OUTPUT",
+    "LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", "LOCAL_ANALYZER_TOOL_STEPS",
+    "LOCAL_ANALYZER_TOOL_TIMEOUT", "LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS",
+    "LOCAL_ANALYZER_YIELD_SECONDS", "LOCAL_ANALYZER_TEMPERATURE", "LOCAL_ANALYZER_TOP_P",
+    "LOCAL_ANALYZER_TOP_K", "LOCAL_ANALYZER_ENABLE_THINKING",
+    "MULTIMODAL_CONTEXT", "MULTIMODAL_UPSCALE",
+)
+
+
+def config_analyzer_env() -> dict[str, str]:
+    """Config analyzer/multimodal settings as the Makefile exported them.
+
+    Without these a Pennyroyal run falls back to the agent's own defaults: no
+    board images and a 32K context window (new-baseline v1).
+    """
+    return {key: os.environ[key] for key in _CONFIG_ANALYZER_KEYS if os.environ.get(key, "").strip()}
+
+
 def apply_harness_env() -> None:
     """Local runs: config settings fill in what the shell did not set."""
     for key, value in harness_env().items():
@@ -139,7 +160,8 @@ def pennyroyal_setup_command() -> str:
             "served_model_name", "port", "server_startup_timeout_s", "sglang",
         ) if key in cfg
     }
-    spec["env"] = harness_env()
+    # harness_env wins over the analyzer/multimodal sections, as on vLLM.
+    spec["env"] = {**config_analyzer_env(), **harness_env()}
     launcher = "$TAAF_KAGGLE_BUNDLE_DIR/src/ARC3-Inference/inference/framework/pennyroyal_launch.py"
     return f'ARC3_PENNYROYAL_SPEC={shlex.quote(json.dumps(spec))} "$PYTHON" "{launcher}"'
 
