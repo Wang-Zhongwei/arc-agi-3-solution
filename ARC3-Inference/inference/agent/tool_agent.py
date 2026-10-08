@@ -20,6 +20,7 @@ from urllib.parse import urlparse, urlunparse
 import requests
 
 from inference.agent.noop_repeat_guard import NoopRepeatGuard, action_signature
+from inference.agent.adaptive_context import AdaptiveContext
 from inference.agent.scheduling.priority import (
     ProgressPace, PrioritySnapshot, parse_total_levels, priority_value,
 )
@@ -3613,6 +3614,7 @@ class ToolAgent:
             1024,
             _LOCAL_ANALYZER_CONTEXT_WINDOW - self._reply_reserve_tokens - self._request_safety_margin_tokens,
         )
+        self._adaptive_context = AdaptiveContext.from_env(self._context_budget_tokens)
         self._turns_without_wm_update = 0
         self._pending_wm_rebuild_reason = ""
         self._wm_absorbed_in_turn = False
@@ -3724,6 +3726,7 @@ class ToolAgent:
             self._session_generated_tokens = 0
             self._last_call_reasoning_tokens = None
             self._summary_context_tokens_since_attempt = 0
+            self._adaptive_context = AdaptiveContext.from_env(self._context_budget_tokens)
             self._last_step_summary = None
             self._last_action_call_result = None
             self._summarized_knowledge = _empty_world_model()
@@ -3962,6 +3965,9 @@ class ToolAgent:
         if not summary:
             return
         self._observe_yield(summary)
+        adaptive = self._adaptive_context_policy()
+        if adaptive is not None:
+            adaptive.record_progress(self._levels_completed(summary))
         wipe_reason = ""
         revise_reason = ""
         if summary.get("level_transition"):
@@ -6170,6 +6176,12 @@ class ToolAgent:
             )
         return ""
 
+    def _adaptive_context_policy(self) -> AdaptiveContext | None:
+        # Older serialized agents do not yet have this field.
+        if not hasattr(self, "_adaptive_context"):
+            self._adaptive_context = AdaptiveContext.from_env(self._context_budget_tokens)
+        return self._adaptive_context
+
     def _append_context_message(
         self, messages: list[dict[str, Any]], message: dict[str, Any]
     ) -> None:
@@ -6181,16 +6193,21 @@ class ToolAgent:
         itself bypasses this helper and starts a fresh interval.
         """
         messages.append(message)
-        if _summary_interval_tokens() <= 0:
+        adaptive = self._adaptive_context_policy()
+        summary_enabled = _summary_interval_tokens() > 0
+        if not summary_enabled and adaptive is None:
             return
         added = max(
             0,
             self._estimate_request_input_tokens([message])
             - self._estimate_request_input_tokens([]),
         )
-        self._summary_context_tokens_since_attempt = (
-            getattr(self, "_summary_context_tokens_since_attempt", 0) + added
-        )
+        if summary_enabled:
+            self._summary_context_tokens_since_attempt = (
+                getattr(self, "_summary_context_tokens_since_attempt", 0) + added
+            )
+        if adaptive is not None:
+            adaptive.record_append(added)
 
     def _maybe_append_rolling_summary(
         self, append_transcript, tools: list[dict[str, Any]] | None,
@@ -6497,7 +6514,8 @@ class ToolAgent:
         trimmed_history = trimmed[1:]
         history = self._keep_recent_history_turns(
             trimmed_history,
-            max_turns=_persistent_history_assistant_turns(),
+            max_turns=(0 if self._adaptive_context_policy() is not None
+                       else _persistent_history_assistant_turns()),
             drain_turns=_history_turn_drain(),
             force_drain=token_trim_dropped and _history_drain_coalesce(),
         )
@@ -6734,6 +6752,24 @@ class ToolAgent:
         drain_tokens = min(_context_drain_tokens(), budget_tokens // 2)
         target_tokens = max(1, budget_tokens - drain_tokens) if drain_tokens else budget_tokens
         floor_mode = bool(drain_tokens) and _context_drain_floor_mode()
+        adaptive = self._adaptive_context_policy()
+        initial_estimate: int | None = None
+        if adaptive is not None:
+            was_expanded = adaptive.expanded
+            initial_estimate = self._estimate_request_input_tokens(messages, tools=tools)
+            budget_tokens, target_tokens = adaptive.limits(
+                initial_estimate,
+                budget_tokens, force_drain=force_drain,
+            )
+            drain_tokens = budget_tokens - target_tokens
+            # The adaptive low water is a trim target, not a retention floor.
+            floor_mode = False
+            if adaptive.expanded != was_expanded:
+                log.info(
+                    "adaptive_context: expanded to %d input tokens; new tokens since progress=%s",
+                    budget_tokens, "no completion yet" if adaptive.last_progress_tokens is None
+                    else adaptive.appended_tokens - adaptive.last_progress_tokens,
+                )
         # Normally eviction starts only once the estimate exceeds the budget.
         # After the server has rejected a request the estimate is known to be
         # wrong, so waiting for it to admit the request is too big would drop
@@ -6763,16 +6799,19 @@ class ToolAgent:
         # another round trip.
         def _stop_early(used_tokens: int) -> bool:
             return (
-                _drain_stop_at_summaries()
+                adaptive is None
+                and _drain_stop_at_summaries()
                 and draining
                 and not force_drain
                 and used_tokens <= budget_tokens
                 and _head_is_summary()
             )
 
-        estimate_before: int | None = None
+        estimate_before: int | None = initial_estimate
         while history:
-            used = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+            used = (initial_estimate if initial_estimate is not None
+                    else self._estimate_request_input_tokens([system_message, *history], tools=tools))
+            initial_estimate = None
             if estimate_before is None:
                 estimate_before = used
             over_budget = used > budget_tokens
@@ -6809,6 +6848,8 @@ class ToolAgent:
         # yielding the slot to another game costs nothing.
         if len(history) != len(messages) - 1:
             after = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+            if adaptive is not None:
+                adaptive.did_trim()
             self._note_history_evicted(
                 f"{'forced_drain' if force_drain else 'token_budget'}"
                 f" msgs={len(messages) - 1}->{len(history)}"
@@ -6829,6 +6870,9 @@ class ToolAgent:
         history = list(messages[1:])
         if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
             return list(messages)
+        adaptive = self._adaptive_context_policy()
+        if adaptive is not None:
+            adaptive.did_trim()
         self._note_history_evicted(f"force_reduce msgs={len(messages) - 1}->{len(history)}")
         return [system_message, *history]
 

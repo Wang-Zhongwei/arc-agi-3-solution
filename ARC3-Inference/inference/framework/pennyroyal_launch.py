@@ -156,6 +156,9 @@ CFG = dict(
     SPEC_ACCEPT_SINGLE=1.0,
     SPEC_ACCEPT_ACC=1.0,
     SPEC_STEPS=3,
+    OFFLOAD_EMBED_TOKENS=False,
+    WIDE_BF16_GEMM=False,
+    LOG_BF16_GEMM_SHAPES=False,
     # The harness's thinking budget (custom_params.thinking_budget) is enforced
     # by sglang's reasoner grammar, which only filters tokens in strict mode.
     # Strict mode also keeps tool-call and end-of-turn tokens out of thinking.
@@ -378,10 +381,20 @@ env.update({
     "SGLANG_SM120_LOWM_FP8_WEIGHT": "0", "SGLANG_SM120_LM_HEAD_FP8": "0",
     "SGLANG_MAMBA_CONV_DTYPE": "bfloat16", "SGLANG_NUMA_BIND_V2": "false",
     "SGLANG_MM_PREPROCESS_DEVICE": "cpu", "NUMPY_MADVISE_HUGEPAGE": "0",
+    "ARC3_OFFLOAD_EMBED_TOKENS": "1" if CFG["OFFLOAD_EMBED_TOKENS"] else "0",
+    "ARC3_WIDE_BF16_GEMM": "1" if CFG["WIDE_BF16_GEMM"] else "0",
+    "SGLANG_BF16_GEMM_LOG_SHAPES": "1" if CFG["LOG_BF16_GEMM_SHAPES"] else "0",
 })
+if CFG["OFFLOAD_EMBED_TOKENS"] or CFG["WIDE_BF16_GEMM"]:
+    patch_args = [PYTHON, Path(__file__).with_name("pennyroyal_patch.py")]
+    if CFG["OFFLOAD_EMBED_TOKENS"]:
+        patch_args.append("--embedding")
+    if CFG["WIDE_BF16_GEMM"]:
+        patch_args.append("--wide-gemm")
+    run(patch_args, env=env)
 run([str(Path(CUDA_HOME) / "bin/nvcc"), "--version"], env=env)
 print("Host compiler:", CXX)
-# Report the optional later caching patch. This cell does not modify wheel code.
+# Report the installed engine and device before loading weights.
 run([PYTHON, "-c", '''import pathlib, sglang, torch
 print("sglang", sglang.__version__, "| torch", torch.__version__)
 assert torch.cuda.is_available(), "CUDA unavailable"

@@ -140,6 +140,22 @@ def pennyroyal_setup_command() -> str:
         ) if key in cfg
     }
     spec["env"] = harness_env()
+    sglang = spec.get("sglang", {})
+    active = int(spec["env"].get("ARC3_MAX_ACTIVE_STREAMS", 10))
+    capacity = int(sglang.get("MAXREQ", 10))
+    graph_max = int(sglang.get("CUDAGRAPH_MAXBS", 10))
+    if not 0 < active <= capacity <= graph_max:
+        raise ValueError("Pennyroyal requires 0 < active streams <= MAXREQ <= CUDAGRAPH_MAXBS")
+    context = int(spec["env"].get("LOCAL_ANALYZER_CONTEXT_WINDOW", 131072))
+    if int(sglang.get("CTX", 139264)) < context:
+        raise ValueError("Pennyroyal CTX must cover the harness context window (including reply reserve)")
+    # Validate the adaptive input ceiling before packaging, as well as when the
+    # agent starts. Use the handoff values rather than the packaging process env.
+    if str(spec["env"].get("ARC3_ADAPTIVE_CONTEXT", "0")).lower() in {"1", "true", "yes", "on"}:
+        output = int(spec["env"].get("LOCAL_ANALYZER_MAX_OUTPUT", 12288)) or 512
+        high = int(spec["env"].get("ARC3_CONTEXT_EXPANDED_HIGH", 131072))
+        if high > context - output - 512:
+            raise ValueError("Adaptive context must leave room for output and the 512-token safety margin")
     launcher = "$TAAF_KAGGLE_BUNDLE_DIR/src/ARC3-Inference/inference/framework/pennyroyal_launch.py"
     return f'ARC3_PENNYROYAL_SPEC={shlex.quote(json.dumps(spec))} "$PYTHON" "{launcher}"'
 

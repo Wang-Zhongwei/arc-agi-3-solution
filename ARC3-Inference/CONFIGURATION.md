@@ -221,6 +221,40 @@ The dimension estimate uses 32-pixel patches plus two image marker tokens. For e
 
 The original `LOCAL_ANALYZER_CONTEXT_WINDOW` and `LOCAL_ANALYZER_MAX_OUTPUT` still determine the ordinary prompt budget, reserving generation space plus a safety margin. A large context setting does not override a smaller assistant-message cap or a smaller server context limit.
 
+### Adaptive context after a stall
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_ADAPTIVE_CONTEXT` | Off | Enables per-game token thresholds below, replacing fixed token drains and the assistant-message cap. |
+| `ARC3_CONTEXT_NORMAL_LOW` | `32768` | Trim target while using the normal ceiling, and after success in expanded mode. |
+| `ARC3_CONTEXT_NORMAL_HIGH` | `65536` | Normal retained-input ceiling; also the amount of newly appended context without a level-up that permits expansion. |
+| `ARC3_CONTEXT_EXPANDED_LOW` | `98304` | Trim target when expanded and still stalled. |
+| `ARC3_CONTEXT_EXPANDED_HIGH` | `131072` | Expanded retained-input ceiling. |
+
+At the normal ceiling, a game with no completion yet, or no completion within
+the latest 64k newly appended conversation tokens, expands without dropping
+history. Otherwise it trims toward 32k. Expanded games trim toward 96k until a
+level-up. That success is latched: at the **next trim**, retain at most 32k where
+whole exchanges allow, then return to the 64k ceiling. Progress does not cause
+an immediate trim. Trims keep the existing scheduler handover; expansion does
+not yield. The last user message/tool exchange remains protected even if it
+alone exceeds a target.
+
+The progress clock estimates each new message once, including reasoning,
+tool output and images; repeated prompt usage and retained history do not add
+credit. State survives agent serialization and resets for a new game. Adaptive
+trimming ignores the assistant-turn cap, floor mode and summary stopping points.
+Other optional pruning/summary replacement features still evict history if
+enabled; the supplied adaptive configs leave them off. Server-overflow recovery
+can force an earlier trim and never responds by expanding the context.
+
+These thresholds are **input** budgets. The expanded ceiling must fit inside
+`LOCAL_ANALYZER_CONTEXT_WINDOW - LOCAL_ANALYZER_MAX_OUTPUT - 512`; for example,
+the prepared configs use a 147456 total harness window, 12288 output tokens and
+a 155648 server window. Thresholds must satisfy
+`0 < normal_low < normal_high <= expanded_low < expanded_high <= input budget`.
+With the feature off, existing context behavior is unchanged.
+
 ### Optional control-message pruning
 
 | Setting | Default | Behavior |
@@ -487,11 +521,25 @@ These changes do not increase the server’s true context limit. Correctly match
 | `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
 | `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
 | `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. |
+| `sglang` | Pennyroyal launcher defaults | With `serving=pennyroyal`, overrides engine settings such as `CTX`, `MAXREQ`, `CUDAGRAPH_MAXBS`, `MEMFRAC` and `MAMBA_CACHE`. Requires `active streams <= MAXREQ <= CUDAGRAPH_MAXBS` and a server context at least as large as the harness window. |
 | `vllm` | Lord launcher defaults | With `serving=lordhansolo`, passes engine settings to the pinned launcher's `DuckKaggleVllmConfig`, including `max_model_len`, cache dtypes, `max_num_seqs`, MTP tokens, prefix-cache controls, and `draft_vocab`. The draft vocabulary path is relative to `ARC3-Inference/`. |
 | `default_chat_template_kwargs` | `{"preserve_thinking": true}` | With `serving=lordhansolo`, sets the server's template defaults without importing the source notebook's `xhigh` reasoning setting. |
 | `private_waves` | `1` | With `serving=lordhansolo`, opts competition reruns into multiple waves with the priority scheduler. Lanes are rounded up from the live trial count divided by waves. The remaining `private_runtime_minutes` budget, measured from notebook start, is divided between waves after engine startup. Public runs keep one wave. UCB rejects multiple waves. |
 
 By default every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. Priority scheduling can opt into private waves as described above. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
+
+Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse:
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the ordinary input table in pinned host BF16 memory, shared by target and MTP. TP=1, untied lm_head, same-process draft only. PLE and the GPU lm_head are unchanged. Requires GPU validation. |
+| `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 and other shapes unchanged. Uses actual graph-padded M; requires numerical and timing validation. |
+| `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's existing unique `(M, N, K)` shape logging for BF16 dispatch. |
+
+The two optional patches are installed from this run's source bundle, without
+rebuilding the wheelhouse. Both are independently disabled in the prepared
+adaptive configs. No FP8 PLE or embedding conversion is performed. See the
+[plan and validation sequence](../docs/serving/adaptive-context-plan.md).
 
 ### RunPod runs
 
