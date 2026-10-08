@@ -116,10 +116,12 @@ precache_wheels_thread = threading.Thread(target=precache, args=(WHEELHOUSE_DIR,
 precache_wheels_thread.start()
 precache_wheels_thread.join()
 
-# Model read tuning from kaggle.sglang; the defaults are Daniel's cell. Early
-# precache starts reading now, during the install, instead of 60 s after launch.
+# Model read tuning from kaggle.sglang. 6 precache + 8 prefetch threads load about
+# 20% faster than Daniel's cell's 3 + 4; see docs/serving/startup-read-threads.md.
+# Early precache (during the install instead of 60 s after launch) outruns the
+# loader and gets evicted, since 185 GB exceeds RAM, so it stays off.
 _READ = SPEC.get("sglang", {})
-MODEL_PRECACHE_THREADS = int(_READ.get("MODEL_PRECACHE_THREADS", 3))
+MODEL_PRECACHE_THREADS = int(_READ.get("MODEL_PRECACHE_THREADS", 6))
 MODEL_PRECACHE_EARLY = bool(_READ.get("MODEL_PRECACHE_EARLY", False))
 
 # Daemon: this process exits once the server is up, and must not wait on it.
@@ -156,8 +158,8 @@ CFG = dict(
     # Preserve the original Kaggle checkpoint prefetch/cache behavior.
     PREFETCH_CHECKPOINTS=True,
     DROP_CACHE_AFTER_LOAD=True,
-    # sglang's one-shard lookahead prefetch readers (its default is 4).
-    PREFETCH_THREADS=4,
+    # sglang's one-shard lookahead prefetch readers (sglang's own default is 4).
+    PREFETCH_THREADS=8,
     LINEAR_BACKEND="flashinfer",
     KVDTYPE="fp8_e4m3",
     SSM_DTYPE="bfloat16",
@@ -450,7 +452,7 @@ args = [SGLANG, "serve", "--model-path", MODEL_DIR, "--load-format", "safetensor
     "--enable-cache-report", "--enable-metrics", "--enable-request-time-stats-logging"]
 if CFG["PREFETCH_CHECKPOINTS"]: args += ["--weight-loader-prefetch-checkpoints"]
 if CFG["DROP_CACHE_AFTER_LOAD"]: args += ["--weight-loader-drop-cache-after-load"]
-if int(CFG["PREFETCH_THREADS"]) != 4: args += ["--weight-loader-prefetch-num-threads", str(int(CFG["PREFETCH_THREADS"]))]
+args += ["--weight-loader-prefetch-num-threads", str(int(CFG["PREFETCH_THREADS"]))]
 tmpl = Path(MODEL_DIR, "chat_template.jinja")
 if tmpl.is_file(): args += ["--chat-template", str(tmpl)]
 if not CFG["AUTOTUNE"]: args += ["--disable-flashinfer-autotune"]

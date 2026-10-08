@@ -528,9 +528,9 @@ Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The lau
 | `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the input `embed_tokens` table (~1.2 GiB BF16) in pinned host memory, gathered by the PLE kernel and shared with the MTP draft; the freed GPU memory goes to the KV pool. TP=1 and an untied `lm_head` only. PLE and the GPU `lm_head` are unchanged. |
 | `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 path unchanged. Unvalidated. |
 | `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's unique `(M, N, K)` shape logging for BF16 dispatch. |
-| `MODEL_PRECACHE_THREADS` | `3` | Reader threads of the launcher's page-cache precache of the model and draft (185.4 GB); `0` turns it off and leaves the read to sglang's prefetch. |
-| `MODEL_PRECACHE_EARLY` | `false` | Starts that precache right after the wheel precache, during the install, instead of 60 s after server launch. |
-| `PREFETCH_THREADS` | `4` | sglang's one-shard lookahead prefetch threads (`--weight-loader-prefetch-num-threads`); passed only when not 4. |
+| `MODEL_PRECACHE_THREADS` | `6` | Reader threads of the launcher's page-cache precache of the model and draft (185.4 GB), starting 60 s after server launch; `0` turns it off. Daniel's cell used `3`. See [startup read threads](../docs/serving/startup-read-threads.md). |
+| `MODEL_PRECACHE_EARLY` | `false` | Starts that precache right after the wheel precache, during the install, instead of 60 s after server launch. It outruns the loader and is evicted from page cache (1,011 s load with 12 threads), so leave it off. |
+| `PREFETCH_THREADS` | `8` | sglang's one-shard lookahead prefetch threads (`--weight-loader-prefetch-num-threads`). sglang's and Daniel's default is `4`. |
 
 ### RunPod runs
 
