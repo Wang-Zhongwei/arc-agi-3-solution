@@ -106,8 +106,25 @@ through 16, the adaptive thresholds, and both optional patches disabled.
 This dry-run bundle predates the 10,240-token thinking-budget update; regenerate
 it from the current config before launching.
 
-No notebook was pushed and no GPU run was launched. GPU startup, numerical
-checks, performance, memory capacity at 16 streams and ARC quality remain
-unmeasured. The shape logger includes warmup/capture shapes; it does not measure
-their runtime frequency. Enable and measure each optional patch separately
-after the context-only comparison.
+GPU startup, numerical checks, performance, memory capacity at 16 streams and
+ARC quality remain unmeasured. The shape logger includes warmup/capture shapes;
+it does not measure their runtime frequency. Enable and measure each optional
+patch separately after the context-only comparison.
+
+## First Kaggle run
+
+At the user's request, only `adaptive-16` was pushed:
+[jonathanwang2022/context-adaptive-16, version 1](https://www.kaggle.com/code/jonathanwang2022/context-adaptive-16)
+on 2026-10-08. The CLI confirmed `Kernel version 1 successfully pushed`; the
+subsequent status check returned `QUEUED`. This is a public-game trial in a
+private notebook, not a competition leaderboard submission or an evaluated
+result. Both 10-stream configs remain local.
+
+Source commit: `e358175`. Settings: 25 games, one pass, 120-minute public budget,
+16 active streams, 10,240 thinking tokens inside 12,288 output tokens, 155,648
+server context, Daniel's W4A16 model and BF16 tables. Optional offload and wider
+GEMM are disabled. Exact launch artifacts are under
+`ARC3-Inference/runs/kaggle/jonathanwang2022/context-adaptive-16/v01/`.
+
+The first attempt stopped at authentication before uploading. The retry used
+the existing saved API token and succeeded; no credential was changed.
