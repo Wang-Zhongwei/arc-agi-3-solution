@@ -61,7 +61,7 @@ Several consistency fixes are unconditional: documentation now includes frame `.
 
 ### Richer shape metadata — unconditional
 
-Extended the existing segmentation representation with rotation-aware shape information. Components expose canonical hashes and orientation-related metadata, including `shape_hash`, `pose_hash`, `rotation`, and `rotational_symmetry`. Canonicalization accounts for rotations, and color-independent orientation is calculated consistently across differently colored copies of a shape.
+Extended the existing segmentation representation with rotation-aware shape information. Components expose a rotation-invariant `hash` plus `rotation` and `rotational_symmetry`. Canonicalization accounts for rotations, and color-independent orientation is calculated consistently across differently colored copies of a shape. Each node also carries `bbox`, its inclusive bounding box as `[r0, c0, r1, c1]`, the same layout `frame_diff` uses. `pose_hash` and `shape_hash` were removed from nodes and `frame_diff` entries because the agent almost never read them ([report](../docs/harness/segmentation-node-fields.md)); `frame_diff` still pairs recolored objects by their color-free shape internally.
 
 Segmentation still uses same-color **four-connectivity**. Diagonal contacts, multicolor objects, and touching objects can therefore produce components that differ from the game’s conceptual objects. Hashes describe shapes/appearances; they are not unique object IDs.
 
