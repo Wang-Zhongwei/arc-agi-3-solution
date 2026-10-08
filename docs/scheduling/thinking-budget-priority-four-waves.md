@@ -72,3 +72,12 @@ Two packaging quirks of the worktree push:
 - The bundle's `git_status.txt` names the main checkout (`416cba3`, dirty), and `src/` also contains 21 files from that checkout that `eea6f57` lacks: newer configs, `inference/framework/lordhansolo/`, `pennyroyal_{patch,wide_gemm,bf16_embedding}.py`, `benchmark_pennyroyal_optional.py`, runpod tools, and `deploy_runpod.py`/`runpod_pod.py`. Nothing at `eea6f57` or in the generated notebook references them, so they are not loaded.
 
 Record scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=3`. The 30-min public run is a health check, not a score comparison.
+
+## Version 4: v3 with 10 active streams
+
+Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v4.json`. Same source and settings as v3, except `ARC3_MAX_ACTIVE_STREAMS` is 10 (as in v1 and v2) instead of 14. v3's 14 came from the replay doc's settings line, not from the intended plan.
+
+```
+make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v4.json \
+  KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=30
+```
