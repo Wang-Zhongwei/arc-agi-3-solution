@@ -6,6 +6,7 @@ from PIL import Image
 
 from inference.agent import tool_agent, vision_context as vision
 from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
+from inference.utils.animation import build_animation_frames, build_animation_view
 
 
 def frame(step, value=0, level=1):
@@ -50,8 +51,12 @@ def test_python_call_attaches_only_new_intermediate_boards(monkeypatch, tmp_path
     assert len(images) == 1 + expected
     assert image(images[-1]).size == (512, 512)
     assert [image(part).size for part in images[:-1]] == [(128, 128)] * expected
-    labels = [part['text'] for part in message['content'] if part['type'] == 'text' and part['text'].startswith('after action')]
-    assert labels == [f'after action {6 + index}, DOWN:' for index in range(expected)]
+    labels = [part['text'] for part in message['content'] if part['type'] == 'text' and part['text'].startswith('history[')]
+    assert labels == [f'history[{2 + index}].frame (after DOWN):' for index in range(expected)]
+    # The history index is absolute, not the action step or the batch position.
+    payload = tool_agent._ascii_history_view_payload(entries)
+    for index, part in enumerate(images[:-1]):
+        assert image(part).getpixel((0, 0)) == vision.ARC_COLOR_MAP[payload[2 + index]['frame']['grid'][0][0]]
     again = agent._build_user_message('Continue', entries[-1].frame)
     assert sum(part['type'] == 'image_url' for part in again['content']) == 1
 
@@ -62,8 +67,8 @@ def test_fatal_board_and_level_transition_labels():
                HistoryEntry('RESET', frame(4, level=2))]
     parts = vision.intermediate_frame_parts(entries, after_step=1, before_step=4)
     assert len(parts) == 2
-    assert parts[0][0] == 'after action 2, UP:'
-    assert parts[1][0] == 'after action 3, DOWN:'
+    assert parts[0][0] == 'history[0].frame (after UP):'
+    assert parts[1][0] == 'history[1].frame (after DOWN):'
     assert vision.intermediate_frame_parts(entries, after_step=4, before_step=4) == []
 
 
@@ -107,6 +112,21 @@ def test_sampled_animation_caps_and_spreads_frames():
     assert [image(part).getpixel((0, 0)) for _, part in parts] == [
         vision.ARC_COLOR_MAP[v] for v in [1, 2, 4, 6, 8, 10, 12, 14]
     ]
+
+
+@pytest.mark.parametrize('values', [list(range(16)), [0, 0, 1, 1, 0, 2, 3, 3]])
+def test_sampled_captions_index_the_exposed_animation_frames(values):
+    import re
+    chain = [frame(0, value).grid for value in values]
+    record = {'chain': chain, 'step': 27, 'level': 2}
+    exposed = build_animation_frames(record)
+    timeline = build_animation_view(record)
+    for label, part in vision.animation_sampled_parts(chain):
+        index = int(re.fullmatch(r'last_animation_frames\[(\d+)\]:', label).group(1))
+        expected = frame(27, exposed[index]['grid'][0][0], level=2)
+        expected_image = vision.frame_to_png_data_url(expected, upscale=2)
+        assert part['image_url']['url'] == expected_image
+        assert any(step['step'] == index + 1 for step in timeline['steps'])
 
 
 @pytest.mark.parametrize('fatal', [False, True])

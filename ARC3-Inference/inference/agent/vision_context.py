@@ -89,11 +89,12 @@ def intermediate_frame_parts(
     if not current_grid_image_enabled():
         return []
     parts = []
-    for entry in entries:
+    # Match the complete history exposed in the sandbox, before turn filtering.
+    for history_index, entry in enumerate(entry for entry in entries if entry.frame is not None):
         frame = entry.frame
         if frame is None or not after_step < frame.step < before_step:
             continue
-        label = f"after action {frame.step}, {entry.action}:"
+        label = f"history[{history_index}].frame (after {entry.action}):"
         parts.append((label, {"type": "image_url", "image_url": {
             "url": frame_to_png_data_url(frame, upscale=auxiliary_image_upscale("intermediate")),
         }}))
@@ -195,7 +196,7 @@ def animation_sampled_parts(chain: list[Any]) -> list[tuple[str, dict[str, Any]]
     if len(candidates) > 8:
         candidates = [candidates[i * (len(candidates) - 1) // 7] for i in range(8)]
     return [
-        (f"frame {index}/{len(grids) - 1}:",
+        (f"last_animation_frames[{index - 1}]:",
          {"type": "image_url", "image_url": {"url": frame_to_png_data_url(
              Frame(grid=grid, step=0, level=1), upscale=auxiliary_image_upscale("animation"),
          )}})
