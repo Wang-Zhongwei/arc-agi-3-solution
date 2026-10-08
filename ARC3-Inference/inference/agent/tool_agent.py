@@ -73,7 +73,7 @@ from inference.agent.vision_context import (
     current_grid_image_part,
 )
 
-from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
@@ -2741,7 +2741,8 @@ def _render_auto_frame_diff(
         remaining = len(entries) - shown - sum(swarm.values())
         if remaining > 0:
             lines.append(f"- {bucket}: +{remaining} more")
-    lines.append("(call frame_diff() in python for the full object list)")
+    if frame_diff_enabled():
+        lines.append("(call frame_diff() in python for the full object list)")
     if _estimate_diff_tokens("\n".join(lines)) <= budget_tokens:
         return lines
     # rung 3: counts only, cannot be large
@@ -2750,9 +2751,8 @@ def _render_auto_frame_diff(
         for bucket in _DIFF_BUCKETS
         if diff.get(bucket)
     ]
-    return [
-        header + " " + ", ".join(parts) + " (details omitted; call frame_diff() in python)."
-    ]
+    omitted = " (details omitted; call frame_diff() in python)." if frame_diff_enabled() else " (details omitted)."
+    return [header + " " + ", ".join(parts) + omitted]
 
 
 def _build_system_prompt(*, tool_output_tokens: int) -> str:
@@ -2782,8 +2782,12 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
             " Each turn's message includes an 'Auto frame diff' section summarizing "
             "object-level changes since your previous analyzer turn (it spans all "
             "actions executed in between, not just the last one). Treat it as ground "
-            "truth for what changed, consult it before acting, and call `frame_diff()` "
-            "in python when you need per-action or full object detail."
+            "truth for what changed, consult it before acting"
+            + (
+                ", and call `frame_diff()` in python when you need per-action or full "
+                "object detail."
+                if frame_diff_enabled() else "."
+            )
         )
     if _DIFF_IMAGE and current_grid_image_enabled():
         prompt += (
@@ -2815,10 +2819,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         WORLD_MODEL_FREE_ADDENDUM if _memory_sections_disabled() else WORLD_MODEL_ADDENDUM
     )
     prompt += PYTHON_ADDENDUM_TAIL
-    if _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
-        # documents `frame_diff(before, after)`. The function stays callable
-        # either way - this only controls whether the model is told about it,
-        # so the arm measures whether knowing costs more than it returns.
+    if frame_diff_enabled() and _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
+        # documents `frame_diff(before, after)`. With ARC3_FRAME_DIFF on, the
+        # function stays callable either way - the hint only controls whether
+        # the model is told about it. ARC3_FRAME_DIFF=0 removes both.
         prompt += FRAME_DIFF_HINT_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.

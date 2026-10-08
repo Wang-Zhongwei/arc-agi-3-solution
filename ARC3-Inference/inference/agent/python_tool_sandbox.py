@@ -369,6 +369,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         initial = _recv()
         global COLOR_CHARS
         COLOR_CHARS = str(initial.get("color_chars") or "")
+        frame_diff_enabled = bool(initial.get("frame_diff_enabled", True))
         timeout_seconds = max(1, int(initial.get("timeout_seconds", 30)))
         sandbox_cwd = str(initial.get("sandbox_cwd", "")).strip()
         if sandbox_cwd:
@@ -434,7 +435,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 last_transition.after_frame if last_transition is not None else None
             )
             runtime_globals["last_action"] = last_transition.action if last_transition is not None else None
-            runtime_globals["frame_diff"] = frame_diff
+            if frame_diff_enabled:
+                runtime_globals["frame_diff"] = frame_diff
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["death_ledger"] = state_payload.get("death_ledger") or {"attempts": []}
             runtime_globals["last_action_call_result"] = action_result
@@ -840,6 +842,14 @@ def _memory_kill_error(memory_limit_bytes: int) -> str:
     )
 
 
+def frame_diff_enabled() -> bool:
+    """ARC3_FRAME_DIFF (read at call time, default on): off removes the
+    `frame_diff` helper from the sandbox and every prompt mention of it."""
+    return os.environ.get("ARC3_FRAME_DIFF", "1").strip().lower() not in {
+        "0", "off", "false", "no",
+    }
+
+
 def _sandbox_env() -> dict[str, str]:
     return {
         "PYTHONUNBUFFERED": "1",
@@ -940,6 +950,7 @@ def run_sandboxed_python(
                 "sandbox_cwd": sandbox_dir,
                 "state": initial_state,
                 "color_chars": ARC_COLOR_CHARS,
+                "frame_diff_enabled": frame_diff_enabled(),
             },
         )
 

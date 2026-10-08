@@ -270,6 +270,9 @@ These are not decided; each needs an A/B test per the
   budget bars visible, since the prompt tells the agent to watch them.
 - **A/B removing `frame_diff` entirely.** This is the only ablation here that
   could move the score. Lord's agent shows the cost: it hand-writes cell diffs
-  instead.
+  instead. The arm is `ARC3_FRAME_DIFF=0` in `harness_env` (default `1`, see
+  [CONFIGURATION.md](../../ARC3-Inference/CONFIGURATION.md)). It removes the
+  helper from the sandbox and every prompt mention of it: with `new-baseline`'s
+  `harness_env`, that is 1,734 characters of system prompt.
 - **Keep `rotated`**: an empty list is cheap and the entries are rare but
   informative.

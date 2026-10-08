@@ -65,7 +65,7 @@ Extended the existing segmentation representation with rotation-aware shape info
 
 Segmentation still uses same-color **four-connectivity**. Diagonal contacts, multicolor objects, and touching objects can therefore produce components that differ from the game’s conceptual objects. Hashes describe shapes/appearances; they are not unique object IDs.
 
-### `frame_diff` — unconditional Python helper
+### `frame_diff` — Python helper (on by default)
 
 Added `frame_diff(before=None, after=None)` to the sandbox. Its defaults compare `previous_frame` with `current_frame`. It returns a compact structured account of changed cells and candidate object changes: movement, rotation, appearance, disappearance, recoloring, and resizing. Different-sized frames return an explicit full-redraw/shape-mismatch result.
 
@@ -73,6 +73,7 @@ Matching uses component information and assignment heuristics. Multiple similar 
 
 | Setting | Default | Change |
 |---|---|---|
+| `ARC3_FRAME_DIFF` | On (`1`) | Exposes the `frame_diff` helper in the sandbox. `0` removes it, along with the `ARC3_FRAME_DIFF_HINT` documentation and the auto frame diff's pointers to it, for the ablation proposed in the [frame_diff usage report](../docs/harness/frame-diff-fields.md). |
 | `ARC3_AUTO_FRAME_DIFF` | Off | Inserts a compact structured/textual frame-difference summary in the user prompt. Separate from availability of the Python helper. |
 | `ARC3_AUTO_FRAME_DIFF_BUDGET` | `300` | Approximate token budget for the automatic text diff; rendering falls back from individual changes to grouped changes and then counts. |
 | `ARC3_LEVEL_INVENTORY` | Off | Compares object inventories at the starts of successive levels, highlighting newly appearing types. Independent of ordinary per-action diffs and diff images. |
