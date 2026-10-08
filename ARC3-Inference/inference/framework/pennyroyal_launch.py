@@ -116,11 +116,19 @@ precache_wheels_thread = threading.Thread(target=precache, args=(WHEELHOUSE_DIR,
 precache_wheels_thread.start()
 precache_wheels_thread.join()
 
+# Model read tuning from kaggle.sglang; the defaults are Daniel's cell. Early
+# precache starts reading now, during the install, instead of 60 s after launch.
+_READ = SPEC.get("sglang", {})
+MODEL_PRECACHE_THREADS = int(_READ.get("MODEL_PRECACHE_THREADS", 3))
+MODEL_PRECACHE_EARLY = bool(_READ.get("MODEL_PRECACHE_EARLY", False))
+
 # Daemon: this process exits once the server is up, and must not wait on it.
 precache_model_thread = threading.Thread(
     target=precache, args=(MODEL_DIR, *([DRAFT_MODEL_DIR] if DRAFT_MODEL_DIR else [])),
-    kwargs={'delay': 60, 'threads': 3}, daemon=True,
+    kwargs={'delay': 0 if MODEL_PRECACHE_EARLY else 60, 'threads': MODEL_PRECACHE_THREADS}, daemon=True,
 )
+if MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
 
 # Paste this entire file into the launcher cell.
 # Required notebook variables: MODEL_DIR, DRAFT_MODEL_DIR, WHEELHOUSE_DIR,
@@ -147,6 +155,8 @@ CFG = dict(
     # Preserve the original Kaggle checkpoint prefetch/cache behavior.
     PREFETCH_CHECKPOINTS=True,
     DROP_CACHE_AFTER_LOAD=True,
+    # sglang's one-shard lookahead prefetch readers (its default is 4).
+    PREFETCH_THREADS=4,
     LINEAR_BACKEND="flashinfer",
     KVDTYPE="fp8_e4m3",
     SSM_DTYPE="bfloat16",
@@ -439,6 +449,7 @@ args = [SGLANG, "serve", "--model-path", MODEL_DIR, "--load-format", "safetensor
     "--enable-cache-report", "--enable-metrics", "--enable-request-time-stats-logging"]
 if CFG["PREFETCH_CHECKPOINTS"]: args += ["--weight-loader-prefetch-checkpoints"]
 if CFG["DROP_CACHE_AFTER_LOAD"]: args += ["--weight-loader-drop-cache-after-load"]
+if int(CFG["PREFETCH_THREADS"]) != 4: args += ["--weight-loader-prefetch-num-threads", str(int(CFG["PREFETCH_THREADS"]))]
 tmpl = Path(MODEL_DIR, "chat_template.jinja")
 if tmpl.is_file(): args += ["--chat-template", str(tmpl)]
 if not CFG["AUTOTUNE"]: args += ["--disable-flashinfer-autotune"]
@@ -460,7 +471,8 @@ if CFG["SPEC"]:
         args += ["--speculative-token-map", str(tok)]
 
 # ---- launch detached and wait for health ----
-precache_model_thread.start()
+if not MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
 print("\n" + shlex.join(args) + "\n")
 log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
 with open(LOG, "ab", buffering=0) as logf:

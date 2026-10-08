@@ -72,3 +72,31 @@ def test_new_baseline_v3_differs_from_v2_only_in_startup_and_offload(monkeypatch
     command = kaggle.pennyroyal_setup_command()
     spec = json.loads(command.split("ARC3_PENNYROYAL_SPEC=", 1)[1].split(" \"$PYTHON\"", 1)[0].strip("'"))
     assert spec["sglang"] == {"OFFLOAD_EMBED_TOKENS": True}
+
+
+@pytest.mark.parametrize("config,threads,early,prefetch", [
+    ("new-baseline/v3", 3, False, None),
+    ("startup-read-threads/v1", 12, True, "16"),
+    ("startup-read-threads/v2", 6, True, "8"),
+])
+def test_model_read_threads_reach_the_launcher(config, threads, early, prefetch):
+    sglang = json.loads((ROOT / f"configs/{config}.json").read_text())["kaggle"].get("sglang", {})
+    launcher = (ROOT / "inference/framework/pennyroyal_launch.py").read_text()
+    ns = {"SPEC": {"sglang": sglang}, "DRAFT_MODEL_DIR": "draft", "SERVED_MODEL_NAME": "flashnext"}
+    exec(launcher[launcher.index("_READ = "):launcher.index("\n# Daemon:")], ns)
+    exec(launcher[launcher.index("CFG = dict("):launcher.index("\nVENV = ")], ns)
+    assert (ns["MODEL_PRECACHE_THREADS"], ns["MODEL_PRECACHE_EARLY"]) == (threads, early)
+    line = next(l for l in launcher.splitlines() if "--weight-loader-prefetch-num-threads" in l)
+    ns["args"] = []
+    exec(line, ns)
+    assert ns["args"] == ([] if prefetch is None else ["--weight-loader-prefetch-num-threads", prefetch])
+
+
+def test_quick_read_runs_differ_from_v3_only_in_read_and_runtime():
+    v3 = json.loads((ROOT / "configs/new-baseline/v3.json").read_text())
+    for name in ("v1", "v2"):
+        quick = json.loads((ROOT / f"configs/startup-read-threads/{name}.json").read_text())
+        assert quick["kaggle"]["public_runtime_minutes"] == 5
+        for key in ("kernel_slug", "kernel_title", "dataset_slug", "public_runtime_minutes", "sglang"):
+            quick["kaggle"][key] = v3["kaggle"][key]
+        assert quick == v3

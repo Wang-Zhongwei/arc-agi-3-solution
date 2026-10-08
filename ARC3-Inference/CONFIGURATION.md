@@ -515,6 +515,9 @@ Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The lau
 | `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the input `embed_tokens` table (~1.2 GiB BF16) in pinned host memory, gathered by the PLE kernel and shared with the MTP draft; the freed GPU memory goes to the KV pool. TP=1 and an untied `lm_head` only. PLE and the GPU `lm_head` are unchanged. |
 | `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 path unchanged. Unvalidated. |
 | `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's unique `(M, N, K)` shape logging for BF16 dispatch. |
+| `MODEL_PRECACHE_THREADS` | `3` | Reader threads of the launcher's page-cache precache of the model and draft (185.4 GB). |
+| `MODEL_PRECACHE_EARLY` | `false` | Starts that precache right after the wheel precache, during the install, instead of 60 s after server launch. |
+| `PREFETCH_THREADS` | `4` | sglang's one-shard lookahead prefetch threads (`--weight-loader-prefetch-num-threads`); passed only when not 4. |
 
 ### RunPod runs
 
