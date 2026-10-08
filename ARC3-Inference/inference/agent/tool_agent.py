@@ -28,6 +28,7 @@ from inference.agent.scheduling.ucb import (
     weighted_levels,
 )
 from inference.utils.animation import (
+    _bbox_phrase as _animation_bbox_phrase,
     _transient_cells as _animation_transient_cells,
     build_animation_frames,
     build_animation_view,
@@ -52,6 +53,7 @@ from inference.agent.prompts import (
     PYTHON_ADDENDUM_TAIL,
     GAMEPLAY_CHANGED_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
+    HISTORY_REVISIT_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
     MULTIMODAL_CONTEXT_ADDENDUM,
@@ -2764,6 +2766,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
+    prompt += HISTORY_REVISIT_ADDENDUM
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
@@ -3745,7 +3748,7 @@ class ToolAgent:
         deliberation - the rolling summary. Its tokens are real GPU time and
         belong in the session and per-game totals, or a summary-heavy run looks
         cheaper than it is and gets more compute than
-        max_generated_tokens_per_game intends. But the per-turn yield budget
+        public_max_generated_tokens_per_game intends. But the per-turn yield budget
         measures how long the model has been working on THIS turn, and charging
         it for a summary would shorten whichever turn happened to follow one.
         """
@@ -5078,62 +5081,51 @@ class ToolAgent:
                 )
             if previous_step_summary.get("game_over"):
                 lines.append(
-                    "GAME OVER occurred during the previous sequence. This means the "
-                    "attempt FAILED (it does NOT mean the run is finished). The game has "
-                    "already been automatically RESET: the current level restarted from "
-                    "its initial state and previously completed levels are kept. A game "
-                    "over is caused either by the specific action taken (e.g., moving "
-                    "onto a hazard cell) or by a step/time budget running out, which is "
-                    "usually indicated by a bar at the grid border that shrinks with each "
-                    "action. Before acting again, diagnose the cause by inspecting the "
-                    "board right before the death. `history[-1].action` is 'RESET', "
-                    "`history[-2].action` is the fatal action, `history[-2].frame` is the "
-                    "death frame (the board after the fatal action), and "
-                    "`history[-3].frame` is the board immediately before "
-                    "the fatal action — check what cell the fatal move targeted there, and "
-                    "inspect the budget bar in the death frame. BAR RULE: the bar "
-                    "shrinking with each action is NORMAL — a slightly shorter bar is "
-                    "NOT evidence of the cause of death. The budget caused the death "
-                    "ONLY if the bar is fully (or almost fully) depleted in the death "
-                    "frame (`history[-2].frame`). If it IS depleted: you must reach the "
-                    "goal in fewer actions, or look for a way to restore the bar (e.g., "
-                    "collecting an item that refills it). If the bar clearly had budget "
-                    "remaining: the fatal action itself caused the death (hazard or "
-                    "forbidden move) — do NOT retry the same path; a DIFFERENT approach "
-                    "must be tried. Record the diagnosed cause in your world model."
+                    "GAME OVER: the attempt failed. The game automatically RESET the "
+                    "current level; completed levels are kept.\n\n"
+                    "Before acting, diagnose the death:\n"
+                    "- `history[-1].action` is RESET.\n"
+                    "- `history[-2].action` is the fatal action; `history[-2].frame` "
+                    "is the death frame.\n"
+                    "- `history[-3].frame` is the board before the fatal action.\n\n"
+                    "BAR RULE: the border budget bar normally shrinks with each "
+                    "action. Attribute death to the budget ONLY if the bar is fully "
+                    "or almost depleted in the death frame. Then use fewer actions "
+                    "or find a way to refill it. "
+                    "If budget clearly remains, then the last action must trigger some mechanism that leads to death. "
+                    "What is that mechanism, and how to avoid it?"
                 )
-                if _animation_enabled():
-                    # after the BAR RULE, which tells the model how to read
-                    # history[-2] and history[-3]; this says what those two
-                    # frames cannot contain
-                    death_animation_line = describe_animation(
-                        previous_step_summary.get("animation"),
-                        action_display=previous_step_summary.get("animation_action"),
-                        # the animated action's own flag, not the sequence's: an
-                    # inert SPACE at the end of a batch that moved other things
-                    # still hid everything it did
-                    gameplay_changed=self._last_action_gameplay_changed,
-                        game_over=True,
-                        timeline=_animation_timeline_enabled(),
-                    )
-                    if death_animation_line:
-                        lines.append(death_animation_line)
-                fatal_action = str(previous_step_summary.get("fatal_action") or "")
-                if fatal_action:
-                    lines.append(
-                        f"The game over occurred immediately after action {fatal_action!r}. "
-                        "Apply the BAR RULE above to decide: bar fully depleted in the "
-                        "death frame means budget death (shorter route or bar restore "
-                        "needed); bar with budget remaining means this action itself was "
-                        "fatal and a DIFFERENT approach is required."
-                    )
                 game_over_trace = previous_step_summary.get("game_over_trace") or []
                 if game_over_trace:
                     lines.append(
-                        "Per-action trace of the previous sequence: "
-                        + "; ".join(str(t) for t in game_over_trace)
+                        "Previous sequence: "
+                        + "; ".join(
+                            str(t).replace(
+                                "GAME OVER (attempt ended immediately after this action)",
+                                "GAME OVER",
+                            )
+                            for t in game_over_trace
+                        )
                         + "."
                     )
+                else:
+                    fatal_action = str(previous_step_summary.get("fatal_action") or "")
+                    if fatal_action:
+                        lines.append(f"Previous sequence: {fatal_action} -> GAME OVER.")
+                if _animation_enabled():
+                    death_animation = previous_step_summary.get("animation") or {}
+                    frames = death_animation.get("frames")
+                    if frames and int(frames) > 1:
+                        accessors = "`last_animation_frames`"
+                        if _animation_timeline_enabled():
+                            accessors += " or `last_animation_timeline`"
+                        animation_line = f"The fatal action animated over {frames} frames. "
+                        transient = int(death_animation.get("transient_pixels") or 0)
+                        if transient > 0:
+                            cells = "1 cell" if transient == 1 else f"{transient} cells"
+                            where = _animation_bbox_phrase(death_animation.get("transient_bbox"))
+                            animation_line += f"{cells} changed more than once{where}. "
+                        lines.append(animation_line + f"Inspect {accessors}.")
                 self._prepare_gameover_images(
                     history_entries, previous_step_summary
                 )
@@ -5150,9 +5142,7 @@ class ToolAgent:
                     "deterministic, so replaying the sequence that just killed you "
                     "will kill you again. Change the plan BEFORE the fatal point - a "
                     "different route, action, or timing. If you believe the same "
-                    "moves 'should' work, that belief is exactly what this death "
-                    "falsified; record the correction in your world model instead "
-                    "of retesting it."
+                    "moves 'should' work, that belief is exactly what this death falsified."
                 )
         elif (current_frame is not None and current_frame.step > 0) or action_num > 0:
             lines.append("No previous action sequence was captured.")

@@ -49,6 +49,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
     SAFE_MODULES = {
         "bisect",
+        "builtins",
         "collections",
         "copy",
         # pure-Python sequence comparison, no I/O. Measured across 32
@@ -59,15 +60,26 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "difflib",
         "fractions",
         "functools",
+        "glob",
+        "hashlib",
         "heapq",
+        "importlib",
+        "inspect",
         "itertools",
         "json",
         "math",
         "operator",
+        "os",
+        "pathlib",
+        "pickle",
         "random",
         "re",
         "statistics",
         "string",
+        "sys",
+        "time",
+        "traceback",
+        "types",
     }
     SAFE_BUILTINS = {
         # Exception types. Only four were present, so anything narrower than

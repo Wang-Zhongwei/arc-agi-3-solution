@@ -392,7 +392,7 @@ contain the corresponding usage data.
 Score one run directory:
 
 ```bash
-make score_run SCORE_RUN_DIR=/path/to/run
+make evaluate_run EVALUATE_RUN_DIR=/path/to/run
 ```
 
 Evaluate runs from `configs/eval.json`:
@@ -404,8 +404,10 @@ make eval
 Write a score file somewhere specific:
 
 ```bash
-make score_run SCORE_RUN_DIR=/path/to/run SCORE_OUTPUT_PATH=docs/candidate-evaluation.json
+make evaluate_run EVALUATE_RUN_DIR=/path/to/run EVALUATION_OUTPUT_PATH=docs/candidate-evaluation.json
 ```
+
+The existing `score_run` target with `SCORE_RUN_DIR` and `SCORE_OUTPUT_PATH` remains supported.
 
 The scorer reads TAAF `benchmark.json`, uses persisted `final_score` values when
 present, and otherwise asks TAAF's `GameRun` scorer to compute the score from
@@ -468,7 +470,7 @@ transitions linked back to message indices.
 - `make sbatch`: submit through TAAF Slurm deployment.
 - `make chat PROMPT="..."`: send a direct chat probe to the configured model.
 - `make view`: serve the run viewer.
-- `make score_run SCORE_RUN_DIR=...`: score one saved run.
+- `make evaluate_run EVALUATE_RUN_DIR=...`: evaluate one saved run, including score and action curves.
 - `make eval`: score runs selected by an eval config.
 - `make significance`: compare two score files.
 - `make traces`: export trace JSON.
