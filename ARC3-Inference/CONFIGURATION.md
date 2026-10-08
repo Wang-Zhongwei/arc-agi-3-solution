@@ -96,6 +96,18 @@ Added images that show changed cells in their true palette colors while dimming 
 
 The original `MULTIMODAL_CONTEXT=current_grid` and `MULTIMODAL_UPSCALE` settings remain the basic image controls. The latter’s source default is 16; running at 10× is a notebook configuration choice, not a new fixed default. Filtering historical images changes request prefixes and can affect prefix reuse.
 
+### Boards between actions
+
+| Config field | Environment variable | Default | Behavior |
+|---|---|---|---|
+| `multimodal.intermediate_frames` | `MULTIMODAL_INTERMEDIATE_FRAMES` | `false` | Attach the boards after actions within the previous Python call, in action order, excluding the final board already shown as current. Includes boards across multiple `action(...)` calls and a fatal board before automatic RESET. Requires `current_grid`. |
+| `multimodal.intermediate_upscale` | `MULTIMODAL_INTERMEDIATE_UPSCALE` | Inherit `multimodal.upscale` | Positive integer scale for those intermediate boards. |
+| `multimodal.animation_upscale` | `MULTIMODAL_ANIMATION_UPSCALE` | Inherit `multimodal.upscale` | Positive integer scale for sampled/peak/composite animation images, including fatal-action animations. |
+
+Intermediate boards use the existing per-action history; they are separate from animation frames within one action. Each is labeled `after action N, ACTION:`, directly after the executed-action text. Sampled animation images follow the animation text, labeled `frame N/total:`. The current board sits beside the current-state text when these extra images are present. A single action without an automatic reset adds no intermediate board. Current and diff images keep using `multimodal.upscale`. These images follow normal history trimming and `ARC3_HISTORY_IMAGE_KEEP`.
+
+Upscale 2 produces a 128×128 PNG for a 64×64 board. Daniel's pinned processor subsequently enlarges it to 256×256, so it has the same visual-token count as upscale 4; see [processor previews](../docs/multimodal/README.md).
+
 ### Intermediate animation frames
 
 Added capture of intermediate frames returned by an action, consecutive-frame deduplication, transient-pixel detection, and compact animation metadata. This recovers information that disappears before the final board is returned.
@@ -104,8 +116,8 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
-| `ARC3_ANIMATION_IMAGE` | `off` | `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Ordinary animation imagery is attached for transient activity when the gameplay area did not change. |
-| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `peak`/`composite` option for the fatal action’s animation. |
+| `ARC3_ANIMATION_IMAGE` | `off` | `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity when the gameplay area did not change. |
+| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `sampled`/`peak`/`composite` option for the fatal action’s animation. |
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 
@@ -505,6 +517,7 @@ Each setting has one place. A setting with a typed field goes in that field; `ha
 | `analyzer.max_output`, `.thinking_token_budget`, `.temperature`, `.top_p`, `.top_k`, `.tool_steps`, `.tool_timeout`, `.tool_output_tokens`, `.yield_seconds`, `.app_name`, `.site_url`, `.timeout` | `LOCAL_ANALYZER_` + the name in capitals |
 | `analyzer.thinking` | `LOCAL_ANALYZER_ENABLE_THINKING` |
 | `multimodal.context`, `multimodal.upscale` | `MULTIMODAL_CONTEXT`, `MULTIMODAL_UPSCALE` |
+| `multimodal.intermediate_frames`, `multimodal.intermediate_upscale`, `multimodal.animation_upscale` | `MULTIMODAL_INTERMEDIATE_FRAMES`, `MULTIMODAL_INTERMEDIATE_UPSCALE`, `MULTIMODAL_ANIMATION_UPSCALE` |
 
 Every `kaggle.serving` option hands the harness these fields plus `harness_env`, applied after the launcher's own defaults, so the serving never changes the harness settings. A field left out takes the Makefile default (for example `analyzer.yield_seconds` 60, `multimodal.upscale` 16). `analyzer.timeout` is the one exception: `make kaggle-duck` sets the request timeout to 900 seconds. `tests/test_serving_config.py` runs each serving's real handoff for every config under `configs/`.
 
