@@ -488,6 +488,7 @@ These changes do not increase the server’s true context limit. Correctly match
 | `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
 | `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
 | `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. All three hand the harness the same settings; see [Harness settings in a config](#harness-settings-in-a-config). |
+| `sglang` | Pennyroyal launcher defaults | With `serving=pennyroyal`, overrides the launcher's `CFG` engine settings, e.g. `CTX`, `MAXREQ`, `MEMFRAC`, `MAMBA_CACHE`, and the optional switches below. |
 | `vllm` | Lord launcher defaults | With `serving=lordhansolo`, passes engine settings to the pinned launcher's `DuckKaggleVllmConfig`, including `max_model_len`, cache dtypes, `max_num_seqs`, MTP tokens, prefix-cache controls, and `draft_vocab`. The draft vocabulary path is relative to `ARC3-Inference/`. |
 | `default_chat_template_kwargs` | `{"preserve_thinking": true}` | With `serving=lordhansolo`, sets the server's template defaults without importing the source notebook's `xhigh` reasoning setting. |
 | `private_waves` | `1` | With `serving=lordhansolo`, opts competition reruns into multiple waves with the priority scheduler. Lanes are rounded up from the live trial count divided by waves. The remaining `private_runtime_minutes` budget, measured from notebook start, is divided between waves after engine startup. Public runs keep one wave. UCB rejects multiple waves. |
@@ -506,6 +507,14 @@ Each setting has one place. A setting with a typed field goes in that field; `ha
 | `multimodal.context`, `multimodal.upscale` | `MULTIMODAL_CONTEXT`, `MULTIMODAL_UPSCALE` |
 
 Every `kaggle.serving` option hands the harness these fields plus `harness_env`, applied after the launcher's own defaults, so the serving never changes the harness settings. A field left out takes the Makefile default (for example `analyzer.yield_seconds` 60, `multimodal.upscale` 16). `analyzer.timeout` is the one exception: `make kaggle-duck` sets the request timeout to 900 seconds. `tests/test_serving_config.py` runs each serving's real handoff for every config under `configs/`.
+
+Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The launcher installs the hooks from this run's source bundle with `inference/framework/pennyroyal_patch.py`, which checks the SGLang version and source anchors before writing; a switch left off keeps the baseline code path.
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the input `embed_tokens` table (~1.2 GiB BF16) in pinned host memory, gathered by the PLE kernel and shared with the MTP draft; the freed GPU memory goes to the KV pool. TP=1 and an untied `lm_head` only. PLE and the GPU `lm_head` are unchanged. |
+| `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 path unchanged. Unvalidated. |
+| `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's unique `(M, N, K)` shape logging for BF16 dispatch. |
 
 ### RunPod runs
 
