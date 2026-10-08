@@ -321,6 +321,15 @@ endif
 ifeq ($(origin MULTIMODAL_UPSCALE),undefined)
 MULTIMODAL_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.upscale 16)
 endif
+ifeq ($(origin MULTIMODAL_INTERMEDIATE_FRAMES),undefined)
+MULTIMODAL_INTERMEDIATE_FRAMES := $(shell $(CONFIG_VALUE) multimodal.intermediate_frames false)
+endif
+ifeq ($(origin MULTIMODAL_INTERMEDIATE_UPSCALE),undefined)
+MULTIMODAL_INTERMEDIATE_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.intermediate_upscale)
+endif
+ifeq ($(origin MULTIMODAL_ANIMATION_UPSCALE),undefined)
+MULTIMODAL_ANIMATION_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.animation_upscale)
+endif
 
 ifeq ($(origin CHAT_BASE_URL),undefined)
 CHAT_BASE_URL := $(shell $(CONFIG_VALUE) chat.base_url $(LOCAL_ANALYZER_BASE_URL))
@@ -392,6 +401,9 @@ export ARC3_HARNESS_ENV_JSON
 export ARC3_KAGGLE_JSON
 export ARC3_RUNPOD_JSON
 export MULTIMODAL_UPSCALE
+export MULTIMODAL_INTERMEDIATE_FRAMES
+export MULTIMODAL_INTERMEDIATE_UPSCALE
+export MULTIMODAL_ANIMATION_UPSCALE
 export CHAT_PROVIDER
 export OPENROUTER_API_KEY
 export OPENAI_API_KEY

@@ -162,9 +162,9 @@ def describe_animation(
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
-    # point at whichever accessor is actually available
+    # Frames are always available; mention the timeline only when enabled.
     where_to_look = (
-        "`last_animation_timeline`"
+        "`last_animation_frames` or `last_animation_timeline`"
         if timeline
         else "`last_animation_frames`"
     )
@@ -188,7 +188,7 @@ def describe_animation(
         )
     return (
         f"The last executed action{name} animated over {frames} frames. "
-        f"{cells[0].upper()}{cells[1:]}{where}. {where_to_look} shows them."
+        f"{cells[0].upper()}{cells[1:]}{where}. Inspect {where_to_look}."
     )
 
 
