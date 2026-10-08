@@ -42,3 +42,24 @@ The cap is not extended, because the hidden run has no slack: 4 × 132 min plus 
 ## Results
 
 Version 1 was pushed on 2026-10-04 from commit `458e575` (clean tree), with 28 lanes and a 132-min per-game cap. It was QUEUED at the time of writing. Record its scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=1`.
+
+## Version 3: allocation finding, one wave
+
+Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v3.json`. The source is the same as v2 (`eea6f57`). The only changes are the allocation settings from [the priority replay](../allocation/priority-replay.md#decision): rank by $R = v\,C$ (no tail B, efficiency ablated), with 14 active streams and one wave.
+
+| | v2 | v3 |
+|---|---|---|
+| `ARC3_PRIORITY_TAIL_LOOKUP` | `remaining` (B = 8/7/5/0) | unset |
+| `ARC3_PRIORITY_TAIL_CAP` | unset (4, unused under `remaining`) | 0, so B = 0 |
+| `ARC3_PRIORITY_HUMAN_ACTIONS` | unset (25) | `1e9`, so e ≈ 1 |
+| `ARC3_PRIORITY_SCORE_NORMALIZATION` | 1 | 1 |
+| `ARC3_MAX_ACTIVE_STREAMS` | 10 | 14 |
+| Lanes × per-game cap | 28 × 132 min (4 waves) | 120 × 532 min (1 wave, the Makefile default at this commit) |
+| Public run length | 30 min | 30 min |
+
+With these settings, `priority_value` at this source returns $\lfloor 55\,v\,C \rfloor$ (checked on five snapshots). The tail fade and the soft stop are left as in v2; with B = 0 the fade has no effect.
+
+```
+make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v3.json \
+  KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=30
+```
