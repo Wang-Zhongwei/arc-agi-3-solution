@@ -1,5 +1,8 @@
 ## Changes relative to Daniel's baseline
 
+Use [v2.json](v2.json) for the resubmission after rebasing onto `main` at `7a64a88`.
+It includes the Pennyroyal handoff fix so the analyzer and multimodal settings reach the agent; v01 lost those settings, including board images and the 131072-token context window.
+
 1. `thinking_token_budget = 8192`. [Evidence](../../../docs/reasoning/feature_report.md).
 2. `tool_output_tokens = 1024`. [Evidence](../../../docs/tools/tool-output-tokens.md).
 3. Use one private wave (the knob is removed) and simplify the priority allocator. [Evidence](../../../docs/allocation/priority-replay.md).
