@@ -78,6 +78,8 @@ def test_config_export_and_pennyroyal_handoff(monkeypatch, name, streams, adapti
     env = kaggle.harness_env()
     assert int(env["ARC3_MAX_ACTIVE_STREAMS"]) == streams
     assert env["ARC3_ADAPTIVE_CONTEXT"] == str(int(adaptive))
+    assert int(env["LOCAL_ANALYZER_THINKING_TOKEN_BUDGET"]) == 10240
+    assert int(env["LOCAL_ANALYZER_MAX_OUTPUT"]) == 12288
     assert cfg["kaggle"]["sglang"]["MAXREQ"] == streams
     assert cfg["kaggle"]["sglang"]["CUDAGRAPH_MAXBS"] == streams
     assert cfg["kaggle"]["wheelhouse_dataset_source"] == "dfranzen/pennyroyal-v253"

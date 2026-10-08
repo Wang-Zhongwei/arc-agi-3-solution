@@ -8,6 +8,10 @@ quality difference observed with Lord's checkpoint is sufficient reason to
 retain this baseline; its cause has not been isolated. No FP8 PLE or embedding
 quantization is planned for Kaggle.
 
+Follow-up agreement: set the thinking budget to **10,240 tokens** in all three
+comparison configs, inside the existing 12,288-token total output limit.
+Pennyroyal's existing strict-thinking mode enforces this budget.
+
 ## Agreed context policy
 
 All context thresholds below count retained request input tokens; `k` means
@@ -99,6 +103,8 @@ dataset `jonathanwang2022/context-adaptive-16-src`. The prepared bundle is
 Its seven changed/new agent and serving runtime files match this branch byte
 for byte, and the handoff contains 16 streams, 16 server requests, graph coverage
 through 16, the adaptive thresholds, and both optional patches disabled.
+This dry-run bundle predates the 10,240-token thinking-budget update; regenerate
+it from the current config before launching.
 
 No notebook was pushed and no GPU run was launched. GPU startup, numerical
 checks, performance, memory capacity at 16 streams and ARC quality remain
