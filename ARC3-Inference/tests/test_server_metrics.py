@@ -197,3 +197,30 @@ def test_build_server_block_summarizes_trials(tmp_path: Path) -> None:
     assert block["sample_count"] == 1
     assert block["logs_found"] == 1
     assert "notes" in block
+
+
+def test_lordhansolo_vllm_log_name_is_read(tmp_path: Path) -> None:
+    _write_log(tmp_path, lines=[_stat("10", 100.0, 10.0, 1, 0, 50.0, 90.0)], name="vllm-openai-server.log")
+    block = build_server_block([tmp_path])
+
+    assert block["logs_found"] == 1
+    assert block["prefix_cache_hit_rate_pct"]["mean"] == 50.0
+
+
+def test_sglang_serve_log_falls_back_to_batch_lines(tmp_path: Path) -> None:
+    _write_log(
+        tmp_path,
+        lines=[
+            "[2026-10-01 12:00:00] Prefill batch, #new-token: 100, #cached-token: 900, "
+            "full token usage: 0.25, input throughput (token/s): 1000.00",
+            "[2026-10-01 12:00:01] Decode batch, #running-req: 10, full token usage: 0.50, "
+            "gen throughput (token/s): 800.00, #queue-req: 0",
+        ],
+        name="serve.log",
+    )
+    block = build_server_block([tmp_path])
+
+    assert block["source"] == "serving logs"
+    assert block["prefix_cache_hit_rate_pct"]["mean"] == 90
+    assert block["per_server"][0]["prefill_tokens"] == {"cached": 900, "new": 100}
+    assert block["metric_labels"]["prefix_cache_hit_rate_pct"] == "Logged prefill cache reuse / %"
