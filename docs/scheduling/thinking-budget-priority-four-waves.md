@@ -77,7 +77,9 @@ Record scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-bu
 
 Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v4.json`. Same source and settings as v3, except `ARC3_MAX_ACTIVE_STREAMS` is 10 (as in v1 and v2) instead of 14. v3's 14 came from the replay doc's settings line, not from the intended plan.
 
+The public run is set for about 10 min of play: `MAX_EXPERIMENT_RUNTIME_MINUTES=31`. At this source the soft end is the budget minus min(10 min, budget / 2), counted from notebook start, and v2's server was ready after 625 s (about 11 min in). So 31 ends at minute 21, about 10 min of play. A literal 10 would end at minute 5, before the server is up, and play nothing.
+
 ```
 make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v4.json \
-  KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=30
+  KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=31
 ```
