@@ -27,3 +27,9 @@ Upscale 1 becomes 256 × 256 with softened edges; upscale 4 retains sharp blocks
 
 Previews show RGB before normalization and patch extraction. They were not
 captured from a live server and do not show internal model embeddings.
+
+## Animation and intermediate-board attachments
+
+[Open the attachment preview](frame-attachments.html) to compare the two experiments. It uses synthetic boards rendered through the production message builder, showing image order, labels, and PNG dimensions before model preprocessing.
+
+Validation: 93 image attachment/scaling/sampling, animation-description, and serving-config handoff tests passed. The animation-only and intermediate-only notebooks are prepared locally; no game-score comparison has been run.

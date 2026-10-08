@@ -96,6 +96,9 @@ CONFIG_FIELDS = {
     "LOCAL_ANALYZER_ENABLE_THINKING": "analyzer.thinking",
     "MULTIMODAL_CONTEXT": "multimodal.context",
     "MULTIMODAL_UPSCALE": "multimodal.upscale",
+    "MULTIMODAL_INTERMEDIATE_FRAMES": "multimodal.intermediate_frames",
+    "MULTIMODAL_INTERMEDIATE_UPSCALE": "multimodal.intermediate_upscale",
+    "MULTIMODAL_ANIMATION_UPSCALE": "multimodal.animation_upscale",
 }
 # kaggle-duck sets the request timeout through the solver (--analyzer-timeout).
 _NOT_HANDED_TO_KAGGLE = frozenset({"LOCAL_ANALYZER_TIMEOUT"})
