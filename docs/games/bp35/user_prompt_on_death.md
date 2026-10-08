@@ -20,4 +20,5 @@ BAR RULE: the border budget bar normally shrinks with each action. Attribute dea
 
 Previous sequence: 1: MOUSE(row=33, col=39) -> GAME OVER.
 The fatal action animated over 27 frames. 1968 cells changed more than once around rows 0-62, cols 1-62. Inspect `last_animation_frames` or `last_animation_timeline`.
+Do NOT re-submit this same series of moves: the game is deterministic, so replaying the sequence that just killed you will kill you again. Change the plan BEFORE the fatal point - a different route, action, or timing. If you believe the same moves 'should' work, that belief is exactly what this death falsified.
 ```

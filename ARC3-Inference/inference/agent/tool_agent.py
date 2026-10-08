@@ -5137,6 +5137,13 @@ class ToolAgent:
                             history_entries, previous_step_summary
                         )
                     )
+                lines.append(
+                    "Do NOT re-submit this same series of moves: the game is "
+                    "deterministic, so replaying the sequence that just killed you "
+                    "will kill you again. Change the plan BEFORE the fatal point - a "
+                    "different route, action, or timing. If you believe the same "
+                    "moves 'should' work, that belief is exactly what this death falsified."
+                )
         elif (current_frame is not None and current_frame.step > 0) or action_num > 0:
             lines.append("No previous action sequence was captured.")
         else:
