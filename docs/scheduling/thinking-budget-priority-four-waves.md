@@ -63,3 +63,12 @@ With these settings, `priority_value` at this source returns $\lfloor 55\,v\,C \
 make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v3.json \
   KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=30
 ```
+
+Version 3 was pushed on 2026-10-08 from `808f025`, a clean tree on branch `allocation-vc-one-wave` (`eea6f57` plus this config and section). It reported `Passes: 1; concurrency: 120; waves: 1`, with a 532-min per-game cap. The generated notebook is cell-for-cell identical to v2's. `setup_commands.json` differs from v2 only in the four env settings above. Every source file that v2 bundled is byte-identical in v3's bundle.
+
+Two packaging quirks of the worktree push:
+
+- `kaggle kernels push` printed `Expecting value: line 1 column 1` and exited 1, but Kaggle did create version 3, and it started running.
+- The bundle's `git_status.txt` names the main checkout (`416cba3`, dirty), and `src/` also contains 21 files from that checkout that `eea6f57` lacks: newer configs, `inference/framework/lordhansolo/`, `pennyroyal_{patch,wide_gemm,bf16_embedding}.py`, `benchmark_pennyroyal_optional.py`, runpod tools, and `deploy_runpod.py`/`runpod_pod.py`. Nothing at `eea6f57` or in the generated notebook references them, so they are not loaded.
+
+Record scores here after `make pull-kaggle NOTEBOOK=jonathanwang2022/thinking-budget-priority-four-waves VERSION=3`. The 30-min public run is a health check, not a score comparison.
