@@ -10,6 +10,8 @@ The model is 185.4 GB. sglang's loader prefetches one shard (~5 GB) ahead with 4
 | [v1.json](v1.json) (x4 precache) | 12 threads, from ~14 s | 4 | Kaggle v1: precache 185 GB in 335 s, load **1,011 s**. 185 GB plus ~100 GB pinned PLE exceeds 177 GB RAM, so the early read was evicted and re-read. |
 | [v2.json](v2.json) (x2 both) | 6 threads, from ~113 s | 8 | Kaggle v2: load **224 s** (5.9 s/shard), precache 185 GB in 189 s (982 MB/s), server ready 486 s after notebook start. Its wheel read (913 MB/s) was median, so the host was typical; the 22 baseline runs loaded in 266–858 s. 14 threads gave ~1.3x the 7-thread rate (~60 vs ~90 MB/s per thread). |
 | [v3.json](v3.json) (prefetch only) | off | 16 | Kaggle v3: cancelled after ~1,000 s, before the server was ready, so slower than v2. |
-| [v5.json](v5.json) (x2 again) | 12 threads, from ~113 s | 16 | Kaggle v5 (v4 was the same config, cancelled before it ran). |
+| [v5.json](v5.json) (x2 again) | 12 threads, from ~113 s | 16 | Kaggle v5 (v4 was the same config, cancelled before it ran): load **236 s** (6.2 s/shard), precache 185 GB in 202 s (917 MB/s), ready 504 s. Slower host (wheel read 704 MB/s vs v2's 913), so no clear gain over v2: the read saturates near 1 GB/s. |
 
 Read from each run: `Load weight end. elapsed=` and the per-shard progress in `serve.log`, the `Checkpoint prefetch: ... up to N range-reader threads` line, and the `Precaching: loaded 62 files (185.40 GB) in N seconds` line in the notebook log. Machine speed varies (266–858 s loads across 23 runs), so compare seconds per shard against the ~7 s floor, not one load time.
+
+**Conclusion:** use v2's 6 precache + 8 prefetch threads with the normal precache start. It loads as fast as 12 + 16 with half the readers and more page-cache headroom.
