@@ -59,10 +59,12 @@ def test_wide_hook_keeps_small_and_unknown_shapes(monkeypatch):
         assert ns["sm120_lowm_bf16_gemm"](x, types.SimpleNamespace(shape=(512, 2560))) == expected
 
 
-def test_new_baseline_v3_offloads_embedding_and_otherwise_matches_v2(monkeypatch):
+def test_new_baseline_v3_differs_from_v2_only_in_startup_and_offload(monkeypatch):
     v2 = json.loads((ROOT / "configs/new-baseline/v2.json").read_text())
     v3 = json.loads((ROOT / "configs/new-baseline/v3.json").read_text())
     assert v3["kaggle"].pop("sglang") == {"OFFLOAD_EMBED_TOKENS": True}
+    assert (v2["kaggle"]["server_startup_timeout_s"], v3["kaggle"]["server_startup_timeout_s"]) == (720, 1200)
+    v3["kaggle"]["server_startup_timeout_s"] = 720
     assert v3 == v2
     v3["kaggle"]["sglang"] = {"OFFLOAD_EMBED_TOKENS": True}
     monkeypatch.setenv("ARC3_KAGGLE_JSON", json.dumps(v3["kaggle"]))

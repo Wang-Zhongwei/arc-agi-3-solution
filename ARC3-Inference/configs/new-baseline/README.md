@@ -1,6 +1,6 @@
 ## Changes relative to Daniel's baseline
 
-[v3.json](v3.json) is v2 plus `kaggle.sglang.OFFLOAD_EMBED_TOKENS = true`: the input embedding table moves to pinned host memory, freeing about 1.2 GiB of GPU memory for the KV pool (about 100K more tokens on top of 1,011,264). Daniel's runs fill that pool to 93–98%. The lookup reuses the PLE host-gather kernel and costs microseconds per decode step.
+[v3.json](v3.json) is v2 plus `kaggle.sglang.OFFLOAD_EMBED_TOKENS = true`: the input embedding table moves to pinned host memory, freeing about 1.2 GiB of GPU memory for the KV pool (about 100K more tokens on top of 1,011,264). Daniel's runs fill that pool to 93–98%. The lookup reuses the PLE host-gather kernel and costs microseconds per decode step. v3 also raises `server_startup_timeout_s` from 720 to 1200 so the benchmark waits for the server; v2 released the games about 3 minutes before its server was ready after a 621 s weight load.
 
 Use [v2.json](v2.json) for the resubmission after rebasing onto `main` at `7a64a88`.
 It includes the Pennyroyal handoff fix so the analyzer and multimodal settings reach the agent; v01 lost those settings, including board images and the 131072-token context window.
