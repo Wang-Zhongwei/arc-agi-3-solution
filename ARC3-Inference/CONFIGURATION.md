@@ -487,12 +487,25 @@ These changes do not increase the server’s true context limit. Correctly match
 | `public_max_generated_tokens_per_game` | `null` | Generated-token cap per public game across all levels. `null` uses the legacy `environment.max_generated_tokens_per_game` cap if configured; zero disables it. Private competition reruns, emulated submissions, and local runs ignore this option. |
 | `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
 | `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
-| `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. All three hand the harness the `analyzer`, `multimodal` and `shared.context_window` settings, with `harness_env` taking precedence. |
+| `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. All three hand the harness the same settings; see [Harness settings in a config](#harness-settings-in-a-config). |
 | `vllm` | Lord launcher defaults | With `serving=lordhansolo`, passes engine settings to the pinned launcher's `DuckKaggleVllmConfig`, including `max_model_len`, cache dtypes, `max_num_seqs`, MTP tokens, prefix-cache controls, and `draft_vocab`. The draft vocabulary path is relative to `ARC3-Inference/`. |
 | `default_chat_template_kwargs` | `{"preserve_thinking": true}` | With `serving=lordhansolo`, sets the server's template defaults without importing the source notebook's `xhigh` reasoning setting. |
 | `private_waves` | `1` | With `serving=lordhansolo`, opts competition reruns into multiple waves with the priority scheduler. Lanes are rounded up from the live trial count divided by waves. The remaining `private_runtime_minutes` budget, measured from notebook start, is divided between waves after engine startup. Public runs keep one wave. UCB rejects multiple waves. |
 
 By default every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. Priority scheduling can opt into private waves as described above. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
+
+### Harness settings in a config
+
+Each setting has one place. A setting with a typed field goes in that field; `harness_env` carries everything else (`ARC3_*`, `LOCAL_ANALYZER_YIELD_TOKENS`, ...). A `harness_env` key that repeats a typed field stops the run and names the field to use.
+
+| Field | Harness variable |
+|---|---|
+| `shared.context_window` (or `analyzer.context_window`) | `LOCAL_ANALYZER_CONTEXT_WINDOW` |
+| `analyzer.max_output`, `.thinking_token_budget`, `.temperature`, `.top_p`, `.top_k`, `.tool_steps`, `.tool_timeout`, `.tool_output_tokens`, `.yield_seconds`, `.app_name`, `.site_url`, `.timeout` | `LOCAL_ANALYZER_` + the name in capitals |
+| `analyzer.thinking` | `LOCAL_ANALYZER_ENABLE_THINKING` |
+| `multimodal.context`, `multimodal.upscale` | `MULTIMODAL_CONTEXT`, `MULTIMODAL_UPSCALE` |
+
+Every `kaggle.serving` option hands the harness these fields plus `harness_env`, applied after the launcher's own defaults, so the serving never changes the harness settings. A field left out takes the Makefile default (for example `analyzer.yield_seconds` 60, `multimodal.upscale` 16). `analyzer.timeout` is the one exception: `make kaggle-duck` sets the request timeout to 900 seconds. `tests/test_serving_config.py` runs each serving's real handoff for every config under `configs/`.
 
 ### RunPod runs
 
