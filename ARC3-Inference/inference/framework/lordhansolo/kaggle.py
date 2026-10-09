@@ -1151,6 +1151,43 @@ def apply_runtime_patch(manifest: dict) -> None:
     print(f'Runtime patch {patch["artifact"]}: {result.stdout.strip()}', flush=True)
 
 
+INC_PLE_ANCHOR = (
+    '        if not isinstance(quant_config, Fp8Config):\n'
+    '            raise NotImplementedError(\n'
+    '                "Qwen4Exp PLE embedding does not support quantization config "'
+)
+
+
+def route_inc_ple_to_unquantized(manifest: dict) -> None:
+    '''Let the runtime's PLE embedding load an Intel AutoRound (INC) checkpoint.
+
+    The PLE embedding accepts only the NVFP4, ModelOpt and FP8 configs of the mixed
+    checkpoints and raises for INC, whose PLE table is unquantized BF16, as in
+    dfranzen/intel-qwen3.8-flash-next-w4a16-autoround. INCConfig is routed to the
+    unquantized PLE method, as matijaludvig/arc3-vcintel-25x1 does; other quantization
+    configs take the same path as before. A runtime without the anchor fails only when
+    the checkpoint is AutoRound, which would otherwise fail at weight load.
+    '''
+    ple_py = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models'
+              / 'qwen4_exp' / 'nvidia' / 'ngram_embedding.py')
+    source = ple_py.read_text(encoding='utf-8') if ple_py.is_file() else ''
+    if source.count(INC_PLE_ANCHOR) == 1:
+        ple_py.write_text(source.replace(
+            INC_PLE_ANCHOR,
+            '        if type(quant_config).__name__ == "INCConfig":\n'
+            '            return Qwen4ExpPLEUnquantizedEmbeddingMethod()\n' + INC_PLE_ANCHOR,
+        ), encoding='utf-8')
+        print(f'Routed INC to the unquantized PLE embedding in {ple_py}', flush=True)
+        return
+    config = json.loads((MODEL_PATH / 'config.json').read_text(encoding='utf-8'))
+    method = str((config.get('quantization_config') or {}).get('quant_method', '')).lower()
+    if method in {'auto-round', 'auto_round', 'inc'}:
+        raise RuntimeError(
+            f'{method} checkpoint needs the INC PLE route, but its anchor appears '
+            f'{source.count(INC_PLE_ANCHOR)} times in {ple_py}'
+        )
+
+
 def install_image_runtime() -> dict:
     '''Unpack the image layers in index order, replay whiteouts and apply the runtime overlay.'''
     manifest = read_runtime_manifest()
@@ -1515,6 +1552,7 @@ def start_vllm_server() -> None:
     indefinitely.
     '''
     manifest = install_image_runtime()
+    route_inc_ple_to_unquantized(manifest)
     server_env = build_image_runtime_env(manifest)
     cmd = build_vllm_server_command()
     configure_cache_diagnostics(manifest, server_env, cmd)
