@@ -106,3 +106,15 @@ On 2026-10-09 the ticbudja notebook was renamed `thinking-budget-priority-one-wa
 - **Configs:** main rejects a typed setting repeated in `harness_env`. In v1, v3, v4 and v5, the `LOCAL_ANALYZER_*` and `MULTIMODAL_*` entries moved to their `analyzer`, `shared` and `multimodal` fields, with the values that reached the harness on Kaggle (temperature 0.7, `max_output` 12288, `tool_output_tokens` 3072, `upscale` 10).
 
 Checks: with v5's serving env, the system prompt is byte-identical before and after the merge. A dry-run v5 bundle matches the pushed v5 bundle (`ticbudja/thinking-budget-priority-one-wave` v2) in serving spec, harness env (plus `MULTIMODAL_INTERMEDIATE_FRAMES=false`) and run config (1 pass, 120 lanes, one wave, 532 min). The branch's own tests and the ported options' tests pass. Main's tests that assert its prompt wording (`test_animation_description.py`), segmentation fields (`test_segmentation.py`) and final frame-image layout (`test_intermediate_images.py`) fail here by design.
+
+## One-wave v3: animation frames in context (prepared, not pushed)
+
+Config: `ARC3-Inference/configs/thinking-budget-priority-one-wave/v3.json`, for the next version (Kaggle v3) of the renamed notebook `ticbudja/thinking-budget-priority-one-wave`. It is v5 with sampled animation frames turned on: `ARC3_ANIMATION_IMAGE` and `ARC3_ANIMATION_DEATH_IMAGE` set to `sampled`, `multimodal.animation_upscale: 2`, and `multimodal.intermediate_frames: false`. The last action's animation, and a fatal action's, send up to eight frames at 128×128. The current board stays at upscale 10. The run shape now lives in the config: `kaggle.public_runtime_minutes: 131` (about 120 min of public play), `kaggle.private_runtime_minutes: 532`, and `kaggle.concurrent_jobs: 120`.
+
+A `KAGGLE_DRY_RUN=true` build matches the pushed one-wave v2 bundle in serving spec and harness env, except for the four added keys (`ARC3_ANIMATION_IMAGE`, `ARC3_ANIMATION_DEATH_IMAGE`, `MULTIMODAL_ANIMATION_UPSCALE=2`, `MULTIMODAL_INTERMEDIATE_FRAMES=false`). The run shape is 1 pass, 120 lanes, one wave, 532 min per game, and a 141-min public notebook budget. [frame-attachments-one-wave.html](../multimodal/frame-attachments-one-wave.html) shows the resulting per-turn messages. It was rendered with `docs/multimodal/scripts/render_frame_attachments.py` from that dry-run bundle.
+
+Rename the Kaggle notebook to "Thinking budget priority one wave" before pushing, or the push creates a new notebook at version 1. To push:
+
+```
+kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-one-wave/v3.json KAGGLE_USERNAME=ticbudja
+```
