@@ -82,10 +82,17 @@ def auxiliary_image_upscale(kind: str) -> int:
     return scale
 
 
+def _sample_indices(count: int, limit: int = 8) -> range | list[int]:
+    """Evenly choose up to limit positions, including both ends."""
+    if count <= limit:
+        return range(count)
+    return [i * (count - 1) // (limit - 1) for i in range(limit)]
+
+
 def intermediate_frame_parts(
     entries: list[HistoryEntry], *, after_step: int, before_step: int,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """Post-action boards from the last Python call, excluding its final board."""
+    """Every post-action board, excluding the separately shown final board."""
     if not current_grid_image_enabled():
         return []
     parts = []
@@ -182,19 +189,20 @@ def animation_image_mode() -> str:
 
 
 def animation_sampled_parts(chain: list[Any]) -> list[tuple[str, dict[str, Any]]]:
-    """At most eight changed interior frames, evenly sampled in time order."""
+    """At most eight post-action frames before the current/death board."""
     if not current_grid_image_enabled() or len(chain) < 3:
         return []
     grids = [tuple(tuple(row) for row in grid) for grid in chain]
+    # chain[0] is the pre-action board. chain[-1] is already shown as the
+    # current or death board. The engine normally collapsed consecutive
+    # duplicates, but keep the same rule for direct callers.
     candidates = []
     previous = grids[0]
     for index, grid in enumerate(grids[1:-1], start=1):
-        changed = grid != previous
-        previous = grid
-        if changed and grid not in (grids[0], grids[-1]):
+        if grid != previous:
             candidates.append((index, grid))
-    if len(candidates) > 8:
-        candidates = [candidates[i * (len(candidates) - 1) // 7] for i in range(8)]
+        previous = grid
+    candidates = [candidates[i] for i in _sample_indices(len(candidates))]
     return [
         (f"last_animation_frames[{index - 1}]:",
          {"type": "image_url", "image_url": {"url": frame_to_png_data_url(

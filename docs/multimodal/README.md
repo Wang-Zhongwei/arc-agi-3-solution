@@ -30,6 +30,6 @@ captured from a live server and do not show internal model embeddings.
 
 ## Animation and intermediate-board attachments
 
-[Open the attachment preview](frame-attachments.html) to compare the two experiments. It uses synthetic boards rendered through the production message builder, showing image order, labels, and PNG dimensions before model preprocessing.
+[Open the attachment preview](frame-attachments.html) to compare animation only, intermediate boards only, and [both included](frame-attachments.html#both). All three use one shared prompt template. Every intermediate board is attached in action order, with its full `history[i].frame (after ACTION)` caption, so the agent can trace each action to its result. Animation samples keep their `last_animation_frames` indices. Synthetic boards show image order, labels, and PNG dimensions before model preprocessing; the [ten-action example](frame-attachments.html#long-intermediate) shows all nine intermediate boards, and expandable cases cover level-up, death/reset, animation with unchanged interior, and guard stops.
 
-Validation: 93 image attachment/scaling/sampling, animation-description, and serving-config handoff tests passed. The animation-only and intermediate-only notebooks are prepared locally; no game-score comparison has been run.
+Validation: 105 image attachment/scaling/sampling, shared event prompt, animation-description, and frame-diff tests passed for this prompt update. See the [intermediate](../../ARC3-Inference/configs/intermediate-frames/README.md) and [animation](../../ARC3-Inference/configs/animation-frames/README.md) experiment READMEs for submitted versions and results.

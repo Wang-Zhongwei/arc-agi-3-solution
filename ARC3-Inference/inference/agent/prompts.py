@@ -12,18 +12,29 @@ LEVEL_TRANSFER_SYSTEM_GUIDANCE = (
 )
 
 LEVEL_START_USER_PROMPT = (
-    "You have completed the previous level. `current_frame` now contains the starting "
-    "board of the next level; any accompanying current-grid image shows this new board. "
-    "Build a new plan for this layout rather than continuing the previous level's action "
-    "sequence.\n\n"
-    "Start from the mechanics you established on the previous level; do not rediscover "
-    "them without reason. Inspect the new board for unfamiliar elements, changed "
-    "arrangements, or interactions your previous understanding does not explain. New "
-    "elements often introduce mechanics needed to solve this level, so prioritize small, "
-    "informative tests when their behavior is unclear.\n\n"
-    "Reassess the goal: does the previous objective still apply, now requiring the new "
-    "mechanics, or does the evidence suggest a different objective? Combine retained "
-    "knowledge with new findings to plan for this board."
+    "You have completed the previous level. `current_frame` is the starting board of "
+    "the next level. Build a plan for this layout.\n\n"
+    "Carry forward established mechanics. Inspect unfamiliar elements, changed "
+    "arrangements, and interactions your previous understanding does not explain; "
+    "use small tests where behavior is unclear.\n\n"
+    "Reassess the goal: does the previous objective still apply with new mechanics, "
+    "or has it changed? Combine retained knowledge with new findings to plan for this board."
+)
+
+GAME_OVER_USER_PROMPT = (
+    "Before acting, diagnose the death using BAR RULE: attribute death to the budget "
+    "only if its bar is fully or almost depleted in the death board. Then use fewer "
+    "actions or find a way to refill it. If budget clearly remains, identify the "
+    "mechanism triggered by the fatal action and avoid it.\n\n"
+    "The game is deterministic: replaying the fatal sequence will kill you again. "
+    "Change the route, action, or timing before the fatal point. If you believe the "
+    "same moves 'should' work, that belief is exactly what this death falsified."
+)
+
+CONTINUE_USER_PROMPT = (
+    "Inspect the evidence from the newest history, and search or score candidate "
+    "actions or short sequences against the current goal as you currently understand "
+    "it. Separate gameplay-object changes from HUD changes."
 )
 
 

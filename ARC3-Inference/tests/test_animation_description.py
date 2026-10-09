@@ -29,3 +29,13 @@ def test_single_change_is_visible_in_endpoints():
         action_display="RIGHT", gameplay_changed=True,
     ) == ""
     assert "changed more than once" in ANIMATION_ADDENDUM
+
+
+@pytest.mark.parametrize('timeline', [False, True])
+def test_fatal_animation_without_transient_cells_still_identifies_the_fatal_action(timeline):
+    text = describe_animation({'frames': 4, 'transient_pixels': 0}, action_display='RIGHT',
+                              gameplay_changed=True, game_over=True, timeline=timeline)
+    assert 'The fatal action RIGHT animated over 4 frames.' in text
+    assert 'changed more than once' not in text
+    assert 'last_animation_frames' in text
+    assert ('last_animation_timeline' in text) is timeline
