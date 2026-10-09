@@ -86,3 +86,19 @@ Over 46.6 minutes: 552 vs 666 tok/s (−17%); decode-only 922 vs 775; 10.3M vs 2
 **The squeeze is self-sustaining.** Once the pool is full, every admitted turn evicts a paused game's prefix; that game re-prefills its whole history on its next turn, which needs more KV and more time, so games advance slowly and reach the 118K drain point late. It lasted ~20 minutes (15–35) and ended only when enough games drained. Games then restart near 59K together and grow at similar rates, so the next squeeze is likely one drain cycle later (new-baseline v3's own KV peaks recur every ~15–20 minutes at 10 streams). +6% KV did not move it: a fresh 14-stream run needs ~1.47M tokens at its peak.
 
 Healthy phases (0–15 and 35–45 minutes) ran 765–825 tok/s against 638–696: 14 streams are worth +20–25% whenever the pool is not full. Keeping that gain needs load control rather than more KV: admit fewer turns or drain history earlier when the server's KV usage nears full, or a lower fixed concurrency (11 fits the peak).
+
+## v4: 12 streams
+
+v3 showed that 14 streams overshoot the KV pool at the synchronized peak by ~18% (14 × ~109K tokens per game before its 118K drain against 1.25M), which turned into a self-sustaining squeeze. At 12 streams the peak is ~1.31M against ~1.29M, a 1–5% overshoot: Daniel's v05 ran at 0.98 of its pool with 1.9% queueing and no collapse, so a small overshoot should mean brief queueing, not eviction thrash.
+
+[v4.json](v4.json) is v3 with everything that scales with concurrency resized for 12:
+
+| | v3 | v4 | Rule |
+|---|---|---|---|
+| `MAXREQ`, `CUDAGRAPH_MAXBS`, `ARC3_MAX_ACTIVE_STREAMS` | 14 | 12 | streams |
+| `CUDAGRAPH_BS` | 1, 2, 4, 7–14 | 1, 2, 4, 7–12 | every size from 7 up, so common batches are not padded |
+| `MAMBA_CACHE` | 70 | 62 | ≥ 5 × 12 = 60 (SGLang's cap); 62 − 4 × 12 = 14 unlocked, as in v3 (hit rate 93–97%) |
+| Wide BF16 GEMM rows | 36–56 | 36–48 | verify M = 4 × batch for batches 9–12 (the launcher benchmarks exactly these) |
+| `CHUNK`/`MAX_PREFILL`, `MEMFRAC` | 2048, 0.974 | unchanged | v3: 1.63 GB free after graphs, lowest 0.37 GiB |
+
+Expected KV pool ≈ 1.29M tokens (v3 + 8 Mamba slots ≈ +36K, plus slightly smaller graphs). Expected ~740–790 tok/s effective if no squeeze forms (decode-only 879–938 at 11–12 running, ~11 running on average). Pass: minutes 15–35 stay healthy (prefix hit ≥ 90%, little queueing); otherwise fall back to 11 streams.
