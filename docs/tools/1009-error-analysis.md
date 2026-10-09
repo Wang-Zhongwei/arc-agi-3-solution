@@ -6,7 +6,7 @@ The downloaded v1 transcripts in `ARC3-Inference/runs/kaggle/jonathanwang2022/in
 
 ## Earlier runs
 
-This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of all **47 downloaded exact-version Kaggle folders** under `ARC3-Inference/runs/kaggle/<owner>/<notebook>/vNN/` found **34 versions across 21 notebooks** with **12,868 observed token-budget yields**. A run pulled afterwards, `ticbudja/thinking-budget-priority-one-wave/v01`, adds 458 more; it is in the table and is analyzed in [Generated tokens with the yield on](#generated-tokens-with-the-yield-on). Every affected transcript that prints the effective setting says `yield_tokens: 2048`. The counts below are yield-status messages, not scores or estimates of lost actions. They include two reference notebooks owned by other accounts.
+This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of all **47 downloaded exact-version Kaggle folders** under `ARC3-Inference/runs/kaggle/<owner>/<notebook>/vNN/` found **34 versions across 21 notebooks** with **12,868 observed token-budget yields**. A run pulled afterwards, `ticbudja/thinking-budget-priority-four-waves/v01`, adds 458 more; it is in the table and is analyzed in [Generated tokens with the yield on](#generated-tokens-with-the-yield-on). Every affected transcript that prints the effective setting says `yield_tokens: 2048`. The counts below are yield-status messages, not scores or estimates of lost actions. They include two reference notebooks owned by other accounts.
 
 | Notebook | Exact version: observed yields |
 |---|---|
@@ -30,7 +30,7 @@ This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of
 | `ticbudja/api-signatures-and-frame-diff` | v01: 355; v02: 370 |
 | `ticbudja/thinking-budget-and-user-prompt-trim` | v01: 363; v02: 471; v03: 501 |
 | `ticbudja/yield-ucb-scheduling` | v01: 202 |
-| `ticbudja/thinking-budget-priority-one-wave` | v01: 458 |
+| `ticbudja/thinking-budget-priority-four-waves` | v01: 458 |
 | `ticbudja/yield-ucb-scheduling-1001` | v01: 342 |
 
 Four more Kaggle versions had `yield_tokens: 2048` in their transcripts but **no observed token-budget yield**: `jonathanwang2022/concurrency-14-streams/v01` and `jonathanwang2022/startup-read-threads/v01`, `/v02`, and `/v05`. Eight other saved Kaggle version folders have no game transcripts, so their runtime behavior cannot be checked: `jonathanwang2022/animation-frames/v01`, `bp25-experiment/v01`, `bp35-lordhansolo/v10` and `/v13`, `startup-read-threads/v03`, `thinking-budget-priority-four-waves/v01`, and `ticbudja/thinking-budget-and-user-prompt-trim-submit/v01` and `/v02`. The remaining reference folder, `lordhansolo/built-on-tufa-labs-duck-harness-milestone-2/v293`, has transcripts but no observed token-budget yield. A separate RunPod smoke output, `ARC3-Inference/runs/runpod/jonathanwang2022/runpod-smoke/c7gq8re8ot95cg/`, shows 11 more yields across two games with the same effective setting. This audit does not cover remote notebook versions whose outputs have not been saved locally.
@@ -43,7 +43,7 @@ The harness [adds each model reply's reported `completion_tokens`](../../ARC3-In
 
 ## Generated tokens with the yield on
 
-[`ticbudja/thinking-budget-priority-one-wave`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-one-wave) v1 ran with `yield_tokens: 2048`, `max_output_tokens: 12288` and a thinking budget of 8,192. It played 25 public games for about 2 h and scored 55.94. Its 1,669 analyzer turns ended as follows:
+[`ticbudja/thinking-budget-priority-four-waves`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-four-waves) v1 ran with `yield_tokens: 2048`, `max_output_tokens: 12288` and a thinking budget of 8,192. It played 25 public games for about 2 h and scored 55.94. Its 1,669 analyzer turns ended as follows:
 
 | Turn outcome | Turns |
 |---|---|
@@ -71,5 +71,5 @@ Estimated generated tokens:
 Reproduce from the main checkout, where `ARC3-Inference/runs/` exists:
 
 ```sh
-python docs/tools/scripts/turn_token_stats.py ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-one-wave/v01
+python docs/tools/scripts/turn_token_stats.py ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-four-waves/v01
 ```
