@@ -75,23 +75,6 @@ class PrioritySnapshot:
     cost_multiplier: float = 1.0
     # Appended to preserve four-argument callers and older pickled snapshots.
     total_levels: int | None = None
-    # Reasoning tokens of the game's most recent model call (the call that
-    # emitted the last action); None when the server reports none.
-    thinking_tokens: float | None = None
-
-
-def thinking_multiplier(thinking_tokens: float | None, reference: float) -> float:
-    """clip((thinking / reference) ** -0.5, 0.5, 2); 1 when off or unknown.
-
-    Short deliberation before acting goes with understanding the level: across
-    60 games the level-up turn's last call has a median of 260 reasoning
-    tokens against 1,162 for other turns (docs/reasoning/thinking-vs-level-up.md).
-    The reference only places the clip window, [reference / 4, 4 * reference],
-    since it scales every game alike.
-    """
-    if reference <= 0 or thinking_tokens is None or not math.isfinite(thinking_tokens):
-        return 1.0
-    return min(2.0, max(0.5, (max(1.0, thinking_tokens) / reference) ** -0.5))
 
 
 def priority_value(
@@ -100,7 +83,7 @@ def priority_value(
     action_scale: float = 115.0, token_scale: float = 62000.0,
     action_weight: float = 0.25, tail_base: float = 6.0, tail_cap: float = 6.0,
     normalize_score: bool = False, tail_lookup: bool | str = False,
-    tail_efficiency: float = 0.8, thinking_reference: float = 0.0,
+    tail_efficiency: float = 0.8,
 ) -> int:
     """No phase offset: all candidates must be evaluated at the same time.
 
@@ -111,9 +94,6 @@ def priority_value(
     tail_lookup=True uses the empirical 80k table; "remaining" uses the
     fixed 8/7/5/0 table without an efficiency discount. False keeps the capped
     tail. normalize_score scales only A, never B or the endgame's 0.25 floor.
-
-    thinking_reference > 0 multiplies the value by thinking_multiplier of the
-    snapshot's last-call reasoning tokens, in both phases.
     """
     level = max(1, state.level)
     total_levels = parse_total_levels(getattr(state, "total_levels", None)) or 10
@@ -151,5 +131,4 @@ def priority_value(
             + (1.0 - action_weight) * 0.5 ** ((tokens / (token_scale * pace)) ** 2)
         )
         value = (current_value + tail) * chance / pace * 100
-    value *= thinking_multiplier(getattr(state, "thinking_tokens", None), thinking_reference)
     return max(1, int(value))
