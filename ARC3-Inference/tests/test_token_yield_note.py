@@ -44,6 +44,15 @@ def test_token_yield_says_so_in_the_tool_result(monkeypatch, tmp_path):
     assert "Yielded control to solver: turn_token_budget." in transcript
 
 
+def test_tool_description_mentions_the_limit_only_when_set(tmp_path):
+    agent = tool_agent.ToolAgent(model="test-model", base_url="http://127.0.0.1:8001/v1", provider="vllm")
+    state = tmp_path / "state.json"
+    agent._yield_tokens = 4096
+    assert "about 4,096 generated tokens" in agent._tools(state)[0]["function"]["description"]
+    agent._yield_tokens = None
+    assert "generated tokens" not in agent._tools(state)[0]["function"]["description"]
+
+
 def test_no_note_below_the_limit_or_when_an_action_ran(monkeypatch, tmp_path):
     # one exchange of 150 tokens, then the tool-step budget ends the turn
     _, below, _ = run_turn(

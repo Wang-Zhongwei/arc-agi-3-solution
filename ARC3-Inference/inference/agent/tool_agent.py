@@ -5456,7 +5456,11 @@ class ToolAgent:
                 "type": "function",
                 "function": {
                     "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION,
+                    "description": _PYTHON_TOOL_DESCRIPTION + (
+                        f" A turn ends without an action once its replies pass about "
+                        f"{self._yield_tokens:,} generated tokens; keep reasoning brief."
+                        if self._yield_tokens else ""
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
