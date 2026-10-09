@@ -102,3 +102,22 @@ def test_quick_read_runs_differ_from_v3_only_in_read_and_runtime():
         for key in ("kernel_slug", "kernel_title", "dataset_slug", "public_runtime_minutes", "sglang"):
             quick["kaggle"][key] = v3["kaggle"][key]
         assert quick == v3
+
+
+@pytest.mark.parametrize("sglang,graphs,rows", [
+    ({}, [1, 2, 4, 7, 8, 9, 10], [36, 40]),
+    ({"MAXREQ": 12, "CUDAGRAPH_MAXBS": 12, "CUDAGRAPH_BS": [1, 2, 4, 7, 8, 9, 10, 11, 12]},
+     [1, 2, 4, 7, 8, 9, 10, 11, 12], [36, 40, 44, 48]),
+    ({"MAXREQ": 14, "CUDAGRAPH_MAXBS": 14}, [1, 2, 4, 7, 8, 9, 10, 14], [36, 40, 56]),
+])
+def test_graph_sizes_and_wide_gemm_check_rows(sglang, graphs, rows):
+    launcher = (ROOT / "inference/framework/pennyroyal_launch.py").read_text()
+    ns = {"SPEC": {"sglang": sglang}, "DRAFT_MODEL_DIR": "draft", "SERVED_MODEL_NAME": "flashnext"}
+    exec(launcher[launcher.index("CFG = dict("):launcher.index("\nVENV = ")], ns)
+    calls = []
+    ns.update(CFG=dict(ns["CFG"], WIDE_BF16_GEMM=True), PYTHON="python", WORKING_DIR=".", env={}, Path=Path,
+              __file__=str(ROOT / "inference/framework/pennyroyal_launch.py"),
+              run=lambda cmd, **kw: calls.append(cmd) or None)
+    exec(launcher[launcher.index("graph_bs = sorted("):launcher.index("\nargs = [SGLANG")], ns)
+    assert ns["graph_bs"] == graphs
+    assert calls[0][calls[0].index("--rows") + 1:] == rows
