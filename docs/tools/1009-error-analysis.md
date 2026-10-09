@@ -6,7 +6,7 @@ The downloaded v1 transcripts in `ARC3-Inference/runs/kaggle/jonathanwang2022/in
 
 ## Earlier runs
 
-This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of all **47 downloaded exact-version Kaggle folders** under `ARC3-Inference/runs/kaggle/<owner>/<notebook>/vNN/` found **34 versions across 21 notebooks** with **12,868 observed token-budget yields**. Every affected transcript that prints the effective setting says `yield_tokens: 2048`. The counts below are yield-status messages, not scores or estimates of lost actions. They include two reference notebooks owned by other accounts.
+This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of all **47 downloaded exact-version Kaggle folders** under `ARC3-Inference/runs/kaggle/<owner>/<notebook>/vNN/` found **34 versions across 21 notebooks** with **12,868 observed token-budget yields**. A run pulled afterwards, `ticbudja/thinking-budget-priority-four-waves/v01`, adds 458 more; it is in the table and is analyzed in [Generated tokens with the yield on](#generated-tokens-with-the-yield-on). Every affected transcript that prints the effective setting says `yield_tokens: 2048`. The counts below are yield-status messages, not scores or estimates of lost actions. They include two reference notebooks owned by other accounts.
 
 | Notebook | Exact version: observed yields |
 |---|---|
@@ -30,6 +30,7 @@ This was not isolated to the combined-frame notebook. On 2026-10-09, an audit of
 | `ticbudja/api-signatures-and-frame-diff` | v01: 355; v02: 370 |
 | `ticbudja/thinking-budget-and-user-prompt-trim` | v01: 363; v02: 471; v03: 501 |
 | `ticbudja/yield-ucb-scheduling` | v01: 202 |
+| `ticbudja/thinking-budget-priority-four-waves` | v01: 458 |
 | `ticbudja/yield-ucb-scheduling-1001` | v01: 342 |
 
 Four more Kaggle versions had `yield_tokens: 2048` in their transcripts but **no observed token-budget yield**: `jonathanwang2022/concurrency-14-streams/v01` and `jonathanwang2022/startup-read-threads/v01`, `/v02`, and `/v05`. Eight other saved Kaggle version folders have no game transcripts, so their runtime behavior cannot be checked: `jonathanwang2022/animation-frames/v01`, `bp25-experiment/v01`, `bp35-lordhansolo/v10` and `/v13`, `startup-read-threads/v03`, `thinking-budget-priority-four-waves/v01`, and `ticbudja/thinking-budget-and-user-prompt-trim-submit/v01` and `/v02`. The remaining reference folder, `lordhansolo/built-on-tufa-labs-duck-harness-milestone-2/v293`, has transcripts but no observed token-budget yield. A separate RunPod smoke output, `ARC3-Inference/runs/runpod/jonathanwang2022/runpod-smoke/c7gq8re8ot95cg/`, shows 11 more yields across two games with the same effective setting. This audit does not cover remote notebook versions whose outputs have not been saved locally.
@@ -39,3 +40,35 @@ One clear example is `cn04-2fe56bfb_p0.txt`, `analysis_step=41`, action 132, at 
 The harness [adds each model reply's reported `completion_tokens`](../../ARC3-Inference/inference/agent/tool_agent.py#L3765-L3793) to `_turn_generated_tokens`, then [checks the threshold](../../ARC3-Inference/inference/agent/tool_agent.py#L7010-L7024). Generated thinking, text, and tool-call arguments are part of those replies; **returned Python output is not added**. The check runs between replies, so it does not cut off a tool call mid-generation. The [code comment](../../ARC3-Inference/inference/agent/tool_agent.py#L202-L209) says token-based yielding was introduced to avoid a wall-clock yield changing with server throughput; it does not make this threshold mandatory. The default is `0` (disabled), and the solver still has its normal stop check.
 
 [V2](../../ARC3-Inference/configs/intermediate-animation-frames/v2.json#L88) changes only `LOCAL_ANALYZER_YIELD_TOKENS` from `2048` to `0`. `yield_seconds=0` and `tool_steps=0` were already disabled. The separate per-response limits remain `max_output=12288` and `thinking_token_budget=8192`; the public run retains its 120-minute runtime limit. V2 is prepared and JSON-validated, **not submitted or scored**, so no gameplay improvement is claimed.
+
+## Generated tokens with the yield on
+
+[`ticbudja/thinking-budget-priority-four-waves`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-four-waves) v1 ran with `yield_tokens: 2048`, `max_output_tokens: 12288` and a thinking budget of 8,192. It played 25 public games for about 2 h and scored 55.94. Its 1,669 analyzer turns ended as follows:
+
+| Turn outcome | Turns |
+|---|---|
+| Executed an action | 1,196 |
+| Yielded on `turn_token_budget` | 458 (27.4%) |
+| Yielded on `stop_requested` (the run's soft end) | 7 |
+| Other (request error or no status) | 8 |
+
+The transcripts give each reply's characters (reasoning, content and tool-call arguments) but not its tokens. As in the harness's own estimate, each reply's tokens are its characters divided by the game's current `text_token_calibration` divisor (mostly the 3.3 ceiling; the seed is 3). These are rough estimates. Their total, 4.03M, is 0.92 of the exact 4.37M generated tokens in `benchmark.json`, so they run about 8% low.
+
+Estimated generated tokens:
+
+| Unit | n | Median | Mean | p90 | p99 | Max |
+|---|---|---|---|---|---|---|
+| Reply | 2,560 | 921 | 1,576 | 3,860 | 7,959 | 10,077 |
+| Turn, all | 1,669 | 2,054 | 2,417 | 5,205 | 8,647 | 11,028 |
+| Turn that executed an action | 1,196 | 1,392 | 2,005 | 4,587 | 8,451 | 10,541 |
+| Turn that yielded on `turn_token_budget` | 458 | 2,893 | 3,546 | 6,463 | 9,040 | 11,028 |
+
+- **2,048 is not an output cap.** The check runs between replies, so a reply always runs to completion. Half of all turns generated 2,048 tokens or more, and the longest generated about 11k. No reply came near `max_output_tokens`: 24.6% reached 2,048, 8.9% reached 4,096, and 0.6% reached 8,192.
+- **One reply usually triggers the yield.** In a yielded turn, the replies before the one that crossed 2,048 generated a median of 454 tokens. The crossing reply generated a median of 2,398. In 41% of yielded turns, the first reply alone crossed the threshold.
+- **Yielded turns hold 40% of the generated tokens.** These turns ended without an action, and the next turn had to request again before the game moved. Acting turns hold the other 59%. 36% of acting turns exceeded 2,048 tokens, all in the reply that executed the action, which the check cannot interrupt.
+
+Reproduce from the main checkout, where `ARC3-Inference/runs/` exists:
+
+```sh
+python docs/tools/scripts/turn_token_stats.py ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-four-waves/v01
+```
