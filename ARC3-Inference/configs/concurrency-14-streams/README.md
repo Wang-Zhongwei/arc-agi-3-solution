@@ -25,3 +25,27 @@ The wide BF16 GEMM check passed (`pennyroyal-gemm-bench.jsonl`): all 42 shapes (
 [v2.json](v2.json) is v1 with `CHUNK` and `MAX_PREFILL` 4096 (from 8192 and 16384); everything else, including `MEMFRAC` 0.968, is unchanged. Scaling the ~3.1–3.3 GB peak of an 8192-token forward, 4096 needs roughly 1.6–1.9 GB against v1's 2.20 GB free. (The tuneup runs held 0.967 at 14 streams with a 2048 chunk and 1.26 GB free; 6144 would need ~2.4–2.5 GB and likely OOM at 0.968.)
 
 Prefill is ~15–20% of wall time (decode-only intervals 53–54%; the rest mostly decodes alongside prefill), and each forward pays a fixed ~40–60 ms (mostly weight reads) on ~0.5 s of compute at ~8K tok/s, so halving the chunk should cost ~5% prefill time, ~1% tok/s (estimate). Chunk size does not change decode batches: compare decode-only intervals by running requests (concurrency effect) separately from prefill intervals (chunk effect).
+
+## v2 result (Kaggle `ticbudja/concurrency-14-streams` v1, 2026-10-09)
+
+v2.json ran on the teammate account (jonathanwang2022's weekly GPU quota was used up), so its Kaggle version is v1. No OOM: lowest free memory during serving 0.25 GiB (v3: 0.04). 23 minutes of games, 25 games, 753K tokens. Compared with new-baseline v3 over the same windows from benchmark start (`serve.log`):
+
+| | v3, 10 streams | v2, 14 streams |
+|---|---|---|
+| **First 15 min** (before the KV pool filled) | | |
+| Effective tok/s | 667 | **808** (+21%) |
+| Decode-only tok/s | 778 | 972 (+25%) |
+| Mean running requests | 9.47 | 13.48 |
+| Prefix hit | 95.8% | 95.3% |
+| **All 23 min** | | |
+| Effective tok/s | 668 | 602 (−10%) |
+| Uncached prefill tokens | 1.36M | 4.83M |
+| Prefix hit | 95.4% | 82% |
+| KV usage p50 / p95 / max | 0.41 / 0.79 / 0.86 | 0.54 / 0.96 / 0.99 |
+| Intervals with queued requests | 1.4% | 12.6% |
+
+Decode-only tok/s by running requests: 793 at 10 (v3); 921 / 953 / 985 at 12 / 13 / 14 (v2). Draft acceptance is unchanged (2.6).
+
+**At ~15 minutes the KV pool filled and the prefix cache thrashed.** All 14 games started together, so their histories grew in lockstep and reached ~85K tokens each before the first 118K history drain (14 × 85K ≈ 1.19M against 1,181,312 tokens). With locked usage at 0.94–0.99, requests queued 80–100% of the time, and admitting a queued request evicted the cached prefix of a game between turns; that game then re-prefilled its whole conversation. 954 prefill chunks restarted from the system prompt alone, 3.86M tokens (80% of all prefill); the hit rate fell to 5–38% per 3 minutes. v3 peaked at 0.86 and then drained to ~0.3.
+
+Over a full drain cycle (59K → 118K, ~88K average) 14 streams need ~1.23M tokens, more than the pool; 12 need ~1.06M (0.9). Without new quantization, 14 streams need either fewer tokens per stream (earlier drain, a context change) or admission that backs off when the pool is nearly full. A fixed 12 streams (decode-only ~921 tok/s) should fit as is.
