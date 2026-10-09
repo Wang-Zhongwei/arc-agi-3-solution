@@ -521,12 +521,14 @@ Each setting has one place. A setting with a typed field goes in that field; `ha
 
 Every `kaggle.serving` option hands the harness these fields plus `harness_env`, applied after the launcher's own defaults, so the serving never changes the harness settings. A field left out takes the Makefile default (for example `analyzer.yield_seconds` 60, `multimodal.upscale` 16). `analyzer.timeout` is the one exception: `make kaggle-duck` sets the request timeout to 900 seconds. `tests/test_serving_config.py` runs each serving's real handoff for every config under `configs/`.
 
-Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The launcher installs the hooks from this run's source bundle with `inference/framework/pennyroyal_patch.py`, which checks the SGLang version and source anchors before writing; a switch left off keeps the baseline code path.
+Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The launcher installs the hooks from this run's source bundle with `inference/framework/pennyroyal_patch.py`, which checks the SGLang version and source anchors before writing; a switch left off keeps the baseline code path. `OFFLOAD_EMBED_TOKENS` and `WIDE_BF16_GEMM` cannot be combined with the lordhansolo tuning switches (`EMBED_TOKENS_HOST`, `LOWM_MAX_M`, ...; `pennyroyal_patches.py`): both edit the same source anchors, so the launcher stops before installing either.
 
 | Setting | Default | Behavior |
 |---|---|---|
 | `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the input `embed_tokens` table (~1.2 GiB BF16) in pinned host memory, gathered by the PLE kernel and shared with the MTP draft; the freed GPU memory goes to the KV pool. TP=1 and an untied `lm_head` only. PLE and the GPU `lm_head` are unchanged. |
 | `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 path unchanged. Unvalidated. |
+| `WIDE_BF16_GEMM_BENCH` | `true` | With `WIDE_BF16_GEMM`, runs `benchmark_pennyroyal_optional.py --gemm` on the GPU before the server starts, at the verify row counts of the captured batch sizes ((`SPEC_STEPS` + 1) × batch, 36–64). Writes `pennyroyal-gemm-bench.jsonl` (error and torch vs candidate µs per shape); a failed correctness check serves with `WIDE_BF16_GEMM` off. |
+| `CUDAGRAPH_BS` | `[]` | Decode CUDA graph batch sizes. Empty keeps 1, 2, 4, 7, 8, 9, 10; `MAXREQ` and `CUDAGRAPH_MAXBS` are always added, and sizes above `CUDAGRAPH_MAXBS` are dropped. Uncaptured batches pad up to the next captured size. |
 | `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's unique `(M, N, K)` shape logging for BF16 dispatch. |
 | `MODEL_PRECACHE_THREADS` | `6` | Reader threads of the launcher's page-cache precache of the model and draft (185.4 GB), starting 60 s after server launch; `0` turns it off. Daniel's cell used `3`. See [startup read threads](../docs/serving/startup-read-threads.md). |
 | `MODEL_PRECACHE_EARLY` | `false` | Starts that precache right after the wheel precache, during the install, instead of 60 s after server launch. It outruns the loader and is evicted from page cache (1,011 s load with 12 threads), so leave it off. |

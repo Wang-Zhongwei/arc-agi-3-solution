@@ -190,7 +190,13 @@ CFG = dict(
     SPEC_STEPS=3,
     OFFLOAD_EMBED_TOKENS=False,
     WIDE_BF16_GEMM=False,
+    # Before the server starts, check the wide kernels against torch at the
+    # verify row counts this run captures and time both (benchmark_pennyroyal_optional.py,
+    # pennyroyal-gemm-bench.jsonl); a failed check turns WIDE_BF16_GEMM off.
+    WIDE_BF16_GEMM_BENCH=True,
     LOG_BF16_GEMM_SHAPES=False,
+    # Decode CUDA graph batch sizes; empty keeps 1, 2, 4, 7, 8, 9, 10 plus MAXREQ.
+    CUDAGRAPH_BS=[],
     # The harness's thinking budget (custom_params.thinking_budget) is enforced
     # by sglang's reasoner grammar, which only filters tokens in strict mode.
     # Strict mode also keeps tool-call and end-of-turn tokens out of thinking.
@@ -231,6 +237,12 @@ CFG = dict(
     MAMBA_SKIP_DECODE_LOCK=False,
 )
 CFG.update(SPEC.get("sglang", {}))
+# pennyroyal_patch.py (embedding offload, wide GEMM) and pennyroyal_patches.py
+# (lordhansolo tuning) edit the same anchors; each refuses the other's edits.
+if (CFG["OFFLOAD_EMBED_TOKENS"] or CFG["WIDE_BF16_GEMM"]) and (
+        CFG["EMBED_TOKENS_HOST"] or CFG["MOE_MARLIN"] or CFG["LOWM_FP8"] or CFG["MTP_SHARED_HEAD"]
+        or CFG["QSA_INDEX_FP8"] or CFG["ONLINE_MXFP8"] or int(CFG["LOWM_MAX_M"]) != 32):
+    raise ValueError("OFFLOAD_EMBED_TOKENS/WIDE_BF16_GEMM cannot be combined with the lordhansolo tuning flags")
 if CFG["WINDOW_PREFETCH"]: CFG["PREFETCH_CHECKPOINTS"] = False
 CFG["SPEC"] = CFG["SPEC"] and (bool(DRAFT_MODEL_DIR) or views.has_embedded_mtp(MODEL_DIR))
 VENV = f"{PREFIX}/venv"
@@ -531,8 +543,20 @@ elif CFG["SPEC"]:
 mark_startup("views_ready")
 
 # ---- assemble Pennyroyal / AutoRound launch arguments ----
-graph_bs = sorted({1, 2, 4, 7, 8, 9, 10, CFG["MAXREQ"], CFG["CUDAGRAPH_MAXBS"]})
+graph_bs = sorted(set(CFG["CUDAGRAPH_BS"] or [1, 2, 4, 7, 8, 9, 10]) | {CFG["MAXREQ"], CFG["CUDAGRAPH_MAXBS"]})
 graph_bs = [n for n in graph_bs if n <= CFG["CUDAGRAPH_MAXBS"]]
+if CFG["WIDE_BF16_GEMM"] and CFG["WIDE_BF16_GEMM_BENCH"]:
+    # Verify forwards carry SPEC_STEPS + 1 rows per request.
+    rows = sorted({(CFG["SPEC_STEPS"] + 1) * n for n in graph_bs} & set(range(36, 65, 4)))
+    bench = run([PYTHON, Path(__file__).with_name("benchmark_pennyroyal_optional.py"), "--gemm",
+                 "--rows", *rows], check=False, env=env) if rows else None
+    if bench is not None:
+        Path(WORKING_DIR, "pennyroyal-gemm-bench.jsonl").write_text(bench.stdout)
+        if bench.returncode:
+            print("Wide BF16 GEMM check failed; serving with WIDE_BF16_GEMM off", flush=True)
+            CFG["WIDE_BF16_GEMM"] = False
+            env["ARC3_WIDE_BF16_GEMM"] = "0"
+    mark_startup("wide_gemm_checked")
 args = [SGLANG, "serve", "--model-path", SERVE_DIR, "--load-format", "safetensors",
     "--model-loader-extra-config", '{"enable_multithread_load":false}',
     "--served-model-name", str(CFG["SERVED_NAME"]), "--host", "127.0.0.1",
@@ -699,6 +723,7 @@ Path(WORKING_DIR, "pennyroyal-startup.json").write_text(json.dumps(
      "chunked_prefill": CFG["CHUNK"], "window_prefetch": bool(CFG["WINDOW_PREFETCH"]),
      "prefetch_checkpoints": bool(CFG["PREFETCH_CHECKPOINTS"]), "server_status": status,
      "max_running_requests": CFG["MAXREQ"], "cuda_graph_bs": graph_bs, "mem_fraction_static": CFG["MEMFRAC"],
+     "offload_embed_tokens": bool(CFG["OFFLOAD_EMBED_TOKENS"]), "wide_bf16_gemm": bool(CFG["WIDE_BF16_GEMM"]),
      "tuneup": TUNEUP}, indent=1))
 if status == "exited":
     # Games against a dead endpoint only burn the session; fail the setup step.
