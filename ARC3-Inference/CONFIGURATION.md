@@ -436,7 +436,7 @@ The second field lists every eviction since the previous request, in order: `tok
 
 | Setting | Default | Behavior |
 |---|---|---|
-| `LOCAL_ANALYZER_YIELD_TOKENS` | `0`: disabled | Adds a generated-token threshold for yielding an analyzer turn. Checked between completions; it is not a hard mid-stream token cutoff. |
+| `LOCAL_ANALYZER_YIELD_TOKENS` | `0`: disabled | Adds a generated-token threshold for yielding an analyzer turn. Checked between completions; it is not a hard mid-stream token cutoff. The count restarts at 0 every analyzer turn, including resumptions. When it ends a turn after a tool call, that tool result gets a note saying the turn token limit was reached and asking for shorter reasoning. |
 | `ARC3_YIELD_RESUME_PROMPT` | `full` | Selects the full opener, a shorter continuation prompt, or `state_only`. |
 | `ARC3_YIELD_RESUME_TONE` | `commit` | Selects commit-oriented, `neutral`, or `minimal` resumption wording. |
 | `ARC3_YIELD_ON_TIMEOUT` | On | Allows a read timeout to yield while preserving useful history rather than losing the turn’s work. |

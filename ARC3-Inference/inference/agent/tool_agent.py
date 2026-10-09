@@ -43,6 +43,7 @@ from inference.agent.prompts import (
     EPHEMERAL_FUNCTIONS_LINE,
     SUMMARY_REQUEST_PROMPT,
     PREFER_TOOL_CALLS_LINE,
+    TOKEN_YIELD_TOOL_NOTE,
     GAME_OVERVIEW_ADDENDUM,
     WORLD_MODEL_ADDENDUM,
     WORLD_MODEL_FREE_ADDENDUM,
@@ -7569,20 +7570,28 @@ class ToolAgent:
                                 "action changed the board; restoring default reasoning_effort"
                             )
                             self._reasoning_effort_rung = -1
-                    append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(dispatch.content))
+                    # checked before the result is recorded, so a token yield
+                    # can say so in the result the model reads on resumption
+                    if not dispatch.step_executed:
+                        yielded_control_reason = control_yield_reason()
+                    tool_content = dispatch.content
+                    if yielded_control_reason == "turn_token_budget":
+                        tool_content += "\n\n" + TOKEN_YIELD_TOOL_NOTE.format(
+                            generated=self._turn_generated_tokens, limit=self._yield_tokens
+                        )
+                    append_transcript(f"TOOL RESULT: {tool_name}", _render_tool_result_display(tool_content))
                     self._append_context_message(
                         messages,
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.get("id", ""),
-                            "content": dispatch.content,
+                            "content": tool_content,
                         }
                     )
                     if dispatch.step_executed:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
                         break
-                    yielded_control_reason = control_yield_reason()
                     if yielded_control_reason is not None:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
