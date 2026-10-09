@@ -4,10 +4,10 @@
 
 The model, game list, 10 active streams, budgets, and Pennyroyal serving settings match the two single-feature configs. Embedding-table offload is **off**: this config has no `OFFLOAD_EMBED_TOKENS` override, and the launcher defaults it to `false`. Because the regular board upscale also changes from 8 to 10, this is a combined treatment rather than an isolated test of adding the second frame type.
 
-The local packaging dry run succeeded on 2026-10-09. This notebook has not been submitted to Kaggle. The intended destination is `jonathanwang2022/intermediate-animation-frames`, with source dataset `jonathanwang2022/intermediate-animation-frames-src`.
+Submitted as [Kaggle v1](https://www.kaggle.com/code/jonathanwang2022/intermediate-animation-frames) on 2026-10-09, using source commit `2a7dfc2` and dataset `jonathanwang2022/intermediate-animation-frames-src`. Kaggle accepted the launch; no result has been downloaded or evaluated yet. The exact local submitted bundle is under `/private/tmp/arc3-intermediate-animation-prep/kaggle/jonathanwang2022/intermediate-animation-frames/v01/`. The earlier packaging dry run also succeeded.
 
-From `ARC3-Inference/`, prepare the bundle without pushing:
+From `ARC3-Inference/`, the submission command was:
 
 ```sh
-make kaggle-duck CONFIG_PATH=configs/intermediate-animation-frames/v1.json KAGGLE_DRY_RUN=true KAGGLE_USERNAME=jonathanwang2022 KAGGLE_KERNEL_SLUG=intermediate-animation-frames KAGGLE_DATASET_REF=jonathanwang2022/intermediate-animation-frames-src
+make kaggle-duck CONFIG_PATH=configs/intermediate-animation-frames/v1.json KAGGLE_USERNAME=jonathanwang2022 KAGGLE_KERNEL_SLUG=intermediate-animation-frames KAGGLE_DATASET_REF=jonathanwang2022/intermediate-animation-frames-src EXPERIMENTS_DIR=/private/tmp/arc3-intermediate-animation-prep
 ```
