@@ -102,3 +102,26 @@ v3 showed that 14 streams overshoot the KV pool at the synchronized peak by ~18%
 | `CHUNK`/`MAX_PREFILL`, `MEMFRAC` | 2048, 0.974 | unchanged | v3: 1.63 GB free after graphs, lowest 0.37 GiB |
 
 Expected KV pool ≈ 1.29M tokens (v3 + 8 Mamba slots ≈ +36K, plus slightly smaller graphs). Expected ~740–790 tok/s effective if no squeeze forms (decode-only 879–938 at 11–12 running, ~11 running on average). Pass: minutes 15–35 stay healthy (prefix hit ≥ 90%, little queueing); otherwise fall back to 11 streams.
+
+## v4 result (Kaggle `ticbudja/concurrency-14-streams` v3, 2026-10-09): no squeeze, +9%
+
+KV pool 1,282,496 tokens (predicted ~1.29M), 1.73 GB free after graph capture, lowest 0.33 GiB, no OOM, `max_running_requests` 12 (no Mamba cap). 48 minutes of games; accept length 2.64.
+
+| Minutes | new-baseline v3, 10 streams | v4, 12 streams | Running | KV mean / max | Queued | Prefix hit |
+|---|---|---|---|---|---|---|
+| 0–5 | 661 | 731 | 11.7 | 0.17 / 0.31 | 9% | 90% |
+| 5–10 | 690 | 763 | 11.5 | 0.43 / 0.58 | 3% | 96% |
+| 10–15 | 651 | 757 | 11.2 | 0.66 / 0.82 | 6% | 97% |
+| 15–20 | 662 | 722 | 11.0 | 0.74 / 0.87 | 5% | 97% |
+| 20–25 | 686 | 745 | 11.6 | 0.35 / 0.75 | 4% | 92% |
+| 25–30 | 696 | 758 | 11.5 | 0.41 / 0.56 | 2% | 96% |
+| 30–35 | 667 | 733 | 11.2 | 0.60 / 0.70 | 9% | 97% |
+| 35–40 | 645 | 688 | 11.0 | 0.72 / 0.85 | 3% | 97% |
+| 40–45 | 638 | 643 | 10.8 | 0.68 / 0.82 | 1% | 93% |
+| **0–45 mean** | **666** | **727 (+9%)** | | | | |
+
+(45–50 is v4's benchmark ending at 48 minutes.) Whole 48-minute window: 704 vs 666 tok/s, decode-only 858 vs 776, KV p50/p95/max 0.57/0.80/0.87 (v3: 0.48/0.78/0.86), prefix hit 94.7% vs 95.4%, queueing 4.7% vs 1.1% of intervals. Decode-only by running requests: 804 / 847 / 876 / 895 at 9 / 10 / 11 / 12.
+
+The pool peaked at 0.87 (~1.12M tokens, ~93K per stream: the games do not all peak at once), so 12 streams stay clear of the eviction squeeze that 14 hit. The gain is smaller than the healthy phases of 14 streams (+20–25%) and below the +12–18% estimate: 11.2 requests run on average, decode-only at 12 running was 895 here against 921–938 in v2/v3 (longer contexts throughout, or a different host), and the last 10 minutes narrowed to +1–7% as uncached prefill rose (0.55M in 40–45).
+
+13 streams would need ~1.21M at this run's per-stream peak (0.94 of the pool): possible but at the edge.
