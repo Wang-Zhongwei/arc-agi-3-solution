@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from inference.agent.runtime_state import Frame
+from inference.agent.runtime_state import Frame, HistoryEntry
 
 
 ARC_COLOR_MAP: dict[int, tuple[int, int, int]] = {
@@ -68,6 +68,46 @@ def current_grid_image_upscale() -> int:
         return 16
 
 
+def auxiliary_image_upscale(kind: str) -> int:
+    """Separate scale for animation/intermediate images; inherit the board scale."""
+    raw = os.environ.get(f"MULTIMODAL_{kind.upper()}_UPSCALE", "").strip()
+    if not raw:
+        return current_grid_image_upscale()
+    try:
+        scale = int(raw)
+    except ValueError:
+        raise ValueError(f"MULTIMODAL_{kind.upper()}_UPSCALE must be a positive integer") from None
+    if scale < 1:
+        raise ValueError(f"MULTIMODAL_{kind.upper()}_UPSCALE must be a positive integer")
+    return scale
+
+
+def _sample_indices(count: int, limit: int = 8) -> range | list[int]:
+    """Evenly choose up to limit positions, including both ends."""
+    if count <= limit:
+        return range(count)
+    return [i * (count - 1) // (limit - 1) for i in range(limit)]
+
+
+def intermediate_frame_parts(
+    entries: list[HistoryEntry], *, after_step: int, before_step: int,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every post-action board, excluding the separately shown final board."""
+    if not current_grid_image_enabled():
+        return []
+    parts = []
+    # Match the complete history exposed in the sandbox, before turn filtering.
+    for history_index, entry in enumerate(entry for entry in entries if entry.frame is not None):
+        frame = entry.frame
+        if frame is None or not after_step < frame.step < before_step:
+            continue
+        label = f"history[{history_index}].frame (after {entry.action}):"
+        parts.append((label, {"type": "image_url", "image_url": {
+            "url": frame_to_png_data_url(frame, upscale=auxiliary_image_upscale("intermediate")),
+        }}))
+    return parts
+
+
 def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
     rows = len(frame.grid)
     cols = max((len(row) for row in frame.grid), default=0)
@@ -108,11 +148,11 @@ def current_grid_image_part(frame: Frame | None) -> dict[str, Any] | None:
 DIFF_UNCHANGED_RGB: tuple[int, int, int] = (16, 24, 48)
 
 
-_ANIMATION_IMAGE_MODES = ("off", "peak", "composite")
+_ANIMATION_IMAGE_MODES = ("off", "peak", "composite", "sampled")
 
 
 def _animation_image_mode(name: str) -> str:
-    """One of off, peak, composite. Anything else raises.
+    """One of off, peak, composite, sampled. Anything else raises.
 
     These two are the only enum knobs among a set of otherwise boolean ARC3_*
     variables, so `=1` is the natural thing to write - and silently meant off,
@@ -129,7 +169,7 @@ def _animation_image_mode(name: str) -> str:
 
 
 def animation_death_image_mode() -> str:
-    """off | peak | composite, for the fatal action of a game over.
+    """off | peak | composite | sampled, for the fatal action of a game over.
 
     Separate from ARC3_ANIMATION_IMAGE because the two fire on different
     conditions and a game-over turn already carries two images, so a third is
@@ -139,13 +179,37 @@ def animation_death_image_mode() -> str:
 
 
 def animation_image_mode() -> str:
-    """off | peak | composite.
+    """off | peak | composite | sampled.
 
-    Only ever attached when the action left the board area unchanged, which is
+    Peak/composite attach when the action left the board area unchanged, which is
     exactly when the board image the model receives is uninformative: the
     action did something, and no frame it can reach shows what.
     """
     return _animation_image_mode("ARC3_ANIMATION_IMAGE")
+
+
+def animation_sampled_parts(chain: list[Any]) -> list[tuple[str, dict[str, Any]]]:
+    """At most eight post-action frames before the current/death board."""
+    if not current_grid_image_enabled() or len(chain) < 3:
+        return []
+    grids = [tuple(tuple(row) for row in grid) for grid in chain]
+    # chain[0] is the pre-action board. chain[-1] is already shown as the
+    # current or death board. The engine normally collapsed consecutive
+    # duplicates, but keep the same rule for direct callers.
+    candidates = []
+    previous = grids[0]
+    for index, grid in enumerate(grids[1:-1], start=1):
+        if grid != previous:
+            candidates.append((index, grid))
+        previous = grid
+    candidates = [candidates[i] for i in _sample_indices(len(candidates))]
+    return [
+        (f"last_animation_frames[{index - 1}]:",
+         {"type": "image_url", "image_url": {"url": frame_to_png_data_url(
+             Frame(grid=grid, step=0, level=1), upscale=auxiliary_image_upscale("animation"),
+         )}})
+        for index, grid in candidates
+    ]
 
 
 def animation_composite_part(
@@ -223,7 +287,7 @@ def animation_composite_part(
             int(round(base + weight * (target - base)))
             for base, target in zip(DIFF_UNCHANGED_RGB, colour)
         )
-    scale = current_grid_image_upscale()
+    scale = auxiliary_image_upscale("animation")
     if scale > 1:
         image = image.resize((cols * scale, rows * scale), multimodal_resample())
     buffer = io.BytesIO()
@@ -272,7 +336,7 @@ def animation_peak_part(
         for col_idx in range(cols):
             value = row[col_idx] if col_idx < len(row) else 0
             pixels[col_idx, row_idx] = ARC_COLOR_MAP.get(int(value), ARC_COLOR_MAP[0])
-    scale = current_grid_image_upscale()
+    scale = auxiliary_image_upscale("animation")
     if scale > 1:
         image = image.resize((cols * scale, rows * scale), multimodal_resample())
     buffer = io.BytesIO()

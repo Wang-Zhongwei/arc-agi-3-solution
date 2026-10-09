@@ -498,9 +498,8 @@ def _kaggle_env(username: str, key: str) -> dict[str, str]:
     env = os.environ.copy()
     env["KAGGLE_USERNAME"] = username
     env["KAGGLE_KEY"] = key
-    # kaggle CLI >= 2.x authenticates with KAGGLE_API_TOKEN. Keep KAGGLE_KEY
-    # for older clients and set both so the deployment works across versions.
-    env["KAGGLE_API_TOKEN"] = key
+    # Keep legacy keys separate from access tokens. Preserve an explicit
+    # KAGGLE_API_TOKEN; otherwise let the CLI discover its cached credentials.
     return env
 
 

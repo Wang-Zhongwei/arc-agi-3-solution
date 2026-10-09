@@ -147,48 +147,43 @@ def describe_animation(
 ) -> str:
     """The opener line, or "" when there is nothing worth saying.
 
-    Silent unless cells changed more than once. Where every cell changed at
-    most once the final frame already shows the outcome, and a line saying so
-    would spend tokens to report that nothing is missing.
+    Ordinary actions are silent unless cells changed more than once. Fatal
+    animations are also reported without transient cells: the current board
+    has reset and cannot show the fatal outcome.
     """
     if not summary:
         return ""
     transient = int(summary.get("transient_pixels") or 0)
-    if transient <= 0:
-        return ""
     frames = summary.get("frames")
+    if (game_over and int(frames or 0) <= 1) or (not game_over and transient <= 0):
+        return ""
     cells = "1 cell changed more than once" if transient == 1 else (
         f"{transient} cells changed more than once"
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
-    name = f" (`{action_display}`)" if action_display else ""
-    # point at whichever accessor is actually available
+    name = f" {action_display}" if action_display else ""
+    # Frames are always available; mention the timeline only when enabled.
     where_to_look = (
-        "`last_animation_timeline`"
+        "`last_animation_frames` or `last_animation_timeline`"
         if timeline
         else "`last_animation_frames`"
     )
 
     if game_over:
-        # Follows the BAR RULE block, which has just walked the model through
-        # history[-3] and history[-2]. The endpoints alone do not fully show
-        # the changes during the animation.
+        changes = f"{cells[0].upper()}{cells[1:]}{where}. " if transient > 0 else ""
         return (
-            f"That fatal action animated over {frames} frames, and inside it "
-            f"{cells}{where}. Those intermediate changes are not fully captured by "
-            f"`history[-3].frame` or `history[-2].frame` - read {where_to_look} to see "
-            "what happened between them."
+            f"The fatal action{name} animated over {frames} frames. "
+            f"{changes}Inspect {where_to_look}."
         )
     if gameplay_changed is False:
         return (
-            f"The last executed action{name} animated over {frames} frames and left the "
-            f"board area unchanged, but it was not a no-op: {cells}{where}. "
-            "Whatever this action did is visible only there - "
-            f"read {where_to_look} before concluding it failed."
+            f"The last action{name} animated over {frames} frames. "
+            f"{cells[0].upper()}{cells[1:]}{where}. The board interior is unchanged "
+            f"after the animation; inspect {where_to_look} before treating this as a no-op."
         )
     return (
-        f"The last executed action{name} animated over {frames} frames. "
-        f"{cells[0].upper()}{cells[1:]}{where}. {where_to_look} shows them."
+        f"The last action{name} animated over {frames} frames. "
+        f"{cells[0].upper()}{cells[1:]}{where}. Inspect {where_to_look} for details."
     )
 
 

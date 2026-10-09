@@ -28,7 +28,6 @@ from inference.agent.scheduling.ucb import (
     weighted_levels,
 )
 from inference.utils.animation import (
-    _bbox_phrase as _animation_bbox_phrase,
     _transient_cells as _animation_transient_cells,
     build_animation_frames,
     build_animation_view,
@@ -39,6 +38,8 @@ from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
+    GAME_OVER_USER_PROMPT,
+    CONTINUE_USER_PROMPT,
     COMPACT_TOOL_SESSION_ADDENDUM,
     PERSISTENT_FUNCTIONS_LINE,
     EPHEMERAL_FUNCTIONS_LINE,
@@ -69,8 +70,10 @@ from inference.agent.vision_context import (
     animation_death_image_mode,
     animation_image_mode,
     animation_peak_part,
+    animation_sampled_parts,
     current_grid_image_enabled,
     current_grid_image_part,
+    intermediate_frame_parts,
 )
 
 from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
@@ -335,6 +338,23 @@ def _format_valid_action_line(valid_actions: list[str] | None) -> str:
     return ", ".join(names)
 
 
+def _format_executed_actions(actions: list[str]) -> str:
+    """Group consecutive repeats; abbreviate the middle of long group lists."""
+    groups: list[tuple[str, int]] = []
+    for action in actions:
+        name = str(action).strip()
+        if not name:
+            continue
+        if groups and groups[-1][0] == name:
+            groups[-1] = (name, groups[-1][1] + 1)
+        else:
+            groups.append((name, 1))
+    rendered = [f"{name} x {count}" if count > 1 else name for name, count in groups]
+    if len(rendered) > 12:
+        rendered = rendered[:6] + ["..."] + rendered[-6:]
+    return ", ".join(rendered)
+
+
 def _terminal_action_reason(result: dict[str, Any]) -> str | None:
     if result.get("run_complete"):
         return "run_complete"
@@ -389,11 +409,7 @@ def _stale_summary_lines(summary: dict[str, Any]) -> list[str]:
             "inspected state - that is fine)."
         ]
     executed_actions = summary.get("executed_actions")
-    rendered = ""
-    if isinstance(executed_actions, list):
-        rendered = ", ".join(
-            str(name).strip() for name in executed_actions[:10] if str(name).strip()
-        )
+    rendered = _format_executed_actions(executed_actions) if isinstance(executed_actions, list) else ""
     if summary.get("game_over"):
         fatal = str(summary.get("fatal_action") or "")
         lines.append(
@@ -3641,6 +3657,9 @@ class ToolAgent:
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
+        self._pending_animation_samples: list[tuple[str, dict[str, Any]]] = []
+        self._pending_intermediate_images: list[tuple[str, dict[str, Any]]] = []
+        self._current_history_entry: tuple[int, HistoryEntry] | None = None
         self._pending_diff_image_label: str = ""
         self._turn_diff_image: dict[str, Any] | None = None
         self._turn_diff_image_label: str = ""
@@ -3990,16 +4009,6 @@ class ToolAgent:
                     "Redefine any helpers you still need after checking their assumptions "
                     "against the new board."
                 )
-        elif (
-            summary.get("level_transition")
-            and _persistent_functions_scope() == "game"
-            and _persistent_functions()
-            and getattr(self, "_kept_functions", None)
-        ):
-            self._retained_clear_notice = (
-                "Your retained functions remain available from previous levels. "
-                "Check level-specific assumptions against the new board before reusing them."
-            )
         if summary.get("level_transition"):
             # read at call time (not a module constant) so this patch's hunks
             # stay clear of the env-knob block that other patches extend
@@ -4129,13 +4138,18 @@ class ToolAgent:
         prev_step = getattr(previous_frame, "step", None)
         cur_step = getattr(current_frame, "step", None)
         span = f"step {prev_step} -> {cur_step}"
+        entries = getattr(self, "_prompt_history_entries", [])
+        indices = [next((index for index, entry in enumerate(entries)
+                         if entry.frame == frame), None)
+                   for frame in (previous_frame, current_frame)]
+        if all(index is not None for index in indices):
+            span = f"history[{indices[0]}].frame -> history[{indices[1]}].frame"
         if _DIFF_IMAGE:
             part = diff_image_part(previous_frame, current_frame)
             if part is not None and previous_frame.grid != current_frame.grid:
                 label = (
-                    f"Diff image ({span}): cells that changed since your previous "
-                    "analyzer turn in their new true color; unchanged cells dimmed "
-                    "to dark navy (an off-palette color)."
+                    f"Diff image ({span}): cells that changed keep their true color; "
+                    "unchanged cells dimmed to dark navy."
                 )
                 self._pending_diff_image = part
                 self._pending_diff_image_label = label
@@ -4459,7 +4473,7 @@ class ToolAgent:
             diff_image_part,
         )
 
-        entries = list(history_entries or [])
+        entries = [entry for entry in history_entries if entry.frame is not None]
         if len(entries) < 3 or str(entries[-1].action or "").upper() != "RESET":
             return
         death = entries[-2]
@@ -4470,9 +4484,8 @@ class ToolAgent:
         if death_part is not None:
             self._pending_gameover_images.append(
                 (
-                    "Death frame image (the board at the moment the attempt "
-                    "ended, before the automatic reset): inspect the budget bar "
-                    "here for the BAR RULE.",
+                    f"history[{len(entries) - 2}].frame (after {death.action}): "
+                    "this is the DEATH board.",
                     death_part,
                 )
             )
@@ -4483,10 +4496,10 @@ class ToolAgent:
         if fatal_part is not None and last_alive.frame.grid != death.frame.grid:
             self._pending_gameover_images.append(
                 (
-                    "Fatal step diff image (last alive frame -> death frame): "
-                    "cells changed by the killing action in their new true "
-                    "color; unchanged cells dimmed to dark navy (an off-palette "
-                    "color).",
+                    f"Fatal step diff image (history[{len(entries) - 3}].frame -> "
+                    f"history[{len(entries) - 2}].frame): "
+                    "cells changed by the killing action keep their true color; "
+                    "unchanged cells dimmed to dark navy.",
                     fatal_part,
                 )
             )
@@ -4609,6 +4622,9 @@ class ToolAgent:
         mode = animation_death_image_mode()
         if mode == "off" or not summary:
             return
+        if mode == "sampled":
+            self._pending_gameover_images.extend(animation_sampled_parts(self._last_animation_chain or []))
+            return
         animation = summary.get("animation") or {}
         if not int(animation.get("transient_pixels") or 0):
             return
@@ -4661,6 +4677,9 @@ class ToolAgent:
         mode = animation_image_mode()
         if mode == "off" or not summary:
             return
+        if mode == "sampled":
+            self._pending_animation_samples = animation_sampled_parts(self._last_animation_chain or [])
+            return
         if self._last_action_gameplay_changed is not False:
             return
         animation = summary.get("animation") or {}
@@ -4708,10 +4727,10 @@ class ToolAgent:
             if signatures:
                 scope = {"levelup": "on this level", "turn": "in this turn", "game": "in this game"}[_persistent_functions_scope()]
                 parts.append(
-                    "Your retained functions from earlier Python calls " + scope + ": "
-                    + ", ".join(signatures) + ". These are your previous definitions, "
-                    "available to call directly. Their presence does not mean they are "
-                    "correct; revise them if new evidence contradicts their assumptions."
+                    "Retained functions " + scope + ": " + ", ".join(signatures) + ". "
+                    + ("Check level-specific assumptions against the new board before reusing them."
+                       if (self._last_step_summary or {}).get("level_transition") else
+                       "Recheck them when new evidence contradicts their assumptions.")
                 )
             self._retained_clear_notice = ""
             return "\n\n" + "\n".join(parts) if parts else ""
@@ -4782,12 +4801,16 @@ class ToolAgent:
         diff_label = self._pending_diff_image_label
         animation_part = self._pending_animation_image
         animation_label = self._pending_animation_image_label
+        animation_samples = list(self._pending_animation_samples)
         gameover_images = list(self._pending_gameover_images)
+        intermediate_images = list(getattr(self, "_pending_intermediate_images", []))
         self._pending_diff_image = None
         self._pending_diff_image_label = ""
         self._pending_animation_image = None
         self._pending_animation_image_label = ""
+        self._pending_animation_samples = []
         self._pending_gameover_images = []
+        self._pending_intermediate_images = []
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -4796,19 +4819,68 @@ class ToolAgent:
         if image_part is None:
             return {"role": "user", "content": user_prompt}
 
-        content: list[dict[str, Any]] = [
-            {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
-            image_part,
-        ]
-        if diff_part is not None:
-            content.append({"type": "text", "text": diff_label})
-            content.append(diff_part)
-        if animation_part is not None:
-            content.append({"type": "text", "text": animation_label})
-            content.append(animation_part)
-        for label, part in gameover_images:
-            content.append({"type": "text", "text": label})
-            content.append(part)
+        # Both experiments use this layout; only their optional images differ.
+        anchors = getattr(self, "_prompt_image_anchors", {})
+        fatal_turn = "death" in anchors
+        death_boards = [(label, part) for label, part in gameover_images if "DEATH board" in label]
+        fatal_diffs = [(label, part) for label, part in gameover_images if label.startswith("Fatal step diff image")]
+        fatal_animations = [(label, part) for label, part in gameover_images
+                            if "DEATH board" not in label and not label.startswith("Fatal step diff image")]
+        history = getattr(self, "_prompt_history_entries", [])
+        if not death_boards and len(history) >= 3 and fatal_turn:
+            death_index = len(history) - 2
+            death_boards = [
+                (label[:-1] + ": this is the DEATH board.", part)
+                for label, part in intermediate_images
+                if label.startswith(f"history[{death_index}].frame ") or label.startswith(f"{death_index} (")
+            ]
+        if death_boards:
+            death_index = len(history) - 2
+            # Show the death board once, after its animation.
+            intermediate_images = [(label, part) for label, part in intermediate_images
+                                   if not (label.startswith(f"history[{death_index}].frame ")
+                                           or label.startswith(f"{death_index} ("))]
+        current_label = "This is the CURRENT board to act on."
+        current_entry = getattr(self, "_current_history_entry", None)
+        if current_entry is not None and current_entry[1].frame == current_frame:
+            index, entry = current_entry
+            caption = f"history[{index}].frame"
+            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) or intermediate_images:
+                caption += f" (after {entry.action})"
+            current_label = f"{caption}: this is the CURRENT board to act on."
+        current_images = [(current_label, image_part)]
+        diff_images = [(diff_label, diff_part)] if diff_part else []
+        animations = animation_samples + ([(animation_label, animation_part)] if animation_part else [])
+        # Earlier actions precede the last action's animation and resulting
+        # board. Fatal turns then show RESET and the alive -> death diff.
+        groups = {
+            "actions": intermediate_images,
+            "death" if fatal_turn else "animation": (
+                animations + fatal_animations + death_boards + current_images + fatal_diffs + diff_images
+            ),
+        }
+        placements = []
+        for name, parts in groups.items():
+            anchor = anchors.get(name) or anchors.get("actions", "")
+            before_state = not anchor
+            if before_state:
+                anchor = anchors.get("current", "")
+            start = user_prompt.find(anchor) if anchor else -1
+            end = start + (0 if before_state else len(anchor)) if start >= 0 else len(user_prompt)
+            placements.append((end, parts))
+        placements.sort(key=lambda item: item[0])
+        content = []
+        cursor = 0
+        for end, parts in placements:
+            if not parts:
+                continue
+            if user_prompt[cursor:end].strip():
+                content.append({"type": "text", "text": user_prompt[cursor:end]})
+            for label, part in parts:
+                content.extend([{"type": "text", "text": label}, part])
+            cursor = end
+        if user_prompt[cursor:].strip():
+            content.append({"type": "text", "text": user_prompt[cursor:]})
         return {"role": "user", "content": content}
 
 
@@ -4880,13 +4952,9 @@ class ToolAgent:
             return []
         label = "action" if normalized == 1 else "actions"
         lines.append(f"The code executed {normalized} {label} in the previous sequence.")
-        rendered = summary.get("executed_actions") or []
+        rendered = _format_executed_actions(summary.get("executed_actions") or [])
         if rendered:
-            prefix = (
-                "Executed actions:" if len(rendered) <= 10
-                else "Executed actions (first 10):"
-            )
-            lines.append(f"{prefix} {', '.join(str(a) for a in rendered[:10])}.")
+            lines.append(f"Executed actions: {rendered}.")
         changed = summary.get("gameplay_changed")
         if _report_gameplay_changed():
             if changed is True:
@@ -4930,7 +4998,17 @@ class ToolAgent:
         history_entries: list[HistoryEntry] | None = None,
         previous_step_summary: dict[str, Any] | None = None,
     ) -> str:
+        self._prompt_image_anchors: dict[str, str] = {}
         history_entries = history_entries or []
+        board_sequence = current_grid_image_enabled() and (
+            _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) or bool(getattr(self, "_pending_intermediate_images", []))
+        )
+        self._current_history_entry = None
+        self._prompt_history_entries = [entry for entry in history_entries if entry.frame is not None]
+        if current_frame is not None:
+            for index, entry in enumerate(self._prompt_history_entries):
+                if entry.frame.step == current_frame.step and entry.frame == current_frame:
+                    self._current_history_entry = (index, entry)
         current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
         current_level = current_frame.level if current_frame is not None else 1
         summary_level = None
@@ -4946,6 +5024,8 @@ class ToolAgent:
             default=current_level,
         )
         lines: list[str] = []
+        level_status_line = ""
+        event_lines: list[str] = []
         if previous_step_summary and previous_step_summary.get("stale"):
             lines.extend(_stale_summary_lines(previous_step_summary))
         elif previous_step_summary:
@@ -4955,16 +5035,19 @@ class ToolAgent:
             except (TypeError, ValueError):
                 normalized_count = None
             action_label = "action" if normalized_count == 1 else "actions"
-            lines.append(f"The code executed {normalized_count or 0} {action_label} in the previous sequence.")
+            opener = f"The code executed {normalized_count or 0} {action_label}"
+            if previous_step_summary.get("game_over"):
+                opener += "; the environment then automatically RESET the current level after GAME OVER"
+            lines.append(opener + ".")
             executed_actions = previous_step_summary.get("executed_actions")
             rendered_actions: list[str] = []
             if isinstance(executed_actions, list):
                 rendered_actions = [str(name).strip() for name in executed_actions if str(name).strip()]
             if rendered_actions:
-                action_prefix = "Executed actions (first 10):" if len(rendered_actions) > 10 else "Executed actions:"
-                lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
+                lines.append(f"Executed actions: {_format_executed_actions(rendered_actions)}.")
             else:
                 lines.append("Executed actions: none.")
+            self._prompt_image_anchors["actions"] = lines[-1]
             if _report_gameplay_changed() and normalized_count:
                 # Whether the sequence MOVED anything. The harness computes this
                 # for every action - it drives the batch stop - and until now
@@ -4997,157 +5080,92 @@ class ToolAgent:
                 if animation_line:
                     lines.append(animation_line)
                 self._prepare_animation_image(previous_step_summary)
+                if self._pending_animation_samples and not animation_line:
+                    animation_line = "Last action animation (sampled):"
+                    lines.append(animation_line)
+                if animation_line:
+                    self._prompt_image_anchors["animation"] = animation_line
             no_op_stops = previous_step_summary.get("no_op_stops") or []
             for stop in no_op_stops[:3]:
+                index = int(stop.get("index") or 1)
                 skipped = stop.get("skipped") or []
-                skipped_text = (
-                    f" The remaining {len(skipped)} action(s) {skipped!r} were skipped."
-                    if skipped
-                    else ""
+                text = (
+                    f"Action {index}, {stop.get('action')}, executed but changed nothing "
+                    "in the board interior."
                 )
-                lines.append(
-                    f"Note: a batched sequence was stopped by the no-op guard: action "
-                    f"{stop.get('action')!r} (position {stop.get('index')} in that batch) "
-                    + (f"executed but produced no change inside the board area.{skipped_text} "
-                       if _new_noop_wording() else
-                       f"executed but changed nothing outside the border.{skipped_text} ")
-                    +
-                    "That action IS included in the executed list above, so it is the "
-                    f"LAST of them - only the first {max(0, int(stop.get('index') or 1) - 1)} "
-                    "executed action(s) moved anything. Do not count submitted or executed "
-                    "actions to update your position; re-locate from current_frame."
-                )
-                trace = stop.get("trace") or []
-                if trace:
-                    lines.append("Per-action trace: " + "; ".join(str(t) for t in trace) + ".")
+                if len(skipped) == 1:
+                    text += (
+                        f" The no-op guard stopped the batch before action {index + 1}, "
+                        f"{skipped[0]}, which was never executed."
+                    )
+                elif skipped:
+                    text += (
+                        f" The no-op guard skipped the remaining {len(skipped)} actions, "
+                        f"starting at action {index + 1}; none were executed."
+                    )
+                else:
+                    text += " The no-op guard stopped the batch after this action."
+                event_lines.append(text)
             if len(no_op_stops) > 3:
-                lines.append(
+                event_lines.append(
                     f"({len(no_op_stops) - 3} further no-op guard stop(s) occurred this sequence.)"
                 )
             guard_stops = previous_step_summary.get("guard_stops") or []
             for stop in guard_stops[:3]:
                 skipped = stop.get("skipped") or []
-                skipped_text = (
-                    f" The remaining {len(skipped)} action(s) ({skipped!r}) were never executed."
-                    if skipped
-                    else ""
-                )
                 if stop.get("kind") == "stale_state":
-                    # the exception said this in the turn where it happened;
-                    # restated here because the plan being void is worth
-                    # carrying into the turn that has to replace it
-                    lines.append(
-                        f"Note: the sequence was stopped before {stop.get('action')!r} - an "
-                        + ("earlier action in that snippet produced no change inside the "
-                           "board area, so the positions and "
-                           if _new_noop_wording() else
-                           "earlier action in that snippet changed nothing, so the positions and ")
-                        +
-                        f"paths it had computed may have been wrong.{skipped_text} Re-ground on "
+                    text = (
+                        f"The next action, {stop.get('action')}, was not executed: an earlier "
+                        "action in the snippet changed nothing in the board interior, so the "
+                        "snippet's computed positions and paths may be stale. Re-ground on "
                         "the current board before planning again."
                     )
                 elif stop.get("kind") == "known_death":
-                    lines.append(
-                        f"Note: the sequence was stopped before {stop.get('action')!r} - that "
-                        "action ended a previous attempt from that exact board state, so it was "
-                        f"NOT executed and the attempt is intact.{skipped_text} Plan a different "
-                        "move, or repeat it deliberately if you now believe it is safe."
+                    text = (
+                        f"The next action, {stop.get('action')}, was not executed: it ended "
+                        "a previous attempt from this exact board state; the attempt is intact. "
+                        "Plan a different move, or repeat it deliberately if you now believe it is safe."
                     )
                 else:
-                    lines.append(
-                        f"Note: the sequence was stopped before {stop.get('action')!r} - that "
-                        + ("action already produced no change inside the board area in that "
-                           "exact board state, so it was "
-                           if _new_noop_wording() else
-                           "action already changed nothing in that exact board state, so it was ")
-                        +
-                        f"NOT executed and no action was spent.{skipped_text}"
+                    text = (
+                        f"The next action, {stop.get('action')}, was not executed: it already "
+                        "changed nothing in the board interior in this exact board state; no action was spent."
                     )
-                trace = stop.get("trace") or []
-                if trace:
-                    lines.append("Per-action trace: " + "; ".join(str(t) for t in trace) + ".")
+                if len(skipped) > 1:
+                    text += f" All {len(skipped)} remaining actions were skipped and never executed."
+                event_lines.append(text)
             if len(guard_stops) > 3:
-                lines.append(
+                event_lines.append(
                     f"({len(guard_stops) - 3} further guard stop(s) occurred this sequence.)"
                 )
             if previous_step_summary.get("run_complete"):
-                lines.append("You have completed the run!")
+                level_status_line = "You have completed the run!"
             elif previous_step_summary.get("level_transition"):
-                lines.append(
+                level_status_line = (
                     LEVEL_START_USER_PROMPT
                     if _level_transfer_guidance_enabled()
                     else "You have progressed to a new level!"
                 )
-            else:
-                lines.append(
-                    self._manual_reset_context_line(previous_step_summary)
-                    or "You are still on the same level."
-                )
+            elif not previous_step_summary.get("game_over"):
+                level_status_line = (self._manual_reset_context_line(previous_step_summary)
+                                     or "You are still on the same level.")
             if previous_step_summary.get("game_over"):
-                lines.append(
-                    "GAME OVER: the attempt failed. The game automatically RESET the "
-                    "current level; completed levels are kept.\n\n"
-                    "Before acting, diagnose the death:\n"
-                    "- `history[-1].action` is RESET.\n"
-                    "- `history[-2].action` is the fatal action; `history[-2].frame` "
-                    "is the death frame.\n"
-                    "- `history[-3].frame` is the board before the fatal action.\n\n"
-                    "BAR RULE: the border budget bar normally shrinks with each "
-                    "action. Attribute death to the budget ONLY if the bar is fully "
-                    "or almost depleted in the death frame. Then use fewer actions "
-                    "or find a way to refill it. "
-                    "If budget clearly remains, then the last action must trigger some mechanism that leads to death. "
-                    "What is that mechanism, and how to avoid it?"
-                )
-                game_over_trace = previous_step_summary.get("game_over_trace") or []
-                if game_over_trace:
-                    lines.append(
-                        "Previous sequence: "
-                        + "; ".join(
-                            str(t).replace(
-                                "GAME OVER (attempt ended immediately after this action)",
-                                "GAME OVER",
-                            )
-                            for t in game_over_trace
-                        )
-                        + "."
-                    )
-                else:
-                    fatal_action = str(previous_step_summary.get("fatal_action") or "")
-                    if fatal_action:
-                        lines.append(f"Previous sequence: {fatal_action} -> GAME OVER.")
                 if _animation_enabled():
-                    death_animation = previous_step_summary.get("animation") or {}
-                    frames = death_animation.get("frames")
-                    if frames and int(frames) > 1:
-                        accessors = "`last_animation_frames`"
-                        if _animation_timeline_enabled():
-                            accessors += " or `last_animation_timeline`"
-                        animation_line = f"The fatal action animated over {frames} frames. "
-                        transient = int(death_animation.get("transient_pixels") or 0)
-                        if transient > 0:
-                            cells = "1 cell" if transient == 1 else f"{transient} cells"
-                            where = _animation_bbox_phrase(death_animation.get("transient_bbox"))
-                            animation_line += f"{cells} changed more than once{where}. "
-                        lines.append(animation_line + f"Inspect {accessors}.")
-                self._prepare_gameover_images(
-                    history_entries, previous_step_summary
-                )
-                if _get_env_bool("ARC3_GAMEOVER_DIFF", False):
-                    # read at call time so this patch's hunks stay clear of the
-                    # env-knob block that other patches extend
-                    lines.extend(
-                        self._game_over_diff_lines(
-                            history_entries, previous_step_summary
-                        )
+                    animation_line = describe_animation(
+                        previous_step_summary.get("animation"),
+                        action_display=(previous_step_summary.get("fatal_action")
+                                        or previous_step_summary.get("animation_action")),
+                        gameplay_changed=self._last_action_gameplay_changed,
+                        game_over=True,
+                        timeline=_animation_timeline_enabled(),
                     )
-                lines.append(
-                    "Do NOT re-submit this same series of moves: the game is "
-                    "deterministic, so replaying the sequence that just killed you "
-                    "will kill you again. Change the plan BEFORE the fatal point - a "
-                    "different route, action, or timing. If you believe the same "
-                    "moves 'should' work, that belief is exactly what this death falsified."
-                )
+                    if animation_line:
+                        lines.append(animation_line)
+                self._prompt_image_anchors["death"] = lines[-1]
+                self._prepare_gameover_images(history_entries, previous_step_summary)
+                event_lines.append(GAME_OVER_USER_PROMPT)
+                if _get_env_bool("ARC3_GAMEOVER_DIFF", False):
+                    event_lines.extend(self._game_over_diff_lines(history_entries, previous_step_summary))
         elif (current_frame is not None and current_frame.step > 0) or action_num > 0:
             lines.append("No previous action sequence was captured.")
         else:
@@ -5186,12 +5204,12 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
-        lines.extend(
-            [
-                state_line,
-                f"Valid actions right now: {_format_valid_action_line(valid_actions)}.",
-            ]
-        )
+        self._prompt_image_anchors["current"] = state_line
+        lines.append(state_line)
+        if level_status_line:
+            lines.append(level_status_line)
+        lines.extend(event_lines)
+        lines.append(f"Valid actions right now: {_format_valid_action_line(valid_actions)}.")
         # recording is independent of display: the guard needs the ledger even
         # when the advisory lines are switched off
         self._death_ledger_observe(history_entries, previous_step_summary)
@@ -5205,24 +5223,18 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
-        # The tool mechanics this opener used to repeat every turn - the tool and
-        # its globals, no numeric grid, compact output, how to diff the latest
-        # change, call and batch action(), the tool-call format, MOUSE row/col -
-        # are all in the system prompt (runtime state, visual game, Python tool
-        # and tool session sections), so they are not restated here. The
-        # methodology lines (inspect and score candidates, ground on turn one,
-        # then focus on the latest change) stay as a per-turn nudge.
-        #
-        # The world-model lines stay too: they introduce the memory block that
-        # follows in this message. With ARC3_MEMORY_SECTIONS=off that block is
-        # suppressed, and so are they - upstream's version told the model to
-        # revise a world model it was never shown, and replies carrying any
-        # assistant text dropped from 76% to 43%. That arm keeps the first
-        # sentence without its world-model clause.
+        # Event prompts already supply guidance; ordinary turns keep the common
+        # nudge. Memory-enabled arms retain the instructions for their memory block.
         if _memory_sections_disabled():
-            lines.append(
-                "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
-            )
+            has_event_guidance = bool(previous_step_summary and (
+                previous_step_summary.get("game_over")
+                or previous_step_summary.get("level_transition")
+                or previous_step_summary.get("run_complete")
+                or previous_step_summary.get("no_op_stops")
+                or previous_step_summary.get("guard_stops")
+            )) or bool(self._prompt_image_anchors.get("animation"))
+            if not has_event_guidance:
+                lines.append(CONTINUE_USER_PROMPT)
         else:
             lines.extend(
                 [
@@ -5246,7 +5258,7 @@ class ToolAgent:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
             )
-        else:
+        elif not _memory_sections_disabled():
             lines.append(
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )
@@ -6110,6 +6122,12 @@ class ToolAgent:
         if step_executed:
             self._last_step_summary = self._summarize_step_sequence(action_results)
             self._update_summarized_knowledge_from_step_summary()
+            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) and current_frame is not None:
+                final_frame, updated_history = load_runtime_state(state_path)
+                if final_frame is not None:
+                    self._pending_intermediate_images = intermediate_frame_parts(
+                        updated_history, after_step=current_frame.step, before_step=final_frame.step,
+                    )
         elif self._last_step_summary and not self._last_step_summary.get("stale"):
             # carried over across an exchange that executed nothing: mark it so
             # the next prompt reminds instead of re-narrating it as fresh

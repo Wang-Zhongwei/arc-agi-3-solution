@@ -14,9 +14,12 @@
 
 ## Submit to Kaggle
 
-- Use `make kaggle-duck CONFIG_PATH=configs/<experiment>.json` with the intended `KAGGLE_USERNAME`, `KAGGLE_KERNEL_SLUG`, and `KAGGLE_DATASET_REF`. Confirm the destination and effective settings before pushing.
+- Use `make kaggle-duck CONFIG_PATH=configs/<experiment>.json` with the intended `KAGGLE_USERNAME`, `KAGGLE_KERNEL_SLUG`, and `KAGGLE_DATASET_REF`. State the resolved destination and effective settings before pushing.
+- A request to push the configured notebook authorizes uploading its source bundle to the established account/source dataset and launching that notebook. Reuse that authorization; ask only if the destination or scope is unclear or changes, or a tool approval review requires it.
+- Use `KAGGLE_DRY_RUN=true` for preparation-only requests. Once a push is requested, run the normal Make command directly; do not repeat dry runs, dependency installs, or preflights without a concrete failure to investigate. Report any retry and its reason.
 - Kaggle numbers notebook versions automatically; keep version numbers out of notebook slugs/titles and dataset slugs. A version in a config path (`configs/scheduling/v1.json`) is the Kaggle notebook version only; one experiment is one notebook.
 - Keep credentials outside Git. If using a configured alternate profile, prefix the command with `kaggle-as <profile>` and ensure private input datasets are shared with that account.
+- Keep legacy `KAGGLE_KEY` separate from `KAGGLE_API_TOKEN`. Preserve an explicit access token or let the CLI find cached credentials; never copy a legacy key into the token variable or print credential values.
 - Resolve both flat and namespaced Kaggle mounts for wheelhouses and datasets. Prefer this run's packaged TAAF source over a serving bundle's copy.
 - Record the pushed version. `QUEUED` or `RUNNING` means submitted, not evaluated; report results only from completed, exact-version artifacts.
 

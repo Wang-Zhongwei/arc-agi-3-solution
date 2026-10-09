@@ -96,6 +96,18 @@ Added images that show changed cells in their true palette colors while dimming 
 
 The original `MULTIMODAL_CONTEXT=current_grid` and `MULTIMODAL_UPSCALE` settings remain the basic image controls. The latter’s source default is 16; running at 10× is a notebook configuration choice, not a new fixed default. Filtering historical images changes request prefixes and can affect prefix reuse.
 
+### Boards between actions
+
+| Config field | Environment variable | Default | Behavior |
+|---|---|---|---|
+| `multimodal.intermediate_frames` | `MULTIMODAL_INTERMEDIATE_FRAMES` | `false` | Attach the boards after actions within the previous Python call, in action order, excluding the final board already shown as current. Includes boards across multiple `action(...)` calls and a fatal board before automatic RESET. Requires `current_grid`. |
+| `multimodal.intermediate_upscale` | `MULTIMODAL_INTERMEDIATE_UPSCALE` | Inherit `multimodal.upscale` | Positive integer scale for those intermediate boards. |
+| `multimodal.animation_upscale` | `MULTIMODAL_ANIMATION_UPSCALE` | Inherit `multimodal.upscale` | Positive integer scale for sampled/peak/composite animation images, including fatal-action animations. |
+
+Intermediate boards use the existing per-action history; they are separate from animation frames within one action. Each is labeled `history[i].frame (after ACTION):`, using its index in the complete game history (initial board at index 0), directly after the executed-action text. Sampled animation images follow the animation text, labeled `last_animation_frames[i]:` with the exact zero-based index in that list; sampling never renumbers them. The existing timeline uses transition step `i + 1`. The current board sits beside the current-state text when these extra images are present. A single action without an automatic reset adds no intermediate board. Current and diff images keep using `multimodal.upscale`. These images follow normal history trimming and `ARC3_HISTORY_IMAGE_KEEP`.
+
+Upscale 2 produces a 128×128 PNG for a 64×64 board. Daniel's pinned processor subsequently enlarges it to 256×256, so it has the same visual-token count as upscale 4; see [processor previews](../docs/multimodal/README.md).
+
 ### Intermediate animation frames
 
 Added capture of intermediate frames returned by an action, consecutive-frame deduplication, transient-pixel detection, and compact animation metadata. This recovers information that disappears before the final board is returned.
@@ -104,8 +116,8 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
-| `ARC3_ANIMATION_IMAGE` | `off` | `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Ordinary animation imagery is attached for transient activity when the gameplay area did not change. |
-| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `peak`/`composite` option for the fatal action’s animation. |
+| `ARC3_ANIMATION_IMAGE` | `off` | `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity when the gameplay area did not change. |
+| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `sampled`/`peak`/`composite` option for the fatal action’s animation. |
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 
@@ -430,7 +442,7 @@ These extend the original time-based yielding/tool-step controls. They do not me
 |---|---|---|
 | `ARC3_REASONING_HISTORY_KEY` | `reasoning` | Configures the reasoning field(s) retained in request history, including `reasoning_content` for compatible servers/models. |
 | `ARC3_PRESERVE_THINKING` | `1` | Sends `preserve_thinking` in chat-template kwargs. False disables it; an empty value omits it. Preserves other template options such as enable-thinking. |
-| `LOCAL_ANALYZER_THINKING_TOKEN_BUDGET` (`analyzer.thinking_token_budget`) | `0`: disabled | Caps the thinking tokens of each gameplay request: the server then forces `</think>` and the model answers in the same request. The rolling summary and requests with thinking off are not budgeted, and the budget is off when `LOCAL_ANALYZER_MAX_OUTPUT` is at or below it. On Pennyroyal, setting it in `harness_env` also launches sglang with `--enable-strict-thinking` (override with `kaggle.sglang.STRICT_THINKING`). |
+| `LOCAL_ANALYZER_THINKING_TOKEN_BUDGET` (`analyzer.thinking_token_budget`) | `0`: disabled | Caps the thinking tokens of each gameplay request: the server then forces `</think>` and the model answers in the same request. The rolling summary and requests with thinking off are not budgeted, and the budget is off when `LOCAL_ANALYZER_MAX_OUTPUT` is at or below it. On Pennyroyal, a nonzero budget also launches sglang with `--enable-strict-thinking` (override with `kaggle.sglang.STRICT_THINKING`). |
 | `ARC3_THINKING_BUDGET_MODE` | `auto` | Which request field carries the budget. `vllm` sends `thinking_token_budget`. `sglang` sends `custom_params.thinking_budget`, enforced by its reasoner grammar under `--enable-strict-thinking` (which also keeps tool-call and end-of-turn tokens out of thinking); it works with EAGLE/MTP speculative decoding. `auto` reads `owned_by` from `/models`, and on sglang logs an error if `/server_info` shows strict thinking off, since the budget would then be ignored. |
 | `ARC3_REASONING_EFFORT_LADDER` | Empty: disabled | After output-length truncation, moves through configured reasoning-effort values, usually toward less reasoning. Resets after an action executes. |
 | `ARC3_TOOLCALL_TEXT_FALLBACK` | On | Recovers recognizable tool calls emitted as text/markup when the backend did not produce structured tool-call objects. |
@@ -487,12 +499,38 @@ These changes do not increase the server’s true context limit. Correctly match
 | `public_max_generated_tokens_per_game` | `null` | Generated-token cap per public game across all levels. `null` uses the legacy `environment.max_generated_tokens_per_game` cap if configured; zero disables it. Private competition reruns, emulated submissions, and local runs ignore this option. |
 | `private_runtime_minutes` | `532` | Per-game cap in minutes. With every game in one wave it is the competition run's play time, which ignores the soft end. It also caps public games, where the soft end normally binds first. |
 | `concurrent_jobs` | `120` | Game lanes. Keep it at or above the game count (about 110 hidden games) so every game runs in one wave; the notebook raises it to the trial count when it is lower. |
-| `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. |
+| `serving` | `vllm` | `pennyroyal` selects Daniel Franzen's SGLang launcher; `lordhansolo` selects Lord Hansolo's pinned, patched vLLM image runtime. Both use `wheelhouse_dataset_source` and `model_source` from the config. All three hand the harness the same settings; see [Harness settings in a config](#harness-settings-in-a-config). |
+| `sglang` | Pennyroyal launcher defaults | With `serving=pennyroyal`, overrides the launcher's `CFG` engine settings, e.g. `CTX`, `MAXREQ`, `MEMFRAC`, `MAMBA_CACHE`, and the optional switches below. |
 | `vllm` | Lord launcher defaults | With `serving=lordhansolo`, passes engine settings to the pinned launcher's `DuckKaggleVllmConfig`, including `max_model_len`, cache dtypes, `max_num_seqs`, MTP tokens, prefix-cache controls, and `draft_vocab`. The draft vocabulary path is relative to `ARC3-Inference/`. |
 | `default_chat_template_kwargs` | `{"preserve_thinking": true}` | With `serving=lordhansolo`, sets the server's template defaults without importing the source notebook's `xhigh` reasoning setting. |
 | `private_waves` | `1` | With `serving=lordhansolo`, opts competition reruns into multiple waves with the priority scheduler. Lanes are rounded up from the live trial count divided by waves. The remaining `private_runtime_minutes` budget, measured from notebook start, is divided between waves after engine startup. Public runs keep one wave. UCB rejects multiple waves. |
 
 By default every game runs in one wave: all games start together and the admission gate (`ARC3_MAX_ACTIVE_STREAMS`) decides which ones generate. The UCB scheduler requires this, because the gate keeps one shared clock from the first game's start. Priority scheduling can opt into private waves as described above. The 1001 submission ran 28 lanes × 132 minutes, so about 110 hidden games ran in four waves.
+
+### Harness settings in a config
+
+Each setting has one place. A setting with a typed field goes in that field; `harness_env` carries everything else (`ARC3_*`, `LOCAL_ANALYZER_YIELD_TOKENS`, ...). A `harness_env` key that repeats a typed field stops the run and names the field to use.
+
+| Field | Harness variable |
+|---|---|
+| `shared.context_window` (or `analyzer.context_window`) | `LOCAL_ANALYZER_CONTEXT_WINDOW` |
+| `analyzer.max_output`, `.thinking_token_budget`, `.temperature`, `.top_p`, `.top_k`, `.tool_steps`, `.tool_timeout`, `.tool_output_tokens`, `.yield_seconds`, `.app_name`, `.site_url`, `.timeout` | `LOCAL_ANALYZER_` + the name in capitals |
+| `analyzer.thinking` | `LOCAL_ANALYZER_ENABLE_THINKING` |
+| `multimodal.context`, `multimodal.upscale` | `MULTIMODAL_CONTEXT`, `MULTIMODAL_UPSCALE` |
+| `multimodal.intermediate_frames`, `multimodal.intermediate_upscale`, `multimodal.animation_upscale` | `MULTIMODAL_INTERMEDIATE_FRAMES`, `MULTIMODAL_INTERMEDIATE_UPSCALE`, `MULTIMODAL_ANIMATION_UPSCALE` |
+
+Every `kaggle.serving` option hands the harness these fields plus `harness_env`, applied after the launcher's own defaults, so the serving never changes the harness settings. A field left out takes the Makefile default (for example `analyzer.yield_seconds` 60, `multimodal.upscale` 16). `analyzer.timeout` is the one exception: `make kaggle-duck` sets the request timeout to 900 seconds. `tests/test_serving_config.py` runs each serving's real handoff for every config under `configs/`.
+
+Optional `kaggle.sglang` switches for Daniel's pinned v2.5.3 wheelhouse. The launcher installs the hooks from this run's source bundle with `inference/framework/pennyroyal_patch.py`, which checks the SGLang version and source anchors before writing; a switch left off keeps the baseline code path.
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `OFFLOAD_EMBED_TOKENS` | `false` | Keeps the input `embed_tokens` table (~1.2 GiB BF16) in pinned host memory, gathered by the PLE kernel and shared with the MTP draft; the freed GPU memory goes to the KV pool. TP=1 and an untied `lm_head` only. PLE and the GPU `lm_head` are unchanged. |
+| `WIDE_BF16_GEMM` | `false` | Candidate BF16 kernels for selected M=36–64 projection shapes; leaves the original M≤32 path unchanged. Unvalidated. |
+| `LOG_BF16_GEMM_SHAPES` | `false` | Enables Pennyroyal's unique `(M, N, K)` shape logging for BF16 dispatch. |
+| `MODEL_PRECACHE_THREADS` | `6` | Reader threads of the launcher's page-cache precache of the model and draft (185.4 GB), starting 60 s after server launch; `0` turns it off. Daniel's cell used `3`. See [startup read threads](../docs/serving/startup-read-threads.md). |
+| `MODEL_PRECACHE_EARLY` | `false` | Starts that precache right after the wheel precache, during the install, instead of 60 s after server launch. It outruns the loader and is evicted from page cache (1,011 s load with 12 threads), so leave it off. |
+| `PREFETCH_THREADS` | `8` | sglang's one-shard lookahead prefetch threads (`--weight-loader-prefetch-num-threads`). sglang's and Daniel's default is `4`. |
 
 ### RunPod runs
 

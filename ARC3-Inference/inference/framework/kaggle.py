@@ -76,13 +76,41 @@ _SERVING_KEYS = frozenset({
 })
 
 
+# Settings with a typed config field, which the Makefile reads and exports under
+# these names. Each has exactly one place in a config: its field, never
+# harness_env, so no precedence rule decides between two values.
+CONFIG_FIELDS = {
+    "LOCAL_ANALYZER_APP_NAME": "analyzer.app_name",
+    "LOCAL_ANALYZER_SITE_URL": "analyzer.site_url",
+    "LOCAL_ANALYZER_CONTEXT_WINDOW": "shared.context_window",
+    "LOCAL_ANALYZER_MAX_OUTPUT": "analyzer.max_output",
+    "LOCAL_ANALYZER_THINKING_TOKEN_BUDGET": "analyzer.thinking_token_budget",
+    "LOCAL_ANALYZER_TIMEOUT": "analyzer.timeout",
+    "LOCAL_ANALYZER_TEMPERATURE": "analyzer.temperature",
+    "LOCAL_ANALYZER_TOP_P": "analyzer.top_p",
+    "LOCAL_ANALYZER_TOP_K": "analyzer.top_k",
+    "LOCAL_ANALYZER_TOOL_STEPS": "analyzer.tool_steps",
+    "LOCAL_ANALYZER_TOOL_TIMEOUT": "analyzer.tool_timeout",
+    "LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS": "analyzer.tool_output_tokens",
+    "LOCAL_ANALYZER_YIELD_SECONDS": "analyzer.yield_seconds",
+    "LOCAL_ANALYZER_ENABLE_THINKING": "analyzer.thinking",
+    "MULTIMODAL_CONTEXT": "multimodal.context",
+    "MULTIMODAL_UPSCALE": "multimodal.upscale",
+    "MULTIMODAL_INTERMEDIATE_FRAMES": "multimodal.intermediate_frames",
+    "MULTIMODAL_INTERMEDIATE_UPSCALE": "multimodal.intermediate_upscale",
+    "MULTIMODAL_ANIMATION_UPSCALE": "multimodal.animation_upscale",
+}
+# kaggle-duck sets the request timeout through the solver (--analyzer-timeout).
+_NOT_HANDED_TO_KAGGLE = frozenset({"LOCAL_ANALYZER_TIMEOUT"})
+
+
 def harness_env() -> dict[str, str]:
     """Harness settings from the config's `harness_env` section.
 
-    The Makefile exports the section as ARC3_HARNESS_ENV_JSON. Any harness
-    variable is accepted (ARC3_*, LOCAL_ANALYZER_*, MULTIMODAL_*, ...) except
-    the endpoint keys, which the serving setup pins. Values are stringified
-    like any env var.
+    The Makefile exports the section as ARC3_HARNESS_ENV_JSON. It carries the
+    settings without a typed config field (ARC3_*, LOCAL_ANALYZER_YIELD_TOKENS,
+    ...); endpoint keys belong to the serving setup and typed settings to their
+    field. Values are stringified like any env var.
     """
     raw = os.environ.get("ARC3_HARNESS_ENV_JSON", "").strip()
     if not raw:
@@ -93,10 +121,28 @@ def harness_env() -> dict[str, str]:
     bad = sorted(str(key) for key in data if str(key) in _SERVING_KEYS)
     if bad:
         raise ValueError(f"harness_env cannot set serving endpoint keys {bad}")
+    typed = sorted(str(key) for key in data if str(key) in CONFIG_FIELDS)
+    if typed:
+        fields = ", ".join(f"{key} -> {CONFIG_FIELDS[key]}" for key in typed)
+        raise ValueError(f"harness_env repeats settings that have a config field; set them there: {fields}")
     return {
         str(key): ("1" if value is True else "0" if value is False else str(value))
         for key, value in data.items() if value is not None
     }
+
+
+def kaggle_harness_env() -> dict[str, str]:
+    """Every config setting a Kaggle run hands the harness, whatever the serving.
+
+    The typed fields as the Makefile exported them, plus harness_env. The two
+    never share a key. Each serving's setup command applies this last, after
+    its own defaults.
+    """
+    typed = {
+        key: os.environ[key] for key in CONFIG_FIELDS
+        if key not in _NOT_HANDED_TO_KAGGLE and os.environ.get(key, "").strip()
+    }
+    return {**typed, **harness_env()}
 
 
 def apply_harness_env() -> None:
@@ -139,7 +185,7 @@ def pennyroyal_setup_command() -> str:
             "served_model_name", "port", "server_startup_timeout_s", "sglang",
         ) if key in cfg
     }
-    spec["env"] = harness_env()
+    spec["env"] = kaggle_harness_env()
     launcher = "$TAAF_KAGGLE_BUNDLE_DIR/src/ARC3-Inference/inference/framework/pennyroyal_launch.py"
     return f'ARC3_PENNYROYAL_SPEC={shlex.quote(json.dumps(spec))} "$PYTHON" "{launcher}"'
 
@@ -173,15 +219,11 @@ def lordhansolo_setup_command() -> str:
         raise ValueError("Lord Hansolo launcher template changed; review the adapter")
     command = command.replace(original, repr(template))
     # The upstream launcher hands off its own analyzer defaults. Override them
-    # with our complete harness_env before the benchmark imports the agent.
+    # with this config's settings before the benchmark imports the agent.
     marker = "setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])"
     if command.count(marker) != 1:
         raise ValueError("Lord Hansolo launcher handoff changed; review the adapter")
-    overrides = harness_env()
-    overrides.setdefault(
-        "LOCAL_ANALYZER_THINKING_TOKEN_BUDGET",
-        os.environ.get("LOCAL_ANALYZER_THINKING_TOKEN_BUDGET", "0"),
-    )
+    overrides = kaggle_harness_env()
     overrides["ARC3_KAGGLE_PRIVATE_WAVES"] = str(cfg.get("private_waves", 1))
     overrides["ARC3_KAGGLE_PRIVATE_RUNTIME_MINUTES"] = str(cfg.get("private_runtime_minutes", 532))
     handoff = f"setup_env.update({overrides!r})\n"
@@ -261,7 +303,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MULTIMODAL_UPSCALE__": repr(os.environ.get("MULTIMODAL_UPSCALE", "4")),
         "__VLLM_TENSOR_PARALLEL_SIZE__": repr(int(cfg.tensor_parallel_size)),
         "__WHEELHOUSE_STAMP_TEXT__": repr(cfg.wheelhouse_stamp_text),
-        "__HARNESS_ENV__": repr(harness_env()),
+        "__HARNESS_ENV__": repr(kaggle_harness_env()),
     }
     script = _DUCK_VLLM_SETUP_SCRIPT
     for placeholder, value in replacements.items():
@@ -535,7 +577,7 @@ setup_env = {
     'MULTIMODAL_UPSCALE': __MULTIMODAL_UPSCALE__,
 }
 setup_env_path = Path(os.environ['TAAF_KAGGLE_SETUP_ENV'])
-# ARC3_* harness settings from the launcher config's harness_env section.
+# The config's settings (kaggle_harness_env), applied over the defaults above.
 setup_env.update(__HARNESS_ENV__)
 print('Harness env: ' + json.dumps(__HARNESS_ENV__, sort_keys=True), flush=True)
 existing_setup_env = {}
