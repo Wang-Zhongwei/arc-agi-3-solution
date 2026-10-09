@@ -44,3 +44,16 @@ From the server logs of the vcintel run (`vllm-openai-server.log`, latest output
 - **Images per request.** The launch caps each image at 409,600 pixels and disables video, but sets no image count. Sampled animation frames add up to eight 128×128 images per turn.
 - **Startup.** Lord's setup blocks until vLLM answers, for up to 3,600 s, before any game starts. The vcintel notebook warns its competition rerun is not supported, because Daniel's flow releases the harness after 12 minutes. Ours runs no game until the server is ready, as Lord's own submissions do, but the competition-rerun timing has not been tried with this config.
 - **Streams.** vcintel ran 13 streams, from the Intel checkpoint's KV pool (1,319,052 tokens in the vLLM log). This config keeps the harness's 10.
+
+## Run: ticbudja v1's harness on Lord's vLLM
+
+[`ticbudja/priority-one-wave-lord-vllm`](https://www.kaggle.com/code/ticbudja/priority-one-wave-lord-vllm) version 1 was pushed on 2026-10-09 from `8004f63` (branch `priority-one-wave-lord-vllm`) to test throughput. Config: [`configs/priority-one-wave-lord-vllm/v1.json`](../../ARC3-Inference/configs/priority-one-wave-lord-vllm/v1.json).
+
+It differs from [`ticbudja/thinking-budget-priority-four-waves`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-four-waves) version 1 (the v4 config at `92dece7`, submitted on 2026-10-08 for 30.78) only in serving:
+
+- **Config:** v4 with this page's serving swap. That means `serving: "lordhansolo"`, Lord's runtime dataset, the `vllm` block, no Pennyroyal drafter, `preserve_thinking`, `private_waves: 1` and `ARC3_MAX_ANALYZER_FAILURES=150`. The turn yield stays at 2,048, and no animation frames are added.
+- **Code:** `ARC3-Inference/inference/agent/` is restored byte for byte to `92dece7`. The serving, deploy and framework code is from `allocation-vc-one-wave` at `b36b03b`. The pushed bundle's 136 source files match `8004f63`, apart from three `.DS_Store` files, with no files from the main checkout. All 21 `inference/agent` and `inference/utils` files hash-match `92dece7`.
+- **Harness env:** 51 of 58 `ARC3_*`/`LOCAL_ANALYZER_*`/`MULTIMODAL_*` keys equal ticbudja v1's `taaf_setup_env.json`. The rest are serving or private-rerun plumbing: the analyzer URL, model id and provider (now set by Lord's setup), `ARC3_MAX_ANALYZER_FAILURES`, `ARC3_KAGGLE_PRIVATE_WAVES`/`_RUNTIME_MINUTES`, and `MULTIMODAL_INTERMEDIATE_FRAMES=false`, which the `92dece7` agent does not read.
+- **Run shape:** `public_runtime_minutes: 24`. The vcintel notebook's vLLM was ready 847 s after notebook start, so this leaves about 10 min of play. The private shape is 120 lanes, one wave and 532 min per game.
+
+Fetch it with `make pull-kaggle NOTEBOOK=ticbudja/priority-one-wave-lord-vllm VERSION=1`. It was RUNNING at the time of writing.
