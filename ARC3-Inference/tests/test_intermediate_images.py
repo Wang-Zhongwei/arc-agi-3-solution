@@ -467,6 +467,11 @@ def test_animation_guidance_is_shared_and_samples_follow_it(monkeypatch, tmp_pat
                                         'animation': summarize_animation(chain), 'animation_action': 'SPACE'})
     parts = agent._build_user_message(prompt, entries[-1].frame)['content']
     text = '\n'.join(part.get('text', '') for part in parts)
+    current_caption = next(part['text'] for part in parts if 'CURRENT board' in part.get('text', ''))
+    assert current_caption == (
+        'history[2].frame: this is the CURRENT board to act on.' if mode == 'animation'
+        else 'history[2].frame (after SPACE): this is the CURRENT board to act on.'
+    )
     assert 'The last action SPACE animated over 3 frames.' in text
     assert 'changed more than once' in text
     assert ('board interior is unchanged after the animation' in text) is (not changed)

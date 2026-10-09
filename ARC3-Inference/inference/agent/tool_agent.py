@@ -4844,7 +4844,9 @@ class ToolAgent:
         current_entry = getattr(self, "_current_history_entry", None)
         if current_entry is not None and current_entry[1].frame == current_frame:
             index, entry = current_entry
-            caption = f"history[{index}].frame (after {entry.action})"
+            caption = f"history[{index}].frame"
+            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) or intermediate_images:
+                caption += f" (after {entry.action})"
             current_label = f"{caption}: this is the CURRENT board to act on."
         current_images = [(current_label, image_part)]
         diff_images = [(diff_label, diff_part)] if diff_part else []
