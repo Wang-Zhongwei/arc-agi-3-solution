@@ -12,29 +12,18 @@ LEVEL_TRANSFER_SYSTEM_GUIDANCE = (
 )
 
 LEVEL_START_USER_PROMPT = (
-    "You have completed the previous level. `current_frame` is the starting board of "
-    "the next level. Build a plan for this layout.\n\n"
-    "Carry forward established mechanics. Inspect unfamiliar elements, changed "
-    "arrangements, and interactions your previous understanding does not explain; "
-    "use small tests where behavior is unclear.\n\n"
-    "Reassess the goal: does the previous objective still apply with new mechanics, "
-    "or has it changed? Combine retained knowledge with new findings to plan for this board."
-)
-
-GAME_OVER_USER_PROMPT = (
-    "Before acting, diagnose the death using BAR RULE: attribute death to the budget "
-    "only if its bar is fully or almost depleted in the death board. Then use fewer "
-    "actions or find a way to refill it. If budget clearly remains, identify the "
-    "mechanism triggered by the fatal action and avoid it.\n\n"
-    "The game is deterministic: replaying the fatal sequence will kill you again. "
-    "Change the route, action, or timing before the fatal point. If you believe the "
-    "same moves 'should' work, that belief is exactly what this death falsified."
-)
-
-CONTINUE_USER_PROMPT = (
-    "Inspect the evidence from the newest history, and search or score candidate "
-    "actions or short sequences against the current goal as you currently understand "
-    "it. Separate gameplay-object changes from HUD changes."
+    "You have completed the previous level. `current_frame` now contains the starting "
+    "board of the next level; any accompanying current-grid image shows this new board. "
+    "Build a new plan for this layout rather than continuing the previous level's action "
+    "sequence.\n\n"
+    "Start from the mechanics you established on the previous level; do not rediscover "
+    "them without reason. Inspect the new board for unfamiliar elements, changed "
+    "arrangements, or interactions your previous understanding does not explain. New "
+    "elements often introduce mechanics needed to solve this level, so prioritize small, "
+    "informative tests when their behavior is unclear.\n\n"
+    "Reassess the goal: does the previous objective still apply, now requiring the new "
+    "mechanics, or does the evidence suggest a different objective? Combine retained "
+    "knowledge with new findings to plan for this board."
 )
 
 
@@ -144,7 +133,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
     "- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.\n"
     "- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.\n"
-    "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores position AND rotation -- equal hashes indicate matching color and shape up to rotation; they do not establish object identity), `bbox` (`[min_row, min_col, max_row, max_col]`, inclusive), `pixels` (cell count), `rotation` (degrees clockwise from the object's canonical orientation: 0/90/180/270, reduced to 0/90 for 2-fold symmetric shapes, `None` for fully symmetric ones), `rotational_symmetry` (1, 2, or 4), `boundary` (clockwise outer-perimeter corner points as `[row, col]` cell coordinates), and `children` (ids of objects fully enclosed by this one).\n"
+    "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores position AND rotation -- equal hashes indicate matching color and shape up to rotation; they do not establish object identity), `rotation` (degrees clockwise from the object's canonical orientation: 0/90/180/270, reduced to 0/90 for 2-fold symmetric shapes, `None` for fully symmetric ones), `rotational_symmetry` (1, 2, or 4), `pose_hash` (the rotation-SENSITIVE variant, if you need to match exact orientation), `shape_hash` (color-independent pose shape signature), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]` cell coordinates), and `children` (ids of objects fully enclosed by this one).\n"
     "- `segmentation['adjacency_list']` is a list of `[i, j]` node-id pairs whose objects share an edge.\n"
     
     "- `current_frame.step` is the current environment step count.\n"
@@ -171,11 +160,6 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
 )
 
-HISTORY_REVISIT_ADDENDUM = (
-    "- `history` and `transitions` RETAIN earlier actions and boards even after "
-    "conversation trimming, so you can REVISIT what led to a level-up or game over.\n"
-)
-
 ANIMATION_ADDENDUM_TIMELINE = (
     "- `last_animation_timeline` is a diff timeline of those frames: it "
     "shows which cells changed at each step. It is a dict with `action`, `frames` and "
@@ -189,9 +173,9 @@ ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
     "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
-    "changed more than once during the animation, not necessarily back to their "
-    "original color. Their intermediate changes are not fully captured by "
-    "`current_frame`, `previous_frame`, or `history`.\n"
+    "changed and then changed BACK during the animation, so they appear in no frame "
+    "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
+    "in `history`.\n"
     "- `last_animation_frames` is the frames of the last executed action that "
     "animated, as views with "
     "`.ascii`, `.shape` and `.segmentation`, the same as `current_frame`. Index 0 is "

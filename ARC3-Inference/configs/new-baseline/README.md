@@ -3,8 +3,8 @@
 [v4.json](v4.json) starts from v3 and enables the animation-only frame treatment:
 up to eight sampled frames from the last action at upscale 2, including fatal
 animations. Intermediate action boards stay off; the regular board remains at
-upscale 8. `ARC3_ANIMATION_IMAGE` and `ARC3_ANIMATION_DEATH_IMAGE` remain the
-on/off knobs (`sampled` or `off`). See the
+upscale 8. `ARC3_ANIMATION_IMAGE` controls ordinary and fatal animations
+(`sampled` or `off`). See the
 [three-run decision](../../../docs/multimodal/animation-port-decision.md).
 This is a prepared config, not an evaluated v4 run. The separate 2,048-token
 analyzer yield setting is unchanged from v3.

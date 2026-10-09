@@ -85,13 +85,13 @@ def _object_signature(cells, color):
     Hashes the shape in all four 90-degree rotations (extend the transform list
     with reflections for full D4 canonicalization later) and takes the lowest
     hash as the canonical id. Returns (canonical_hash, rotation, symmetry,
-    shape_signature) where:
+    pose_hash) where:
       - canonical_hash: identical for all rotated copies of the same shape+color.
       - rotation: degrees CLOCKWISE to rotate the canonical form to obtain the
         observed object. None for 4-fold symmetric shapes (all rotations equal);
         reduced mod 180 (i.e. 0 or 90) for 2-fold symmetric shapes.
       - symmetry: rotational symmetry order (1, 2, or 4).
-      - shape_signature: colour-free, rotation-SENSITIVE hash of the observed pose.
+      - pose_hash: the classic rotation-SENSITIVE hash of the observed pose.
     """
     norm = _normalize_cells(cells)
     variants = [norm]
@@ -113,16 +113,8 @@ def _object_signature(cells, color):
         rotation = None
     elif symmetry == 2:
         rotation = rotation % 180
-    return canonical, rotation, symmetry, shape_hashes[0]
-
-
-class Node(dict):
-    """A segmentation node: a plain dict of the documented fields. The colour-free
-    pose signature rides along as the ``shape_signature`` attribute, outside the
-    dict, so frame_diff can pair recoloured objects while printing a node shows
-    only the fields the model is told about."""
-
-    __slots__ = ("shape_signature",)
+    shape_hash = _cells_hash(norm, "__shape__")
+    return canonical, rotation, symmetry, hashes[0], shape_hash
 
 
 def segment_layer(layer, color_chars):
@@ -143,8 +135,6 @@ def segment_layer(layer, color_chars):
         hash regardless of position (lets objects be matched across frames, or when
         several similar objects appear in one frame).
       - ``pixels``: number of cells in the component.
-      - ``bbox``: ``[r0, c0, r1, c1]`` -- the component's inclusive bounding box. It
-        spans enclosed children, though ``pixels`` does not count them.
       - ``boundary``: the component's outer perimeter as an ordered, clockwise list of
         ``[row, col]`` corner points -- a Moore-neighbour trace reduced to only the
         vertices where the contour changes direction (enclosed holes are not traced).
@@ -244,22 +234,19 @@ def segment_layer(layer, color_chars):
         color = color_chars[max(0, min(15, comp["value"]))]
         boundary = _corner_points(_trace_outer_contour(comp["cells"], comp["start"]))
         signature = _object_signature(comp["cells"], color)
-        rows = [r for r, _ in comp["cells"]]
-        cols = [c for _, c in comp["cells"]]
-        node = Node(
+        nodes.append(
             {
                 "id": cid,
                 "color": color,
                 "hash": signature[0],
-                "bbox": [min(rows), min(cols), max(rows), max(cols)],
-                "pixels": len(comp["cells"]),
                 "rotation": signature[1],
                 "rotational_symmetry": signature[2],
+                "pose_hash": signature[3],
+                "shape_hash": signature[4],
+                "pixels": len(comp["cells"]),
                 "boundary": [[r, c] for r, c in boundary],
                 "children": children[cid],
             }
         )
-        node.shape_signature = signature[3]
-        nodes.append(node)
 
     return {"nodes": nodes, "adjacency_list": adjacency_list}

@@ -2,9 +2,8 @@
 
 Enable the animation-only treatment in
 [`new-baseline/v4.json`](../../ARC3-Inference/configs/new-baseline/v4.json).
-It keeps the existing `ARC3_ANIMATION_IMAGE` and
-`ARC3_ANIMATION_DEATH_IMAGE` knobs: `sampled` attaches up to eight frames from
-the last action, and `off` disables those attachments. The frames use upscale
+It uses `ARC3_ANIMATION_IMAGE` for ordinary and fatal actions: `sampled` attaches
+up to eight frames from the last action, and `off` disables those attachments. The frames use upscale
 2; the current board stays at upscale 8. Intermediate action boards remain
 disabled. No shared prompt or frame-rendering code changes are needed.
 

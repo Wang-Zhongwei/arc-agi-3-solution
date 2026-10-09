@@ -49,7 +49,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
     SAFE_MODULES = {
         "bisect",
-        "builtins",
         "collections",
         "copy",
         # pure-Python sequence comparison, no I/O. Measured across 32
@@ -60,26 +59,33 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         "difflib",
         "fractions",
         "functools",
-        "glob",
-        "hashlib",
         "heapq",
-        "importlib",
-        "inspect",
         "itertools",
         "json",
         "math",
         "operator",
-        "os",
-        "pathlib",
-        "pickle",
         "random",
         "re",
         "statistics",
         "string",
-        "sys",
+        # Language and numeric helpers without file or process I/O. Like
+        # difflib, not named in the prompt: allowed so an import the model
+        # reaches for does not fail the snippet. Unlike main's bp35 list, os, sys, pathlib, glob,
+        # pickle, importlib and builtins stay out: each reaches I/O or
+        # bypasses this list. inspect can reach the sandbox's own frames,
+        # the same reach as the already-open dunder attributes.
+        "abc",
+        "array",
+        "cmath",
+        "dataclasses",
+        "decimal",
+        "enum",
+        "hashlib",
+        "inspect",
+        "numbers",
         "time",
-        "traceback",
         "types",
+        "typing",
     }
     SAFE_BUILTINS = {
         # Exception types. Only four were present, so anything narrower than

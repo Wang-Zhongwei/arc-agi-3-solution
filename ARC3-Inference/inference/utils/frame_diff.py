@@ -79,16 +79,6 @@ def _node_center2(node):
     rows = [p[0] for p in points]; cols = [p[1] for p in points]
     return (min(rows) + max(rows), min(cols) + max(cols))
 
-def _presence_entry(node):
-    # an appeared/disappeared entry. "_shape" is the node's colour-free pose
-    # signature: it pairs recolourings below and is dropped before returning.
-    return {"color": node.get("color"),
-            "pixels": node.get("pixels"),
-            "hash": node.get("hash"),
-            "at": list(_node_topleft(node)),
-            "bbox": list(_node_bbox(node)),
-            "_shape": getattr(node, "shape_signature", None)}
-
 def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
     # Object-level diff between two same-shaped grids with precomputed
     # segmentation nodes. Returns only what changed; unchanged objects are
@@ -171,13 +161,28 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
         ):
             # too many identical objects to match affordably
             for node_a in group_a:
-                disappeared.append(_presence_entry(node_a))
+                disappeared.append({"color": node_a.get("color"),
+                                    "pixels": node_a.get("pixels"),
+                                    "hash": node_a.get("hash"),
+                                    "shape_hash": node_a.get("shape_hash"),
+                                    "at": list(_node_topleft(node_a)),
+                                    "bbox": list(_node_bbox(node_a))})
             for node_b in group_b:
-                appeared.append(_presence_entry(node_b))
+                appeared.append({"color": node_b.get("color"),
+                                 "pixels": node_b.get("pixels"),
+                                 "hash": node_b.get("hash"),
+                                 "shape_hash": node_b.get("shape_hash"),
+                                 "at": list(_node_topleft(node_b)),
+                                 "bbox": list(_node_bbox(node_b))})
             continue
         if not group_b:
             for node_a in group_a:
-                disappeared.append(_presence_entry(node_a))
+                disappeared.append({"color": node_a.get("color"),
+                                    "pixels": node_a.get("pixels"),
+                                    "hash": node_a.get("hash"),
+                                    "shape_hash": node_a.get("shape_hash"),
+                                    "at": list(_node_topleft(node_a)),
+                                    "bbox": list(_node_bbox(node_a))})
             continue
         # optimal assignment over bbox-center distances; rows = smaller side
         transposed = len(group_a) > len(group_b)
@@ -203,16 +208,31 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
         if transposed:
             for col_index, node_a in enumerate(cols):
                 if col_index not in matched_cols:
-                    disappeared.append(_presence_entry(node_a))
+                    disappeared.append({"color": node_a.get("color"),
+                                        "pixels": node_a.get("pixels"),
+                                        "hash": node_a.get("hash"),
+                                    "shape_hash": node_a.get("shape_hash"),
+                                        "at": list(_node_topleft(node_a)),
+                                        "bbox": list(_node_bbox(node_a))})
         else:
             for col_index, node_b in enumerate(cols):
                 if col_index not in matched_cols:
-                    appeared.append(_presence_entry(node_b))
+                    appeared.append({"color": node_b.get("color"),
+                                     "pixels": node_b.get("pixels"),
+                                     "hash": node_b.get("hash"),
+                             "shape_hash": node_b.get("shape_hash"),
+                                     "at": list(_node_topleft(node_b)),
+                                     "bbox": list(_node_bbox(node_b))})
             continue
         # transposed: every after-node (a row) got matched; nothing appeared
     for group_b in groups_after.values():
         for node_b in group_b:
-            appeared.append(_presence_entry(node_b))
+            appeared.append({"color": node_b.get("color"),
+                             "pixels": node_b.get("pixels"),
+                             "hash": node_b.get("hash"),
+                             "shape_hash": node_b.get("shape_hash"),
+                             "at": list(_node_topleft(node_b)),
+                             "bbox": list(_node_bbox(node_b))})
     # Phase A - changed_color: EXACT pairs only. Same position, byte-
     # identical shape (color-independent pose signature), different
     # color. This asserts "these exact cells changed color" and nothing
@@ -224,8 +244,8 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
             if ni in used_new:
                 continue
             if (gone["at"] == new["at"]
-                    and gone["_shape"]
-                    and gone["_shape"] == new["_shape"]
+                    and gone.get("shape_hash")
+                    and gone.get("shape_hash") == new.get("shape_hash")
                     and gone["color"] != new["color"]):
                 changed_color.append({"at": gone["at"],
                                       "pixels": gone["pixels"],
@@ -281,8 +301,6 @@ def compute_frame_diff(grid_a, grid_b, nodes_a, nodes_b, max_group_match=None):
                         "after_hash": new.get("hash")})
     disappeared = [entry for index, entry in enumerate(disappeared) if index not in used_gone]
     appeared = [entry for index, entry in enumerate(appeared) if index not in used_new]
-    for entry in appeared + disappeared:
-        del entry["_shape"]
     return {"changed_cell_count": len(changed), "moved": moved,
             "rotated": rotated,
             "appeared": appeared, "disappeared": disappeared,

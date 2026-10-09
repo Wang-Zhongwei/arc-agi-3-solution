@@ -116,8 +116,7 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
-| `ARC3_ANIMATION_IMAGE` | `off` | `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity when the gameplay area did not change. |
-| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `sampled`/`peak`/`composite` option for the fatal action’s animation. |
+| `ARC3_ANIMATION_IMAGE` | `off` | Applies to ordinary and fatal actions. `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity and, for ordinary actions, an unchanged gameplay area. Fatal-action images appear in the post-death opener after automatic RESET. |
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 
@@ -412,6 +411,14 @@ value = yield + c × √(ln(1 + elapsed_minutes) / count)
 `elapsed_minutes` is the gate's shared clock. Gains are recorded at the generated-token position of the step that completed the level. A count of zero ranks highest. The value is mapped monotonically into an integer below one priority band, so the cache bands, untrimmed-first admission and backend `priority` hint all behave as with `priority`. Waiting games are always re-scored at admission, because the bonus moves with the clock.
 
 Only the ranking changes. There are no time quanta: a game keeps its slot until context trimming invalidates its prefix, then hands over exactly as above. Endgame, pace and tail-fade settings apply only to `priority`.
+
+### Soft stop at the per-game cap
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_GAME_SOFT_STOP_SECONDS` | `0`: disabled | Grace G before `max_runtime_s_per_game`. From cap − G the game starts no new turn, but the turn in flight finishes: its thinking continuations run, its actions execute, and a context trim keeps the gate slot instead of handing over. Only the cap itself cuts a turn. |
+
+Without it, a game is cut wherever it is when the cap passes, usually between thinking continuations of a turn that has not acted yet, and its request timeout is shortened to the time left. The cap is unchanged, so a lane spends no longer on a game than before. That matters when games run in waves (`concurrent_jobs` below the game count): each lane plays several games back to back, and the notebook's 9-hour limit leaves no room for one to overrun. In v3's turns, 300 s covers about 95% of turn lengths (p50 35 s, p90 153 s, p95 266 s, gate waits included).
 
 ### Context trim log
 
