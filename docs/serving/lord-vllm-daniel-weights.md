@@ -56,4 +56,18 @@ It differs from [`ticbudja/thinking-budget-priority-four-waves`](https://www.kag
 - **Harness env:** 51 of 58 `ARC3_*`/`LOCAL_ANALYZER_*`/`MULTIMODAL_*` keys equal ticbudja v1's `taaf_setup_env.json`. The rest are serving or private-rerun plumbing: the analyzer URL, model id and provider (now set by Lord's setup), `ARC3_MAX_ANALYZER_FAILURES`, `ARC3_KAGGLE_PRIVATE_WAVES`/`_RUNTIME_MINUTES`, and `MULTIMODAL_INTERMEDIATE_FRAMES=false`, which the `92dece7` agent does not read.
 - **Run shape:** `public_runtime_minutes: 24`. The vcintel notebook's vLLM was ready 847 s after notebook start, so this leaves about 10 min of play. The private shape is 120 lanes, one wave and 532 min per game.
 
-Fetch it with `make pull-kaggle NOTEBOOK=ticbudja/priority-one-wave-lord-vllm VERSION=1`. It was RUNNING at the time of writing.
+Fetch it with `make pull-kaggle NOTEBOOK=ticbudja/priority-one-wave-lord-vllm VERSION=1`. It completed; its output has not been pulled yet.
+
+### Version 2: vcintel's serving, 13 streams
+
+Config: [`configs/priority-one-wave-lord-vllm/v2.json`](../../ARC3-Inference/configs/priority-one-wave-lord-vllm/v2.json). The aim is vcintel's speed with ticbudja v1's harness. The config is v1 with `ARC3_MAX_ACTIVE_STREAMS` and `kaggle.vllm.max_num_seqs` raised from 10 to 13, as in vcintel. It was pushed on 2026-10-09 from `8bcb36f` as version 2.
+
+The setup script resolves to vcintel's launch (`vllm-setup.log` of `matijaludvig/arc3-vcintel-25x1`) in every flag that affects speed:
+
+- **Batching and graphs:** `--max-num-seqs 13`, `--max-cudagraph-capture-size 56`, `--max-num-batched-tokens 2048`, async scheduling and chunked prefill.
+- **Speculative decoding:** MTP 3 with `use_local_argmax_reduction` over a 32,000-token draft vocabulary.
+- **Caches:** FP8 KV and indexer, BF16 Mamba state, `gpu_memory_utilization` 0.98, and prefix caching with match unit 128 and retention 0.
+- **Offload:** `embed_tokens` and engram CPU offload.
+- **Model and inputs:** `max_model_len` 147072, `max_pixels` 409,600 with video off, and the same `dfranzen` AutoRound weights.
+
+Only the served model name and the port differ. The harness keeps ticbudja v1's request settings: 12,288 `max_output`, an 8,192 thinking budget and a 2,048-token yield. The bundle's agent and utils files still hash-match `92dece7`.
