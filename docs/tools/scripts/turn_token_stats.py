@@ -24,8 +24,8 @@ SEED_CHARS_PER_TOKEN = 3.0
 YIELD_TOKENS = 2048
 
 
-def reply_chars(meta: str) -> int:
-    """Generated characters of one reply: reasoning + content + tool-call arguments."""
+def reply_chars(meta: str) -> tuple[int, int]:
+    """Generated characters of one reply: (reasoning, content + tool-call arguments)."""
     reasoning = int(re.search(r"^reasoning_chars: (\d+)", meta, re.M).group(1))
     content = int(re.search(r"^content_chars: (\d+)", meta, re.M).group(1))
     raw = re.search(r"^raw_tool_calls:\n", meta, re.M)
@@ -33,7 +33,7 @@ def reply_chars(meta: str) -> int:
     if raw and meta[raw.end():].startswith("["):
         calls, _ = json.JSONDecoder().raw_decode(meta[raw.end():])
         args = sum(len(c.get("function", {}).get("arguments") or "") for c in calls)
-    return reasoning + content + args
+    return reasoning, content + args
 
 
 def outcome(block: str) -> str:
@@ -49,17 +49,19 @@ def game_turns(transcript: Path) -> list[dict]:
     divisor, turns = SEED_CHARS_PER_TOKEN, []
     for start, end in zip(heads, heads[1:]):
         block = text[start:end]
-        tokens = []
+        split = []
         # The divisor in force for a reply is the last calibration printed before it.
         cursor = 0
         for m in META_RE.finditer(block):
             for c in CALIBRATION_RE.finditer(block, cursor, m.start()):
                 divisor = float(c.group(1))
             cursor = m.start()
-            tokens.append(reply_chars(block[m.end():]) / divisor)
+            thinking, code = reply_chars(block[m.end():])
+            split.append((thinking / divisor, code / divisor))
         for c in CALIBRATION_RE.finditer(block, cursor):
             divisor = float(c.group(1))
-        turns.append({"outcome": outcome(block), "replies": tokens})
+        turns.append({"outcome": outcome(block), "split": split,
+                      "replies": [a + b for a, b in split]})
     return turns
 
 
@@ -85,6 +87,14 @@ def main(run_dir: Path) -> None:
     print("tokens per reply:", describe(replies))
     for cut in (2048, 4096, 8192):
         print(f"  replies >= {cut}: {sum(r >= cut for r in replies) / len(replies):.1%}")
+    split = [s for t in turns for s in t["split"]]
+    print("  thinking per reply:", describe([a for a, _ in split]))
+    print("  code + text per reply:", describe([b for _, b in split]))
+    for cut in (4096, 8192):
+        long = [(a, b) for a, b in split if a + b >= cut]
+        print(f"  replies >= {cut}: thinking share median "
+              f"{statistics.median(a / (a + b) for a, b in long):.0%}, "
+              f"code + text max {max(b for _, b in long):,.0f}")
 
     groups = {"all turns": turns,
               "acting turns": [t for t in turns if t["outcome"] == "executed"],
