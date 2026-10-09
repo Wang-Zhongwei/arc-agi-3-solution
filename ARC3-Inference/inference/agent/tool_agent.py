@@ -318,7 +318,8 @@ _PYTHON_TOOL_DESCRIPTION = (
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
     "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
-    "Use `print(...)` for compact output or assign final data to `result`."
+    "Use `print(...)` for compact output or assign final data to `result`. "
+    "File I/O such as open() or json.dump() is NOT allowed."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
