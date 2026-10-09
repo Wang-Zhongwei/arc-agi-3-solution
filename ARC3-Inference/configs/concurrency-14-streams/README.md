@@ -49,3 +49,16 @@ Decode-only tok/s by running requests: 793 at 10 (v3); 921 / 953 / 985 at 12 / 1
 **At ~15 minutes the KV pool filled and the prefix cache thrashed.** All 14 games started together, so their histories grew in lockstep and reached ~85K tokens each before the first 118K history drain (14 × 85K ≈ 1.19M against 1,181,312 tokens). With locked usage at 0.94–0.99, requests queued 80–100% of the time, and admitting a queued request evicted the cached prefix of a game between turns; that game then re-prefilled its whole conversation. 954 prefill chunks restarted from the system prompt alone, 3.86M tokens (80% of all prefill); the hit rate fell to 5–38% per 3 minutes. v3 peaked at 0.86 and then drained to ~0.3.
 
 Over a full drain cycle (59K → 118K, ~88K average) 14 streams need ~1.23M tokens, more than the pool; 12 need ~1.06M (0.9). Without new quantization, 14 streams need either fewer tokens per stream (earlier drain, a context change) or admission that backs off when the pool is nearly full. A fixed 12 streams (decode-only ~921 tok/s) should fit as is.
+
+## v3: the remaining KV room, 45 minutes
+
+[v3.json](v3.json) is v2 plus the options in [kv-cache-room-1009](../../../docs/serving/kv-cache-room-1009.md) that keep numerics:
+
+| `kaggle.sglang` | v2 | v3 | Why |
+|---|---|---|---|
+| `MAMBA_CACHE` | 76 | 70 | SGLang caps running requests at `MAMBA_CACHE // 5`; 70 is the floor for 14 (+0.33 GiB, ~27K tokens) |
+| `CHUNK`, `MAX_PREFILL` | 4096 | 2048 | Peak prefill headroom ≈ 0.80 GB + 0.28 MB/token (fit to ~3.10 GB at 8192 and ~1.95 GB at 4096), so ~1.37 GB at 2048 |
+| `MEMFRAC` | 0.968 | 0.974 | Spends ~0.57 GiB of that headroom (+~46K tokens); ~1.63 GB stays free after graph capture (≥ 1.2 GB) |
+| `public_runtime_minutes` | 32 | 55 | ~45 minutes of games, past the first history drain |
+
+CUDA graphs stay at 1–14: dropping 11 and 13 frees ~0.05 GB and would pad the common 13-request batch to 14. Expected KV pool ≈ 1.25M tokens (v2: 1,181,312), still below the ~1.47M a synchronized start reaches before the first drain, so expect a milder, later squeeze rather than none. Watch: lowest free memory, prefix hit rate and queueing around minutes 15–20, accept length (v2: 2.63), and effective tok/s against new-baseline v3 over the same window.
