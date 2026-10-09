@@ -99,7 +99,7 @@ On 2026-10-09 the ticbudja notebook was renamed `thinking-budget-priority-one-wa
 
 ## Merge of main (2026-10-09)
 
-`main` (`a15491c`) was merged into this branch, with this branch's prompts and tools kept as they were.
+`main` (`67d3490`) was merged into this branch, with this branch's prompts and tools kept as they were.
 
 - **Kept from this branch:** `prompts.py`, the turn prompts and captions in `tool_agent.py`, the Python sandbox's module list, and the `animation.py`, `segmentation.py` and `frame_diff.py` outputs the model reads. Main's prompt rewrites (`6303467` game-over and level-start text, `0371330`, `d62d95f` turn messages and captions, `0ee3507` file-I/O guidance), its segmentation `bbox` change with `pose_hash`/`shape_hash` dropped, and its wider sandbox module list are not taken.
 - **Taken from main:** serving, Kaggle and config fixes (one place per setting, the credential handoff, private reruns ignore token budgets, the 6 precache + 8 prefetch model read), the evaluator and serving metrics, RunPod and Lord Hansolo serving, and the opt-in options `ARC3_FRAME_DIFF` (default on), `ARC3_PRIORITY_THINKING` (default off), `ARC3_ANIMATION_IMAGE`/`ARC3_ANIMATION_DEATH_IMAGE=sampled` and `multimodal.intermediate_frames` (default off). The frame options are ported at `e26d05d`, before main's later layout and caption changes.
