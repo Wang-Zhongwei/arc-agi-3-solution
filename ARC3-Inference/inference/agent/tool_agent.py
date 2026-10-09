@@ -64,7 +64,6 @@ from inference.agent.prompts import (
 
 from inference.agent.vision_context import (
     animation_composite_part,
-    animation_death_image_mode,
     animation_image_mode,
     animation_peak_part,
     animation_sampled_parts,
@@ -1898,15 +1897,13 @@ def _animation_timeline_enabled() -> bool:
 def _frame_image_layout() -> bool:
     """Main's frame-image layout, used only with the frame-image options.
 
-    With sampled animation frames (ARC3_ANIMATION_IMAGE or
-    ARC3_ANIMATION_DEATH_IMAGE) or intermediate boards
+    With sampled animation frames (ARC3_ANIMATION_IMAGE) or intermediate boards
     (MULTIMODAL_INTERMEDIATE_FRAMES), images carry `history[i]` captions and sit
     beside the action that produced them, as on main. Otherwise this branch's
     captions and its image block after the prompt text are unchanged.
     """
     return (
         animation_image_mode() == "sampled"
-        or animation_death_image_mode() == "sampled"
         or _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False)
     )
 
@@ -4664,7 +4661,7 @@ class ToolAgent:
         """
         if not _animation_enabled():
             return
-        mode = animation_death_image_mode()
+        mode = animation_image_mode()
         if mode == "off" or not summary:
             return
         if mode == "sampled":
