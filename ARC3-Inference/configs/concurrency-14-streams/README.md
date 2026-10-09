@@ -20,6 +20,8 @@ The server came up (KV pool 1,181,312 tokens, 2.20 GB free after graph capture v
 
 The wide BF16 GEMM check passed (`pennyroyal-gemm-bench.jsonl`): all 42 shapes (M 36–56) match torch within 0.03 absolute and run 1.01–1.49× faster than cuBLAS under CUDA graphs.
 
-## v2: 2,048-token prefill chunk
+## v2: 4,096-token prefill chunk
 
-[v2.json](v2.json) is v1 with `CHUNK` and `MAX_PREFILL` 2048 (from 8192 and 16384), the setting the tuneup runs used to hold 0.967 at 14 streams with 1.26 GB free. Everything else, including `MEMFRAC` 0.968, is unchanged. Smaller prefill forwards may cost prefill speed; compare decode-only intervals by running requests (concurrency effect) separately from prefill intervals (chunk effect).
+[v2.json](v2.json) is v1 with `CHUNK` and `MAX_PREFILL` 4096 (from 8192 and 16384); everything else, including `MEMFRAC` 0.968, is unchanged. Scaling the ~3.1–3.3 GB peak of an 8192-token forward, 4096 needs roughly 1.6–1.9 GB against v1's 2.20 GB free. (The tuneup runs held 0.967 at 14 streams with a 2048 chunk and 1.26 GB free; 6144 would need ~2.4–2.5 GB and likely OOM at 0.968.)
+
+Prefill is ~15–20% of wall time (decode-only intervals 53–54%; the rest mostly decodes alongside prefill), and each forward pays a fixed ~40–60 ms (mostly weight reads) on ~0.5 s of compute at ~8K tok/s, so halving the chunk should cost ~5% prefill time, ~1% tok/s (estimate). Chunk size does not change decode batches: compare decode-only intervals by running requests (concurrency effect) separately from prefill intervals (chunk effect).
