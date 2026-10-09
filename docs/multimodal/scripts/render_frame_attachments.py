@@ -297,7 +297,7 @@ def main() -> None:
     os.environ.update(env)  # before import: tool_agent reads some settings at import time
     from inference.agent import tool_agent  # noqa: F401
 
-    shown_keys = ["ARC3_ANIMATION", "ARC3_ANIMATION_IMAGE", "ARC3_ANIMATION_DEATH_IMAGE",
+    shown_keys = ["ARC3_ANIMATION", "ARC3_ANIMATION_IMAGE",
                   "MULTIMODAL_INTERMEDIATE_FRAMES", "MULTIMODAL_CONTEXT", "MULTIMODAL_UPSCALE",
                   "MULTIMODAL_ANIMATION_UPSCALE", "ARC3_DIFF_IMAGE", "ARC3_GAMEOVER_DIFF_IMAGE",
                   "ARC3_MEMORY_SECTIONS", "LOCAL_ANALYZER_YIELD_TOKENS"]
@@ -308,12 +308,12 @@ def main() -> None:
         cases = scenarios(Path(tmp))
         # The same ordinary turn as currently run (animation frames off), for comparison.
         baseline = dict(cases[0], id="baseline", title="Ordinary turn with animation frames off",
-                        note="The first turn again with ARC3_ANIMATION_IMAGE and ARC3_ANIMATION_DEATH_IMAGE off, "
+                        note="The first turn again with ARC3_ANIMATION_IMAGE off, "
                              "as in the runs so far: the prompt text comes first, then the current board and diff image.")
         for case in cases + [baseline]:
-            saved = {k: os.environ.get(k) for k in ("ARC3_ANIMATION_IMAGE", "ARC3_ANIMATION_DEATH_IMAGE")}
+            saved = {k: os.environ.get(k) for k in ("ARC3_ANIMATION_IMAGE",)}
             if case["id"] == "baseline":
-                os.environ["ARC3_ANIMATION_IMAGE"] = os.environ["ARC3_ANIMATION_DEATH_IMAGE"] = "off"
+                os.environ["ARC3_ANIMATION_IMAGE"] = "off"
             try:
                 parts = render_turn(new_agent(Path(tmp) / case["id"]), case["entries"], case["summary"],
                                     case["chain"], changed=case["changed"])
