@@ -53,7 +53,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-SERVER_LOG_NAME = "server.log"
+from inference.tools.serving_logs import SERVER_LOG_NAMES, recover_server_block
+
 STDERR_LOG_NAME = "stderr.log"
 
 _ENGINE_STAT_RE = re.compile(
@@ -239,8 +240,8 @@ def parse_client_errors(path: Path) -> tuple[int, int]:
 
 
 def collect_trial_metrics(trial_dir: Path) -> TrialServerMetrics:
-    log_path = trial_dir / SERVER_LOG_NAME
-    metrics = parse_server_log(log_path) if log_path.exists() else TrialServerMetrics()
+    log_path = next((trial_dir / name for name in SERVER_LOG_NAMES if (trial_dir / name).exists()), None)
+    metrics = parse_server_log(log_path) if log_path else TrialServerMetrics()
     metrics.read_timeouts, metrics.analyzer_failures = parse_client_errors(trial_dir / STDERR_LOG_NAME)
     return metrics
 
@@ -408,4 +409,5 @@ def build_server_block(trial_dirs: list[Path]) -> dict[str, Any]:
         "cache hit rates are vLLM sliding-window values, so mean/min/max describe the "
         "distribution and last is the final window."
     )
-    return block
+    # SGLang logs have no vLLM engine-stat lines; fall back to batch-line parsing.
+    return block if block["sample_count"] else recover_server_block(trial_dirs, block)
