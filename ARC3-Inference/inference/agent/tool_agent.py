@@ -1893,6 +1893,22 @@ def _animation_timeline_enabled() -> bool:
     return _get_env_bool("ARC3_ANIMATION_TIMELINE", True)
 
 
+def _frame_image_layout() -> bool:
+    """Main's frame-image layout, used only with the frame-image options.
+
+    With sampled animation frames (ARC3_ANIMATION_IMAGE or
+    ARC3_ANIMATION_DEATH_IMAGE) or intermediate boards
+    (MULTIMODAL_INTERMEDIATE_FRAMES), images carry `history[i]` captions and sit
+    beside the action that produced them, as on main. Otherwise this branch's
+    captions and its image block after the prompt text are unchanged.
+    """
+    return (
+        animation_image_mode() == "sampled"
+        or animation_death_image_mode() == "sampled"
+        or _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False)
+    )
+
+
 def _dedupe_multicall_line() -> bool:
     """Drop the duplicated multi-call permission and its stale caveat.
 
@@ -3655,6 +3671,8 @@ class ToolAgent:
         self._pending_animation_image_label: str = ""
         self._pending_animation_samples: list[tuple[str, dict[str, Any]]] = []
         self._pending_intermediate_images: list[tuple[str, dict[str, Any]]] = []
+        self._current_history_entry: tuple[int, HistoryEntry] | None = None
+        self._prompt_history_entries: list[HistoryEntry] = []
         self._pending_diff_image_label: str = ""
         self._turn_diff_image: dict[str, Any] | None = None
         self._turn_diff_image_label: str = ""
@@ -4143,10 +4161,21 @@ class ToolAgent:
         prev_step = getattr(previous_frame, "step", None)
         cur_step = getattr(current_frame, "step", None)
         span = f"step {prev_step} -> {cur_step}"
+        frame_layout = _frame_image_layout()
+        if frame_layout:
+            entries = getattr(self, "_prompt_history_entries", [])
+            indices = [next((index for index, entry in enumerate(entries)
+                             if entry.frame == frame), None)
+                       for frame in (previous_frame, current_frame)]
+            if all(index is not None for index in indices):
+                span = f"history[{indices[0]}].frame -> history[{indices[1]}].frame"
         if _DIFF_IMAGE:
             part = diff_image_part(previous_frame, current_frame)
             if part is not None and previous_frame.grid != current_frame.grid:
                 label = (
+                    f"Diff image ({span}): cells that changed keep their true color; "
+                    "unchanged cells dimmed to dark navy."
+                ) if frame_layout else (
                     f"Diff image ({span}): cells that changed since your previous "
                     "analyzer turn in their new true color; unchanged cells dimmed "
                     "to dark navy (an off-palette color)."
@@ -4473,7 +4502,12 @@ class ToolAgent:
             diff_image_part,
         )
 
-        entries = list(history_entries or [])
+        frame_layout = _frame_image_layout()
+        # The frame-image layout indexes history as the sandbox does: frames only.
+        entries = (
+            [entry for entry in history_entries or [] if entry.frame is not None]
+            if frame_layout else list(history_entries or [])
+        )
         if len(entries) < 3 or str(entries[-1].action or "").upper() != "RESET":
             return
         death = entries[-2]
@@ -4484,6 +4518,9 @@ class ToolAgent:
         if death_part is not None:
             self._pending_gameover_images.append(
                 (
+                    f"history[{len(entries) - 2}].frame (after {death.action}): "
+                    "this is the DEATH board."
+                    if frame_layout else
                     "Death frame image (the board at the moment the attempt "
                     "ended, before the automatic reset): inspect the budget bar "
                     "here for the BAR RULE.",
@@ -4497,6 +4534,11 @@ class ToolAgent:
         if fatal_part is not None and last_alive.frame.grid != death.frame.grid:
             self._pending_gameover_images.append(
                 (
+                    f"Fatal step diff image (history[{len(entries) - 3}].frame -> "
+                    f"history[{len(entries) - 2}].frame): "
+                    "cells changed by the killing action keep their true color; "
+                    "unchanged cells dimmed to dark navy."
+                    if frame_layout else
                     "Fatal step diff image (last alive frame -> death frame): "
                     "cells changed by the killing action in their new true "
                     "color; unchanged cells dimmed to dark navy (an off-palette "
@@ -4820,62 +4862,111 @@ class ToolAgent:
         if image_part is None:
             return {"role": "user", "content": user_prompt}
 
-        # Inline the experimental images beside their existing prose. Anchors
-        # are the exact lines recorded while building this prompt, not markers
-        # sent to the model. Other image modes retain their established layout.
-        if intermediate_images or animation_samples or (
-            gameover_images and animation_death_image_mode() == "sampled"
-        ):
-            groups = {
-                "actions": intermediate_images,
-                "animation": animation_samples + ([(animation_label, animation_part)] if animation_part else []),
-                "death": gameover_images,
-                "current": ([(diff_label, diff_part)] if diff_part else []) + [(
-                    "Current board after RESET—act on this." if gameover_images else "Current board—act on this.",
-                    image_part,
-                )],
-            }
-            anchors = getattr(self, "_prompt_image_anchors", {})
-            placements = []
-            for name, parts in groups.items():
-                anchor = anchors.get(name, "")
-                start = user_prompt.find(anchor) if anchor else -1
-                placements.append((start + len(anchor) if start >= 0 else len(user_prompt), name, parts))
-            placements.sort(key=lambda item: item[0])
-            content = []
-            cursor = 0
-            for end, _, parts in placements:
-                if not parts:
-                    continue
-                if user_prompt[cursor:end].strip():
-                    content.append({"type": "text", "text": user_prompt[cursor:end]})
-                for label, part in parts:
-                    content.extend([{"type": "text", "text": label}, part])
-                cursor = end
-            if user_prompt[cursor:].strip():
-                content.append({"type": "text", "text": user_prompt[cursor:]})
-            return {"role": "user", "content": content}
+        if _frame_image_layout():
+            return {"role": "user", "content": self._frame_image_content(
+                user_prompt, current_frame, image_part,
+                diff_part=diff_part, diff_label=diff_label,
+                animation_part=animation_part, animation_label=animation_label,
+                animation_samples=animation_samples, gameover_images=gameover_images,
+                intermediate_images=intermediate_images,
+            )}
 
         content: list[dict[str, Any]] = [
             {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
             image_part,
         ]
-        for label, part in intermediate_images:
-            content.append({"type": "text", "text": label})
-            content.append(part)
         if diff_part is not None:
             content.append({"type": "text", "text": diff_label})
             content.append(diff_part)
         if animation_part is not None:
             content.append({"type": "text", "text": animation_label})
             content.append(animation_part)
-        for label, part in animation_samples:
-            content.append({"type": "text", "text": label})
-            content.append(part)
         for label, part in gameover_images:
             content.append({"type": "text", "text": label})
             content.append(part)
         return {"role": "user", "content": content}
+
+    def _frame_image_content(
+        self,
+        user_prompt: str,
+        current_frame: Frame | None,
+        image_part: dict[str, Any],
+        *,
+        diff_part: dict[str, Any] | None,
+        diff_label: str,
+        animation_part: dict[str, Any] | None,
+        animation_label: str,
+        animation_samples: list[tuple[str, dict[str, Any]]],
+        gameover_images: list[tuple[str, dict[str, Any]]],
+        intermediate_images: list[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Main's layout for the frame-image options (d62d95f, 89427e5).
+
+        Images go beside the prompt line they illustrate. Anchors are the exact
+        lines recorded while building this prompt, not markers sent to the model.
+        """
+        anchors = getattr(self, "_prompt_image_anchors", {})
+        fatal_turn = "death" in anchors
+        death_boards = [(label, part) for label, part in gameover_images if "DEATH board" in label]
+        fatal_diffs = [(label, part) for label, part in gameover_images if label.startswith("Fatal step diff image")]
+        fatal_animations = [(label, part) for label, part in gameover_images
+                            if "DEATH board" not in label and not label.startswith("Fatal step diff image")]
+        history = getattr(self, "_prompt_history_entries", [])
+        if not death_boards and len(history) >= 3 and fatal_turn:
+            death_index = len(history) - 2
+            death_boards = [
+                (label[:-1] + ": this is the DEATH board.", part)
+                for label, part in intermediate_images
+                if label.startswith(f"history[{death_index}].frame ") or label.startswith(f"{death_index} (")
+            ]
+        if death_boards:
+            death_index = len(history) - 2
+            # Show the death board once, after its animation.
+            intermediate_images = [(label, part) for label, part in intermediate_images
+                                   if not (label.startswith(f"history[{death_index}].frame ")
+                                           or label.startswith(f"{death_index} ("))]
+        current_label = "This is the CURRENT board to act on."
+        current_entry = getattr(self, "_current_history_entry", None)
+        if current_entry is not None and current_entry[1].frame == current_frame:
+            index, entry = current_entry
+            caption = f"history[{index}].frame"
+            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) or intermediate_images:
+                caption += f" (after {entry.action})"
+            current_label = f"{caption}: this is the CURRENT board to act on."
+        current_images = [(current_label, image_part)]
+        diff_images = [(diff_label, diff_part)] if diff_part else []
+        animations = animation_samples + ([(animation_label, animation_part)] if animation_part else [])
+        # Earlier actions precede the last action's animation and resulting
+        # board. Fatal turns then show RESET and the alive -> death diff.
+        groups = {
+            "actions": intermediate_images,
+            "death" if fatal_turn else "animation": (
+                animations + fatal_animations + death_boards + current_images + fatal_diffs + diff_images
+            ),
+        }
+        placements = []
+        for name, parts in groups.items():
+            anchor = anchors.get(name) or anchors.get("actions", "")
+            before_state = not anchor
+            if before_state:
+                anchor = anchors.get("current", "")
+            start = user_prompt.find(anchor) if anchor else -1
+            end = start + (0 if before_state else len(anchor)) if start >= 0 else len(user_prompt)
+            placements.append((end, parts))
+        placements.sort(key=lambda item: item[0])
+        content: list[dict[str, Any]] = []
+        cursor = 0
+        for end, parts in placements:
+            if not parts:
+                continue
+            if user_prompt[cursor:end].strip():
+                content.append({"type": "text", "text": user_prompt[cursor:end]})
+            for label, part in parts:
+                content.extend([{"type": "text", "text": label}, part])
+            cursor = end
+        if user_prompt[cursor:].strip():
+            content.append({"type": "text", "text": user_prompt[cursor:]})
+        return content
 
 
     def _memory_section_guidance(self, block_shown: bool) -> list[str]:
@@ -4998,6 +5089,14 @@ class ToolAgent:
     ) -> str:
         self._prompt_image_anchors: dict[str, str] = {}
         history_entries = history_entries or []
+        # History indices for the frame-image captions, counted as the sandbox
+        # exposes `history` (entries with a frame).
+        self._current_history_entry = None
+        self._prompt_history_entries = [entry for entry in history_entries if entry.frame is not None]
+        if current_frame is not None:
+            for index, entry in enumerate(self._prompt_history_entries):
+                if entry.frame.step == current_frame.step and entry.frame == current_frame:
+                    self._current_history_entry = (index, entry)
         current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
         current_level = current_frame.level if current_frame is not None else 1
         summary_level = None
