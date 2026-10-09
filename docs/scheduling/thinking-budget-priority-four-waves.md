@@ -84,13 +84,15 @@ make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v4.json
   KAGGLE_USERNAME=jonathanwang2022 MAX_EXPERIMENT_RUNTIME_MINUTES=31
 ```
 
-The v4 config first ran on 2026-10-08 as `jonathanwang2022/thinking-budget-priority-four-waves` version 1 (a new notebook after the original was renamed), with `MAX_EXPERIMENT_RUNTIME_MINUTES=31`. On 2026-10-09 jonathanwang2022 had used its 45-hour weekly GPU quota, so the 120-min-play run was pushed as [`ticbudja/thinking-budget-priority-four-waves`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-four-waves) version 1 from `92dece7`, with `kaggle-as tic` and `MAX_EXPERIMENT_RUNTIME_MINUTES=141` (soft end at minute 131, about 120 min of play). Fetch it with `make pull-kaggle NOTEBOOK=ticbudja/thinking-budget-priority-four-waves VERSION=1`.
+The v4 config first ran on 2026-10-08 as `jonathanwang2022/thinking-budget-priority-four-waves` version 1 (a new notebook after the original was renamed), with `MAX_EXPERIMENT_RUNTIME_MINUTES=31`. On 2026-10-09 jonathanwang2022 had used its 45-hour weekly GPU quota, so the 120-min-play run was pushed as [`ticbudja/thinking-budget-priority-one-wave`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-one-wave) version 1 from `92dece7`, with `kaggle-as tic` and `MAX_EXPERIMENT_RUNTIME_MINUTES=141` (soft end at minute 131, about 120 min of play). Fetch it with `make pull-kaggle NOTEBOOK=ticbudja/thinking-budget-priority-one-wave VERSION=1`.
 
 ## Version 5: v4 without the 2,048-token turn yield
 
-Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v5.json`. Same source and settings as v4, except `LOCAL_ANALYZER_YIELD_TOKENS` is 0 instead of 2048, which disables the per-turn yield (see [the 1009 error analysis](../tools/1009-error-analysis.md)). The per-request limits stay at `max_tokens: 12288` and a thinking budget of 8,192. It was pushed on 2026-10-09 from `cb02f7f` as `ticbudja/thinking-budget-priority-four-waves` version 2 (bundled `LOCAL_ANALYZER_YIELD_TOKENS: "0"`), with the same 120-min play window as that notebook's v1, to compare against it:
+Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v5.json`. Same source and settings as v4, except `LOCAL_ANALYZER_YIELD_TOKENS` is 0 instead of 2048, which disables the per-turn yield (see [the 1009 error analysis](../tools/1009-error-analysis.md)). The per-request limits stay at `max_tokens: 12288` and a thinking budget of 8,192. It was pushed on 2026-10-09 from `cb02f7f` as `ticbudja/thinking-budget-priority-one-wave` version 2 (bundled `LOCAL_ANALYZER_YIELD_TOKENS: "0"`), with the same 120-min play window as that notebook's v1, to compare against it:
 
 ```
 kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v5.json \
   KAGGLE_USERNAME=ticbudja MAX_EXPERIMENT_RUNTIME_MINUTES=141
 ```
+
+On 2026-10-09 the ticbudja notebook was renamed `thinking-budget-priority-one-wave` (title "Thinking budget priority one wave"), because it runs one wave; its local runs moved to `ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-one-wave/`. `v5.json` now targets that slug. The source dataset keeps its name, `ticbudja/thinking-budget-priority-four-waves-src`.
