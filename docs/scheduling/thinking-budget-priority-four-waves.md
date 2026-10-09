@@ -118,3 +118,5 @@ Rename the Kaggle notebook to "Thinking budget priority one wave" before pushing
 ```
 kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-one-wave/v3.json KAGGLE_USERNAME=ticbudja
 ```
+
+The `python` tool description, sent with every request, now ends with two lines: "No I/O is allowed: do not read or write files." and "Only use the exposed packages; any other import fails." The sandbox already rejects `open()` and imports outside its module list, so these lines only tell the model what the sandbox enforces. They apply to one-wave v3 onwards.
