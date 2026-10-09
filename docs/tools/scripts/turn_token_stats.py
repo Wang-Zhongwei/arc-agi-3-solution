@@ -22,17 +22,31 @@ META_RE = re.compile(r"^\[MODEL RESPONSE META\]\n", re.M)
 CALIBRATION_RE = re.compile(r"text_token_calibration: ([0-9.]+) chars/token")
 SEED_CHARS_PER_TOKEN = 3.0
 YIELD_TOKENS = 2048
+NEXT_SECTION_RE = re.compile(r"^(\[[A-Z ]+\]|--- analysis_step=)", re.M)
+TRUNCATED_RE = re.compile(r"\n\.\.\. \[truncated (\d+) chars\]")
+truncated_blocks = 0
 
 
 def reply_chars(meta: str) -> tuple[int, int]:
     """Generated characters of one reply: (reasoning, content + tool-call arguments)."""
+    global truncated_blocks
     reasoning = int(re.search(r"^reasoning_chars: (\d+)", meta, re.M).group(1))
     content = int(re.search(r"^content_chars: (\d+)", meta, re.M).group(1))
     raw = re.search(r"^raw_tool_calls:\n", meta, re.M)
     args = 0
     if raw and meta[raw.end():].startswith("["):
-        calls, _ = json.JSONDecoder().raw_decode(meta[raw.end():])
-        args = sum(len(c.get("function", {}).get("arguments") or "") for c in calls)
+        block = meta[raw.end():]
+        try:
+            # strict=False: tool-call arguments can hold raw control characters.
+            calls, _ = json.JSONDecoder(strict=False).raw_decode(block)
+            args = sum(len(c.get("function", {}).get("arguments") or "") for c in calls)
+        except json.JSONDecodeError:
+            # The harness trims long blocks to "... [truncated N chars]"; count
+            # the printed JSON plus N (JSON escaping makes this a slight overcount).
+            truncated_blocks += 1
+            cut = TRUNCATED_RE.search(block)
+            end = NEXT_SECTION_RE.search(block)
+            args = cut.start() + int(cut.group(1)) if cut else (end.start() if end else len(block))
     return reasoning, content + args
 
 
@@ -83,7 +97,8 @@ def main(run_dir: Path) -> None:
     counts: dict[str, int] = {}
     for t in turns:
         counts[t["outcome"]] = counts.get(t["outcome"], 0) + 1
-    print(f"turns {len(turns)} {counts}; replies {len(replies)}")
+    print(f"turns {len(turns)} {counts}; replies {len(replies)}; "
+          f"truncated tool-call blocks {truncated_blocks}")
     print("tokens per reply:", describe(replies))
     for cut in (2048, 4096, 8192):
         print(f"  replies >= {cut}: {sum(r >= cut for r in replies) / len(replies):.1%}")
@@ -100,6 +115,9 @@ def main(run_dir: Path) -> None:
               "acting turns": [t for t in turns if t["outcome"] == "executed"],
               "yielded turns (turn_token_budget)": [t for t in turns if t["outcome"] == "turn_token_budget"]}
     for name, group in groups.items():
+        if not group:
+            print(f"\n{name}: none")
+            continue
         per_turn = [sum(t["replies"]) for t in group]
         print(f"\n{name}: tokens per turn", describe(per_turn))
         print("  replies per turn", describe([len(t["replies"]) for t in group]))
@@ -107,6 +125,8 @@ def main(run_dir: Path) -> None:
         for cut in (2048, 4096, 8192):
             print(f"  turns >= {cut}: {sum(x >= cut for x in per_turn) / len(per_turn):.1%}")
     yielded = groups["yielded turns (turn_token_budget)"]
+    if not yielded:
+        return
     before = [sum(t["replies"][:-1]) for t in yielded if t["replies"]]
     last = [t["replies"][-1] for t in yielded if t["replies"]]
     print("\nyielded turns: tokens before the reply that crossed 2,048", describe(before))
