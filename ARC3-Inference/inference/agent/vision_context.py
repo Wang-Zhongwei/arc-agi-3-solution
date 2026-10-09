@@ -154,7 +154,7 @@ _ANIMATION_IMAGE_MODES = ("off", "peak", "composite", "sampled")
 def _animation_image_mode(name: str) -> str:
     """One of off, peak, composite, sampled. Anything else raises.
 
-    These two are the only enum knobs among a set of otherwise boolean ARC3_*
+    This is an enum knob among a set of otherwise boolean ARC3_*
     variables, so `=1` is the natural thing to write - and silently meant off,
     which cost a whole run to notice. Failing at startup is better than a
     feature that is configured and quietly absent.
@@ -168,22 +168,13 @@ def _animation_image_mode(name: str) -> str:
     return mode
 
 
-def animation_death_image_mode() -> str:
-    """off | peak | composite | sampled, for the fatal action of a game over.
-
-    Separate from ARC3_ANIMATION_IMAGE because the two fire on different
-    conditions and a game-over turn already carries two images, so a third is
-    a cost worth deciding on its own.
-    """
-    return _animation_image_mode("ARC3_ANIMATION_DEATH_IMAGE")
-
-
 def animation_image_mode() -> str:
-    """off | peak | composite | sampled.
+    """off | peak | composite | sampled, for ordinary and fatal actions.
 
     Peak/composite attach when the action left the board area unchanged, which is
     exactly when the board image the model receives is uninformative: the
-    action did something, and no frame it can reach shows what.
+    action did something, and no frame it can reach shows what. Fatal actions
+    use the same mode, since the current board has already reset.
     """
     return _animation_image_mode("ARC3_ANIMATION_IMAGE")
 

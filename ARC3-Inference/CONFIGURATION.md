@@ -116,8 +116,7 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
-| `ARC3_ANIMATION_IMAGE` | `off` | `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity when the gameplay area did not change. |
-| `ARC3_ANIMATION_DEATH_IMAGE` | `off` | Separate `sampled`/`peak`/`composite` option for the fatal action’s animation. |
+| `ARC3_ANIMATION_IMAGE` | `off` | Applies to ordinary and fatal actions. `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity and, for ordinary actions, an unchanged gameplay area. Fatal-action images appear in the post-death opener after automatic RESET. |
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 

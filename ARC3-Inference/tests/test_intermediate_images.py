@@ -167,10 +167,29 @@ def test_sampled_captions_index_the_exposed_animation_frames(values):
 
 
 @pytest.mark.parametrize('fatal', [False, True])
+@pytest.mark.parametrize('mode', ['off', 'peak', 'composite', 'sampled'])
+def test_animation_image_mode_controls_normal_and_fatal_actions(monkeypatch, fatal, mode):
+    monkeypatch.setenv('ARC3_ANIMATION', '1')
+    monkeypatch.setenv('ARC3_ANIMATION_IMAGE', mode)
+    agent = tool_agent.ToolAgent(model='test-model', base_url='http://127.0.0.1:8001/v1', provider='vllm')
+    agent._last_animation_chain = [frame(0, v).grid for v in [0, 1, 2, 0]]
+    agent._last_action_gameplay_changed = False
+    summary = {'animation': {'transient_pixels': 4096}}
+    if fatal:
+        agent._append_fatal_animation_image(summary)
+    else:
+        agent._prepare_animation_image(summary)
+    message = agent._build_user_message('Continue', frame(1))
+    parts = [p for p in message['content'] if p['type'] == 'image_url']
+    expected = {'off': 0, 'peak': 1, 'composite': 1, 'sampled': 2}[mode]
+    assert len(parts) == 1 + expected  # current board plus animation images
+    assert sum(image(part).size == (128, 128) for part in parts) == expected
+
+
+@pytest.mark.parametrize('fatal', [False, True])
 def test_sampled_mode_bypasses_old_gates_and_keeps_diffs(monkeypatch, fatal):
     monkeypatch.setenv('ARC3_ANIMATION', '1')
     monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'sampled')
-    monkeypatch.setenv('ARC3_ANIMATION_DEATH_IMAGE', 'sampled')
     agent = tool_agent.ToolAgent(model='test-model', base_url='http://127.0.0.1:8001/v1', provider='vllm')
     agent._last_animation_chain = [frame(0, v).grid for v in [0, 1, 2, 3]]
     agent._last_action_gameplay_changed = True
@@ -193,7 +212,6 @@ def test_sampled_mode_bypasses_old_gates_and_keeps_diffs(monkeypatch, fatal):
 def test_images_follow_related_prompt_text(monkeypatch, tmp_path, kind):
     monkeypatch.setenv('ARC3_ANIMATION', '1')
     monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'sampled')
-    monkeypatch.setenv('ARC3_ANIMATION_DEATH_IMAGE', 'sampled')
     monkeypatch.setenv('ARC3_GAMEOVER_DIFF_IMAGE', '1')
     agent = tool_agent.ToolAgent(model='test-model', base_url='http://127.0.0.1:8001/v1', provider='vllm')
     agent._ensure_session(tmp_path / 'state.json')
@@ -202,6 +220,7 @@ def test_images_follow_related_prompt_text(monkeypatch, tmp_path, kind):
     entries = [HistoryEntry('UP', frame(1)), HistoryEntry('RIGHT', frame(2, 3), {'state': 'GAME_OVER'}), HistoryEntry('RESET', frame(3))]
     if kind == 'actions':
         monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'off')
+        monkeypatch.setenv('MULTIMODAL_INTERMEDIATE_FRAMES', 'true')
         agent._pending_intermediate_images = vision.intermediate_frame_parts(entries, after_step=0, before_step=2)
     summary = {'executed_count': 2, 'executed_actions': ['UP', 'RIGHT'], 'animation': {'frames': 3, 'transient_pixels': 0}, 'game_over': kind == 'death'}
     prompt = agent._build_user_prompt(3, valid_actions=['UP'], current_frame=frame(3), history_entries=entries, previous_step_summary=summary)
@@ -364,7 +383,6 @@ def test_shared_event_prompts_and_evidence_order(monkeypatch, tmp_path, mode, ev
     monkeypatch.setenv('ARC3_MEMORY_SECTIONS', 'off')
     monkeypatch.setenv('ARC3_ANIMATION', '1')
     monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'off' if mode == 'intermediate' else 'sampled')
-    monkeypatch.setenv('ARC3_ANIMATION_DEATH_IMAGE', 'off' if mode == 'intermediate' else 'sampled')
     monkeypatch.setenv('ARC3_GAMEOVER_DIFF_IMAGE', '1')
     monkeypatch.setenv('ARC3_LEVEL_TRANSFER_GUIDANCE', '1')
     monkeypatch.setenv('ARC3_PERSISTENT_FUNCTIONS', '1')
@@ -496,7 +514,6 @@ def test_chronological_order_across_animation_modes(monkeypatch, tmp_path, event
     monkeypatch.setenv('MULTIMODAL_INTERMEDIATE_FRAMES', 'true')
     monkeypatch.setenv('ARC3_ANIMATION', '1')
     monkeypatch.setenv('ARC3_ANIMATION_IMAGE', mode)
-    monkeypatch.setenv('ARC3_ANIMATION_DEATH_IMAGE', mode)
     monkeypatch.setenv('ARC3_GAMEOVER_DIFF_IMAGE', '1')
     monkeypatch.setenv('ARC3_ANIMATION_TIMELINE', '0')
     monkeypatch.setattr(tool_agent, '_AUTO_FRAME_DIFF', False)
@@ -549,7 +566,7 @@ def test_chronological_order_across_animation_modes(monkeypatch, tmp_path, event
 def test_single_fatal_action_with_optional_images_and_animation(monkeypatch, tmp_path, death_images, animated, intermediate):
     monkeypatch.setenv('MULTIMODAL_INTERMEDIATE_FRAMES', str(intermediate).lower())
     monkeypatch.setenv('ARC3_ANIMATION', str(int(animated)))
-    monkeypatch.setenv('ARC3_ANIMATION_DEATH_IMAGE', 'sampled')
+    monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'sampled')
     monkeypatch.setenv('ARC3_GAMEOVER_DIFF_IMAGE', str(int(death_images)))
     monkeypatch.setattr(tool_agent, '_AUTO_FRAME_DIFF', False)
     monkeypatch.setattr(tool_agent, '_DIFF_IMAGE', True)
