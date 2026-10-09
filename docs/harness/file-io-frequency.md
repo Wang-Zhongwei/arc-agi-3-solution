@@ -17,7 +17,7 @@ reach the call. We observed no successful file read or write through these APIs.
 
 The Python tool description now includes one sentence:
 
-> Avoid file I/O: `open()` is unavailable, and relative files do not persist between Python calls.
+> File I/O such as open() or json.dump() is NOT allowed.
 
 Each Python call runs in a fresh temporary directory, which is deleted afterward.
 There is no configuration toggle for file I/O. Allowed imports such as `pathlib`
