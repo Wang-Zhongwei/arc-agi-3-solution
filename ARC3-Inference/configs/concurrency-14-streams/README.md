@@ -13,3 +13,13 @@
 Expected KV pool ≈ 1.18M tokens (v3: 1,190,528): +0.008 memory fraction ≈ +57K, 16 more Mamba slots ≈ −68K. At v3's per-request footprint (median ~65–76K, p95 ~88K at 10 running), 14 streams fit at the median but may queue at the p95.
 
 Compare against v3 (Kaggle `jonathanwang2022/new-baseline` v3): decode tok/s by running requests from `serve.log` (v3: 718 / 753 / 773 at 8 / 9 / 10), KV usage and queueing, and the harness tok/s over the same game window. Scores from a 20-minute run are not comparable to 120-minute runs.
+
+## v1 result (Kaggle v1, 2026-10-09): out of memory on the first prefill
+
+The server came up (KV pool 1,181,312 tokens, 2.20 GB free after graph capture vs v3's 3.14) and crashed on the first batch of game prompts: `torch.OutOfMemoryError` in `_short_conv`, 105 MiB free. No game got a response. An 8192-token prefill forward needs about 3.1–3.3 GB on top of the pools: Daniel's v05 fell from 4.25 GB free to 0.94 GiB during its first prefill, and new-baseline v3 from 3.14 GB to **0.04 GiB** (it survived by ~40 MB). So 0.968 does not fit with an 8192 chunk, and 0.96 at 14 streams (~2.96 GB free) would not either.
+
+The wide BF16 GEMM check passed (`pennyroyal-gemm-bench.jsonl`): all 42 shapes (M 36–56) match torch within 0.03 absolute and run 1.01–1.49× faster than cuBLAS under CUDA graphs.
+
+## v2: 2,048-token prefill chunk
+
+[v2.json](v2.json) is v1 with `CHUNK` and `MAX_PREFILL` 2048 (from 8192 and 16384), the setting the tuneup runs used to hold 0.967 at 14 streams with 1.26 GB free. Everything else, including `MEMFRAC` 0.968, is unchanged. Smaller prefill forwards may cost prefill speed; compare decode-only intervals by running requests (concurrency effect) separately from prefill intervals (chunk effect).
