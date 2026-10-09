@@ -62,3 +62,27 @@ Over a full drain cycle (59K → 118K, ~88K average) 14 streams need ~1.23M toke
 | `public_runtime_minutes` | 32 | 55 | ~45 minutes of games, past the first history drain |
 
 CUDA graphs stay at 1–14: dropping 11 and 13 frees ~0.05 GB and would pad the common 13-request batch to 14. Expected KV pool ≈ 1.25M tokens (v2: 1,181,312), still below the ~1.47M a synchronized start reaches before the first drain, so expect a milder, later squeeze rather than none. Watch: lowest free memory, prefix hit rate and queueing around minutes 15–20, accept length (v2: 2.63), and effective tok/s against new-baseline v3 over the same window.
+
+## v3 result (Kaggle `ticbudja/concurrency-14-streams` v2, 2026-10-09)
+
+The memory settings landed as predicted: KV pool 1,249,216 tokens (+5.7% over v2), 1.63 GB free after graph capture, lowest 0.37 GiB during serving, no OOM, no Mamba cap (70 // 5 = 14). The cache hit rate held at 93–97% outside the squeeze, so 70 Mamba slots are enough; accept length 2.63. 46.6 minutes of games.
+
+Per 5 minutes from benchmark start, against new-baseline v3 (10 streams) over the same window:
+
+| Minutes | v3 baseline tok/s | v3 run tok/s | Running | KV mean / max | Queued | Uncached prefill | Prefix hit |
+|---|---|---|---|---|---|---|---|
+| 0–5 | 661 | 765 | 13.6 | 0.19 / 0.35 | 11% | 0.42M | 90% |
+| 5–10 | 690 | 823 | 13.5 | 0.48 / 0.64 | 5% | 0.31M | 95% |
+| 10–15 | 651 | 825 | 13.2 | 0.75 / 0.94 | 1% | 0.24M | 97% |
+| 15–20 | 662 | **299** | 13.1 | 0.92 / 0.99 | 45% | 1.82M | 55% |
+| 20–25 | 686 | **187** | 12.2 | 0.95 / 0.99 | 100% | 2.37M | 8% |
+| 25–30 | 696 | **171** | 11.5 | 0.95 / 0.99 | 100% | 2.36M | 18% |
+| 30–35 | 667 | 430 | 12.7 | 0.67 / 0.95 | 31% | 1.55M | 59% |
+| 35–40 | 645 | 772 | 13.4 | 0.37 / 0.51 | 5% | 0.44M | 93% |
+| 40–45 | 638 | 821 | 13.2 | 0.62 / 0.79 | 1% | 0.27M | 97% |
+
+Over 46.6 minutes: 552 vs 666 tok/s (−17%); decode-only 922 vs 775; 10.3M vs 2.8M uncached prefill tokens; queueing in 16.4% vs 1.2% of intervals. Decode-only by running requests: 879 / 938 / 959 / 981 at 11 / 12 / 13 / 14.
+
+**The squeeze is self-sustaining.** Once the pool is full, every admitted turn evicts a paused game's prefix; that game re-prefills its whole history on its next turn, which needs more KV and more time, so games advance slowly and reach the 118K drain point late. It lasted ~20 minutes (15–35) and ended only when enough games drained. Games then restart near 59K together and grow at similar rates, so the next squeeze is likely one drain cycle later (new-baseline v3's own KV peaks recur every ~15–20 minutes at 10 streams). +6% KV did not move it: a fresh 14-stream run needs ~1.47M tokens at its peak.
+
+Healthy phases (0–15 and 35–45 minutes) ran 765–825 tok/s against 638–696: 14 streams are worth +20–25% whenever the pool is not full. Keeping that gain needs load control rather than more KV: admit fewer turns or drain history earlier when the server's KV usage nears full, or a lower fixed concurrency (11 fits the peak).
