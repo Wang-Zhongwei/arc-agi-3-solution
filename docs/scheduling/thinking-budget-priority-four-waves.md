@@ -120,3 +120,5 @@ kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-one-
 ```
 
 The `python` tool description, sent with every request, now ends with two lines: "No I/O is allowed: do not read or write files." and "Only use the exposed packages; any other import fails." The sandbox already rejects `open()` and imports outside its module list, so these lines only tell the model what the sandbox enforces. They apply to one-wave v3 onwards.
+
+The sandbox also allows `abc`, `array`, `cmath`, `dataclasses`, `decimal`, `enum`, `hashlib`, `inspect`, `numbers`, `time`, `types` and `typing`, in case the model imports them. None does file or process I/O. They are not named in the prompt (like `difflib`), so the prompt's module list is unchanged. The sandbox has no `__build_class__`, so `dataclasses` and `enum` work only through their functional forms (`make_dataclass`, `Enum('Dir', 'UP')`). `tests/test_sandbox_modules.py` checks that the modules work and that `os`, `sys`, `pathlib`, `glob`, `pickle`, `importlib`, `builtins`, `io`, `shutil` and `open()` stay blocked.
