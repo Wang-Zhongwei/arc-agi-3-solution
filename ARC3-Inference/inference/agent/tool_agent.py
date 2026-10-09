@@ -6,6 +6,7 @@ import heapq
 import threading
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -66,11 +67,13 @@ from inference.agent.vision_context import (
     animation_death_image_mode,
     animation_image_mode,
     animation_peak_part,
+    animation_sampled_parts,
     current_grid_image_enabled,
     current_grid_image_part,
+    intermediate_frame_parts,
 )
 
-from inference.agent.python_tool_sandbox import run_sandboxed_python
+from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
@@ -1979,6 +1982,7 @@ def _priority_refresh_enabled() -> bool:
     # Yield-UCB's bonus moves with the shared clock, so it always refreshes.
     return _scheduler() == "ucb" or any(_get_env_bool(name, False) for name in (
         "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
+        "ARC3_PRIORITY_THINKING",
     ))
 
 
@@ -2011,6 +2015,19 @@ def _ucb_c() -> float:
 
 def _ucb_recent_weight() -> float:
     return min(1.0, max(0.0, _get_env_float("ARC3_UCB_RECENT_WEIGHT", 0.5)))
+
+
+def _usage_reasoning_tokens(usage: dict[str, Any]) -> int | None:
+    """Reasoning tokens from a response's usage, top-level (sglang) or under
+    completion_tokens_details (OpenAI); None when the server reports neither."""
+    details = usage.get("completion_tokens_details")
+    for raw in (usage.get("reasoning_tokens"),
+                details.get("reasoning_tokens") if isinstance(details, dict) else None):
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _priority_action_count(summary: dict[str, Any]) -> int:
@@ -2119,6 +2136,7 @@ class _PriorityGate:
             human_actions=_priority_human_actions(), action_scale=_priority_action_scale(),
             token_scale=_priority_token_scale(), action_weight=_priority_action_weight(),
             tail_base=_priority_tail_base(), tail_cap=_priority_tail_cap(),
+            thinking_reference=_priority_thinking_reference(),
             **_priority_level_options(),
         )
 
@@ -2245,6 +2263,18 @@ def _priority_action_scale() -> float:
 
 def _priority_token_scale() -> float:
     return max(1.0, _get_env_float("ARC3_PRIORITY_TOKEN_SCALE", 62000.0))
+
+
+def _priority_thinking_reference() -> float:
+    """Reference for the thinking multiplier: reasoning tokens of a typical
+    action-emitting call. 0 when ARC3_PRIORITY_THINKING is off. Like pace, it
+    also enables refreshed ranking, since the multiplier travels on the snapshot."""
+    if not _get_env_bool("ARC3_PRIORITY_THINKING", False):
+        return 0.0
+    value = _get_env_float("ARC3_PRIORITY_THINKING_REF", 2048.0)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("ARC3_PRIORITY_THINKING_REF must be finite and > 0")
+    return value
 
 
 def _priority_action_weight() -> float:
@@ -2724,7 +2754,8 @@ def _render_auto_frame_diff(
         remaining = len(entries) - shown - sum(swarm.values())
         if remaining > 0:
             lines.append(f"- {bucket}: +{remaining} more")
-    lines.append("(call frame_diff() in python for the full object list)")
+    if frame_diff_enabled():
+        lines.append("(call frame_diff() in python for the full object list)")
     if _estimate_diff_tokens("\n".join(lines)) <= budget_tokens:
         return lines
     # rung 3: counts only, cannot be large
@@ -2733,9 +2764,8 @@ def _render_auto_frame_diff(
         for bucket in _DIFF_BUCKETS
         if diff.get(bucket)
     ]
-    return [
-        header + " " + ", ".join(parts) + " (details omitted; call frame_diff() in python)."
-    ]
+    omitted = " (details omitted; call frame_diff() in python)." if frame_diff_enabled() else " (details omitted)."
+    return [header + " " + ", ".join(parts) + omitted]
 
 
 def _build_system_prompt(*, tool_output_tokens: int) -> str:
@@ -2764,8 +2794,12 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
             " Each turn's message includes an 'Auto frame diff' section summarizing "
             "object-level changes since your previous analyzer turn (it spans all "
             "actions executed in between, not just the last one). Treat it as ground "
-            "truth for what changed, consult it before acting, and call `frame_diff()` "
-            "in python when you need per-action or full object detail."
+            "truth for what changed, consult it before acting"
+            + (
+                ", and call `frame_diff()` in python when you need per-action or full "
+                "object detail."
+                if frame_diff_enabled() else "."
+            )
         )
     if _DIFF_IMAGE and current_grid_image_enabled():
         prompt += (
@@ -2797,10 +2831,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         WORLD_MODEL_FREE_ADDENDUM if _memory_sections_disabled() else WORLD_MODEL_ADDENDUM
     )
     prompt += PYTHON_ADDENDUM_TAIL
-    if _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
-        # documents `frame_diff(before, after)`. The function stays callable
-        # either way - this only controls whether the model is told about it,
-        # so the arm measures whether knowing costs more than it returns.
+    if frame_diff_enabled() and _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
+        # documents `frame_diff(before, after)`. With ARC3_FRAME_DIFF on, the
+        # function stays callable either way - the hint only controls whether
+        # the model is told about it. ARC3_FRAME_DIFF=0 removes both.
         prompt += FRAME_DIFF_HINT_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
@@ -3619,6 +3653,8 @@ class ToolAgent:
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
+        self._pending_animation_samples: list[tuple[str, dict[str, Any]]] = []
+        self._pending_intermediate_images: list[tuple[str, dict[str, Any]]] = []
         self._pending_diff_image_label: str = ""
         self._turn_diff_image: dict[str, Any] | None = None
         self._turn_diff_image_label: str = ""
@@ -3670,6 +3706,7 @@ class ToolAgent:
         self._session_runtime_dir: Path | None = None
         self._session_total_tokens = 0
         self._session_generated_tokens = 0
+        self._last_call_reasoning_tokens: int | None = None
         self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self._current_valid_actions: list[str] = []
         self._last_step_summary: dict[str, Any] | None = None
@@ -3703,6 +3740,7 @@ class ToolAgent:
             self._history_messages = []
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
+            self._last_call_reasoning_tokens = None
             self._summary_context_tokens_since_attempt = 0
             self._last_step_summary = None
             self._last_action_call_result = None
@@ -3745,6 +3783,9 @@ class ToolAgent:
         self._session_generated_tokens += generated_token_count
         if count_toward_turn:
             self._turn_generated_tokens += generated_token_count
+            # the last such call before a handover is the one that emitted the
+            # previous turn's action; rolling summaries are not deliberation
+            self._last_call_reasoning_tokens = _usage_reasoning_tokens(usage)
 
         total_tokens = usage.get("total_tokens")
         try:
@@ -4582,6 +4623,9 @@ class ToolAgent:
         mode = animation_death_image_mode()
         if mode == "off" or not summary:
             return
+        if mode == "sampled":
+            self._pending_gameover_images.extend(animation_sampled_parts(self._last_animation_chain or []))
+            return
         animation = summary.get("animation") or {}
         if not int(animation.get("transient_pixels") or 0):
             return
@@ -4633,6 +4677,9 @@ class ToolAgent:
             return
         mode = animation_image_mode()
         if mode == "off" or not summary:
+            return
+        if mode == "sampled":
+            self._pending_animation_samples = animation_sampled_parts(self._last_animation_chain or [])
             return
         if self._last_action_gameplay_changed is not False:
             return
@@ -4755,12 +4802,16 @@ class ToolAgent:
         diff_label = self._pending_diff_image_label
         animation_part = self._pending_animation_image
         animation_label = self._pending_animation_image_label
+        animation_samples = list(self._pending_animation_samples)
         gameover_images = list(self._pending_gameover_images)
+        intermediate_images = list(getattr(self, "_pending_intermediate_images", []))
         self._pending_diff_image = None
         self._pending_diff_image_label = ""
         self._pending_animation_image = None
         self._pending_animation_image_label = ""
+        self._pending_animation_samples = []
         self._pending_gameover_images = []
+        self._pending_intermediate_images = []
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -4769,16 +4820,58 @@ class ToolAgent:
         if image_part is None:
             return {"role": "user", "content": user_prompt}
 
+        # Inline the experimental images beside their existing prose. Anchors
+        # are the exact lines recorded while building this prompt, not markers
+        # sent to the model. Other image modes retain their established layout.
+        if intermediate_images or animation_samples or (
+            gameover_images and animation_death_image_mode() == "sampled"
+        ):
+            groups = {
+                "actions": intermediate_images,
+                "animation": animation_samples + ([(animation_label, animation_part)] if animation_part else []),
+                "death": gameover_images,
+                "current": ([(diff_label, diff_part)] if diff_part else []) + [(
+                    "Current board after RESET—act on this." if gameover_images else "Current board—act on this.",
+                    image_part,
+                )],
+            }
+            anchors = getattr(self, "_prompt_image_anchors", {})
+            placements = []
+            for name, parts in groups.items():
+                anchor = anchors.get(name, "")
+                start = user_prompt.find(anchor) if anchor else -1
+                placements.append((start + len(anchor) if start >= 0 else len(user_prompt), name, parts))
+            placements.sort(key=lambda item: item[0])
+            content = []
+            cursor = 0
+            for end, _, parts in placements:
+                if not parts:
+                    continue
+                if user_prompt[cursor:end].strip():
+                    content.append({"type": "text", "text": user_prompt[cursor:end]})
+                for label, part in parts:
+                    content.extend([{"type": "text", "text": label}, part])
+                cursor = end
+            if user_prompt[cursor:].strip():
+                content.append({"type": "text", "text": user_prompt[cursor:]})
+            return {"role": "user", "content": content}
+
         content: list[dict[str, Any]] = [
             {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
             image_part,
         ]
+        for label, part in intermediate_images:
+            content.append({"type": "text", "text": label})
+            content.append(part)
         if diff_part is not None:
             content.append({"type": "text", "text": diff_label})
             content.append(diff_part)
         if animation_part is not None:
             content.append({"type": "text", "text": animation_label})
             content.append(animation_part)
+        for label, part in animation_samples:
+            content.append({"type": "text", "text": label})
+            content.append(part)
         for label, part in gameover_images:
             content.append({"type": "text", "text": label})
             content.append(part)
@@ -4903,6 +4996,7 @@ class ToolAgent:
         history_entries: list[HistoryEntry] | None = None,
         previous_step_summary: dict[str, Any] | None = None,
     ) -> str:
+        self._prompt_image_anchors: dict[str, str] = {}
         history_entries = history_entries or []
         current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
         current_level = current_frame.level if current_frame is not None else 1
@@ -4938,6 +5032,7 @@ class ToolAgent:
                 lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
             else:
                 lines.append("Executed actions: none.")
+            self._prompt_image_anchors["actions"] = lines[-1]
             if _report_gameplay_changed() and normalized_count:
                 # Whether the sequence MOVED anything. The harness computes this
                 # for every action - it drives the batch stop - and until now
@@ -4970,6 +5065,11 @@ class ToolAgent:
                 if animation_line:
                     lines.append(animation_line)
                 self._prepare_animation_image(previous_step_summary)
+                if self._pending_animation_samples and not animation_line:
+                    animation_line = "Last action animation (sampled):"
+                    lines.append(animation_line)
+                if animation_line:
+                    self._prompt_image_anchors["animation"] = animation_line
             no_op_stops = previous_step_summary.get("no_op_stops") or []
             for stop in no_op_stops[:3]:
                 skipped = stop.get("skipped") or []
@@ -5114,6 +5214,7 @@ class ToolAgent:
                         + "; ".join(str(t) for t in game_over_trace)
                         + "."
                     )
+                self._prompt_image_anchors["death"] = lines[-1]
                 self._prepare_gameover_images(
                     history_entries, previous_step_summary
                 )
@@ -5172,6 +5273,7 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
+        self._prompt_image_anchors["current"] = state_line
         lines.extend(
             [
                 state_line,
@@ -6101,6 +6203,12 @@ class ToolAgent:
         if step_executed:
             self._last_step_summary = self._summarize_step_sequence(action_results)
             self._update_summarized_knowledge_from_step_summary()
+            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) and current_frame is not None:
+                final_frame, updated_history = load_runtime_state(state_path)
+                if final_frame is not None:
+                    self._pending_intermediate_images = intermediate_frame_parts(
+                        updated_history, after_step=current_frame.step, before_step=final_frame.step,
+                    )
         elif self._last_step_summary and not self._last_step_summary.get("stale"):
             # carried over across an exchange that executed nothing: mark it so
             # the next prompt reminds instead of re-narrating it as fresh
@@ -6604,7 +6712,10 @@ class ToolAgent:
         )
         if gate is not None and _priority_refresh_enabled():
             pace = self._progress_pace.cost_multiplier() if _get_env_bool("ARC3_PRIORITY_PACE", False) else 1.0
-            snapshot = PrioritySnapshot(level, actions, tokens, pace, total_levels)
+            snapshot = PrioritySnapshot(
+                level, actions, tokens, pace, total_levels,
+                getattr(self, "_last_call_reasoning_tokens", None),
+            )
             estimate = gate._snapshot_priority(snapshot, time.monotonic())
         else:
             estimate = _game_priority(

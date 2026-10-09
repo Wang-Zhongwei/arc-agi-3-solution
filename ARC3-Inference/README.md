@@ -340,6 +340,11 @@ is averaged over logged prefill/decode samples; its prefill cache reuse is
 the ratio of logged cached tokens to cached plus new tokens. These are not
 whole-run throughput or vLLM sliding-window cache-hit measurements. Column
 tooltips describe the derived values; unavailable measurements remain blank.
+The curves table shows prompt/decode throughput in tok/s and token cache hit
+rate, with the 10th and 90th percentiles (P10–P90) below each mean. Quantiles
+use linear interpolation over logged samples and are shown separately per
+server. For SGLang, the cache mean is token-weighted while quantiles describe
+individual prefill-batch percentages. Startup samples are included.
 
 Start the viewer for a saved run on the port from `configs/inference.json`:
 
@@ -368,9 +373,14 @@ make view VIEW_RUN_DIR=/shared/arc_3_results/$USER/<run-name>
 The viewer shows run summaries, per-game progress, boards, actions, rewards,
 level transitions, and the duck's transcript.
 
-Game thumbnails are optional and require offline environments plus `arc_agi`.
-Pass `VIEW_ENVIRONMENTS_DIR=/path/to/environments` to enable them when those
-dependencies are available; saved boards and transcripts render independently.
+Hover a game name to preview its initial frame from the saved run. No game
+download is needed when the run includes its initial board. Offline environments
+plus `arc_agi` provide a fallback; pass `VIEW_ENVIRONMENTS_DIR=/path/to/environments`
+to use them for games without a saved initial frame.
+
+The viewer saves each preview as `runs/thumbnails/<game-id>.png` and reads that
+PNG first on later visits. These small files sync with the shared runs folder,
+so teammates can see previews without downloading game environments or traces.
 
 This fork corrects per-turn transcript display, includes all recorded attempts
 when an analysis step is retried, and distinguishes pending transcripts from
@@ -382,7 +392,7 @@ contain the corresponding usage data.
 Score one run directory:
 
 ```bash
-make score_run SCORE_RUN_DIR=/path/to/run
+make evaluate_run EVALUATE_RUN_DIR=/path/to/run
 ```
 
 Evaluate runs from `configs/eval.json`:
@@ -394,13 +404,17 @@ make eval
 Write a score file somewhere specific:
 
 ```bash
-make score_run SCORE_RUN_DIR=/path/to/run SCORE_OUTPUT_PATH=docs/candidate-score.json
+make evaluate_run EVALUATE_RUN_DIR=/path/to/run EVALUATION_OUTPUT_PATH=docs/candidate-evaluation.json
 ```
+
+The existing `score_run` target with `SCORE_RUN_DIR` and `SCORE_OUTPUT_PATH` remains supported.
 
 The scorer reads TAAF `benchmark.json`, uses persisted `final_score` values when
 present, and otherwise asks TAAF's `GameRun` scorer to compute the score from
-the saved state. It writes `evaluation.json` plus the lightweight `score.json`
-format used by significance checks.
+the saved state. It writes one `evaluation.json` with per-pass scores, token
+and action usage, and the score-progression curves (`progression_lanes`) that the
+score-curves page draws. Significance checks read it directly; older runs may
+still carry a `score.json`.
 
 ## Significance
 
@@ -456,7 +470,7 @@ transitions linked back to message indices.
 - `make sbatch`: submit through TAAF Slurm deployment.
 - `make chat PROMPT="..."`: send a direct chat probe to the configured model.
 - `make view`: serve the run viewer.
-- `make score_run SCORE_RUN_DIR=...`: score one saved run.
+- `make evaluate_run EVALUATE_RUN_DIR=...`: evaluate one saved run, including score and action curves.
 - `make eval`: score runs selected by an eval config.
 - `make significance`: compare two score files.
 - `make traces`: export trace JSON.

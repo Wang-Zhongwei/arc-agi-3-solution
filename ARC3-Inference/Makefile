@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := interactive
 
-.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck run _taaf-run chat eval score_run significance view pull-kaggle trace traces zip clean cluster_view_queue
+.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval evaluate_run score_run significance view pull-kaggle pull-runpod trace traces zip clean cluster_view_queue
 
 -include .env
 
@@ -66,6 +66,9 @@ MAX_RUNTIME_MINUTES := $(shell $(CONFIG_VALUE) environment.max_runtime_minutes)
 endif
 ifeq ($(origin MAX_GENERATED_TOKENS_PER_GAME),undefined)
 MAX_GENERATED_TOKENS_PER_GAME := $(shell $(CONFIG_VALUE) environment.max_generated_tokens_per_game)
+endif
+ifeq ($(origin PUBLIC_MAX_GENERATED_TOKENS_PER_GAME),undefined)
+PUBLIC_MAX_GENERATED_TOKENS_PER_GAME := $(shell $(CONFIG_VALUE) kaggle.public_max_generated_tokens_per_game)
 endif
 ifeq ($(origin MAX_EXPERIMENT_RUNTIME_HOURS),undefined)
 MAX_EXPERIMENT_RUNTIME_HOURS := $(shell $(CONFIG_VALUE) environment.max_experiment_runtime_hours)
@@ -142,6 +145,14 @@ KAGGLE_ACCELERATOR ?= NvidiaRtxPro6000
 KAGGLE_RUN_AS_SUBMISSION ?= false
 KAGGLE_DRY_RUN ?= false
 KAGGLE_DATASET_VERSION_MESSAGE ?=
+# Run shape for make kaggle-duck; see CONFIGURATION.md "Kaggle run shape".
+KAGGLE_PUBLIC_GAMES ?= $(shell $(CONFIG_VALUE) kaggle.public_games [])
+KAGGLE_PUBLIC_RUNTIME_MINUTES ?= $(shell $(CONFIG_VALUE) kaggle.public_runtime_minutes 140)
+KAGGLE_PRIVATE_RUNTIME_MINUTES ?= $(shell $(CONFIG_VALUE) kaggle.private_runtime_minutes 532)
+KAGGLE_CONCURRENT_JOBS ?= $(shell $(CONFIG_VALUE) kaggle.concurrent_jobs 120)
+# The notebook's soft end is its budget minus a 10-minute buffer, so the budget is
+# the public play time plus 10.
+KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES = $(shell $(PYTHON) -c 'print(float("$(KAGGLE_PUBLIC_RUNTIME_MINUTES)") + 10)')
 
 ifeq ($(origin SERVER_BACKEND),undefined)
 SERVER_BACKEND := $(shell $(CONFIG_VALUE) server.backend vllm)
@@ -302,11 +313,22 @@ DEPLOYMENT_SLURM_LOCAL_SERVER_CONFIG ?= $(CONFIG_PATH)
 ARC3_HARNESS_ENV_JSON := $(shell $(CONFIG_VALUE) harness_env {})
 # Kaggle serving (kaggle.serving = vllm | pennyroyal, model/wheel sources, image).
 ARC3_KAGGLE_JSON := $(shell $(CONFIG_VALUE) kaggle {})
+# RunPod pod shape and Hugging Face model sources for make runpod-duck.
+ARC3_RUNPOD_JSON := $(shell $(CONFIG_VALUE) runpod {})
 ifeq ($(origin MULTIMODAL_CONTEXT),undefined)
 MULTIMODAL_CONTEXT := $(shell $(CONFIG_VALUE) multimodal.context)
 endif
 ifeq ($(origin MULTIMODAL_UPSCALE),undefined)
 MULTIMODAL_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.upscale 16)
+endif
+ifeq ($(origin MULTIMODAL_INTERMEDIATE_FRAMES),undefined)
+MULTIMODAL_INTERMEDIATE_FRAMES := $(shell $(CONFIG_VALUE) multimodal.intermediate_frames false)
+endif
+ifeq ($(origin MULTIMODAL_INTERMEDIATE_UPSCALE),undefined)
+MULTIMODAL_INTERMEDIATE_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.intermediate_upscale)
+endif
+ifeq ($(origin MULTIMODAL_ANIMATION_UPSCALE),undefined)
+MULTIMODAL_ANIMATION_UPSCALE := $(shell $(CONFIG_VALUE) multimodal.animation_upscale)
 endif
 
 ifeq ($(origin CHAT_BASE_URL),undefined)
@@ -336,6 +358,8 @@ CHAT_SYSTEM ?=
 PROMPT ?=
 
 EVAL_CONFIG_PATH ?= configs/eval.json
+EVALUATION_OUTPUT_PATH ?=
+EVALUATE_RUN_DIR ?=
 SCORE_OUTPUT_PATH ?=
 SCORE_RUN_DIR ?=
 SIGNIFICANCE_CONFIG_PATH ?= configs/significance.json
@@ -375,7 +399,11 @@ export LOCAL_ANALYZER_APP_NAME
 export MULTIMODAL_CONTEXT
 export ARC3_HARNESS_ENV_JSON
 export ARC3_KAGGLE_JSON
+export ARC3_RUNPOD_JSON
 export MULTIMODAL_UPSCALE
+export MULTIMODAL_INTERMEDIATE_FRAMES
+export MULTIMODAL_INTERMEDIATE_UPSCALE
+export MULTIMODAL_ANIMATION_UPSCALE
 export CHAT_PROVIDER
 export OPENROUTER_API_KEY
 export OPENAI_API_KEY
@@ -560,33 +588,39 @@ sbatch: install-local-sources
 sbatch: _taaf-run
 
 kaggle-duck: DEPLOYMENT_TARGET = kaggle
-kaggle-duck: KAGGLE_DUCK_PUBLIC_HARNESS = true
-kaggle-duck: AGENT = duck-harness
-kaggle-duck: GAME =
-kaggle-duck: DATASET =
-kaggle-duck: GAME_TAGS =
-kaggle-duck: EXCLUDE_GAME_TAGS =
-kaggle-duck: MODEL = local
-kaggle-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
-# Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments.
-# The run router adds kaggle/<owner>/<slug>/ under this root.
-kaggle-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
-# The competition run plays all ~110 hidden games in one wave, as in dfranzen's
-# Milestone 2 notebook: every game is live from the start (CONCURRENT_JOBS above
-# the game count) with a per-game cap close to the whole budget, and the priority
-# or UCB gate (ARC3_MAX_ACTIVE_STREAMS) decides which games generate. 28 lanes x
-# 132 min ran four waves with a fixed slice per game instead.
-# The public (non-submission) run plays the 25 public games, also in one wave, and
-# stops at its soft end, MAX_EXPERIMENT_RUNTIME_MINUTES - 10 after notebook start;
-# the competition run ignores that soft end. 150 gives ~131 min of public play
-# after server startup, close to the previous 132-minute public cap.
-kaggle-duck: MAX_RUNTIME_MINUTES = 532
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = 150
-kaggle-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
-kaggle-duck: N_PASSES = 1
-kaggle-duck: CONCURRENT_JOBS = 120
-kaggle-duck: ANALYZER_TIMEOUT = 900
+kaggle-duck runpod-duck: KAGGLE_DUCK_PUBLIC_HARNESS = true
+kaggle-duck runpod-duck: AGENT = duck-harness
+kaggle-duck runpod-duck: GAME =
+kaggle-duck runpod-duck: DATASET =
+kaggle-duck runpod-duck: GAME_TAGS =
+kaggle-duck runpod-duck: EXCLUDE_GAME_TAGS =
+kaggle-duck runpod-duck: MODEL = local
+kaggle-duck runpod-duck: RUN_NAME = $(if $(KAGGLE_CONFIG_KERNEL_SLUG),$(KAGGLE_CONFIG_KERNEL_SLUG),duck-harness-kaggle)
+# Kaggle staging bundles live with pulled Kaggle outputs, not cluster experiments;
+# the runner adds kaggle/ or runpod/<owner>/<slug>/.
+kaggle-duck runpod-duck: EXPERIMENTS_DIR = $(REPO_ROOT)/runs
+# Both runs play every game in one wave, as in dfranzen's Milestone 2 notebook:
+# every game is live from the start (CONCURRENT_JOBS at least the game count; the
+# notebook raises it if not) and the priority or UCB gate (ARC3_MAX_ACTIVE_STREAMS)
+# decides which games generate. The UCB gate only works in one wave; the 1001
+# submission's 28 lanes x 132 min ran ~110 hidden games in four waves.
+# Competition run: the per-game cap, kaggle.private_runtime_minutes, is the whole
+# play time; it ignores the soft end.
+# Public run: plays kaggle.public_games and stops at its soft end,
+# kaggle.public_runtime_minutes after notebook start.
+kaggle-duck runpod-duck: MAX_RUNTIME_MINUTES = $(KAGGLE_PRIVATE_RUNTIME_MINUTES)
+kaggle-duck runpod-duck: MAX_EXPERIMENT_RUNTIME_MINUTES = $(KAGGLE_PUBLIC_NOTEBOOK_BUDGET_MINUTES)
+kaggle-duck runpod-duck: MAX_EXPERIMENT_RUNTIME_HOURS =
+kaggle-duck runpod-duck: N_PASSES = 1
+kaggle-duck runpod-duck: CONCURRENT_JOBS = $(KAGGLE_CONCURRENT_JOBS)
+kaggle-duck runpod-duck: ANALYZER_TIMEOUT = 900
 kaggle-duck: _taaf-run
+
+# Same notebook bundle as kaggle-duck, run on a RunPod GPU pod instead of Kaggle.
+# The pod stages /kaggle/input itself (models from Hugging Face per runpod.hf_models),
+# uploads /kaggle/working as a private Kaggle dataset and deletes itself.
+runpod-duck: DEPLOYMENT_TARGET = runpod
+runpod-duck: _taaf-run
 
 _taaf-run:
 	@if [ -z "$(strip $(MODEL))" ]; then \
@@ -619,6 +653,7 @@ _taaf-run:
 		$(if $(strip $(MAX_ACTIONS)),--max-actions $(MAX_ACTIONS),) \
 		$(if $(strip $(MAX_RUNTIME_MINUTES)),--max-runtime-minutes $(MAX_RUNTIME_MINUTES),) \
 		$(if $(strip $(MAX_GENERATED_TOKENS_PER_GAME)),--max-generated-tokens-per-game $(MAX_GENERATED_TOKENS_PER_GAME),) \
+		$(if $(strip $(PUBLIC_MAX_GENERATED_TOKENS_PER_GAME)),--public-max-generated-tokens-per-game $(PUBLIC_MAX_GENERATED_TOKENS_PER_GAME),) \
 		$(MAX_EXPERIMENT_RUNTIME_ARGS) \
 		--n-passes $(N_PASSES) \
 		--concurrent-jobs $(CONCURRENT_JOBS) \
@@ -644,6 +679,7 @@ _taaf-run:
 		$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_RUN_AS_SUBMISSION)),--kaggle-run-as-submission,) \
 		$(if $(filter true TRUE 1 yes YES on ON,$(KAGGLE_DRY_RUN)),--kaggle-dry-run,) \
 		$(if $(strip $(KAGGLE_DATASET_VERSION_MESSAGE)),--kaggle-dataset-version-message '$(KAGGLE_DATASET_VERSION_MESSAGE)',) \
+		$(if $(filter-out [],$(strip $(KAGGLE_PUBLIC_GAMES))),--kaggle-public-games '$(KAGGLE_PUBLIC_GAMES)',) \
 		--slurm-gpu "$(DEPLOYMENT_SLURM_GPU)" \
 		--slurm-gpu-count "$(DEPLOYMENT_SLURM_GPU_COUNT)" \
 		--slurm-time "$(DEPLOYMENT_SLURM_TIME)" \
@@ -677,14 +713,21 @@ chat:
 		$(if $(PROMPT),--prompt "$(PROMPT)")
 
 eval:
-	$(UV_RUN) inference-eval --config "$(EVAL_CONFIG_PATH)" $(if $(SCORE_OUTPUT_PATH),--score-output "$(SCORE_OUTPUT_PATH)")
+	$(UV_RUN) inference-eval --config "$(EVAL_CONFIG_PATH)" $(if $(SCORE_OUTPUT_PATH),--evaluation-output "$(SCORE_OUTPUT_PATH)")
+
+evaluate_run:
+	@if [ -z "$(strip $(EVALUATE_RUN_DIR))" ]; then \
+		echo "EVALUATE_RUN_DIR is required."; \
+		exit 1; \
+	fi
+	$(UV_RUN) inference-eval "$(EVALUATE_RUN_DIR)" $(if $(EVALUATION_OUTPUT_PATH),--evaluation-output "$(EVALUATION_OUTPUT_PATH)")
 
 score_run:
 	@if [ -z "$(strip $(SCORE_RUN_DIR))" ]; then \
 		echo "SCORE_RUN_DIR is required."; \
 		exit 1; \
 	fi
-	$(UV_RUN) inference-eval "$(SCORE_RUN_DIR)" $(if $(SCORE_OUTPUT_PATH),--score-output "$(SCORE_OUTPUT_PATH)")
+	$(UV_RUN) inference-eval "$(SCORE_RUN_DIR)" $(if $(SCORE_OUTPUT_PATH),--evaluation-output "$(SCORE_OUTPUT_PATH)")
 
 significance:
 	$(UV_RUN) inference-significance \
@@ -703,6 +746,16 @@ view:
 		--runs-dir "$(VIEW_RUNS_DIR)" \
 		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)") \
 		$(if $(VIEW_ENVIRONMENTS_DIR),--environments-dir "$(VIEW_ENVIRONMENTS_DIR)")
+
+pull-runpod:
+	@if [ -z "$(RUN_DIR)" ]; then \
+		echo "Usage: make pull-runpod RUN_DIR=runs/runpod/<owner>/<slug>/<pod-id> [WAIT=true] [STOP=true]"; \
+		exit 1; \
+	fi
+	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src:$$PYTHONPATH" $(UV_RUN) python -m inference.tools.pull_runpod \
+		"$(RUN_DIR)" \
+		$(if $(filter true TRUE 1 yes YES on ON,$(WAIT)),--wait) \
+		$(if $(filter true TRUE 1 yes YES on ON,$(STOP)),--stop)
 
 pull-kaggle:
 	@if [ -z "$(NOTEBOOK)" ] || [ -z "$(VERSION)" ]; then \

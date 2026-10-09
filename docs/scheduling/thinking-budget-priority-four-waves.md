@@ -96,3 +96,13 @@ kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four
 ```
 
 On 2026-10-09 the ticbudja notebook was renamed `thinking-budget-priority-one-wave` (title "Thinking budget priority one wave"), because it runs one wave; its local runs moved to `ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-one-wave/`. `v5.json` now targets that slug. The source dataset keeps its name, `ticbudja/thinking-budget-priority-four-waves-src`.
+
+## Merge of main (2026-10-09)
+
+`main` (`a15491c`) was merged into this branch, with this branch's prompts and tools kept as they were.
+
+- **Kept from this branch:** `prompts.py`, the turn prompts and captions in `tool_agent.py`, the Python sandbox's module list, and the `animation.py`, `segmentation.py` and `frame_diff.py` outputs the model reads. Main's prompt rewrites (`6303467` game-over and level-start text, `0371330`, `d62d95f` turn messages and captions, `0ee3507` file-I/O guidance), its segmentation `bbox` change with `pose_hash`/`shape_hash` dropped, and its wider sandbox module list are not taken.
+- **Taken from main:** serving, Kaggle and config fixes (one place per setting, the credential handoff, private reruns ignore token budgets, the 6 precache + 8 prefetch model read), the evaluator and serving metrics, RunPod and Lord Hansolo serving, and the opt-in options `ARC3_FRAME_DIFF` (default on), `ARC3_PRIORITY_THINKING` (default off), `ARC3_ANIMATION_IMAGE`/`ARC3_ANIMATION_DEATH_IMAGE=sampled` and `multimodal.intermediate_frames` (default off). The frame options are ported at `e26d05d`, before main's later layout and caption changes.
+- **Configs:** main rejects a typed setting repeated in `harness_env`. In v1, v3, v4 and v5, the `LOCAL_ANALYZER_*` and `MULTIMODAL_*` entries moved to their `analyzer`, `shared` and `multimodal` fields, with the values that reached the harness on Kaggle (temperature 0.7, `max_output` 12288, `tool_output_tokens` 3072, `upscale` 10).
+
+Checks: with v5's serving env, the system prompt is byte-identical before and after the merge. A dry-run v5 bundle matches the pushed v5 bundle (`ticbudja/thinking-budget-priority-one-wave` v2) in serving spec, harness env (plus `MULTIMODAL_INTERMEDIATE_FRAMES=false`) and run config (1 pass, 120 lanes, one wave, 532 min). The branch's own tests and the ported options' tests pass. Main's tests that assert its prompt wording (`test_animation_description.py`), segmentation fields (`test_segmentation.py`) and final frame-image layout (`test_intermediate_images.py`) fail here by design.

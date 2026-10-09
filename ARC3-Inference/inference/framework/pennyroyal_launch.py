@@ -116,11 +116,22 @@ precache_wheels_thread = threading.Thread(target=precache, args=(WHEELHOUSE_DIR,
 precache_wheels_thread.start()
 precache_wheels_thread.join()
 
+# Model read tuning from kaggle.sglang. 6 precache + 8 prefetch threads load about
+# 20% faster than Daniel's cell's 3 + 4; see docs/serving/startup-read-threads.md.
+# Early precache (during the install instead of 60 s after launch) outruns the
+# loader and gets evicted, since 185 GB exceeds RAM, so it stays off.
+_READ = SPEC.get("sglang", {})
+MODEL_PRECACHE_THREADS = int(_READ.get("MODEL_PRECACHE_THREADS", 6))
+MODEL_PRECACHE_EARLY = bool(_READ.get("MODEL_PRECACHE_EARLY", False))
+
 # Daemon: this process exits once the server is up, and must not wait on it.
+# MODEL_PRECACHE_THREADS = 0 leaves the read to sglang's own prefetch.
 precache_model_thread = threading.Thread(
     target=precache, args=(MODEL_DIR, *([DRAFT_MODEL_DIR] if DRAFT_MODEL_DIR else [])),
-    kwargs={'delay': 60, 'threads': 3}, daemon=True,
-)
+    kwargs={'delay': 0 if MODEL_PRECACHE_EARLY else 60, 'threads': MODEL_PRECACHE_THREADS}, daemon=True,
+) if MODEL_PRECACHE_THREADS > 0 else None
+if precache_model_thread and MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
 
 # Paste this entire file into the launcher cell.
 # Required notebook variables: MODEL_DIR, DRAFT_MODEL_DIR, WHEELHOUSE_DIR,
@@ -147,6 +158,8 @@ CFG = dict(
     # Preserve the original Kaggle checkpoint prefetch/cache behavior.
     PREFETCH_CHECKPOINTS=True,
     DROP_CACHE_AFTER_LOAD=True,
+    # sglang's one-shard lookahead prefetch readers (sglang's own default is 4).
+    PREFETCH_THREADS=8,
     LINEAR_BACKEND="flashinfer",
     KVDTYPE="fp8_e4m3",
     SSM_DTYPE="bfloat16",
@@ -156,6 +169,9 @@ CFG = dict(
     SPEC_ACCEPT_SINGLE=1.0,
     SPEC_ACCEPT_ACC=1.0,
     SPEC_STEPS=3,
+    OFFLOAD_EMBED_TOKENS=False,
+    WIDE_BF16_GEMM=False,
+    LOG_BF16_GEMM_SHAPES=False,
     # The harness's thinking budget (custom_params.thinking_budget) is enforced
     # by sglang's reasoner grammar, which only filters tokens in strict mode.
     # Strict mode also keeps tool-call and end-of-turn tokens out of thinking.
@@ -378,10 +394,20 @@ env.update({
     "SGLANG_SM120_LOWM_FP8_WEIGHT": "0", "SGLANG_SM120_LM_HEAD_FP8": "0",
     "SGLANG_MAMBA_CONV_DTYPE": "bfloat16", "SGLANG_NUMA_BIND_V2": "false",
     "SGLANG_MM_PREPROCESS_DEVICE": "cpu", "NUMPY_MADVISE_HUGEPAGE": "0",
+    "ARC3_OFFLOAD_EMBED_TOKENS": "1" if CFG["OFFLOAD_EMBED_TOKENS"] else "0",
+    "ARC3_WIDE_BF16_GEMM": "1" if CFG["WIDE_BF16_GEMM"] else "0",
+    "SGLANG_BF16_GEMM_LOG_SHAPES": "1" if CFG["LOG_BF16_GEMM_SHAPES"] else "0",
 })
+if CFG["OFFLOAD_EMBED_TOKENS"] or CFG["WIDE_BF16_GEMM"]:
+    patch_args = [PYTHON, Path(__file__).with_name("pennyroyal_patch.py")]
+    if CFG["OFFLOAD_EMBED_TOKENS"]:
+        patch_args.append("--embedding")
+    if CFG["WIDE_BF16_GEMM"]:
+        patch_args.append("--wide-gemm")
+    run(patch_args, env=env)
 run([str(Path(CUDA_HOME) / "bin/nvcc"), "--version"], env=env)
 print("Host compiler:", CXX)
-# Report the optional later caching patch. This cell does not modify wheel code.
+# Report the installed engine and device before loading weights.
 run([PYTHON, "-c", '''import pathlib, sglang, torch
 print("sglang", sglang.__version__, "| torch", torch.__version__)
 assert torch.cuda.is_available(), "CUDA unavailable"
@@ -426,6 +452,7 @@ args = [SGLANG, "serve", "--model-path", MODEL_DIR, "--load-format", "safetensor
     "--enable-cache-report", "--enable-metrics", "--enable-request-time-stats-logging"]
 if CFG["PREFETCH_CHECKPOINTS"]: args += ["--weight-loader-prefetch-checkpoints"]
 if CFG["DROP_CACHE_AFTER_LOAD"]: args += ["--weight-loader-drop-cache-after-load"]
+args += ["--weight-loader-prefetch-num-threads", str(int(CFG["PREFETCH_THREADS"]))]
 tmpl = Path(MODEL_DIR, "chat_template.jinja")
 if tmpl.is_file(): args += ["--chat-template", str(tmpl)]
 if not CFG["AUTOTUNE"]: args += ["--disable-flashinfer-autotune"]
@@ -447,7 +474,8 @@ if CFG["SPEC"]:
         args += ["--speculative-token-map", str(tok)]
 
 # ---- launch detached and wait for health ----
-precache_model_thread.start()
+if precache_model_thread and not MODEL_PRECACHE_EARLY:
+    precache_model_thread.start()
 print("\n" + shlex.join(args) + "\n")
 log_offset = Path(LOG).stat().st_size if Path(LOG).exists() else 0
 with open(LOG, "ab", buffering=0) as logf:
