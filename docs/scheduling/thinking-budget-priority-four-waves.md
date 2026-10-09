@@ -88,7 +88,7 @@ The v4 config first ran on 2026-10-08 as `jonathanwang2022/thinking-budget-prior
 
 ## Version 5: v4 without the 2,048-token turn yield
 
-Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v5.json`. Same source and settings as v4, except `LOCAL_ANALYZER_YIELD_TOKENS` is 0 instead of 2048, which disables the per-turn yield (see [the 1009 error analysis](../tools/1009-error-analysis.md)). The per-request limits stay at `max_tokens: 12288` and a thinking budget of 8,192. It is pushed as the next version of `ticbudja/thinking-budget-priority-four-waves`, with the same 120-min play window as that notebook's v1, to compare against it:
+Config: `ARC3-Inference/configs/thinking-budget-priority-four-waves/v5.json`. Same source and settings as v4, except `LOCAL_ANALYZER_YIELD_TOKENS` is 0 instead of 2048, which disables the per-turn yield (see [the 1009 error analysis](../tools/1009-error-analysis.md)). The per-request limits stay at `max_tokens: 12288` and a thinking budget of 8,192. It was pushed on 2026-10-09 from `cb02f7f` as `ticbudja/thinking-budget-priority-four-waves` version 2 (bundled `LOCAL_ANALYZER_YIELD_TOKENS: "0"`), with the same 120-min play window as that notebook's v1, to compare against it:
 
 ```
 kaggle-as tic make kaggle-duck CONFIG_PATH=configs/thinking-budget-priority-four-waves/v5.json \
