@@ -1,5 +1,14 @@
 ## Changes relative to Daniel's baseline
 
+[v4.json](v4.json) starts from v3 and enables the animation-only frame treatment:
+up to eight sampled frames from the last action at upscale 2, including fatal
+animations. Intermediate action boards stay off; the regular board remains at
+upscale 8. `ARC3_ANIMATION_IMAGE` and `ARC3_ANIMATION_DEATH_IMAGE` remain the
+on/off knobs (`sampled` or `off`). See the
+[three-run decision](../../../docs/multimodal/animation-port-decision.md).
+This is a prepared config, not an evaluated v4 run. The separate 2,048-token
+analyzer yield setting is unchanged from v3.
+
 [v3.json](v3.json) is v2 plus `kaggle.sglang.OFFLOAD_EMBED_TOKENS = true`: the input embedding table moves to pinned host memory, freeing about 1.2 GiB of GPU memory for the KV pool (about 100K more tokens on top of 1,011,264). Daniel's runs fill that pool to 93–98%. The lookup reuses the PLE host-gather kernel and costs microseconds per decode step. v3 also raises `server_startup_timeout_s` from 720 to 1200 so the benchmark waits for the server; v2 released the games about 3 minutes before its server was ready after a 621 s weight load.
 
 Use [v2.json](v2.json) for the resubmission after rebasing onto `main` at `7a64a88`.
