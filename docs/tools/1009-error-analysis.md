@@ -73,3 +73,38 @@ Reproduce from the main checkout, where `ARC3-Inference/runs/` exists:
 ```sh
 python docs/tools/scripts/turn_token_stats.py ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-four-waves/v01
 ```
+
+## Yield off: a slightly negative result
+
+[`ticbudja/thinking-budget-priority-four-waves`](https://www.kaggle.com/code/ticbudja/thinking-budget-priority-four-waves) v2 ran [`thinking-budget-priority-four-waves/v5.json`](../../ARC3-Inference/configs/thinking-budget-priority-four-waves/v5.json) on 2026-10-09. It is v1 with `LOCAL_ANALYZER_YIELD_TOKENS` set to `0` and nothing else changed: same source, 25 public games, one pass and a 120-min play window. Every v2 transcript says `yield_tokens: disabled`, and no turn yielded on `turn_token_budget`.
+
+| | v1 (yield 2,048) | v2 (yield off) |
+|---|---|---|
+| Mean score | 55.94 | 52.36 |
+| Median score | 58.33 | 58.33 |
+| Games won | 9 | 10 |
+| Levels completed | 115 | 108 |
+| Games still running at the window's end | 16 | 15 |
+| Analyzer turns | 1,669 | 1,253 |
+| Yields on `turn_token_budget` | 458 | 0 |
+| Generated tokens (`benchmark.json`) | 4.37M | 4.61M |
+| Generated tokens/s | 588 | 611 |
+
+Turning the yield off scored slightly lower, but the difference is noise. The median is unchanged. Per game, the paired difference has a mean of −3.58 and a standard deviation of 31.8, so t = −0.56 over 25 games; 8 games went up, 8 went down and 9 were unchanged. With one pass per version, single games dominate the mean: ls20 (75 → 0), m0r0 (71 → 0), tn36 (49 → 4), ka59 (54 → 14) and sp80 (44 → 5) fell; sc25 (0 → 71), s5i5 (8 → 58), re86 (58 → 78), tu93 (80 → 97) and bp35 (2 → 19) rose.
+
+Estimated generated tokens with the yield off, in the same units as the [yield-on table](#generated-tokens-with-the-yield-on):
+
+| Unit | n | Median | Mean | p90 | p99 | Max |
+|---|---|---|---|---|---|---|
+| Reply | 2,477 | 1,008 | 1,728 | 4,462 | 8,023 | 10,255 |
+| Turn, all | 1,253 | 1,862 | 3,417 | 8,398 | 19,905 | 43,000 |
+| Turn that executed an action | 1,239 | 1,854 | 3,378 | 8,310 | 19,804 | 43,000 |
+
+- **Replies barely change; turns grow a long tail.** The median reply is 1,008 tokens against 921 with the yield on, and 11.3% of replies reach 4,096 against 8.9%. But a turn can now keep requesting: replies per turn reach a p99 of 9 and a maximum of 26 (6 with the yield on). 47.8% of turns reach 2,048 tokens, 28.3% reach 4,096 and 10.8% reach 8,192. The longest turn generated about 43k tokens.
+- **Decision: the next run uses a 4,096-token yield.** At 2,048 the yield ended 27% of turns without an action, and those turns held 40% of the generated tokens. With it off, a few turns run to tens of thousands of tokens. At 4,096, at most 28% of v2's turns would have crossed the threshold, and a typical turn (median 1.9k) finishes untouched. It is an upper bound, because the check cannot interrupt the reply that executes the action. [`v6.json`](../../ARC3-Inference/configs/thinking-budget-priority-four-waves/v6.json) sets `LOCAL_ANALYZER_YIELD_TOKENS: "4096"`. v6 also turns on sampled animation frames, so a v6 score cannot be attributed to the yield alone.
+
+The transcript trims long `raw_tool_calls` blocks to `... [truncated N chars]`. Nine v2 replies hit this; the script counts their printed characters plus N. Reproduce with:
+
+```sh
+python docs/tools/scripts/turn_token_stats.py ARC3-Inference/runs/kaggle/ticbudja/thinking-budget-priority-four-waves/v02
+```
