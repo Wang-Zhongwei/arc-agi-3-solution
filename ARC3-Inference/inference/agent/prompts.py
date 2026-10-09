@@ -282,6 +282,16 @@ NOOP_GUARD_ADDENDUM = (
     "next action and it will execute.\n"
 )
 
+# Appended to the tool result after which LOCAL_ANALYZER_YIELD_TOKENS ends the
+# turn. Without it the model never learns why the turn stopped: the next opener
+# only said its snippet "executed NO actions ... that is fine" (all 458 token
+# yields in ticbudja four-waves v1).
+TOKEN_YIELD_TOOL_NOTE = (
+    "[Turn token limit reached: this turn generated about {generated:,} tokens "
+    "(limit {limit:,}) without an action, so it ends here. Keep your reasoning "
+    "shorter and call `action(...)` sooner.]"
+)
+
 PREFER_TOOL_CALLS_LINE = (
     # The closing clause used to warn that a long chain "wastes the whole turn".
     # That overstated it - a truncated reply keeps its reasoning in history, and
