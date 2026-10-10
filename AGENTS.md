@@ -22,6 +22,7 @@
 - Keep legacy `KAGGLE_KEY` separate from `KAGGLE_API_TOKEN`. Preserve an explicit access token or let the CLI find cached credentials; never copy a legacy key into the token variable or print credential values.
 - Resolve both flat and namespaced Kaggle mounts for wheelhouses and datasets. Prefer this run's packaged TAAF source over a serving bundle's copy.
 - Record the pushed version. `QUEUED` or `RUNNING` means submitted, not evaluated; report results only from completed, exact-version artifacts.
+- After a successful push, set a timer for the expected completion and follow that exact version without another user prompt. When the timer fires, check its status; if it is still queued or running, re-arm the timer. Once complete, run `make pull-kaggle NOTEBOOK=<owner>/<slug> VERSION=<n> SOURCE=true`, then `make evaluate_run EVALUATE_RUN_DIR=runs/kaggle/<owner>/<slug>/vNN/` from `ARC3-Inference/` and report the results. If the run fails, fetch the available outputs/logs and report the failure. Preparation-only requests do not start this follow-up.
 
 ## Run on RunPod
 
