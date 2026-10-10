@@ -72,14 +72,16 @@ def _color(part):
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_levelup_opener_attaches_solved_board_after_current(monkeypatch, tmp_path, enabled):
+def test_levelup_opener_shows_solved_board_before_current(monkeypatch, tmp_path, enabled):
     agent, parts = _opener(monkeypatch, tmp_path, enabled)
     images = [part for part in parts if part["type"] == "image_url"]
-    assert _color(images[0]) == vision.ARC_COLOR_MAP[4]
-    labels = [i for i, part in enumerate(parts) if part.get("text", "").startswith("Level-complete image:")]
+    assert _color(images[-1]) == vision.ARC_COLOR_MAP[4]
     if enabled:
-        assert len(images) == 2 and len(labels) == 1
-        assert _color(parts[labels[0] + 1]) == vision.ARC_COLOR_MAP[3]
+        assert len(images) == 2
+        assert parts[0]["text"].endswith("\n\nLast level-complete image:")
+        assert _color(parts[1]) == vision.ARC_COLOR_MAP[3]
+        assert parts[2]["text"] == "Current grid image:"
     else:
-        assert len(images) == 1 and labels == []
+        assert len(images) == 1
+        assert "Last level-complete image:" not in parts[0]["text"]
     assert agent._level_end_grid is None

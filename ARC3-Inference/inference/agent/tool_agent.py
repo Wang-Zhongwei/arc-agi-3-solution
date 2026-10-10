@@ -3673,6 +3673,7 @@ class ToolAgent:
         self._kept_functions: dict[str, str] = {}
         self._last_animation_chain: list[Any] = []
         self._level_end_grid: Any = None
+        self._pending_levelup_image: dict[str, Any] | None = None
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
@@ -4767,23 +4768,11 @@ class ToolAgent:
             self._pending_animation_image_label = label
 
     def _prepare_levelup_board_image(self) -> None:
-        """Attach the board as the previous level was solved.
-
-        Shares the animation image slot: it is placed with the current board
-        in both layouts, and a level-up never fills it otherwise because the
-        board always changes.
-        """
+        """Attach the board as the previous level was solved, shown before the
+        current grid image."""
         grid, self._level_end_grid = self._level_end_grid, None
-        if grid is None or not _levelup_board_image() or self._pending_animation_image is not None:
-            return
-        part = current_grid_image_part(Frame(grid=grid, step=0, level=0))
-        if part is not None:
-            self._pending_animation_image = part
-            self._pending_animation_image_label = (
-                "Level-complete image: the board at the moment the previous level "
-                "was solved, before the next level loaded. `current_frame` and the "
-                "current grid image show the new level."
-            )
+        if grid is not None and _levelup_board_image():
+            self._pending_levelup_image = current_grid_image_part(Frame(grid=grid, step=0, level=0))
 
     def _retained_function_context(self) -> str:
         """Optional prompt metadata must never interrupt game execution."""
@@ -4880,6 +4869,10 @@ class ToolAgent:
         self._pending_animation_samples = []
         self._pending_gameover_images = []
         self._pending_intermediate_images = []
+        levelup_part = self._pending_levelup_image
+        self._pending_levelup_image = None
+        if levelup_part is not None:
+            animation_samples.insert(0, ("Last level-complete image:", levelup_part))
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -4901,6 +4894,13 @@ class ToolAgent:
             {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
             image_part,
         ]
+        if levelup_part is not None:
+            content = [
+                {"type": "text", "text": f"{user_prompt}\n\nLast level-complete image:"},
+                levelup_part,
+                {"type": "text", "text": "Current grid image:"},
+                image_part,
+            ]
         if diff_part is not None:
             content.append({"type": "text", "text": diff_label})
             content.append(diff_part)
