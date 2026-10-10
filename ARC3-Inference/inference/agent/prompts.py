@@ -2,6 +2,17 @@
 
 from inference.utils.grid_utils import ARC_COLOR_LEGEND
 
+GAME_OVER_USER_PROMPT = (
+    "GAME OVER: the attempt failed and this level has automatically RESET; previously "
+    "completed levels are kept. `current_frame` is the restarted board. "
+    "`history[-3].frame` is before the fatal action; `history[-2].frame` is the death board. "
+    "Before acting, diagnose the death using BAR RULE: attribute death to the budget "
+    "only if its bar is fully or almost depleted in the death board. Then use fewer "
+    "actions or find a way to refill it. If budget clearly remains, identify the "
+    "mechanism triggered by the fatal action and avoid it. "
+    "Change the route, action, or timing before the fatal point."
+)
+
 LEVEL_TRANSFER_SYSTEM_GUIDANCE = (
     "- Levels usually build on mechanics learned in earlier levels, especially the most "
     "recent one. Carry forward supported knowledge as a starting hypothesis, while "

@@ -38,6 +38,7 @@ from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
+    GAME_OVER_USER_PROMPT,
     COMPACT_TOOL_SESSION_ADDENDUM,
     PERSISTENT_FUNCTIONS_LINE,
     EPHEMERAL_FUNCTIONS_LINE,
@@ -5255,38 +5256,12 @@ class ToolAgent:
                     or "You are still on the same level."
                 )
             if previous_step_summary.get("game_over"):
-                lines.append(
-                    "GAME OVER occurred during the previous sequence. This means the "
-                    "attempt FAILED (it does NOT mean the run is finished). The game has "
-                    "already been automatically RESET: the current level restarted from "
-                    "its initial state and previously completed levels are kept. A game "
-                    "over is caused either by the specific action taken (e.g., moving "
-                    "onto a hazard cell) or by a step/time budget running out, which is "
-                    "usually indicated by a bar at the grid border that shrinks with each "
-                    "action. Before acting again, diagnose the cause by inspecting the "
-                    "board right before the death. `history[-1].action` is 'RESET', "
-                    "`history[-2].action` is the fatal action, `history[-2].frame` is the "
-                    "death frame (the board after the fatal action), and "
-                    "`history[-3].frame` is the board immediately before "
-                    "the fatal action — check what cell the fatal move targeted there, and "
-                    "inspect the budget bar in the death frame. BAR RULE: the bar "
-                    "shrinking with each action is NORMAL — a slightly shorter bar is "
-                    "NOT evidence of the cause of death. The budget caused the death "
-                    "ONLY if the bar is fully (or almost fully) depleted in the death "
-                    "frame (`history[-2].frame`). If it IS depleted: you must reach the "
-                    "goal in fewer actions, or look for a way to restore the bar (e.g., "
-                    "collecting an item that refills it). If the bar clearly had budget "
-                    "remaining: the fatal action itself caused the death (hazard or "
-                    "forbidden move) — do NOT retry the same path; a DIFFERENT approach "
-                    "must be tried. Record the diagnosed cause in your world model."
-                )
+                lines.append(GAME_OVER_USER_PROMPT)
                 if _animation_enabled():
-                    # after the BAR RULE, which tells the model how to read
-                    # history[-2] and history[-3]; this says what those two
-                    # frames cannot contain
                     death_animation_line = describe_animation(
                         previous_step_summary.get("animation"),
-                        action_display=previous_step_summary.get("animation_action"),
+                        action_display=(previous_step_summary.get("fatal_action")
+                                        or previous_step_summary.get("animation_action")),
                         # the animated action's own flag, not the sequence's: an
                     # inert SPACE at the end of a batch that moved other things
                     # still hid everything it did
@@ -5298,13 +5273,7 @@ class ToolAgent:
                         lines.append(death_animation_line)
                 fatal_action = str(previous_step_summary.get("fatal_action") or "")
                 if fatal_action:
-                    lines.append(
-                        f"The game over occurred immediately after action {fatal_action!r}. "
-                        "Apply the BAR RULE above to decide: bar fully depleted in the "
-                        "death frame means budget death (shorter route or bar restore "
-                        "needed); bar with budget remaining means this action itself was "
-                        "fatal and a DIFFERENT approach is required."
-                    )
+                    lines.append(f"Fatal action: {fatal_action}.")
                 game_over_trace = previous_step_summary.get("game_over_trace") or []
                 if game_over_trace:
                     lines.append(
