@@ -6,7 +6,6 @@ import heapq
 import threading
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -64,15 +63,14 @@ from inference.agent.prompts import (
 
 from inference.agent.vision_context import (
     animation_composite_part,
+    animation_death_image_mode,
     animation_image_mode,
     animation_peak_part,
-    animation_sampled_parts,
     current_grid_image_enabled,
     current_grid_image_part,
-    intermediate_frame_parts,
 )
 
-from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
+from inference.agent.python_tool_sandbox import run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
@@ -314,9 +312,7 @@ _PYTHON_TOOL_DESCRIPTION = (
     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
     "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
-    "Use `print(...)` for compact output or assign final data to `result`. "
-    "No I/O is allowed: do not read or write files. "
-    "Only use the exposed packages; any other import fails."
+    "Use `print(...)` for compact output or assign final data to `result`."
 )
 
 def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
@@ -1894,20 +1890,6 @@ def _animation_timeline_enabled() -> bool:
     return _get_env_bool("ARC3_ANIMATION_TIMELINE", True)
 
 
-def _frame_image_layout() -> bool:
-    """Main's frame-image layout, used only with the frame-image options.
-
-    With sampled animation frames (ARC3_ANIMATION_IMAGE) or intermediate boards
-    (MULTIMODAL_INTERMEDIATE_FRAMES), images carry `history[i]` captions and sit
-    beside the action that produced them, as on main. Otherwise this branch's
-    captions and its image block after the prompt text are unchanged.
-    """
-    return (
-        animation_image_mode() == "sampled"
-        or _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False)
-    )
-
-
 def _dedupe_multicall_line() -> bool:
     """Drop the duplicated multi-call permission and its stale caveat.
 
@@ -1997,7 +1979,6 @@ def _priority_refresh_enabled() -> bool:
     # Yield-UCB's bonus moves with the shared clock, so it always refreshes.
     return _scheduler() == "ucb" or any(_get_env_bool(name, False) for name in (
         "ARC3_PRIORITY_REFRESH_QUEUE", "ARC3_PRIORITY_PACE", "ARC3_PRIORITY_TAIL_FADE",
-        "ARC3_PRIORITY_THINKING",
     ))
 
 
@@ -2030,19 +2011,6 @@ def _ucb_c() -> float:
 
 def _ucb_recent_weight() -> float:
     return min(1.0, max(0.0, _get_env_float("ARC3_UCB_RECENT_WEIGHT", 0.5)))
-
-
-def _usage_reasoning_tokens(usage: dict[str, Any]) -> int | None:
-    """Reasoning tokens from a response's usage, top-level (sglang) or under
-    completion_tokens_details (OpenAI); None when the server reports neither."""
-    details = usage.get("completion_tokens_details")
-    for raw in (usage.get("reasoning_tokens"),
-                details.get("reasoning_tokens") if isinstance(details, dict) else None):
-        try:
-            return max(0, int(raw))
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
 def _priority_action_count(summary: dict[str, Any]) -> int:
@@ -2151,7 +2119,6 @@ class _PriorityGate:
             human_actions=_priority_human_actions(), action_scale=_priority_action_scale(),
             token_scale=_priority_token_scale(), action_weight=_priority_action_weight(),
             tail_base=_priority_tail_base(), tail_cap=_priority_tail_cap(),
-            thinking_reference=_priority_thinking_reference(),
             **_priority_level_options(),
         )
 
@@ -2278,18 +2245,6 @@ def _priority_action_scale() -> float:
 
 def _priority_token_scale() -> float:
     return max(1.0, _get_env_float("ARC3_PRIORITY_TOKEN_SCALE", 62000.0))
-
-
-def _priority_thinking_reference() -> float:
-    """Reference for the thinking multiplier: reasoning tokens of a typical
-    action-emitting call. 0 when ARC3_PRIORITY_THINKING is off. Like pace, it
-    also enables refreshed ranking, since the multiplier travels on the snapshot."""
-    if not _get_env_bool("ARC3_PRIORITY_THINKING", False):
-        return 0.0
-    value = _get_env_float("ARC3_PRIORITY_THINKING_REF", 2048.0)
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError("ARC3_PRIORITY_THINKING_REF must be finite and > 0")
-    return value
 
 
 def _priority_action_weight() -> float:
@@ -2769,8 +2724,7 @@ def _render_auto_frame_diff(
         remaining = len(entries) - shown - sum(swarm.values())
         if remaining > 0:
             lines.append(f"- {bucket}: +{remaining} more")
-    if frame_diff_enabled():
-        lines.append("(call frame_diff() in python for the full object list)")
+    lines.append("(call frame_diff() in python for the full object list)")
     if _estimate_diff_tokens("\n".join(lines)) <= budget_tokens:
         return lines
     # rung 3: counts only, cannot be large
@@ -2779,8 +2733,9 @@ def _render_auto_frame_diff(
         for bucket in _DIFF_BUCKETS
         if diff.get(bucket)
     ]
-    omitted = " (details omitted; call frame_diff() in python)." if frame_diff_enabled() else " (details omitted)."
-    return [header + " " + ", ".join(parts) + omitted]
+    return [
+        header + " " + ", ".join(parts) + " (details omitted; call frame_diff() in python)."
+    ]
 
 
 def _build_system_prompt(*, tool_output_tokens: int) -> str:
@@ -2809,12 +2764,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
             " Each turn's message includes an 'Auto frame diff' section summarizing "
             "object-level changes since your previous analyzer turn (it spans all "
             "actions executed in between, not just the last one). Treat it as ground "
-            "truth for what changed, consult it before acting"
-            + (
-                ", and call `frame_diff()` in python when you need per-action or full "
-                "object detail."
-                if frame_diff_enabled() else "."
-            )
+            "truth for what changed, consult it before acting, and call `frame_diff()` "
+            "in python when you need per-action or full object detail."
         )
     if _DIFF_IMAGE and current_grid_image_enabled():
         prompt += (
@@ -2846,10 +2797,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         WORLD_MODEL_FREE_ADDENDUM if _memory_sections_disabled() else WORLD_MODEL_ADDENDUM
     )
     prompt += PYTHON_ADDENDUM_TAIL
-    if frame_diff_enabled() and _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
-        # documents `frame_diff(before, after)`. With ARC3_FRAME_DIFF on, the
-        # function stays callable either way - the hint only controls whether
-        # the model is told about it. ARC3_FRAME_DIFF=0 removes both.
+    if _get_env_bool("ARC3_FRAME_DIFF_HINT", False):
+        # documents `frame_diff(before, after)`. The function stays callable
+        # either way - this only controls whether the model is told about it,
+        # so the arm measures whether knowing costs more than it returns.
         prompt += FRAME_DIFF_HINT_ADDENDUM
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
@@ -3668,10 +3619,6 @@ class ToolAgent:
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
-        self._pending_animation_samples: list[tuple[str, dict[str, Any]]] = []
-        self._pending_intermediate_images: list[tuple[str, dict[str, Any]]] = []
-        self._current_history_entry: tuple[int, HistoryEntry] | None = None
-        self._prompt_history_entries: list[HistoryEntry] = []
         self._pending_diff_image_label: str = ""
         self._turn_diff_image: dict[str, Any] | None = None
         self._turn_diff_image_label: str = ""
@@ -3723,7 +3670,6 @@ class ToolAgent:
         self._session_runtime_dir: Path | None = None
         self._session_total_tokens = 0
         self._session_generated_tokens = 0
-        self._last_call_reasoning_tokens: int | None = None
         self._step_env_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self._current_valid_actions: list[str] = []
         self._last_step_summary: dict[str, Any] | None = None
@@ -3757,7 +3703,6 @@ class ToolAgent:
             self._history_messages = []
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
-            self._last_call_reasoning_tokens = None
             self._summary_context_tokens_since_attempt = 0
             self._last_step_summary = None
             self._last_action_call_result = None
@@ -3800,9 +3745,6 @@ class ToolAgent:
         self._session_generated_tokens += generated_token_count
         if count_toward_turn:
             self._turn_generated_tokens += generated_token_count
-            # the last such call before a handover is the one that emitted the
-            # previous turn's action; rolling summaries are not deliberation
-            self._last_call_reasoning_tokens = _usage_reasoning_tokens(usage)
 
         total_tokens = usage.get("total_tokens")
         try:
@@ -4160,21 +4102,10 @@ class ToolAgent:
         prev_step = getattr(previous_frame, "step", None)
         cur_step = getattr(current_frame, "step", None)
         span = f"step {prev_step} -> {cur_step}"
-        frame_layout = _frame_image_layout()
-        if frame_layout:
-            entries = getattr(self, "_prompt_history_entries", [])
-            indices = [next((index for index, entry in enumerate(entries)
-                             if entry.frame == frame), None)
-                       for frame in (previous_frame, current_frame)]
-            if all(index is not None for index in indices):
-                span = f"history[{indices[0]}].frame -> history[{indices[1]}].frame"
         if _DIFF_IMAGE:
             part = diff_image_part(previous_frame, current_frame)
             if part is not None and previous_frame.grid != current_frame.grid:
                 label = (
-                    f"Diff image ({span}): cells that changed keep their true color; "
-                    "unchanged cells dimmed to dark navy."
-                ) if frame_layout else (
                     f"Diff image ({span}): cells that changed since your previous "
                     "analyzer turn in their new true color; unchanged cells dimmed "
                     "to dark navy (an off-palette color)."
@@ -4501,12 +4432,7 @@ class ToolAgent:
             diff_image_part,
         )
 
-        frame_layout = _frame_image_layout()
-        # The frame-image layout indexes history as the sandbox does: frames only.
-        entries = (
-            [entry for entry in history_entries or [] if entry.frame is not None]
-            if frame_layout else list(history_entries or [])
-        )
+        entries = list(history_entries or [])
         if len(entries) < 3 or str(entries[-1].action or "").upper() != "RESET":
             return
         death = entries[-2]
@@ -4517,9 +4443,6 @@ class ToolAgent:
         if death_part is not None:
             self._pending_gameover_images.append(
                 (
-                    f"history[{len(entries) - 2}].frame (after {death.action}): "
-                    "this is the DEATH board."
-                    if frame_layout else
                     "Death frame image (the board at the moment the attempt "
                     "ended, before the automatic reset): inspect the budget bar "
                     "here for the BAR RULE.",
@@ -4533,11 +4456,6 @@ class ToolAgent:
         if fatal_part is not None and last_alive.frame.grid != death.frame.grid:
             self._pending_gameover_images.append(
                 (
-                    f"Fatal step diff image (history[{len(entries) - 3}].frame -> "
-                    f"history[{len(entries) - 2}].frame): "
-                    "cells changed by the killing action keep their true color; "
-                    "unchanged cells dimmed to dark navy."
-                    if frame_layout else
                     "Fatal step diff image (last alive frame -> death frame): "
                     "cells changed by the killing action in their new true "
                     "color; unchanged cells dimmed to dark navy (an off-palette "
@@ -4661,11 +4579,8 @@ class ToolAgent:
         """
         if not _animation_enabled():
             return
-        mode = animation_image_mode()
+        mode = animation_death_image_mode()
         if mode == "off" or not summary:
-            return
-        if mode == "sampled":
-            self._pending_gameover_images.extend(animation_sampled_parts(self._last_animation_chain or []))
             return
         animation = summary.get("animation") or {}
         if not int(animation.get("transient_pixels") or 0):
@@ -4718,9 +4633,6 @@ class ToolAgent:
             return
         mode = animation_image_mode()
         if mode == "off" or not summary:
-            return
-        if mode == "sampled":
-            self._pending_animation_samples = animation_sampled_parts(self._last_animation_chain or [])
             return
         if self._last_action_gameplay_changed is not False:
             return
@@ -4843,16 +4755,12 @@ class ToolAgent:
         diff_label = self._pending_diff_image_label
         animation_part = self._pending_animation_image
         animation_label = self._pending_animation_image_label
-        animation_samples = list(self._pending_animation_samples)
         gameover_images = list(self._pending_gameover_images)
-        intermediate_images = list(getattr(self, "_pending_intermediate_images", []))
         self._pending_diff_image = None
         self._pending_diff_image_label = ""
         self._pending_animation_image = None
         self._pending_animation_image_label = ""
-        self._pending_animation_samples = []
         self._pending_gameover_images = []
-        self._pending_intermediate_images = []
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -4860,15 +4768,6 @@ class ToolAgent:
             diff_part = None
         if image_part is None:
             return {"role": "user", "content": user_prompt}
-
-        if _frame_image_layout():
-            return {"role": "user", "content": self._frame_image_content(
-                user_prompt, current_frame, image_part,
-                diff_part=diff_part, diff_label=diff_label,
-                animation_part=animation_part, animation_label=animation_label,
-                animation_samples=animation_samples, gameover_images=gameover_images,
-                intermediate_images=intermediate_images,
-            )}
 
         content: list[dict[str, Any]] = [
             {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
@@ -4884,88 +4783,6 @@ class ToolAgent:
             content.append({"type": "text", "text": label})
             content.append(part)
         return {"role": "user", "content": content}
-
-    def _frame_image_content(
-        self,
-        user_prompt: str,
-        current_frame: Frame | None,
-        image_part: dict[str, Any],
-        *,
-        diff_part: dict[str, Any] | None,
-        diff_label: str,
-        animation_part: dict[str, Any] | None,
-        animation_label: str,
-        animation_samples: list[tuple[str, dict[str, Any]]],
-        gameover_images: list[tuple[str, dict[str, Any]]],
-        intermediate_images: list[tuple[str, dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        """Main's layout for the frame-image options (d62d95f, 89427e5).
-
-        Images go beside the prompt line they illustrate. Anchors are the exact
-        lines recorded while building this prompt, not markers sent to the model.
-        """
-        anchors = getattr(self, "_prompt_image_anchors", {})
-        fatal_turn = "death" in anchors
-        death_boards = [(label, part) for label, part in gameover_images if "DEATH board" in label]
-        fatal_diffs = [(label, part) for label, part in gameover_images if label.startswith("Fatal step diff image")]
-        fatal_animations = [(label, part) for label, part in gameover_images
-                            if "DEATH board" not in label and not label.startswith("Fatal step diff image")]
-        history = getattr(self, "_prompt_history_entries", [])
-        if not death_boards and len(history) >= 3 and fatal_turn:
-            death_index = len(history) - 2
-            death_boards = [
-                (label[:-1] + ": this is the DEATH board.", part)
-                for label, part in intermediate_images
-                if label.startswith(f"history[{death_index}].frame ") or label.startswith(f"{death_index} (")
-            ]
-        if death_boards:
-            death_index = len(history) - 2
-            # Show the death board once, after its animation.
-            intermediate_images = [(label, part) for label, part in intermediate_images
-                                   if not (label.startswith(f"history[{death_index}].frame ")
-                                           or label.startswith(f"{death_index} ("))]
-        current_label = "This is the CURRENT board to act on."
-        current_entry = getattr(self, "_current_history_entry", None)
-        if current_entry is not None and current_entry[1].frame == current_frame:
-            index, entry = current_entry
-            caption = f"history[{index}].frame"
-            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) or intermediate_images:
-                caption += f" (after {entry.action})"
-            current_label = f"{caption}: this is the CURRENT board to act on."
-        current_images = [(current_label, image_part)]
-        diff_images = [(diff_label, diff_part)] if diff_part else []
-        animations = animation_samples + ([(animation_label, animation_part)] if animation_part else [])
-        # Earlier actions precede the last action's animation and resulting
-        # board. Fatal turns then show RESET and the alive -> death diff.
-        groups = {
-            "actions": intermediate_images,
-            "death" if fatal_turn else "animation": (
-                animations + fatal_animations + death_boards + current_images + fatal_diffs + diff_images
-            ),
-        }
-        placements = []
-        for name, parts in groups.items():
-            anchor = anchors.get(name) or anchors.get("actions", "")
-            before_state = not anchor
-            if before_state:
-                anchor = anchors.get("current", "")
-            start = user_prompt.find(anchor) if anchor else -1
-            end = start + (0 if before_state else len(anchor)) if start >= 0 else len(user_prompt)
-            placements.append((end, parts))
-        placements.sort(key=lambda item: item[0])
-        content: list[dict[str, Any]] = []
-        cursor = 0
-        for end, parts in placements:
-            if not parts:
-                continue
-            if user_prompt[cursor:end].strip():
-                content.append({"type": "text", "text": user_prompt[cursor:end]})
-            for label, part in parts:
-                content.extend([{"type": "text", "text": label}, part])
-            cursor = end
-        if user_prompt[cursor:].strip():
-            content.append({"type": "text", "text": user_prompt[cursor:]})
-        return content
 
 
     def _memory_section_guidance(self, block_shown: bool) -> list[str]:
@@ -5086,16 +4903,7 @@ class ToolAgent:
         history_entries: list[HistoryEntry] | None = None,
         previous_step_summary: dict[str, Any] | None = None,
     ) -> str:
-        self._prompt_image_anchors: dict[str, str] = {}
         history_entries = history_entries or []
-        # History indices for the frame-image captions, counted as the sandbox
-        # exposes `history` (entries with a frame).
-        self._current_history_entry = None
-        self._prompt_history_entries = [entry for entry in history_entries if entry.frame is not None]
-        if current_frame is not None:
-            for index, entry in enumerate(self._prompt_history_entries):
-                if entry.frame.step == current_frame.step and entry.frame == current_frame:
-                    self._current_history_entry = (index, entry)
         current_step = max(current_frame.step if current_frame is not None else 0, max(0, action_num)) + 1
         current_level = current_frame.level if current_frame is not None else 1
         summary_level = None
@@ -5130,7 +4938,6 @@ class ToolAgent:
                 lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
             else:
                 lines.append("Executed actions: none.")
-            self._prompt_image_anchors["actions"] = lines[-1]
             if _report_gameplay_changed() and normalized_count:
                 # Whether the sequence MOVED anything. The harness computes this
                 # for every action - it drives the batch stop - and until now
@@ -5163,11 +4970,6 @@ class ToolAgent:
                 if animation_line:
                     lines.append(animation_line)
                 self._prepare_animation_image(previous_step_summary)
-                if self._pending_animation_samples and not animation_line:
-                    animation_line = "Last action animation (sampled):"
-                    lines.append(animation_line)
-                if animation_line:
-                    self._prompt_image_anchors["animation"] = animation_line
             no_op_stops = previous_step_summary.get("no_op_stops") or []
             for stop in no_op_stops[:3]:
                 skipped = stop.get("skipped") or []
@@ -5312,7 +5114,6 @@ class ToolAgent:
                         + "; ".join(str(t) for t in game_over_trace)
                         + "."
                     )
-                self._prompt_image_anchors["death"] = lines[-1]
                 self._prepare_gameover_images(
                     history_entries, previous_step_summary
                 )
@@ -5371,7 +5172,6 @@ class ToolAgent:
         if observed_max_level > current_level:
             state_line += f" out of observed max level {observed_max_level} so far"
         state_line += "."
-        self._prompt_image_anchors["current"] = state_line
         lines.extend(
             [
                 state_line,
@@ -6301,12 +6101,6 @@ class ToolAgent:
         if step_executed:
             self._last_step_summary = self._summarize_step_sequence(action_results)
             self._update_summarized_knowledge_from_step_summary()
-            if _get_env_bool("MULTIMODAL_INTERMEDIATE_FRAMES", False) and current_frame is not None:
-                final_frame, updated_history = load_runtime_state(state_path)
-                if final_frame is not None:
-                    self._pending_intermediate_images = intermediate_frame_parts(
-                        updated_history, after_step=current_frame.step, before_step=final_frame.step,
-                    )
         elif self._last_step_summary and not self._last_step_summary.get("stale"):
             # carried over across an exchange that executed nothing: mark it so
             # the next prompt reminds instead of re-narrating it as fresh
@@ -6810,10 +6604,7 @@ class ToolAgent:
         )
         if gate is not None and _priority_refresh_enabled():
             pace = self._progress_pace.cost_multiplier() if _get_env_bool("ARC3_PRIORITY_PACE", False) else 1.0
-            snapshot = PrioritySnapshot(
-                level, actions, tokens, pace, total_levels,
-                getattr(self, "_last_call_reasoning_tokens", None),
-            )
+            snapshot = PrioritySnapshot(level, actions, tokens, pace, total_levels)
             estimate = gate._snapshot_priority(snapshot, time.monotonic())
         else:
             estimate = _game_priority(
