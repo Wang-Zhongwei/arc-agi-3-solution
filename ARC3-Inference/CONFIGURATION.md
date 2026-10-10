@@ -89,7 +89,7 @@ Added images that show changed cells in their true palette colors while dimming 
 |---|---|---|
 | `ARC3_DIFF_IMAGE` | Off | Attaches ordinary board-difference images. |
 | `ARC3_GAMEOVER_DIFF_IMAGE` | Off | Attaches death-related comparison images in the first post-death opener. |
-| `ARC3_LEVELUP_BOARD_IMAGE` | Off | Attaches the solved board of the level just completed (the engine's second-to-last frame of the winning action) to the first opener after a level-up as `Last level-complete image:`, before the current grid image. Needs current grid images on. |
+| `ARC3_LEVELUP_BOARD_IMAGE` | Off | Attaches the solved board of the level just completed (the engine's second-to-last frame of the winning action) to the first opener after a level-up as `Last level-complete image:`, before the current grid image, only when its interior (inside `ARC3_NOOP_GUARD_BORDER`) differs from the last turn's current grid image. Needs current grid images on. |
 | `ARC3_RESUME_DIFF_IMAGE` | Off | Reattaches the current turn’s diff image to a resumed turn, useful if earlier images have been hidden. |
 | `ARC3_RESUME_PROMPT_IMAGES` | On | Allows images on yield/resumption messages. Turning it off removes those repeated attachments. |
 | `MULTIMODAL_RESAMPLE` | `nearest` | Selects the image resize filter: nearest, bilinear, bicubic, or lanczos. |

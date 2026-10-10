@@ -3674,6 +3674,7 @@ class ToolAgent:
         self._last_animation_chain: list[Any] = []
         self._level_end_grid: Any = None
         self._pending_levelup_image: dict[str, Any] | None = None
+        self._last_shown_grid: Any = None
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
@@ -4769,10 +4770,16 @@ class ToolAgent:
 
     def _prepare_levelup_board_image(self) -> None:
         """Attach the board as the previous level was solved, shown before the
-        current grid image."""
+        current grid image - only when its interior differs from the current
+        grid image of the last turn, which otherwise already showed it."""
         grid, self._level_end_grid = self._level_end_grid, None
-        if grid is not None and _levelup_board_image():
-            self._pending_levelup_image = current_grid_image_part(Frame(grid=grid, step=0, level=0))
+        if grid is None or not _levelup_board_image():
+            return
+        border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+        interior = lambda g: [row[border:len(row) - border] for row in g[border:len(g) - border]]
+        if self._last_shown_grid is not None and interior(grid) == interior(self._last_shown_grid):
+            return
+        self._pending_levelup_image = current_grid_image_part(Frame(grid=grid, step=0, level=0))
 
     def _retained_function_context(self) -> str:
         """Optional prompt metadata must never interrupt game execution."""
@@ -4871,6 +4878,8 @@ class ToolAgent:
         self._pending_intermediate_images = []
         levelup_part = self._pending_levelup_image
         self._pending_levelup_image = None
+        if current_frame is not None:
+            self._last_shown_grid = current_frame.grid
         if levelup_part is not None:
             animation_samples.insert(0, ("Last level-complete image:", levelup_part))
         if animation_part is not None:

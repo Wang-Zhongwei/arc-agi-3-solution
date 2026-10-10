@@ -50,13 +50,14 @@ def test_taaf_placeholder_and_single_frame_are_not_boards():
     assert _level_end_grid(None) is None
 
 
-def _opener(monkeypatch, tmp_path, enabled):
+def _opener(monkeypatch, tmp_path, enabled, last_shown=None):
     monkeypatch.setenv("MULTIMODAL_CONTEXT", "current_grid")
     monkeypatch.setenv("ARC3_MEMORY_SECTIONS", "off")
     monkeypatch.setenv("ARC3_LEVELUP_BOARD_IMAGE", "1" if enabled else "0")
     agent = tool_agent.ToolAgent(model="test-model", base_url="http://127.0.0.1:8001/v1", provider="vllm")
     agent._ensure_session(tmp_path / "state.json")
     agent._level_end_grid = tuple((3,) * 64 for _ in range(64))
+    agent._last_shown_grid = last_shown
     current = Frame(grid=tuple((4,) * 64 for _ in range(64)), step=8, level=2)
     entries = [HistoryEntry("INIT", Frame(grid=current.grid, step=7, level=1)), HistoryEntry("RIGHT", current)]
     summary = {"executed_count": 1, "executed_actions": ["RIGHT"], "level_transition": True}
@@ -85,3 +86,13 @@ def test_levelup_opener_shows_solved_board_before_current(monkeypatch, tmp_path,
         assert len(images) == 1
         assert "Last level-complete image:" not in parts[0]["text"]
     assert agent._level_end_grid is None
+
+
+def test_levelup_image_skipped_when_interior_matches_last_turn(monkeypatch, tmp_path):
+    fringe_only = tuple((5,) * 64 if r < 4 else (3,) * 64 for r in range(64))
+    agent, parts = _opener(monkeypatch, tmp_path, True, last_shown=fringe_only)
+    assert sum(part["type"] == "image_url" for part in parts) == 1
+    assert "Last level-complete image:" not in parts[0]["text"]
+    moved = tuple((3,) * 64 if r != 30 else (5,) * 64 for r in range(64))
+    agent, parts = _opener(monkeypatch, tmp_path, True, last_shown=moved)
+    assert sum(part["type"] == "image_url" for part in parts) == 2
