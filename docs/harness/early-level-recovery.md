@@ -50,4 +50,15 @@ No gameplay improvement is established locally. After both exact versions finish
 
 Local checks on 2026-10-09: full suite **400 passed, 64 existing branch-divergence skips**; the focused recovery/config/MTP suite run through Make **30 passed**; Ruff and `git diff --check` passed. Comparing against the live `origin/allocation-vc-one-wave` source at `7ce6732`, the disabled feature produced byte-identical system prompts, user prompts and tool schemas across nine level/event cases (levels 1–3, ordinary/death/level-transition openers).
 
-Intended destinations: A `ticbudja/early-level-recovery-baseline`, dataset `ticbudja/early-level-recovery-baseline-src`; B `ticbudja/early-level-recovery`, dataset `ticbudja/early-level-recovery-src`. Exact push versions and remote status will be recorded after submission.
+Submitted on 2026-10-10 from clean source commit `143902e`, using the user's `jonathanwang2022` account:
+
+| Arm | Exact notebook version | Private source dataset | Status after submission |
+|---|---|---|---|
+| A | [early-level-recovery-baseline v1](https://www.kaggle.com/code/jonathanwang2022/early-level-recovery-baseline) | `jonathanwang2022/early-level-recovery-baseline-src` v1 | RUNNING |
+| B | [early-level-recovery v1](https://www.kaggle.com/code/jonathanwang2022/early-level-recovery) | `jonathanwang2022/early-level-recovery-src` v1 | RUNNING |
+
+Both pushes explicitly reported `Kernel version 1 successfully pushed`. The packaged deployment targets each contain the intended 15-game pool and a 141-minute notebook cap. The launch command lists 25 initial games; the notebook narrows them using the packaged `public_games` list. The two packaged `tool_agent.py` files have the same SHA256, `0a715ead3c74666e668e8e831c4d4a8c6fa0bf9add4ae7b24268a53d410d9241`. Their rendered setup commands contain recovery thresholds `0` and `32768`, respectively.
+
+A local follow-up monitor is running in managed execution session `50317`. First completion check: **2026-10-10 06:37 UTC / 02:37 Eastern**; subsequent checks every five minutes while queued/running. It retrieves exact v1 outputs and source, then runs `make evaluate_run`; failed runs have their available outputs/logs retrieved. Timer/script/log/status files are under `/private/tmp/arc3-early-level-recovery-followup/`. The current source fetcher recognizes only `taaf-kaggle-source*` automatically, so the monitor supplies the exact named dataset reference and dataset version through its existing `fetch_source` API when that default fails.
+
+Remote RUNNING status is submission evidence, not a gameplay score. Results are pending.
