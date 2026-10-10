@@ -183,3 +183,50 @@ def test_stop_before_request_does_not_consume_reminder(setup_agent):
     assert agent._early_level_recovery_shown_levels == set()
     analyze(agent, state)
     assert MARKER in opener(sent[0])
+
+
+def test_unused_actions_use_execution_history_across_death_and_level_up(setup_agent, monkeypatch):
+    agent, _, _ = setup_agent
+    monkeypatch.setenv("EXPOSE_UNDO", "on")
+    agent._session_generated_tokens = THRESHOLD
+    history = [
+        HistoryEntry("INIT", frame(1, 0)),
+        HistoryEntry("ACTION1", frame(1, 1)),
+        HistoryEntry("MOUSE(row=1, col=1)", frame(1, 2)),
+        HistoryEntry("RESET", frame(1, 3), {"automatic": True}),
+        HistoryEntry("RIGHT", frame(2, 4)),  # completing level 1, not tried on 2
+        HistoryEntry("LEFT", frame(2, 5)),
+    ]
+    actions = ["UP", "LEFT", "RIGHT", "SPACE", "MOUSE", "UNDO", "RESET"]
+    text = agent._early_level_recovery_prompt(frame(1), valid_actions=actions, history_entries=history)
+    assert "Action types not yet tried on this level: LEFT, SPACE, UNDO." in text
+    text = agent._early_level_recovery_prompt(frame(2), valid_actions=actions, history_entries=history)
+    assert "Action types not yet tried on this level: UP, RIGHT, SPACE, MOUSE, UNDO." in text
+    assert "does not cover every target or interaction" in text
+
+
+@pytest.mark.parametrize("mode", ["full", "short", "state_only"])
+def test_unused_actions_reach_every_opener_without_counting_skipped_actions(setup_agent, monkeypatch, mode):
+    agent, state, sent = setup_agent
+    monkeypatch.setenv("ARC3_YIELD_RESUME_PROMPT", mode)
+    agent._session_generated_tokens = THRESHOLD
+    history = [HistoryEntry("INIT", frame()), HistoryEntry("UP", frame(step=1))]
+    write_runtime_state(state, current_frame=frame(step=1), history=history)
+    agent._last_step_summary = {"executed_actions": ["UP"], "skipped_actions": ["SPACE"]}
+    agent._resume_after_yield = mode != "full"
+    agent.analyze(state_path=state, action_num=1, valid_actions=["UP", "SPACE"])
+    assert "Action types not yet tried on this level: SPACE." in opener(sent[0])
+    assert "Action types not yet tried on this level: UP" not in opener(sent[0])
+    # Model context eviction has no effect on the runtime execution history.
+    agent._history_messages = []
+    text = agent._early_level_recovery_prompt(frame(), valid_actions=["UP"], history_entries=history)
+    assert not text  # successful delivery is still one-shot
+
+
+def test_all_actions_tried_does_not_claim_all_interactions_explored(setup_agent):
+    agent, _, _ = setup_agent
+    agent._session_generated_tokens = THRESHOLD
+    history = [HistoryEntry("INIT", frame()), HistoryEntry("MOUSE(row=0, col=0)", frame(step=1))]
+    text = agent._early_level_recovery_prompt(frame(), valid_actions=["MOUSE"], history_entries=history)
+    assert "All currently valid action types have been tried" in text
+    assert "does not cover every target or interaction" in text

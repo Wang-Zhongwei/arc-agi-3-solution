@@ -5083,7 +5083,11 @@ class ToolAgent:
             lines.append(f"Current state: step {step}, level {level}.")
         return lines
 
-    def _early_level_recovery_prompt(self, current_frame: Frame | None) -> str:
+    def _early_level_recovery_prompt(
+        self, current_frame: Frame | None, *,
+        valid_actions: list[str] | None = None,
+        history_entries: list[HistoryEntry] | None = None,
+    ) -> str:
         """Render a one-time early-level check; delivery is committed in analyze."""
         threshold = _get_env_int("ARC3_EARLY_LEVEL_RECOVERY_TOKENS", 0)
         if threshold <= 0 or current_frame is None or current_frame.level not in (1, 2):
@@ -5098,9 +5102,31 @@ class ToolAgent:
         )
         if tokens < threshold:
             return ""
-        return EARLY_LEVEL_RECOVERY_USER_PROMPT.format(
+        prompt = EARLY_LEVEL_RECOVERY_USER_PROMPT.format(
             level=current_frame.level, generated_tokens=tokens,
         )
+        if valid_actions is not None and history_entries is not None:
+            # Runtime history survives context eviction and records actual execution,
+            # including refused/skipped actions being absent. Attribute a level-up
+            # action to its pre-action level, rather than its post-action frame.
+            tried: set[str] = set()
+            before = None
+            for entry in history_entries:
+                if before is not None and before.level == current_frame.level:
+                    if not entry.result.get("automatic"):
+                        tried.add(to_model_action(entry.action.split("(", 1)[0]))
+                before = entry.frame
+            candidates = _normalize_valid_actions(valid_actions)
+            unused = [name for name in candidates if name != "RESET" and name not in tried]
+            if unused:
+                prompt += (
+                    f" Action types not yet tried on this level: {', '.join(unused)}. "
+                    "Consider whether one could test a missing control or interaction."
+                )
+            else:
+                prompt += " All currently valid action types have been tried on this level."
+            prompt += " Trying an action type does not cover every target or interaction."
+        return prompt
 
     def _build_user_prompt(
         self,
@@ -5462,7 +5488,9 @@ class ToolAgent:
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )
         lines.extend(self._memory_section_guidance(bool(knowledge_lines)))
-        recovery_prompt = self._early_level_recovery_prompt(current_frame)
+        recovery_prompt = self._early_level_recovery_prompt(
+            current_frame, valid_actions=valid_actions, history_entries=history_entries,
+        )
         if recovery_prompt:
             lines.append(recovery_prompt)
         if _opener_commit_hint():
@@ -7101,7 +7129,9 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
-        recovery_prompt = self._early_level_recovery_prompt(current_frame)
+        recovery_prompt = self._early_level_recovery_prompt(
+            current_frame, valid_actions=valid_actions, history_entries=history_entries,
+        )
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,
