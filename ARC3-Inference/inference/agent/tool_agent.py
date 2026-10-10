@@ -53,6 +53,7 @@ from inference.agent.prompts import (
     GAMEPLAY_CHANGED_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
+    ANIMATION_IMAGE_GUIDANCE,
     ANIMATION_ADDENDUM_TIMELINE,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
@@ -2800,6 +2801,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         )
     if _animation_enabled():
         prompt += ANIMATION_ADDENDUM
+        if current_grid_image_enabled() and animation_image_mode() != "off":
+            prompt += "- " + ANIMATION_IMAGE_GUIDANCE + "\n"
         if _animation_timeline_enabled():
             prompt += ANIMATION_ADDENDUM_TIMELINE
     if current_grid_image_enabled():
@@ -5168,6 +5171,8 @@ class ToolAgent:
                     lines.append(animation_line)
                 if animation_line:
                     self._prompt_image_anchors["animation"] = animation_line
+                if self._pending_animation_samples or self._pending_animation_image is not None:
+                    lines.append(ANIMATION_IMAGE_GUIDANCE)
             no_op_stops = previous_step_summary.get("no_op_stops") or []
             for stop in no_op_stops[:3]:
                 skipped = stop.get("skipped") or []
@@ -5316,6 +5321,11 @@ class ToolAgent:
                 self._prepare_gameover_images(
                     history_entries, previous_step_summary
                 )
+                if any(
+                    label.startswith(("last_animation_frames[", "Fatal action animation"))
+                    for label, _ in self._pending_gameover_images
+                ):
+                    lines.append(ANIMATION_IMAGE_GUIDANCE)
                 if _get_env_bool("ARC3_GAMEOVER_DIFF", False):
                     # read at call time so this patch's hunks stay clear of the
                     # env-knob block that other patches extend

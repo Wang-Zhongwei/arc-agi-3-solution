@@ -169,6 +169,12 @@ ANIMATION_ADDENDUM_TIMELINE = (
     "count per colour change, when there were too many cells to list).\n"
 )
 
+ANIMATION_IMAGE_GUIDANCE = (
+    "Animation images are for intuitive understanding and may omit frames or fine details. "
+    "Verify details in Python using `last_animation_frames` via `.segmentation` and targeted "
+    "`.ascii` crops; `current_frame` is the settled board."
+)
+
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
