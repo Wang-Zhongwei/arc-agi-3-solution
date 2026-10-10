@@ -11,6 +11,14 @@ LEVEL_TRANSFER_SYSTEM_GUIDANCE = (
     "new mechanics to reach it, or the goal itself may change.\n"
 )
 
+EARLY_LEVEL_RECOVERY_USER_PROMPT = (
+    "Progress check: {generated_tokens:,} generated tokens on level {level} without a level-up. "
+    "Reconsider an uncertain assumption about the controls, mechanics, or goal. "
+    "Check exact board/history data in Python and consider an alternative explanation; "
+    "choose a small test that distinguishes them before extending the same search. "
+    "Keep verified facts. If your plan's predictions match observations and it is making progress, continue it."
+)
+
 LEVEL_START_USER_PROMPT = (
     "You have completed the previous level. `current_frame` now contains the starting "
     "board of the next level; any accompanying current-grid image shows this new board. "

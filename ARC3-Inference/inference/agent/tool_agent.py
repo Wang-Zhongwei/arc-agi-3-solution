@@ -38,6 +38,7 @@ from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
+    EARLY_LEVEL_RECOVERY_USER_PROMPT,
     COMPACT_TOOL_SESSION_ADDENDUM,
     PERSISTENT_FUNCTIONS_LINE,
     EPHEMERAL_FUNCTIONS_LINE,
@@ -3653,6 +3654,8 @@ class ToolAgent:
         self._has_evicted = False
         self._actions_at_level_start = 0
         self._tokens_at_level_start = 0
+        self._early_level_recovery_tokens_at_level_start = 0
+        self._early_level_recovery_shown_levels: set[int] = set()
         self._progress_pace = ProgressPace()
         self._pace_last_completed_level = 0
         self._yield_progress = YieldProgress()
@@ -3757,6 +3760,8 @@ class ToolAgent:
             self._history_messages = []
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
+            self._early_level_recovery_tokens_at_level_start = 0
+            self._early_level_recovery_shown_levels = set()
             self._last_call_reasoning_tokens = None
             self._summary_context_tokens_since_attempt = 0
             self._last_step_summary = None
@@ -4011,6 +4016,7 @@ class ToolAgent:
                     self._pace_last_completed_level = completed_level
             self._actions_at_level_start = _priority_action_count(summary)
             self._tokens_at_level_start = self._session_generated_tokens
+            self._early_level_recovery_tokens_at_level_start = self._session_generated_tokens
         if summary.get("level_transition") and _persistent_functions_scope() == "levelup":
             # a helper can encode the old layout in its code even when it holds
             # no stale data, so the level boundary is where it stops being safe
@@ -5077,6 +5083,25 @@ class ToolAgent:
             lines.append(f"Current state: step {step}, level {level}.")
         return lines
 
+    def _early_level_recovery_prompt(self, current_frame: Frame | None) -> str:
+        """Render a one-time early-level check; delivery is committed in analyze."""
+        threshold = _get_env_int("ARC3_EARLY_LEVEL_RECOVERY_TOKENS", 0)
+        if threshold <= 0 or current_frame is None or current_frame.level not in (1, 2):
+            return ""
+        if (self._last_step_summary or {}).get("run_complete"):
+            return ""
+        if current_frame.level in getattr(self, "_early_level_recovery_shown_levels", set()):
+            return ""
+        tokens = max(
+            0,
+            self.generated_tokens - getattr(self, "_early_level_recovery_tokens_at_level_start", 0),
+        )
+        if tokens < threshold:
+            return ""
+        return EARLY_LEVEL_RECOVERY_USER_PROMPT.format(
+            level=current_frame.level, generated_tokens=tokens,
+        )
+
     def _build_user_prompt(
         self,
         action_num: int,
@@ -5437,6 +5462,9 @@ class ToolAgent:
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )
         lines.extend(self._memory_section_guidance(bool(knowledge_lines)))
+        recovery_prompt = self._early_level_recovery_prompt(current_frame)
+        if recovery_prompt:
+            lines.append(recovery_prompt)
         if _opener_commit_hint():
             # last line of the opener, where the resumption prompt sits relative
             # to the reply it influences
@@ -7073,6 +7101,7 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
+        recovery_prompt = self._early_level_recovery_prompt(current_frame)
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,
@@ -7155,12 +7184,14 @@ class ToolAgent:
             self._pending_diff_image_label = self._turn_diff_image_label
         if resume_mode == "state_only":
             opening_message = self._build_user_message(
-                _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION,
+                _yield_resume_prompt(resume_reason) + "\n\n" + _STATE_ONLY_CAPTION
+                + ("\n\n" + recovery_prompt if recovery_prompt else ""),
                 current_frame,
             )
         elif resume_mode == "short":
             opening_message = self._build_user_message(
-                _yield_resume_prompt(resume_reason), resume_frame
+                _yield_resume_prompt(resume_reason)
+                + ("\n\n" + recovery_prompt if recovery_prompt else ""), resume_frame
             )
         else:
             opening_message = self._build_user_message(
@@ -7202,6 +7233,7 @@ class ToolAgent:
         # turn, so this resets where the clock does
         self._turn_generated_tokens = 0
         yielded_control_reason: str | None = None
+        recovery_delivered = False
 
         def control_yield_reason() -> str | None:
             if should_stop is not None:
@@ -7263,6 +7295,7 @@ class ToolAgent:
                             chat_template_kwargs=self._harness_template_kwargs(),
                         )
                     result = self._chat_completion(messages, **request_kwargs)
+                    recovery_delivered = bool(recovery_prompt)
                     _calibration_note = self._calibrate_from_usage(
                         messages, request_kwargs.get("tools"), result.usage
                     )
@@ -7670,6 +7703,10 @@ class ToolAgent:
                 self._turns_without_wm_update += 1
             if preserve_history:
                 self._history_messages = self._persistent_history_messages(messages, tools=self._tools(state_path))
+                # A failed/unsent request must not use up the one-time check.
+                # Mark the opener's level even if its response cleared that level.
+                if recovery_delivered and current_frame is not None:
+                    self._early_level_recovery_shown_levels.add(current_frame.level)
             else:
                 self._history_messages = previous_history_messages
             solver_obj = getattr(self._step_env_callback, "__self__", None)

@@ -245,6 +245,16 @@ The original `LOCAL_ANALYZER_CONTEXT_WINDOW` and `LOCAL_ANALYZER_MAX_OUTPUT` sti
 
 Internal tags distinguish control messages without leaking those tags into requests. Pruning repairs the trailing user-message structure and records that the context has changed, so scheduling/prefix-state bookkeeping remains consistent.
 
+### Early-level recovery
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_EARLY_LEVEL_RECOVERY_TOKENS` | `0`: disabled | After this many generated tokens without a level-up, append a progress check to the next user opener, once each on levels 1 and 2. Use `32768` for the initial experiment. |
+
+Set this option in `harness_env`. It counts accepted model output (thinking and response/tool-call text, including rolling-summary output), using the existing generated-token usage counter. Input, returned tool data and image tokens do not count; missing usage does not advance the counter. A level transition restarts the count. Deaths, RESET, analyzer yields, and context eviction do not. A new game session clears both the count and the delivery markers.
+
+The reminder asks the agent to check an uncertain assumption against an alternative using exact board/history data and a small distinguishing test, while retaining verified facts and a plan that predicts observations. It adds no model call, reset, forced action, or thinking limit. Full, short, and state-only openers all carry it when due. Crossing the threshold inside an invocation takes effect at the next opener. Requests abandoned with rolled-back history and invocations stopped before a successful response do not consume the reminder. It never triggers on level 3 or later or after run completion. See [the design and A/B settings](../docs/harness/early-level-recovery.md).
+
 ## 9. Rolling summaries
 
 Added periodic model-written summaries as a separate memory mechanism from the structured world-model sections.
