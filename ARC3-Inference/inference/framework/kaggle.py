@@ -206,6 +206,7 @@ def lordhansolo_setup_command() -> str:
     server = runtime.DuckKaggleVllmConfig(
         runtime_dataset_source=cfg["wheelhouse_dataset_source"],
         model_source=cfg["model_source"],
+        draft_model_source=cfg.get("draft_model_source", ""),
         served_model_name=cfg.get("served_model_name", "flashnext"),
         vllm_port=int(cfg.get("port", 8001)),
         **cfg.get("vllm", {}),
