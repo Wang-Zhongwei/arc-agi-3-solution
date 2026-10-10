@@ -78,9 +78,17 @@ DEFAULT_VLLM_GDN_DECODE_KERNEL = ""
 # Opt-in only. The rendered Kaggle setup script applies a second, runtime
 # competition-mode veto before it exposes any profiler configuration to vLLM.
 DEFAULT_VLLM_PROFILE = False
+# server.cache_diagnostics: Lord's prefix-cache tracer, which hooks every cache lookup and
+# eviction. True keeps it on in test runs (never in a competition rerun); false leaves it off
+# for a clean throughput run, as matijaludvig's DHL/vcintel notebooks do.
+DEFAULT_VLLM_CACHE_DIAGNOSTICS = True
 # server.draft_vocab: a JSON file of token-id ranges, relative to ARC3-Inference/, that the
 # e975732 rc3 runtime limits MTP draft proposals to. Empty keeps the full-vocabulary draft head.
 DEFAULT_VLLM_DRAFT_VOCAB = ""
+# kaggle.draft_model_source: a Kaggle model ref whose MTP head drafts for the target in place of
+# the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
+# it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
+DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -140,7 +148,10 @@ class DuckKaggleVllmConfig:
     moe_backend: str = ""
     gdn_decode_kernel: str = DEFAULT_VLLM_GDN_DECODE_KERNEL
     profile: bool = DEFAULT_VLLM_PROFILE
+    cache_diagnostics: bool = DEFAULT_VLLM_CACHE_DIAGNOSTICS
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
+    prefetch_threads: int = 8
+    draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
 
 
 def resolve_draft_vocab(path: str) -> str:
@@ -173,16 +184,21 @@ def duck_kaggle_model_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [cfg.model_source]
+    return [ref for ref in (cfg.model_source, cfg.draft_model_source) if ref]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
     cfg = config or DuckKaggleVllmConfig()
+    if cfg.prefetch_threads < 1:
+        raise ValueError("vLLM prefetch_threads must be >= 1")
     runtime_owner, runtime_slug = _split_dataset_source(
         cfg.runtime_dataset_source,
         option_name="runtime_dataset_source",
     )
     model_source_parts = _split_model_source(cfg.model_source)
+    draft_model_source_parts = (
+        _split_model_source(cfg.draft_model_source) if cfg.draft_model_source else None
+    )
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
     prompt_window = int(cfg.max_model_len) - VLLM_OUTPUT_RESERVE_TOKENS
@@ -206,6 +222,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_OWNER__": repr(runtime_owner),
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
+        "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -255,7 +272,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__VLLM_GDN_DECODE_KERNEL__": repr(str(cfg.gdn_decode_kernel)),
         "__VLLM_CUDA_LAUNCH_BLOCKING__": repr(os.environ.get("KAGGLE_VLLM_CUDA_LAUNCH_BLOCKING", "false").strip().lower() in {"1", "true", "yes", "on"}),
         "__VLLM_PROFILE_REQUESTED__": repr(bool(cfg.profile)),
+        "__VLLM_CACHE_DIAGNOSTICS_REQUESTED__": repr(bool(cfg.cache_diagnostics)),
         "__VLLM_DRAFT_VOCAB__": repr(resolve_draft_vocab(cfg.draft_vocab)),
+        "__VLLM_PREFETCH_THREADS__": repr(int(cfg.prefetch_threads)),
         "__PROJECT_DIR_NAME__": repr(PROJECT_DIR.name),
     }
     script = _DUCK_VLLM_SETUP_SCRIPT
@@ -336,17 +355,19 @@ def is_test_run() -> bool:
 MAX_RESTARTS = 5
 RESTART_DELAY_SECONDS = 10
 HOST_MEMORY_SAMPLE_INTERVAL_SECONDS = 15
-GPU_SHARD_PREFETCH_THREADS = 4
 GPU_SHARD_PREFETCH_WINDOW_BYTES = 8 * 1024**3
 GPU_SHARD_PREFETCH_BLOCK_BYTES = 16 * 1024**2
 GPU_SHARD_PREFETCH_POLL_SECONDS = 0.5
 GPU_SHARD_PREFETCH_STOP_TIMEOUT_SECONDS = 2
-PLE_SHARD_NAME_PREFIX = 'ple-'
+PLE_SHARD_NAME_PREFIXES = ('ple-', 'model-ple-')
 GPU_SHARD_PREFETCH_ABORT = threading.Event()
 WATCHDOG_EXIT_DEFERRED = False
 WATCHDOG_EXIT_REQUESTED = False
 
 config = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+GPU_SHARD_PREFETCH_THREADS = int(config.get('prefetch_threads', 8))
+if GPU_SHARD_PREFETCH_THREADS < 1:
+    raise ValueError('vLLM prefetch_threads must be >= 1')
 server_command = config['command']
 server_log = Path(config['server_log'])
 server_pid = Path(config['server_pid'])
@@ -442,8 +463,10 @@ def list_loader_shards(model_path: Path) -> list[Path]:
     return sorted(shards, key=build_natural_sort_key)
 
 
-def read_file_into_page_cache(path: Path, stop_event: threading.Event) -> dict:
-    '''Read a file in large blocks so its pages sit in the page cache, until the end or a stop.
+def read_file_into_page_cache(
+    path: Path, stop_event: threading.Event, start: int, end: int
+) -> dict:
+    '''Read a disjoint file range into page cache in large blocks, until its end or a stop.
 
     The read stops early when its stop_event or GPU_SHARD_PREFETCH_ABORT is set. Both are checked
     between blocks, so a stop takes effect only after an in-flight read returns. Returns the
@@ -452,10 +475,15 @@ def read_file_into_page_cache(path: Path, stop_event: threading.Event) -> dict:
     started_at = time.monotonic()
     buffer = memoryview(bytearray(GPU_SHARD_PREFETCH_BLOCK_BYTES))
     with path.open('rb', buffering=0) as handle:
-        while not (stopped := stop_event.is_set() or GPU_SHARD_PREFETCH_ABORT.is_set()) and handle.readinto(buffer):
-            pass
+        handle.seek(start)
+        remaining = end - start
+        while remaining and not (stop_event.is_set() or GPU_SHARD_PREFETCH_ABORT.is_set()):
+            count = handle.readinto(buffer[:min(len(buffer), remaining)])
+            if not count:
+                raise OSError(f'Checkpoint file shrank while prefetching {path}')
+            remaining -= count
 
-    return {'started_at': started_at, 'finished_at': time.monotonic(), 'stopped': stopped}
+    return {'started_at': started_at, 'finished_at': time.monotonic(), 'stopped': remaining > 0}
 
 
 def drop_file_from_page_cache(path: Path) -> None:
@@ -505,7 +533,10 @@ class GpuShardPrefetcher:
     already arrive at 615-923 MiB/s through its multi-threaded copy, so only the GPU shards are
     prefetched. vLLM's own prefetch (v264, v265) read ahead with no bound, and after the pinned PLE
     table the page cache holds about 20 GiB, so pages far ahead were evicted before the loader got
-    there. Nothing is read before the loader prints its first progress line, so the window never
+    there. As in SGLang's lookahead reader, threads read disjoint ranges of a shard. The shared
+    pool limits total readers, and only the current shard and its immediate successor may be
+    staged, within the byte window. Intel's model-ple-* shards are excluded too: their loader
+    already copies them in parallel. Nothing is read before the first progress line, so the window never
     competes with the PLE allocation. From then on shards are submitted in load order while the
     bytes submitted and not yet passed by the loader fit the window, and the shard being loaded is
     always submitted.
@@ -528,10 +559,10 @@ class GpuShardPrefetcher:
         self._report_path = report_path
         self._log_offset = log_offset
         self._gpu_shard_indices = [
-            index for index, shard in enumerate(shards) if not shard.name.startswith(PLE_SHARD_NAME_PREFIX)
+            index for index, shard in enumerate(shards) if not shard.name.startswith(PLE_SHARD_NAME_PREFIXES)
         ]
         self._shard_sizes = {index: shards[index].stat().st_size for index in self._gpu_shard_indices}
-        self._futures: dict[int, concurrent.futures.Future] = {}
+        self._futures: dict[int, list[concurrent.futures.Future]] = {}
         self._stop_events: dict[int, threading.Event] = {}
         self._progress_reached_at: dict[int, float] = {}
         self._submitted_position = 0
@@ -562,7 +593,7 @@ class GpuShardPrefetcher:
                     self._record_progress(loaded_shard_count)
                     self._stop_passed_shards(loaded_shard_count)
                     self._drop_passed_shards()
-                    self._submit_window(executor)
+                    self._submit_window(executor, loaded_shard_count)
                 time.sleep(GPU_SHARD_PREFETCH_POLL_SECONDS)
         if self._dropped_position == len(self._gpu_shard_indices) and self._progress_reached_at:
             self._write_report()
@@ -587,19 +618,20 @@ class GpuShardPrefetcher:
             shard_index = self._gpu_shard_indices[self._passed_position]
             if shard_index in self._futures:
                 self._stop_events[shard_index].set()
-                self._futures[shard_index].cancel()
+                for future in self._futures[shard_index]:
+                    future.cancel()
             self._passed_position += 1
 
     def _drop_passed_shards(self) -> None:
         '''Evict passed GPU shards in order, each only after its read has ended.'''
         while self._dropped_position < self._passed_position:
             shard_index = self._gpu_shard_indices[self._dropped_position]
-            if shard_index in self._futures and not self._futures[shard_index].done():
+            if any(not future.done() for future in self._futures.get(shard_index, [])):
                 return
             drop_file_from_page_cache(self._shards[shard_index])
             self._dropped_position += 1
 
-    def _submit_window(self, executor: concurrent.futures.ThreadPoolExecutor) -> None:
+    def _submit_window(self, executor: concurrent.futures.ThreadPoolExecutor, loaded_shard_count: int) -> None:
         '''Submit the next GPU shards while the bytes still held in the page cache fit the window.
 
         The window counts from the first shard not yet evicted, not from the loader, so shards the
@@ -610,16 +642,27 @@ class GpuShardPrefetcher:
             self._shard_sizes[index]
             for index in self._gpu_shard_indices[self._dropped_position:self._submitted_position]
         )
-        while self._submitted_position < len(self._gpu_shard_indices) and (
+        while (
+            self._submitted_position < len(self._gpu_shard_indices)
+            and self._gpu_shard_indices[self._submitted_position] <= loaded_shard_count + 1
+        ) and (
             self._submitted_position == self._passed_position
             or ahead_bytes + self._shard_sizes[self._gpu_shard_indices[self._submitted_position]]
             <= GPU_SHARD_PREFETCH_WINDOW_BYTES
         ):
             shard_index = self._gpu_shard_indices[self._submitted_position]
             self._stop_events[shard_index] = threading.Event()
-            self._futures[shard_index] = executor.submit(
-                read_file_into_page_cache, self._shards[shard_index], self._stop_events[shard_index]
-            )
+            size = self._shard_sizes[shard_index]
+            blocks = (size + GPU_SHARD_PREFETCH_BLOCK_BYTES - 1) // GPU_SHARD_PREFETCH_BLOCK_BYTES
+            readers = min(GPU_SHARD_PREFETCH_THREADS, max(1, blocks))
+            self._futures[shard_index] = [
+                executor.submit(
+                    read_file_into_page_cache, self._shards[shard_index], self._stop_events[shard_index],
+                    (blocks * reader // readers) * GPU_SHARD_PREFETCH_BLOCK_BYTES,
+                    min(size, (blocks * (reader + 1) // readers) * GPU_SHARD_PREFETCH_BLOCK_BYTES),
+                )
+                for reader in range(readers)
+            ]
             ahead_bytes += self._shard_sizes[shard_index]
             self._submitted_position += 1
 
@@ -631,16 +674,18 @@ class GpuShardPrefetcher:
             'loader_reached': round(self._progress_reached_at[shard_index] - loader_started_at, 1),
             'loader_passed': round(self._progress_reached_at[shard_index + 1] - loader_started_at, 1),
         }
-        future = self._futures.get(shard_index)
-        if future is None or future.cancelled():
+        futures = self._futures.get(shard_index, [])
+        completed = [future for future in futures if not future.cancelled()]
+        if not completed:
             row['prefetch'] = 'not started'
-        elif future.exception() is not None:
-            row['prefetch'] = f'failed: {future.exception()!r}'
+        elif errors := [future.exception() for future in completed if future.exception() is not None]:
+            row['prefetch'] = f'failed: {errors[0]!r}'
         else:
-            read = future.result()
-            row['prefetch'] = 'stopped' if read['stopped'] else 'complete'
-            row['prefetch_started'] = round(read['started_at'] - loader_started_at, 1)
-            row['prefetch_finished'] = round(read['finished_at'] - loader_started_at, 1)
+            reads = [future.result() for future in completed]
+            stopped = len(completed) < len(futures) or any(read['stopped'] for read in reads)
+            row['prefetch'] = 'stopped' if stopped else 'complete'
+            row['prefetch_started'] = round(min(read['started_at'] for read in reads) - loader_started_at, 1)
+            row['prefetch_finished'] = round(max(read['finished_at'] for read in reads) - loader_started_at, 1)
 
         return row
 
@@ -650,6 +695,8 @@ class GpuShardPrefetcher:
         rows = [self._describe_shard(index, loader_started_at) for index in self._gpu_shard_indices]
         report = {
             'threads': GPU_SHARD_PREFETCH_THREADS,
+            'reader_mode': 'parallel_ranges',
+            'lookahead_shards': 1,
             'window_gib': GPU_SHARD_PREFETCH_WINDOW_BYTES / 1024**3,
             'gpu_shards': len(self._gpu_shard_indices),
             'gpu_shard_gib': round(sum(self._shard_sizes.values()) / 1024**3, 2),
@@ -808,6 +855,8 @@ def is_test_run() -> bool:
 RUNTIME_OWNER = __RUNTIME_OWNER__
 RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
+# A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
+DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
@@ -836,6 +885,7 @@ VLLM_MOE_BACKEND = __VLLM_MOE_BACKEND__
 VLLM_GDN_DECODE_KERNEL = __VLLM_GDN_DECODE_KERNEL__
 VLLM_CUDA_LAUNCH_BLOCKING = __VLLM_CUDA_LAUNCH_BLOCKING__
 VLLM_PROFILE_REQUESTED = __VLLM_PROFILE_REQUESTED__
+VLLM_CACHE_DIAGNOSTICS_REQUESTED = __VLLM_CACHE_DIAGNOSTICS_REQUESTED__
 VLLM_PROFILE_DIR = WORKING_DIR / 'vllm-profile'
 # The image-layer runtime unpacks to ~19.5 GB. /kaggle/working is a 20 GB volume, while
 # `df` inside a kernel on the RTX PRO 6000 host reported ~1.1 TB free on the root overlay,
@@ -845,6 +895,7 @@ IMAGE_RUNTIME_CACHE_ROOT = IMAGE_RUNTIME_ROOT.with_name(IMAGE_RUNTIME_ROOT.name 
 # The server.draft_vocab path relative to the bundled ARC3-Inference/ snapshot; empty keeps the
 # full-vocabulary MTP draft head.
 VLLM_DRAFT_VOCAB = __VLLM_DRAFT_VOCAB__
+VLLM_PREFETCH_THREADS = __VLLM_PREFETCH_THREADS__
 VLLM_DRAFT_VOCAB_FILE = (
     Path(os.environ['TAAF_KAGGLE_BUNDLE_DIR']) / 'src' / __PROJECT_DIR_NAME__ / VLLM_DRAFT_VOCAB
     if VLLM_DRAFT_VOCAB
@@ -965,6 +1016,8 @@ def describe_kaggle_input_tree(max_depth: int = 5) -> str:
 
 RUNTIME_DATASET = resolve_kaggle_dataset_path(RUNTIME_OWNER, RUNTIME_SLUG)
 MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+# Symlinks into the mounted draft checkpoint plus a filtered index; assembling it copies no weights.
+DRAFT_MODEL_DIR = Path('/tmp/vllm-mtp-draft')
 
 
 def assert_expected_cuda_gpu() -> None:
@@ -1151,6 +1204,87 @@ def apply_runtime_patch(manifest: dict) -> None:
     print(f'Runtime patch {patch["artifact"]}: {result.stdout.strip()}', flush=True)
 
 
+INC_PLE_ANCHOR = (
+    '        if not isinstance(quant_config, Fp8Config):\n'
+    '            raise NotImplementedError(\n'
+    '                "Qwen4Exp PLE embedding does not support quantization config "'
+)
+
+
+def route_inc_ple_to_unquantized(manifest: dict) -> None:
+    '''Let the runtime's PLE embedding load an Intel AutoRound (INC) checkpoint.
+
+    The PLE embedding accepts only the NVFP4, ModelOpt and FP8 configs of the mixed
+    checkpoints and raises for INC, whose PLE table is unquantized BF16, as in
+    dfranzen/intel-qwen3.8-flash-next-w4a16-autoround. INCConfig is routed to the
+    unquantized PLE method, as matijaludvig/arc3-vcintel-25x1 does; other quantization
+    configs take the same path as before. A runtime without the anchor fails only when
+    the checkpoint is AutoRound, which would otherwise fail at weight load.
+    '''
+    ple_py = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models'
+              / 'qwen4_exp' / 'nvidia' / 'ngram_embedding.py')
+    source = ple_py.read_text(encoding='utf-8') if ple_py.is_file() else ''
+    if source.count(INC_PLE_ANCHOR) == 1:
+        ple_py.write_text(source.replace(
+            INC_PLE_ANCHOR,
+            '        if type(quant_config).__name__ == "INCConfig":\n'
+            '            return Qwen4ExpPLEUnquantizedEmbeddingMethod()\n' + INC_PLE_ANCHOR,
+        ), encoding='utf-8')
+        print(f'Routed INC to the unquantized PLE embedding in {ple_py}', flush=True)
+        return
+    config = json.loads((MODEL_PATH / 'config.json').read_text(encoding='utf-8'))
+    method = str((config.get('quantization_config') or {}).get('quant_method', '')).lower()
+    if method in {'auto-round', 'auto_round', 'inc'}:
+        raise RuntimeError(
+            f'{method} checkpoint needs the INC PLE route, but its anchor appears '
+            f'{source.count(INC_PLE_ANCHOR)} times in {ple_py}'
+        )
+
+
+# What the MTP drafter loads from a draft checkpoint besides its mtp.* layer: the LM head and the
+# input embedding. The rest of that checkpoint is a second copy of the target's layers and stays unread.
+DRAFT_SHARED_TENSORS = ('lm_head.weight', 'model.language_model.embed_tokens.weight')
+
+
+def assemble_mtp_draft() -> Path | None:
+    '''Build a draft model directory that holds only the draft checkpoint's MTP head.
+
+    matijaludvig/arc3-vcintel-lorddraft-25x1 drafts for the Intel W4A16 AutoRound target with the
+    NVFP4 MTP head of lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8 instead of Intel's BF16 MTP
+    layer. Each of the draft passes then reads a quarter of the expert bytes, and the KV pool gets
+    what the BF16 layer held. The directory links the checkpoint's config and tokenizer files and
+    the shards that hold the kept tensors, and its index lists only those tensors, so vLLM loads
+    the head without the target layers. A checkpoint with no MTP head fails here instead of
+    starting a server without a drafter.
+    '''
+    if DRAFT_MODEL_SOURCE_PARTS is None:
+        return None
+    source = resolve_kaggle_model_path(DRAFT_MODEL_SOURCE_PARTS)
+    index_path = source / 'model.safetensors.index.json'
+    if not index_path.is_file():
+        raise FileNotFoundError(f'MTP draft checkpoint not mounted at {source}\n' + describe_kaggle_input_tree())
+    weight_map = json.loads(index_path.read_text(encoding='utf-8'))['weight_map']
+    kept = {name: shard for name, shard in weight_map.items()
+            if name.startswith('mtp.') or name in DRAFT_SHARED_TENSORS}
+    mtp_count = sum(name.startswith('mtp.') for name in kept)
+    missing = [name for name in DRAFT_SHARED_TENSORS if name not in kept]
+    if not mtp_count or missing:
+        raise RuntimeError(f'{source} has {mtp_count} mtp.* tensors and lacks {missing}, so it cannot draft')
+    shards = sorted(set(kept.values()))
+    shutil.rmtree(DRAFT_MODEL_DIR, ignore_errors=True)
+    DRAFT_MODEL_DIR.mkdir(parents=True)
+    for entry in source.iterdir():
+        if entry.is_file() and not entry.name.endswith('.safetensors') and entry.name != index_path.name:
+            (DRAFT_MODEL_DIR / entry.name).symlink_to(entry)
+    for shard in shards:
+        (DRAFT_MODEL_DIR / shard).symlink_to(source / shard)
+    (DRAFT_MODEL_DIR / index_path.name).write_text(
+        json.dumps({'metadata': {}, 'weight_map': kept}), encoding='utf-8')
+    print(f'MTP draft at {DRAFT_MODEL_DIR}: {mtp_count} mtp.* tensors from {shards} of {source}', flush=True)
+
+    return DRAFT_MODEL_DIR
+
+
 def install_image_runtime() -> dict:
     '''Unpack the image layers in index order, replay whiteouts and apply the runtime overlay.'''
     manifest = read_runtime_manifest()
@@ -1283,7 +1417,7 @@ def wait_for_vllm_server(watchdog_process: subprocess.Popen, timeout_seconds: in
     raise TimeoutError(f'Timed out waiting for vLLM server at {url}.\nLast server log lines:\n{tail_log(VLLM_SERVER_LOG)}')
 
 
-def build_vllm_server_command() -> list[str]:
+def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
     '''The Qwen3.8-Flash-Next launch on the packed image runtime, as verified on Kaggle in v187.
 
     Prefix caching follows the config. With it enabled, the hybrid model uses
@@ -1297,8 +1431,8 @@ def build_vllm_server_command() -> list[str]:
     nobody picked. The cap has to follow the KV pool rather than the worker count, because a cap
     above what the pool holds only queues the surplus in the scheduler. The experimental runtime
     adds FP8 KV support to QSA attention. Auto is passed as no flag at all; FP8 is enabled only
-    when explicitly selected in the config. The MTP head is the model's own drafter, so no
-    draft model rides along. The pinned KV cache size is optional; zero lets vLLM size the pool
+    when explicitly selected in the config. The MTP head is the model's own drafter unless the
+    config names a draft checkpoint, whose assembled head is then the draft model. The pinned KV cache size is optional; zero lets vLLM size the pool
     from gpu_memory_utilization after profiling the activation peak.
 
     A decode step carries one token per sequence plus its MTP drafts, and vLLM captures CUDA
@@ -1393,6 +1527,8 @@ def build_vllm_server_command() -> list[str]:
         ]
     if VLLM_MTP_TOKENS > 0:
         speculative_config = {'method': 'mtp', 'num_speculative_tokens': VLLM_MTP_TOKENS}
+        if draft_model_dir is not None:
+            speculative_config['model'] = str(draft_model_dir)
         if VLLM_DRAFT_VOCAB:
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]
@@ -1414,10 +1550,10 @@ def build_vllm_server_command() -> list[str]:
 
 
 def configure_cache_diagnostics(manifest: dict, server_env: dict, cmd: list[str]) -> None:
-    '''Install observational hooks only when the notebook explicitly selects test mode.'''
+    '''Install observational hooks only in test mode, and only when the config asks for them.'''
     namespace = {'__name__': 'arc3_cache_diagnostics'}
     exec(CACHE_DIAGNOSTICS_SOURCE, namespace)
-    enabled = namespace['is_test_run']()
+    enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and namespace['is_test_run']()
     server_env['ARC3_CACHE_DIAGNOSTICS'] = '1' if enabled else '0'
     server_env.pop('ARC3_CACHE_DIAGNOSTICS_DIR', None)
     if not enabled:
@@ -1489,6 +1625,7 @@ def build_watchdog_config(cmd: list[str]) -> dict:
         'server_ready': str(VLLM_SERVER_READY),
         'model_path': str(MODEL_PATH),
         'shard_prefetch_report': str(VLLM_SHARD_PREFETCH_REPORT),
+        'prefetch_threads': VLLM_PREFETCH_THREADS,
     }
     if is_test_run():
         watchdog_config['host_memory_log'] = str(WORKING_DIR / 'metrics' / 'host_memory.jsonl')
@@ -1515,8 +1652,10 @@ def start_vllm_server() -> None:
     indefinitely.
     '''
     manifest = install_image_runtime()
+    route_inc_ple_to_unquantized(manifest)
+    draft_model_dir = assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)
-    cmd = build_vllm_server_command()
+    cmd = build_vllm_server_command(draft_model_dir)
     configure_cache_diagnostics(manifest, server_env, cmd)
     configure_vllm_profiler(cmd)
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1667,6 +1806,7 @@ def stop_process(pid_path: Path, name: str) -> None:
 
 stop_process(WORKING_DIR / 'vllm-watchdog.pid', 'vLLM watchdog')
 stop_process(WORKING_DIR / 'vllm-openai-server.pid', 'vLLM server')
+shutil.rmtree('/tmp/vllm-mtp-draft', ignore_errors=True)
 image_runtime_root = Path(os.environ.get('TAAF_IMAGE_RUNTIME_ROOT', '/tmp/vllm-image-runtime'))
 for runtime_path in (image_runtime_root, image_runtime_root.with_name(image_runtime_root.name + '-cache')):
     if runtime_path.exists():

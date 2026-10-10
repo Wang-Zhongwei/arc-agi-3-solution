@@ -46,6 +46,7 @@ from inference.agent.tool_agent import (
     _PRIORITY_UNTRIMMED_BASE,
     ToolAgent,
     _priority_gate,
+    game_soft_stop_seconds,
 )
 from inference.framework.kaggle import (
     kaggle_serving_config,
@@ -526,12 +527,19 @@ class _HarnessGameSession:
         run = self.game.game_run
         return len(run.history) if run is not None else 0
 
-    def runtime_limit_reached(self) -> bool:
+    def runtime_limit_reached(self, *, soft: bool = False) -> bool:
+        """Whether the game's runtime is spent.
+
+        soft=True asks whether the game should stop starting turns, which is
+        game_soft_stop_seconds() before the hard cap; soft=False asks whether
+        it must stop now.
+        """
         if self.solver.max_runtime_s_per_game is None:
             return False
-        return (
-            time.monotonic() - self.started_at
-        ) >= self.solver.max_runtime_s_per_game
+        limit = self.solver.max_runtime_s_per_game
+        if soft:
+            limit = max(0.0, limit - game_soft_stop_seconds())
+        return (time.monotonic() - self.started_at) >= limit
 
     def timing_payload(self) -> dict[str, float | None]:
         elapsed = max(0.0, time.monotonic() - self.started_at)
@@ -592,7 +600,8 @@ class _HarnessGameSession:
         spent = _analyzer_reported_tokens(self.analyzer) - self.game_token_baseline
         return spent >= limit
 
-    def should_stop(self) -> bool:
+    def should_stop(self, *, soft: bool = False) -> bool:
+        """Whether the game must stop now, or with soft=True, start no new turn."""
         run = self.game.game_run
         if run is None or run.state != "playing":
             return True
@@ -600,7 +609,7 @@ class _HarnessGameSession:
             return True
         if _is_run_complete(self.game):
             return True
-        if self.runtime_limit_reached():
+        if self.runtime_limit_reached(soft=soft):
             return True
         if (
             self.solver.max_actions_per_game is not None
@@ -668,7 +677,11 @@ class _HarnessGameSession:
         try:
             retry_analysis_step: int | None = None
             consecutive_failures = 0
-            while not self.should_stop():
+            # True while the last invocation yielded mid-thought, before acting:
+            # the next one finishes that turn, so only the hard cap stops it.
+            continuing_turn = False
+            while not self.should_stop(soft=not continuing_turn):
+                continuing_turn = False
                 if (
                     _is_engine_game_over(self.game)
                     and self.last_engine_action != "RESET"
@@ -741,6 +754,7 @@ class _HarnessGameSession:
                     # token usage).
                     if not result.step_executed:
                         retry_analysis_step = analysis_step
+                        continuing_turn = True
                     continue
                 if not result.step_executed:
                     continue
