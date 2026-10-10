@@ -44,3 +44,19 @@ From the server logs of the vcintel run (`vllm-openai-server.log`, latest output
 - **Images per request.** The launch caps each image at 409,600 pixels and disables video, but sets no image count. Sampled animation frames add up to eight 128×128 images per turn.
 - **Startup.** Lord's setup blocks until vLLM answers, for up to 3,600 s, before any game starts. The vcintel notebook warns its competition rerun is not supported, because Daniel's flow releases the harness after 12 minutes. Ours runs no game until the server is ready, as Lord's own submissions do, but the competition-rerun timing has not been tried with this config.
 - **Streams.** vcintel ran 13 streams, from the Intel checkpoint's KV pool (1,319,052 tokens in the vLLM log). This config keeps the harness's 10.
+
+## Lord's MTP draft head
+
+[`matijaludvig/arc3-vcintel-lorddraft-25x1`](https://www.kaggle.com/code/matijaludvig/arc3-vcintel-lorddraft-25x1) v1 keeps vcintel's target, Daniel's Intel W4A16 AutoRound weights, and replaces only the drafter. Instead of the target's BF16 MTP layer, the MTP head of Lord's `lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8/PyTorch/hf-mixed-mtp-nvfp4/1` (NVFP4 experts) drafts. That run used 14 streams. It scored 56.89, the same as vcintel's 56.92, and generated 803 tok/s against 725. The KV pool grew to 1,558,044 tokens.
+
+| lorddraft change | Here |
+|---|---|
+| Lord's checkpoint mounted beside the target | `kaggle.draft_model_source`, which the notebook adds to its model sources |
+| Draft directory of symlinks: config/tokenizer files, the shards holding `mtp.*`, `lm_head` and `embed_tokens`, and an index listing only those tensors (6,173 `mtp.*` + 2 in v1) | `assemble_mtp_draft` in the setup script, run after the INC route. Without a draft source it does nothing. |
+| `--speculative-config` gets `"model": <draft dir>` | `build_vllm_server_command(draft_model_dir)` |
+| 14 streams, `max_num_seqs` 14 | `harness_env.ARC3_MAX_ACTIVE_STREAMS`, `kaggle.vllm.max_num_seqs` |
+| Lord's cache-diagnostics tracer off | `kaggle.vllm.cache_diagnostics: false`. The default keeps it on in test runs, as before. |
+
+[`configs/priority-one-wave-lorddraft/v1.json`](../../ARC3-Inference/configs/priority-one-wave-lorddraft/v1.json) is `configs/priority-one-wave-lord-vllm/v1.json` with the changes above and the 24-minute public run that both `ticbudja/priority-one-wave-lord-vllm` runs used. Its harness settings are unchanged. A `KAGGLE_DRY_RUN=true` build mounts both models and renders a setup script that matches the lorddraft notebook's serving cell, apart from the served name and port, which follow this harness. The notebook also checks for exactly v1's 6,173 `mtp.*` tensors in four named shards. Ours requires an MTP head plus `lm_head` and `embed_tokens`, and logs the tensor count and shards it links.
+
+Not yet checked on a GPU here: the draft load under our notebook, and whether 14 streams fit this harness's longer contexts. lorddraft's peak KV use was 90.5% with Daniel's harness.

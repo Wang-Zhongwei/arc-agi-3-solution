@@ -78,9 +78,17 @@ DEFAULT_VLLM_GDN_DECODE_KERNEL = ""
 # Opt-in only. The rendered Kaggle setup script applies a second, runtime
 # competition-mode veto before it exposes any profiler configuration to vLLM.
 DEFAULT_VLLM_PROFILE = False
+# server.cache_diagnostics: Lord's prefix-cache tracer, which hooks every cache lookup and
+# eviction. True keeps it on in test runs (never in a competition rerun); false leaves it off
+# for a clean throughput run, as matijaludvig's DHL/vcintel notebooks do.
+DEFAULT_VLLM_CACHE_DIAGNOSTICS = True
 # server.draft_vocab: a JSON file of token-id ranges, relative to ARC3-Inference/, that the
 # e975732 rc3 runtime limits MTP draft proposals to. Empty keeps the full-vocabulary draft head.
 DEFAULT_VLLM_DRAFT_VOCAB = ""
+# kaggle.draft_model_source: a Kaggle model ref whose MTP head drafts for the target in place of
+# the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
+# it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
+DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -140,8 +148,10 @@ class DuckKaggleVllmConfig:
     moe_backend: str = ""
     gdn_decode_kernel: str = DEFAULT_VLLM_GDN_DECODE_KERNEL
     profile: bool = DEFAULT_VLLM_PROFILE
+    cache_diagnostics: bool = DEFAULT_VLLM_CACHE_DIAGNOSTICS
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
     prefetch_threads: int = 8
+    draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
 
 
 def resolve_draft_vocab(path: str) -> str:
@@ -174,7 +184,7 @@ def duck_kaggle_model_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [cfg.model_source]
+    return [ref for ref in (cfg.model_source, cfg.draft_model_source) if ref]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
@@ -186,6 +196,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         option_name="runtime_dataset_source",
     )
     model_source_parts = _split_model_source(cfg.model_source)
+    draft_model_source_parts = (
+        _split_model_source(cfg.draft_model_source) if cfg.draft_model_source else None
+    )
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
     prompt_window = int(cfg.max_model_len) - VLLM_OUTPUT_RESERVE_TOKENS
@@ -209,6 +222,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_OWNER__": repr(runtime_owner),
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
+        "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -258,6 +272,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__VLLM_GDN_DECODE_KERNEL__": repr(str(cfg.gdn_decode_kernel)),
         "__VLLM_CUDA_LAUNCH_BLOCKING__": repr(os.environ.get("KAGGLE_VLLM_CUDA_LAUNCH_BLOCKING", "false").strip().lower() in {"1", "true", "yes", "on"}),
         "__VLLM_PROFILE_REQUESTED__": repr(bool(cfg.profile)),
+        "__VLLM_CACHE_DIAGNOSTICS_REQUESTED__": repr(bool(cfg.cache_diagnostics)),
         "__VLLM_DRAFT_VOCAB__": repr(resolve_draft_vocab(cfg.draft_vocab)),
         "__VLLM_PREFETCH_THREADS__": repr(int(cfg.prefetch_threads)),
         "__PROJECT_DIR_NAME__": repr(PROJECT_DIR.name),
@@ -840,6 +855,8 @@ def is_test_run() -> bool:
 RUNTIME_OWNER = __RUNTIME_OWNER__
 RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
+# A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
+DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
@@ -868,6 +885,7 @@ VLLM_MOE_BACKEND = __VLLM_MOE_BACKEND__
 VLLM_GDN_DECODE_KERNEL = __VLLM_GDN_DECODE_KERNEL__
 VLLM_CUDA_LAUNCH_BLOCKING = __VLLM_CUDA_LAUNCH_BLOCKING__
 VLLM_PROFILE_REQUESTED = __VLLM_PROFILE_REQUESTED__
+VLLM_CACHE_DIAGNOSTICS_REQUESTED = __VLLM_CACHE_DIAGNOSTICS_REQUESTED__
 VLLM_PROFILE_DIR = WORKING_DIR / 'vllm-profile'
 # The image-layer runtime unpacks to ~19.5 GB. /kaggle/working is a 20 GB volume, while
 # `df` inside a kernel on the RTX PRO 6000 host reported ~1.1 TB free on the root overlay,
@@ -998,6 +1016,8 @@ def describe_kaggle_input_tree(max_depth: int = 5) -> str:
 
 RUNTIME_DATASET = resolve_kaggle_dataset_path(RUNTIME_OWNER, RUNTIME_SLUG)
 MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+# Symlinks into the mounted draft checkpoint plus a filtered index; assembling it copies no weights.
+DRAFT_MODEL_DIR = Path('/tmp/vllm-mtp-draft')
 
 
 def assert_expected_cuda_gpu() -> None:
@@ -1221,6 +1241,50 @@ def route_inc_ple_to_unquantized(manifest: dict) -> None:
         )
 
 
+# What the MTP drafter loads from a draft checkpoint besides its mtp.* layer: the LM head and the
+# input embedding. The rest of that checkpoint is a second copy of the target's layers and stays unread.
+DRAFT_SHARED_TENSORS = ('lm_head.weight', 'model.language_model.embed_tokens.weight')
+
+
+def assemble_mtp_draft() -> Path | None:
+    '''Build a draft model directory that holds only the draft checkpoint's MTP head.
+
+    matijaludvig/arc3-vcintel-lorddraft-25x1 drafts for the Intel W4A16 AutoRound target with the
+    NVFP4 MTP head of lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8 instead of Intel's BF16 MTP
+    layer. Each of the draft passes then reads a quarter of the expert bytes, and the KV pool gets
+    what the BF16 layer held. The directory links the checkpoint's config and tokenizer files and
+    the shards that hold the kept tensors, and its index lists only those tensors, so vLLM loads
+    the head without the target layers. A checkpoint with no MTP head fails here instead of
+    starting a server without a drafter.
+    '''
+    if DRAFT_MODEL_SOURCE_PARTS is None:
+        return None
+    source = resolve_kaggle_model_path(DRAFT_MODEL_SOURCE_PARTS)
+    index_path = source / 'model.safetensors.index.json'
+    if not index_path.is_file():
+        raise FileNotFoundError(f'MTP draft checkpoint not mounted at {source}\n' + describe_kaggle_input_tree())
+    weight_map = json.loads(index_path.read_text(encoding='utf-8'))['weight_map']
+    kept = {name: shard for name, shard in weight_map.items()
+            if name.startswith('mtp.') or name in DRAFT_SHARED_TENSORS}
+    mtp_count = sum(name.startswith('mtp.') for name in kept)
+    missing = [name for name in DRAFT_SHARED_TENSORS if name not in kept]
+    if not mtp_count or missing:
+        raise RuntimeError(f'{source} has {mtp_count} mtp.* tensors and lacks {missing}, so it cannot draft')
+    shards = sorted(set(kept.values()))
+    shutil.rmtree(DRAFT_MODEL_DIR, ignore_errors=True)
+    DRAFT_MODEL_DIR.mkdir(parents=True)
+    for entry in source.iterdir():
+        if entry.is_file() and not entry.name.endswith('.safetensors') and entry.name != index_path.name:
+            (DRAFT_MODEL_DIR / entry.name).symlink_to(entry)
+    for shard in shards:
+        (DRAFT_MODEL_DIR / shard).symlink_to(source / shard)
+    (DRAFT_MODEL_DIR / index_path.name).write_text(
+        json.dumps({'metadata': {}, 'weight_map': kept}), encoding='utf-8')
+    print(f'MTP draft at {DRAFT_MODEL_DIR}: {mtp_count} mtp.* tensors from {shards} of {source}', flush=True)
+
+    return DRAFT_MODEL_DIR
+
+
 def install_image_runtime() -> dict:
     '''Unpack the image layers in index order, replay whiteouts and apply the runtime overlay.'''
     manifest = read_runtime_manifest()
@@ -1353,7 +1417,7 @@ def wait_for_vllm_server(watchdog_process: subprocess.Popen, timeout_seconds: in
     raise TimeoutError(f'Timed out waiting for vLLM server at {url}.\nLast server log lines:\n{tail_log(VLLM_SERVER_LOG)}')
 
 
-def build_vllm_server_command() -> list[str]:
+def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
     '''The Qwen3.8-Flash-Next launch on the packed image runtime, as verified on Kaggle in v187.
 
     Prefix caching follows the config. With it enabled, the hybrid model uses
@@ -1367,8 +1431,8 @@ def build_vllm_server_command() -> list[str]:
     nobody picked. The cap has to follow the KV pool rather than the worker count, because a cap
     above what the pool holds only queues the surplus in the scheduler. The experimental runtime
     adds FP8 KV support to QSA attention. Auto is passed as no flag at all; FP8 is enabled only
-    when explicitly selected in the config. The MTP head is the model's own drafter, so no
-    draft model rides along. The pinned KV cache size is optional; zero lets vLLM size the pool
+    when explicitly selected in the config. The MTP head is the model's own drafter unless the
+    config names a draft checkpoint, whose assembled head is then the draft model. The pinned KV cache size is optional; zero lets vLLM size the pool
     from gpu_memory_utilization after profiling the activation peak.
 
     A decode step carries one token per sequence plus its MTP drafts, and vLLM captures CUDA
@@ -1463,6 +1527,8 @@ def build_vllm_server_command() -> list[str]:
         ]
     if VLLM_MTP_TOKENS > 0:
         speculative_config = {'method': 'mtp', 'num_speculative_tokens': VLLM_MTP_TOKENS}
+        if draft_model_dir is not None:
+            speculative_config['model'] = str(draft_model_dir)
         if VLLM_DRAFT_VOCAB:
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]
@@ -1484,10 +1550,10 @@ def build_vllm_server_command() -> list[str]:
 
 
 def configure_cache_diagnostics(manifest: dict, server_env: dict, cmd: list[str]) -> None:
-    '''Install observational hooks only when the notebook explicitly selects test mode.'''
+    '''Install observational hooks only in test mode, and only when the config asks for them.'''
     namespace = {'__name__': 'arc3_cache_diagnostics'}
     exec(CACHE_DIAGNOSTICS_SOURCE, namespace)
-    enabled = namespace['is_test_run']()
+    enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and namespace['is_test_run']()
     server_env['ARC3_CACHE_DIAGNOSTICS'] = '1' if enabled else '0'
     server_env.pop('ARC3_CACHE_DIAGNOSTICS_DIR', None)
     if not enabled:
@@ -1587,8 +1653,9 @@ def start_vllm_server() -> None:
     '''
     manifest = install_image_runtime()
     route_inc_ple_to_unquantized(manifest)
+    draft_model_dir = assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)
-    cmd = build_vllm_server_command()
+    cmd = build_vllm_server_command(draft_model_dir)
     configure_cache_diagnostics(manifest, server_env, cmd)
     configure_vllm_profiler(cmd)
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1739,6 +1806,7 @@ def stop_process(pid_path: Path, name: str) -> None:
 
 stop_process(WORKING_DIR / 'vllm-watchdog.pid', 'vLLM watchdog')
 stop_process(WORKING_DIR / 'vllm-openai-server.pid', 'vLLM server')
+shutil.rmtree('/tmp/vllm-mtp-draft', ignore_errors=True)
 image_runtime_root = Path(os.environ.get('TAAF_IMAGE_RUNTIME_ROOT', '/tmp/vllm-image-runtime'))
 for runtime_path in (image_runtime_root, image_runtime_root.with_name(image_runtime_root.name + '-cache')):
     if runtime_path.exists():
