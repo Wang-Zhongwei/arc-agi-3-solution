@@ -21,3 +21,9 @@ This is a functional test. The smaller context and extra logging mean its score 
 Kaggle **version 1** was published on 2026-10-10 from commit `0dc3b80f4e6ee2242137ee7e341e64e4fd7fa79e` and confirmed `RUNNING`. Packaged feature files match that commit; setup exports both reminder flags as `true` and the context as `65536`. [Notebook](https://www.kaggle.com/code/jonathanwang2022/context-transition-reminders). No evaluated result is available at publication.
 
 A persistent completion monitor checks exact version `v1` every minute and retrieves output, logs, source provenance, and evaluation when it finishes. Its status is saved with the Drive-backed run in `runs/kaggle/jonathanwang2022/context-transition-reminders/v01/followup_status.json`; terminal failures also trigger artifact retrieval.
+
+## Version 2
+
+[`v2.json`](../../ARC3-Inference/configs/context-transition-reminders/v2.json) restores the baseline context policy: 131,072 total tokens, a 59,392-token drain, a 150-assistant-turn cap with a 30-turn drain, and coordinated token/turn trimming. With the unchanged 12,288-token response reserve and 512-token safety margin, input trimming starts above an estimated 118,272 tokens and targets 59,136 tokens before whole-exchange rounding. Scheduler handover still happens after trimming.
+
+Both transition reminders and request logs remain enabled. The public soft runtime is 120 minutes after notebook start, with the existing 10-minute notebook buffer; serving, model, scheduler, and 14 active streams are unchanged. The destination remains `jonathanwang2022/context-transition-reminders` with source dataset `jonathanwang2022/context-transition-reminders-src`. Config validation confirmed that v2 differs from v1 only in context window and public runtime and that its context controls match the baseline.
