@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 RUNS_DIR = os.environ.get("RUNS_DIR", "ARC3-Inference/runs/kaggle")
-OUT = sys.argv[1] if len(sys.argv) > 1 else "docs/images/solve-rate-vs-context.png"
+OUT = sys.argv[1] if len(sys.argv) > 1 else "docs/harness/images/solve-rate-vs-context.png"
 LATER15 = set("bp35 cd82 cn04 dc22 g50t ka59 lf52 ls20 m0r0 s5i5 sk48 sp80 su15 tn36 wa30".split())
 BUDGET = 118272
 KEEP = ("[USER PROMPT]", "[THINKING]", "[ASSISTANT]", "[TOOL CALL", "[TOOL RESULT")

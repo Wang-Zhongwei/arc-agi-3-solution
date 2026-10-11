@@ -2,7 +2,7 @@
 
 Question: on the 15 harder public games, does the chance of solving the current level drop once the context fills and trimming starts (the 118,272-token budget)?
 
-![Solve rate vs untrimmed context](../images/solve-rate-vs-context.png)
+![Solve rate vs untrimmed context](images/solve-rate-vs-context.png)
 
 **Answer: no sharp boundary.** Level 1 holds at roughly 15-25% per 10k tokens from 30k to 118k. Level 2 climbs to about 9-11% by 90-140k, then sits near 5-8%. Level 3 stays at about 7-14% from 100k to 400k. None of the three curves steps down at the budget line.
 
