@@ -29,6 +29,19 @@ How it is measured:
 - **y:** level-ups per 10k of context added while in that window. The bars are exact Poisson 95% intervals.
 - **Test:** a Poisson model with game and level fixed effects, offset by added context, errors clustered by game run.
 
+## Does keeping the last level-up in context help?
+
+For levels 2 and 3, each turn is marked by whether the turn that completed the previous level is still in the trimmed context. After a trim, the context keeps roughly the newest (current - base) tokens, so the level-up is kept if the untrimmed context added since it fits in that.
+
+At the same tokens since the level-up, some attempts have already lost it to a trim and others have not, depending on where in the sawtooth the level began. The comparison uses only 20k bands where both cases occur, with game and level fixed effects, offset by added context, errors clustered by game run.
+
+| Data | Level-up rate, kept vs trimmed away | 95% CI | p | Level-ups |
+|---|---:|---:|---:|---:|
+| Simulated trimming, 30 runs | 1.07 | 0.78-1.45 | 0.68 | 300 |
+| Real prompt sizes, request-log runs | 0.50 | 0.19-1.30 | 0.16 | 58 |
+
+**No detectable effect.** The larger simulated sample centres on no difference, the small real-data sample leans the other way, and the bands disagree in direction (simulated, per 10k added: 60-80k kept 0.116 vs trimmed 0.088; 80-100k kept 0.070 vs trimmed 0.105). Simulated trims mislabel some turns, which pulls the estimate toward 1. An A/B run of `context.retain_last_level_up` (PR #31) would settle it. Script: [`scripts/levelup_in_context.py`](scripts/levelup_in_context.py).
+
 ## Data
 
 - **Games:** the later 15 public games (bp35 cd82 cn04 dc22 g50t ka59 lf52 ls20 m0r0 s5i5 sk48 sp80 su15 tn36 wa30). The 10-game runs used the other 10.
