@@ -166,6 +166,34 @@ Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
   fewer concurrent sequences it usually generates fewer tokens per second,
   which costs budget $\beta$ directly; this replay cannot weigh that.
 
+## Decay parameters
+
+Grid over $C = w \cdot 2^{-(a/h_a)^2} + (1 - w) \cdot 2^{-(s/h)^2}$ in $R = v\,C$:
+$w \in \{0, 0.25, 0.5, 0.75, 1\}$, 10 values each of $h_a \in [43, 345]$ and
+$h \in [31\text{k}, 186\text{k}]$ (320 settings). To match 15 streams on the
+roughly 110-game private pool, each replay uses $K = 15$ on $G = 110$
+trajectories drawn from the 275 (100 pools, $\beta = 150\text{k}$,
+$\gamma = 35\text{k}$). Pools share trajectories, so errors are a
+leave-one-run-out jackknife. The default $C$ ($w = 0.25$, $h_a = 115$,
+$h = 62\text{k}$) scores 41.94, uniform 36.66. Full tables in
+[`data/decay_grid.md`](data/decay_grid.md).
+
+| $w$ | Best setting | vs default $C$ |
+|---|---|---|
+| 0 (tokens only) | $h = 100\text{k}$ | −0.18 ± 0.13 |
+| 0.25 | $h_a = 144$, $h = 31\text{k}$ | +0.16 |
+| 0.5 | $h_a = 86$, $h = 46\text{k}$ | +0.19 ± 0.34 |
+| 0.75 | $h_a = 72$, $h = 55\text{k}$ | +0.01 |
+| 1 (actions only) | $h_a = 72$ | −0.18 ± 0.31 |
+
+- The surface is flat near the default: at $w = 0.25$–$0.5$, every setting
+  with $h_a = 86$–$144$ and $h = 31$–$86\text{k}$ is within $\pm 0.2$.
+- Selection does not transfer: the best setting on runs 7–11 gains $+0.64$
+  there and loses $0.53$ on runs 1–6.
+- Short half-lives lose most (tokens only at $h \le 46\text{k}$, or
+  $h_a = 43$: $-1.3$ to $-2.5$); $h \ge 124\text{k}$ or $h_a \ge 173$ loses
+  $0.5$–$1$.
+
 ## Yield-UCB
 
 `ARC3_SCHEDULER=ucb` (`ARC3-Inference/inference/agent/scheduling/ucb.py`)
@@ -210,8 +238,10 @@ Mean $\bar S$, then the paired difference vs the uniform baseline ($\gamma = 35\
 
 ## Decision
 
-Use $B = 0$ with the efficiency term ablated, $R = v\,C$. I think this is
-probably as far as allocation can take us.
+Use $B = 0$ with the efficiency term ablated, $R = v\,C$, with
+$w = 0.5$, $h_a = 86$, $h = 46\text{k}$ in $C$ (best of the decay grid,
+expected to tie the default). I think this is probably as far as allocation
+can take us.
 
 A lower active fraction $K/G$ is better for allocation. $K = 2$ of $25$
 ($K/G = 0.08$) scored highest at $\beta = 100\text{k}$ ($K = 3$ at $150\text{k}$),
@@ -221,7 +251,9 @@ $0.08$ corresponds to about $8.8$ active games, at a cost in throughput. So
 best choice; 4 waves gives $14/28 = 0.5$, near the control.
 
 Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
-`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep
+`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$),
+`ARC3_PRIORITY_ACTION_WEIGHT=0.5`, `ARC3_PRIORITY_ACTION_SCALE=86`,
+`ARC3_PRIORITY_TOKEN_SCALE=46000`, keep
 `ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$),
 `ARC3_MAX_ACTIVE_STREAMS=14`, and `kaggle.private_waves: 1`.
 
@@ -272,4 +304,5 @@ a level.
 python docs/allocation/scripts/extract_trajectories.py --runs-root ARC3-Inference/runs
 python docs/allocation/scripts/extract_thinking.py --runs-root ARC3-Inference/runs
 python docs/allocation/scripts/replay.py   # writes data/results.md
+python docs/allocation/scripts/decay_grid.py   # writes data/decay_grid.md
 ```
