@@ -74,10 +74,6 @@ from inference.agent.vision_context import (
 
 from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
-from inference.agent.transition_reminders import (
-    EXCHANGE_KEY, OMISSION_MARKER, REASONING_HALF, REASONING_LIMIT,
-    REMINDER_KIND, TransitionReminder, make_reminder,
-)
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
     build_chat_payload,
@@ -1244,10 +1240,9 @@ def _strip_control_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Wire-safe copy: the private tag never leaves the process."""
     cleaned: list[dict[str, Any]] = []
     for message in messages:
-        if _CONTROL_MESSAGE_KEY in message or EXCHANGE_KEY in message:
+        if _CONTROL_MESSAGE_KEY in message:
             copy = dict(message)
             copy.pop(_CONTROL_MESSAGE_KEY, None)
-            copy.pop(EXCHANGE_KEY, None)
             cleaned.append(copy)
         else:
             cleaned.append(message)
@@ -3735,8 +3730,6 @@ class ToolAgent:
         self._death_ledger_index: dict[str, list[tuple[int, int]]] = {}
         self._death_ledger_total: int = 0
         self._history_messages: list[dict[str, Any]] = []
-        self._transition_reminders: dict[str, TransitionReminder] = {}
-        self._transition_exchange_counter = 0
         self._session_runtime_dir: Path | None = None
         self._session_total_tokens = 0
         self._session_generated_tokens = 0
@@ -3772,8 +3765,6 @@ class ToolAgent:
                 self._kept_functions = {}
                 self._retained_clear_notice = ""
             self._history_messages = []
-            self._transition_reminders = {}
-            self._transition_exchange_counter = 0
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
             self._last_call_reasoning_tokens = None
@@ -6613,110 +6604,12 @@ class ToolAgent:
             text,
         )
 
-    def _transition_reminder_enabled(self, kind: str) -> bool:
-        name = "ARC3_RETAIN_LAST_LEVEL_UP" if kind == "level_up" else "ARC3_RETAIN_LAST_GAME_OVER"
-        return _get_env_bool(name, False)
-
-    def _transition_reminders_enabled(self) -> bool:
-        return any(self._transition_reminder_enabled(k) for k in ("level_up", "game_over"))
-
-    def _transition_reasoning_excerpt(self, reasoning: str) -> str:
-        """Use the serving tokenizer; never substitute a character-count cap."""
-        if not reasoning:
-            return ""
-        base = self._model.base_url.rstrip("/")
-        if base.endswith("/v1"):
-            base = base[:-3]
-
-        def post(route: str, payload: dict[str, Any]) -> dict[str, Any]:
-            response = requests.post(
-                f"{base}/{route}", headers=self._headers(), json=payload,
-                timeout=(_CONNECT_TIMEOUT_SECONDS, min(self._timeout or 10, 10)),
-            )
-            response.raise_for_status()
-            return response.json()
-
-        try:
-            tokens = post("tokenize", {
-                "model": self._model.model_id, "prompt": reasoning, "add_special_tokens": False,
-            })["tokens"]
-            if not isinstance(tokens, list) or not tokens or not all(isinstance(t, int) for t in tokens):
-                raise ValueError("tokenizer returned invalid token IDs")
-            if len(tokens) <= REASONING_LIMIT:
-                return reasoning
-            head = post("detokenize", {
-                "model": self._model.model_id, "tokens": tokens[:REASONING_HALF],
-            })["prompt"]
-            tail = post("detokenize", {
-                "model": self._model.model_id, "tokens": tokens[-REASONING_HALF:],
-            })["prompt"]
-            # A token boundary can bisect a multi-byte character. Keep only
-            # complete original characters, rather than insert replacement glyphs.
-            head = head.rstrip("\ufffd")
-            tail = tail.lstrip("\ufffd")
-            if not reasoning.startswith(head) or not reasoning.endswith(tail):
-                raise ValueError("tokenizer did not preserve the original reasoning text")
-            return f"{head}\n{OMISSION_MARKER}\n{tail}"
-        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError) as exc:
-            log.warning("transition reminder: pre-action reasoning omitted; tokenizer unavailable (%s)", exc)
-            return ""
-
-    def _record_transition_reminders(
-        self, state_path: Path, *, sequence_start: int, reasoning: str,
-        source_exchange: int, source_tool_call: str,
-    ) -> None:
-        _, entries = load_runtime_state(state_path)
-        events: list[tuple[str, int]] = []
-        for index in range(max(1, sequence_start), len(entries)):
-            result = entries[index].result
-            if result.get("automatic"):
-                continue
-            kind = (
-                "game_over" if result.get("game_over") else
-                "level_up" if result.get("level_completed") or result.get("run_complete") else ""
-            )
-            if kind and self._transition_reminder_enabled(kind):
-                events.append((kind, index))
-        if not events:
-            return
-        excerpt = self._transition_reasoning_excerpt(reasoning)
-        if not hasattr(self, "_transition_reminders"):
-            self._transition_reminders = {}
-        for kind, index in events:
-            self._transition_reminders[kind] = make_reminder(
-                kind, entries, index, sequence_start=sequence_start, reasoning=excerpt,
-                source_exchange=source_exchange, source_tool_call=source_tool_call,
-            )
-            log.info("transition reminder recorded kind=%s history_index=%d reasoning_chars=%d",
-                     kind, index, len(excerpt))
-
-    def _without_transition_reminders(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [m for m in messages if m.get(_CONTROL_MESSAGE_KEY) != REMINDER_KIND]
-
-    def _transition_reminder_prefix(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        reminders = sorted(
-            (r for kind, r in getattr(self, "_transition_reminders", {}).items()
-             if self._transition_reminder_enabled(kind) and not r.source_retained(history)),
-            key=lambda r: r.history_index,
-        )
-        if not reminders:
-            return []
-        parts = [{"type": "text", "text": (
-            "Earlier conversation has been trimmed. These reminders preserve your latest "
-            "transitions from that conversation. The boards below are historical."
-        )}]
-        for reminder in reminders:
-            parts.extend(reminder.parts)
-        return [_mark_control_message({"role": "user", "content": parts}, REMINDER_KIND)]
-
     def _estimate_request_input_tokens(
         self,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        messages = [{k: v for k, v in m.items() if k != EXCHANGE_KEY} if EXCHANGE_KEY in m else m
-                    for m in messages]
         messages = _apply_summary_visibility(
             messages, evicted=getattr(self, "_has_evicted", False)
         )
@@ -6733,22 +6626,6 @@ class ToolAgent:
         removable = len(history) - preserve_recent
         if removable <= 0:
             return False
-        if self._transition_reminders_enabled():
-            # Keep the recent original transcript intact, including multi-call
-            # groups. An incomplete group must not be partially evicted.
-            end = next((i for i in range(1, len(history)) if history[i].get("role") == "user"), len(history))
-            if end > removable:
-                return False
-            block = history[:end]
-            for index, message in enumerate(block):
-                calls = message.get("tool_calls") or []
-                if message.get("role") == "assistant" and calls:
-                    results = {m.get("tool_call_id") for m in block[index + 1:]
-                               if m.get("role") == "tool"}
-                    if any(call.get("id") not in results for call in calls):
-                        return False
-            del history[:end]
-            return True
         # Never drop the last user message. Dropping one and draining to the
         # next is fine while another exists; when none does, the drain runs to
         # preserve_recent and _drop_until_first_user_message then empties the
@@ -6842,8 +6719,6 @@ class ToolAgent:
         reasons.append(reason)
 
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        original_prefix = [m for m in messages[1:] if m.get(_CONTROL_MESSAGE_KEY) == REMINDER_KIND]
-        messages = self._without_transition_reminders(messages)
         original_history = messages[1:]
         if _any_control_pruning_enabled():
             messages = _prune_control_messages(messages)
@@ -6853,13 +6728,13 @@ class ToolAgent:
             # retention slot
             messages = _apply_history_image_window(messages, keep_images)
         before_trim = len(messages)
-        trimmed = self._trim_messages_for_context([messages[0], *original_prefix, *messages[1:]], tools=tools)
+        trimmed = self._trim_messages_for_context(messages, tools=tools)
         if not trimmed:
             if original_history:
                 self._note_history_evicted(f"history_cleared msgs={len(original_history)}")
             return []
-        token_trim_dropped = len(self._without_transition_reminders(trimmed)) < before_trim
-        trimmed_history = self._without_transition_reminders(trimmed[1:])
+        token_trim_dropped = len(trimmed) < before_trim
+        trimmed_history = trimmed[1:]
         history = self._keep_recent_history_turns(
             trimmed_history,
             max_turns=_persistent_history_assistant_turns(),
@@ -6883,11 +6758,6 @@ class ToolAgent:
                 f"persist msgs={len(original_history)}->{len(history)}"
                 f" token_trim={int(token_trim_dropped)}"
             )
-        if self._transition_reminders_enabled():
-            # The turn cap can evict an event after the token-budget pass.
-            # Rebuild and budget its reminder after that final cut as well.
-            prefix = [m for m in trimmed[1:] if m.get(_CONTROL_MESSAGE_KEY) == REMINDER_KIND]
-            return self._trim_messages_for_context([messages[0], *prefix, *history], tools=tools)[1:]
         return history
 
     def _priority_total_levels(self) -> int:
@@ -7111,13 +6981,7 @@ class ToolAgent:
         if not messages:
             return []
         system_message = messages[0]
-        original_prefix = [m for m in messages[1:] if m.get(_CONTROL_MESSAGE_KEY) == REMINDER_KIND]
-        history = self._without_transition_reminders(messages[1:])
-        before_count = len(history)
-
-        def assemble(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            return [system_message, *self._transition_reminder_prefix(tail), *tail]
-
+        history = list(messages[1:])
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
         # capped at half the budget: a mis-set knob should cost history depth,
@@ -7163,7 +7027,7 @@ class ToolAgent:
 
         estimate_before: int | None = None
         while history:
-            used = self._estimate_request_input_tokens(assemble(history), tools=tools)
+            used = self._estimate_request_input_tokens([system_message, *history], tools=tools)
             if estimate_before is None:
                 estimate_before = used
             over_budget = used > budget_tokens
@@ -7180,7 +7044,7 @@ class ToolAgent:
                 if not self._drop_oldest_history_block(probe, preserve_recent=preserve_recent):
                     break
                 after = self._estimate_request_input_tokens(
-                    assemble(probe), tools=tools
+                    [system_message, *probe], tools=tools
                 )
                 if after < target_tokens:
                     break
@@ -7198,18 +7062,15 @@ class ToolAgent:
         # conversation, so the next request has to be prefilled from the
         # divergence point regardless. That makes it the one moment when
         # yielding the slot to another game costs nothing.
-        if len(history) != before_count:
-            after = self._estimate_request_input_tokens(assemble(history), tools=tools)
+        if len(history) != len(messages) - 1:
+            after = self._estimate_request_input_tokens([system_message, *history], tools=tools)
             self._note_history_evicted(
                 f"{'forced_drain' if force_drain else 'token_budget'}"
-                f" msgs={before_count}->{len(history)}"
+                f" msgs={len(messages) - 1}->{len(history)}"
                 f" est={estimate_before or 0}->{after}"
                 f" budget={budget_tokens} target={target_tokens}"
             )
-        prefix = self._transition_reminder_prefix(history)
-        if prefix != original_prefix:
-            self._note_history_evicted("transition_reminders rebuilt")
-        return [system_message, *prefix, *history]
+        return [system_message, *history]
 
     def _force_reduce_messages(
         self,
@@ -7220,11 +7081,11 @@ class ToolAgent:
         if not messages:
             return []
         system_message = messages[0]
-        history = self._without_transition_reminders(messages[1:])
+        history = list(messages[1:])
         if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
             return list(messages)
         self._note_history_evicted(f"force_reduce msgs={len(messages) - 1}->{len(history)}")
-        return [system_message, *self._transition_reminder_prefix(history), *history]
+        return [system_message, *history]
 
     def analyze(
         self,
@@ -7716,11 +7577,6 @@ class ToolAgent:
                     assistant_message["content"] = content
                 assistant_message["tool_calls"] = tool_calls
                 turn_tool_call_count += len(tool_calls)
-                source_exchange = 0
-                if self._transition_reminders_enabled():
-                    self._transition_exchange_counter = getattr(self, "_transition_exchange_counter", 0) + 1
-                    source_exchange = self._transition_exchange_counter
-                    assistant_message[EXCHANGE_KEY] = source_exchange
                 self._append_context_message(messages, assistant_message)
 
                 for tool_index, tool_call in enumerate(tool_calls):
@@ -7741,15 +7597,7 @@ class ToolAgent:
                         f"TOOL CALL: {tool_name}",
                         rendered_tool_call or (json.dumps(arguments, indent=2) if arguments else "{}"),
                     )
-                    sequence_start = (
-                        len(load_runtime_state(state_path)[1]) if source_exchange else 0
-                    )
                     dispatch = self._dispatch_tool(state_path, tool_name, arguments)
-                    if dispatch.step_executed and source_exchange:
-                        self._record_transition_reminders(
-                            state_path, sequence_start=sequence_start, reasoning=reasoning,
-                            source_exchange=source_exchange, source_tool_call=str(tool_call.get("id", "")),
-                        )
                     if dispatch.step_executed:
                         step_executed = True
                         if self._reasoning_effort_rung >= 0 and dispatch.made_progress:
@@ -7767,7 +7615,6 @@ class ToolAgent:
                             "role": "tool",
                             "tool_call_id": tool_call.get("id", ""),
                             "content": dispatch.content,
-                            **({EXCHANGE_KEY: source_exchange} if source_exchange else {}),
                         }
                     )
                     if dispatch.step_executed:

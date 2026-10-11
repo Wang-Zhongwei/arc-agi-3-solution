@@ -55,8 +55,6 @@ TYPED = {
     "MULTIMODAL_INTERMEDIATE_FRAMES": "true",
     "MULTIMODAL_INTERMEDIATE_UPSCALE": "3",
     "MULTIMODAL_ANIMATION_UPSCALE": "5",
-    "ARC3_RETAIN_LAST_LEVEL_UP": "true",
-    "ARC3_RETAIN_LAST_GAME_OVER": "true",
 }
 HARNESS = {"ARC3_SCHEDULER": "priority", "LOCAL_ANALYZER_YIELD_TOKENS": 2048, "ARC3_ACTION_ECHO": True}
 
@@ -87,14 +85,12 @@ def configure(monkeypatch):
 
 def test_config_fields_match_the_makefile():
     makefile = (ROOT / "Makefile").read_text()
-    read = dict(re.findall(r"^([A-Z0-9_]+) :?= \$\(shell \$\(CONFIG_VALUE\) ([a-z_.]+)", makefile, re.M))
-    exported = set(re.findall(r"^export ([A-Z0-9_]+)$", makefile, re.M))
+    read = dict(re.findall(r"^([A-Z_]+) :?= \$\(shell \$\(CONFIG_VALUE\) ([a-z_.]+)", makefile, re.M))
+    exported = set(re.findall(r"^export ([A-Z_]+)$", makefile, re.M))
     endpoint = {"LOCAL_ANALYZER_BASE_URL", "LOCAL_ANALYZER_PROVIDER", "LOCAL_ANALYZER_MODEL_ID"}
     from_config = {
         name for name in read
-        if (name.startswith(("LOCAL_ANALYZER_", "MULTIMODAL_"))
-            or name in {"ARC3_RETAIN_LAST_LEVEL_UP", "ARC3_RETAIN_LAST_GAME_OVER"})
-        and name not in endpoint
+        if name.startswith(("LOCAL_ANALYZER_", "MULTIMODAL_")) and name not in endpoint
     }
     assert from_config == set(kaggle.CONFIG_FIELDS)
     for name, field in kaggle.CONFIG_FIELDS.items():
