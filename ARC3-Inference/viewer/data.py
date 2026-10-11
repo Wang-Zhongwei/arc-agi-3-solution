@@ -20,6 +20,7 @@ from inference.utils.viewer_artifacts import load_raw_events
 
 
 _SECTION_RE = re.compile(r"(?m)^\[(.+?)\]\s*$")
+_IMAGE_PLACEHOLDER = "[image attached]"
 _KNOWN_SECTION_LABELS = {
     "ASSISTANT",
     "ACTION_RESPONSE",
@@ -1482,6 +1483,10 @@ def _section_signature(section: dict[str, Any]) -> tuple[str, str]:
         except (TypeError, ValueError, json.JSONDecodeError):
             canonical = re.sub(r"\s+", " ", content)
         return (label, canonical)
+    if label == "USER PROMPT":
+        # Transcripts render image parts as "[image attached]" and join parts with
+        # blank lines; request snapshots keep only the text parts.
+        content = re.sub(r"\s+", " ", content.replace(_IMAGE_PLACEHOLDER, " ")).strip()
     return (
         label,
         content,
@@ -1507,6 +1512,8 @@ def _extract_context(
     if request_sections:
         transcript_insertions: dict[int, list[dict[str, Any]]] = defaultdict(list)
         search_start = 0
+        matched_any = False
+        pending: list[dict[str, Any]] = []
         request_signatures = [_section_signature(section) for section in request_sections]
         for section in transcript_sections:
             signature = _section_signature(section)
@@ -1516,11 +1523,17 @@ def _extract_context(
                     found_index = index
                     break
             if found_index is None:
-                transcript_insertions[search_start].append(
-                    {**section, "inContext": True}
-                )
+                pending.append({**section, "inContext": True})
                 continue
+            # Unmatched sections (e.g. THINKING, absent from request snapshots)
+            # precede the request section they were emitted before.
+            transcript_insertions[found_index].extend(pending)
+            pending = []
+            matched_any = True
             search_start = found_index + 1
+        # The transcript is the newest turn: trailing or wholly unmatched
+        # sections follow the last match, or the whole request history.
+        transcript_insertions[search_start if matched_any else len(request_sections)].extend(pending)
 
         for index in range(len(request_sections) + 1):
             sections.extend(transcript_insertions.get(index, []))
