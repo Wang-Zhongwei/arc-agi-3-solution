@@ -185,9 +185,14 @@ def wilson(k, n, z=1.96):
 def main():
     coef = calibrate()
     df = attempts(coef)
+    # x = untrimmed context added since the level started; level 1 counts from
+    # game start, so its base prompt is included and the budget line applies
+    later = df.level > 1
+    df.loc[later, "end"] = df.loc[later, "end"] - df.loc[later, "start"]
+    df.loc[later, "start"] = 0.0
     for level in (1, 2, 3):
         d = df[df.level == level]
-        print(f"level {level}: {d.solved.sum()}/{len(d)} solved; start median {d.start.median() / 1000:.0f}k, "
+        print(f"level {level}: {d.solved.sum()}/{len(d)} solved; "
               f"solve point median {d[d.solved].end.median() / 1000:.0f}k")
     fig, ax = plt.subplots(figsize=(10, 4.6))
     for level, shift in ((1, -2.5), (2, 0), (3, 2.5)):
@@ -198,17 +203,17 @@ def main():
         ax.errorbar(x, t.rate, yerr=[t.rate - ci[:, 0], ci[:, 1] - t.rate], fmt="o-", color=COLORS[level],
                     markersize=4, linewidth=1.2, elinewidth=0.8, label=f"level {level}")
     ax.axvline(BUDGET / 1000, color=MUTED, linestyle="--", linewidth=1)
-    ax.text(BUDGET / 1000, 0.98, f" context budget {BUDGET / 1000:.0f}k: trimming starts", color=INK, fontsize=8,
+    ax.text(BUDGET / 1000, 0.98, f" context budget {BUDGET / 1000:.0f}k: level 1 trimming starts", color=INK, fontsize=8,
             va="top", transform=ax.get_xaxis_transform())
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.grid(axis="y", color="#e6e5e1", linewidth=0.8)
     ax.set_axisbelow(True)
     ax.tick_params(colors=INK, labelsize=9)
-    ax.set_xlabel("untrimmed context since game start (k tokens)", color=INK, fontsize=9)
+    ax.set_xlabel("untrimmed context since the level started (k tokens; level 1: since game start)", color=INK, fontsize=9)
     ax.set_ylabel("solved in the next 10k\n(given unsolved so far)", color=INK, fontsize=9)
     ax.legend(frameon=False, fontsize=9, loc="upper right")
-    ax.set_title(f"Later 15 games: solve rate vs untrimmed context (windows with >= {MIN_AT_RISK} attempts at risk)",
+    ax.set_title(f"Later 15 games: solve rate vs untrimmed context on the level (windows with >= {MIN_AT_RISK} attempts at risk)",
                  color=INK, fontsize=11, loc="left")
     fig.tight_layout()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)

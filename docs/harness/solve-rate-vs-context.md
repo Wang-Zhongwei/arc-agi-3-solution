@@ -4,7 +4,7 @@ Question: on the 15 harder public games, does the chance of solving the current 
 
 ![Solve rate vs untrimmed context](images/solve-rate-vs-context.png)
 
-**Answer: level 1 dips at the trimming line; levels 2 and 3 do not.** Level 1 holds at roughly 15-25% per 10k tokens from 30k to 118k, then drops to about 8-9% in the next two windows. Level 2 climbs to about 9-11% by 90-140k, then sits near 5-8%. Level 3 stays at about 7-14% from 100k to 400k.
+**Answer: level 1 dips at the trimming line; levels 2 and 3 do not.** Level 1 holds at roughly 15-25% per 10k tokens from 30k to 118k, then drops to about 8-9% in the next two windows. Measured from the start of each level, level 2 ramps up over the first 40k to about 8-10%, holds there to about 100k, then sits near 5-7%. Level 3 ramps up over the first 50k, peaks at 13-18% around 60-80k, holds at about 10-15% to 130k, then falls off. Their trimming points vary with how full the context was when the level began, so the budget line applies to level 1 only.
 
 The level-1 dip: of attempts unsolved at 90k, 55/112 (49%) solved before 118k; of those unsolved at 118k, 16/54 (30%) solved before 150k (Fisher's exact on that 2x2 table: odds ratio 2.29, p = 0.020, optimistic because an attempt can be in both rows). It is not uniform: bp35 20/25 -> 2/5, g50t 10/19 -> 2/7 and cd82 6/12 -> 2/6 drop, while sk48 rises 4/26 -> 6/21. Part of it comes from which games are still on level 1 by then: 21 of the 54 attempts past 118k are sk48. Comparing within the same game, the odds ratio is 0.60 (95% CI 0.28-1.27, p = 0.18). The direction fits trimming hurting level 1, but this sample cannot separate it from hard games remaining.
 
@@ -19,7 +19,7 @@ Before trimming, level 1 gets easier as context grows. From 30k to 118k, within 
 
 ## Method
 
-**x-axis.** x is the context the game would have if history were never trimmed: everything that entered the conversation since the game started.
+**x-axis.** x is the untrimmed context added since the level started: everything that entered the conversation since the previous level-up, as if history were never trimmed. Level 1 counts from game start, so it includes the base prompt.
 - Only five runs log server `prompt_tokens`, so x is rebuilt from each transcript. It counts user prompts, thinking, replies, tool calls and tool results, plus a cost per attached image. The per-turn copy of the system prompt and the status blocks are excluded.
 - The fit (`base + chars/2.92 + 350 * images`) uses the runs that saved request logs, at each turn's first request before the game's first trim (n = 2,347).
 - Median absolute error is 3.3%, and the 90th percentile is 8.5%.
