@@ -52,6 +52,7 @@ from inference.agent.prompts import (
     PYTHON_ADDENDUM_TAIL,
     GAMEPLAY_CHANGED_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
+    VIEW_FRAMES_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
     MULTIMODAL_CONTEXT_ADDENDUM,
@@ -68,7 +69,9 @@ from inference.agent.vision_context import (
     animation_peak_part,
     animation_sampled_parts,
     current_grid_image_enabled,
+    budgeted_view_padded,
     current_grid_image_part,
+    frame_to_png_data_url,
     intermediate_frame_parts,
 )
 
@@ -81,6 +84,10 @@ from inference.utils.openai_compat import (
 )
 
 log = logging.getLogger(__name__)
+
+_VIEW_FRAMES_CALL_LIMIT = 4
+_VIEW_FRAMES_TURN_LIMIT = 8
+_VIEW_FRAMES_TOKEN_LIMIT = 64
 
 _LOCAL_ANALYZER_MODEL_ID = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "")
 _LOCAL_ANALYZER_BASE_URL = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -2801,6 +2808,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
+    prompt += VIEW_FRAMES_ADDENDUM.format(
+        limit=_VIEW_FRAMES_CALL_LIMIT, turn_limit=_VIEW_FRAMES_TURN_LIMIT,
+        image_tokens=_VIEW_FRAMES_TOKEN_LIMIT,
+    )
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
@@ -2919,6 +2930,8 @@ class _ToolDispatchResult:
     # and resetting on it lets the model oscillate between truncating at full
     # effort and acting inertly at reduced effort, never settling.
     made_progress: bool = False
+    # Attach requested views after the complete assistant/tool group.
+    images: tuple[tuple[str, dict[str, Any]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3657,6 +3670,8 @@ class ToolAgent:
         self._auto_diff_prev_frame: Frame | None = None
         self._pending_diff_image: dict[str, Any] | None = None
         self._context_was_trimmed = False
+        self._view_frames_turn_count = 0
+        self._pending_view_messages: list[dict[str, Any]] = []
         self._has_evicted = False
         self._actions_at_level_start = 0
         self._tokens_at_level_start = 0
@@ -3760,6 +3775,8 @@ class ToolAgent:
         runtime_dir = state_path.parent
         if self._session_runtime_dir != runtime_dir:
             self._session_runtime_dir = runtime_dir
+            self._view_frames_turn_count = 0
+            self._pending_view_messages = []
             self._priority_level_count_warned = False
             if _persistent_functions():
                 self._kept_functions = {}
@@ -6296,6 +6313,10 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             animation_handler=_handle_animation if _animation_enabled() else None,
+            view_frames_limit=min(
+                _VIEW_FRAMES_CALL_LIMIT,
+                max(0, _VIEW_FRAMES_TURN_LIMIT - self._view_frames_turn_count),
+            ),
             kept_functions=self._retained_sources(),
             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
@@ -6354,7 +6375,58 @@ class ToolAgent:
             self._render_tool_payload(payload, truncate_fields=("stdout", "error", "result")),
             step_executed=step_executed,
             made_progress=made_progress,
+            images=self._view_frames_images(state_path, sandbox_result.get("viewed_frames")),
         )
+
+    def _view_frames_images(
+        self, state_path: Path, requests: Any,
+    ) -> tuple[tuple[str, dict[str, Any]], ...]:
+        """Render sandbox-selected history frames, including frames just executed."""
+        if not requests:
+            return ()
+        room = min(
+            _VIEW_FRAMES_CALL_LIMIT,
+            max(0, _VIEW_FRAMES_TURN_LIMIT - self._view_frames_turn_count),
+        )
+        _, history_entries = load_runtime_state(state_path)
+        entries = [entry for entry in history_entries if entry.frame is not None]
+        images: list[tuple[str, dict[str, Any]]] = []
+        for request in requests:
+            if len(images) >= room:
+                break
+            index = request.get("index") if isinstance(request, dict) else None
+            if type(index) is not int or not 0 <= index < len(entries):
+                continue
+            entry = entries[index]
+            bbox = request.get("bbox")
+            if bbox is not None:
+                bbox = tuple(bbox)
+            flags = [name for name in ("level_completed", "run_complete", "game_over")
+                     if entry.result.get(name)]
+            label = (
+                f"history[{index}]: board after {entry.action or 'start'}, "
+                f"level {entry.frame.level}, step {entry.frame.step}"
+            )
+            if flags:
+                label += f" ({', '.join(flags)})"
+            if bbox is not None:
+                label += f", bbox={bbox} (inclusive global coordinates)"
+            if bbox is not None:
+                view_rows, view_cols = bbox[2] - bbox[0] + 1, bbox[3] - bbox[1] + 1
+            else:
+                view_rows = len(entry.frame.grid)
+                view_cols = max((len(row) for row in entry.frame.grid), default=0)
+            if budgeted_view_padded(view_rows, view_cols, _VIEW_FRAMES_TOKEN_LIMIT):
+                label += "; blue outer margins are padding, not game cells"
+            images.append((label, {
+                "type": "image_url", "image_url": {
+                    "url": frame_to_png_data_url(
+                        entry.frame, bbox=bbox, visual_token_limit=_VIEW_FRAMES_TOKEN_LIMIT,
+                    ),
+                },
+            }))
+        self._view_frames_turn_count += len(images)
+        return tuple(images)
 
     def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
@@ -7103,6 +7175,7 @@ class ToolAgent:
             return None
         self._ensure_session(state_path)
         self._step_env_callback = step_env
+        self._view_frames_turn_count = 0
         if self._noop_repeat_guard is not None:
             solver_obj = getattr(step_env, "__self__", None)
             if solver_obj is not None:
@@ -7267,7 +7340,38 @@ class ToolAgent:
                 turn_count += 1
                 tools = self._tools(state_path)
                 tool_choice = _request_tool_choice(tools)
-                messages = self._trim_messages_for_context(messages, tools=tools)
+                # A view followed by action/yield has not reached the model
+                # yet. Persistence may have stripped its images; restore the
+                # bounded request until an inference response accepts it.
+                for view_message in self._pending_view_messages:
+                    # Match the image-stripped persisted copy too, so the
+                    # restored view replaces it instead of duplicating it.
+                    stripped_view = _strip_message_images(view_message)
+                    matching_index = next((
+                        index for index in range(len(messages) - 1, -1, -1)
+                        if _strip_message_images(messages[index]) == stripped_view
+                    ), None)
+                    if matching_index is not None:
+                        messages.pop(matching_index)
+                        messages.append(view_message)
+                    else:
+                        self._append_context_message(messages, view_message)
+                preserve_recent = 1
+                if self._pending_view_messages:
+                    preserve_recent = len(self._pending_view_messages) + 1
+                    for index, message in enumerate(messages):
+                        if message is opening_message:
+                            # Preserve the current-state opener and complete
+                            # tool exchanges as well as the unsent views.
+                            preserve_recent = max(
+                                preserve_recent,
+                                len(self._without_transition_reminders(messages[index:])),
+                            )
+                            break
+                messages = self._trim_messages_for_context(
+                    messages, tools=tools,
+                    preserve_recent=preserve_recent,
+                )
                 self._maybe_handover()
                 latest_request_messages = json.loads(json.dumps(messages))
                 latest_request_tools = json.loads(json.dumps(tools))
@@ -7302,6 +7406,10 @@ class ToolAgent:
                             chat_template_kwargs=self._harness_template_kwargs(),
                         )
                     result = self._chat_completion(messages, **request_kwargs)
+                    self._pending_view_messages = [
+                        message for message in self._pending_view_messages
+                        if message not in messages
+                    ]
                     _calibration_note = self._calibrate_from_usage(
                         messages, request_kwargs.get("tools"), result.usage
                     )
@@ -7338,11 +7446,14 @@ class ToolAgent:
                     trimmed_messages = self._trim_messages_for_context(
                         messages,
                         tools=tools,
+                        preserve_recent=preserve_recent,
                         extra_safety_tokens=_CONTEXT_OVERFLOW_RETRY_TRIM_TOKENS,
                         force_drain=True,
                     )
                     if trimmed_messages == messages:
-                        trimmed_messages = self._force_reduce_messages(messages)
+                        trimmed_messages = self._force_reduce_messages(
+                            messages, preserve_recent=preserve_recent,
+                        )
                     if trimmed_messages == messages:
                         raise
                     append_transcript(
@@ -7579,6 +7690,7 @@ class ToolAgent:
                 turn_tool_call_count += len(tool_calls)
                 self._append_context_message(messages, assistant_message)
 
+                pending_view_images: list[tuple[str, dict[str, Any]]] = []
                 for tool_index, tool_call in enumerate(tool_calls):
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
                     tool_name = str(function.get("name", "")).strip()
@@ -7617,6 +7729,7 @@ class ToolAgent:
                             "content": dispatch.content,
                         }
                     )
+                    pending_view_images.extend(dispatch.images)
                     if dispatch.step_executed:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
@@ -7626,6 +7739,18 @@ class ToolAgent:
                         if tool_index < len(tool_calls) - 1:
                             preserve_history = False
                         break
+                if pending_view_images:
+                    # Never insert images between tool responses in one group.
+                    note = f"view_frames images ({len(pending_view_images)}):"
+                    parts: list[dict[str, Any]] = [{"type": "text", "text": note}]
+                    for label, image_part in pending_view_images:
+                        parts.extend(({"type": "text", "text": label}, image_part))
+                    append_transcript("VIEW FRAMES", "\n".join(
+                        [note, *(label for label, _ in pending_view_images)],
+                    ))
+                    view_message = {"role": "user", "content": parts}
+                    self._pending_view_messages.append(view_message)
+                    self._append_context_message(messages, view_message)
                 if yielded_control_reason is not None:
                     break
                 if step_executed:

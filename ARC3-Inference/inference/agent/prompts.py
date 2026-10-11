@@ -160,6 +160,17 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
 )
 
+VIEW_FRAMES_ADDENDUM = (
+    "- `view_frames(indices, bbox=None)` displays history boards as images after the "
+    "Python results. Pass one index or an iterable, such as `view_frames(0)` or "
+    "`view_frames(range(10, 14))`. Optional `bbox=(min_row, min_col, max_row, max_col)` "
+    "crops each board using inclusive global coordinates. Each image is limited to "
+    "{image_tokens} visual tokens. Use bbox to focus on relevant objects or see details "
+    "more clearly; crops are automatically enlarged within the same token budget. "
+    "At most {limit} images "
+    "per Python call and {turn_limit} per analyzer invocation; viewing spends no game actions.\n"
+)
+
 ANIMATION_ADDENDUM_TIMELINE = (
     "- `last_animation_timeline` is a diff timeline of those frames: it "
     "shows which cells changed at each step. It is a dict with `action`, `frames` and "

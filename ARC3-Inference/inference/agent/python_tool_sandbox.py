@@ -625,6 +625,94 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             ]
 
         runtime_globals["action"] = action
+        # The host renders these boards after the snippet. Keep this helper
+        # available even when this call has no image room left.
+        _viewed_frames = []
+        _viewed_keys = set()
+        _view_limit = max(0, int(initial.get("view_frames_limit", 4)))
+
+        def view_frames(indices, bbox=None):
+            history = runtime_globals.get("history") or []
+            if not history:
+                raise IndexError("view_frames: history is empty.")
+            if isinstance(indices, int) and not isinstance(indices, bool):
+                requested_indices = [indices]
+            else:
+                try:
+                    requested_indices = list(indices)
+                except TypeError:
+                    raise TypeError("view_frames: history indices must be integers.") from None
+
+            crop = None
+            if bbox is not None:
+                try:
+                    crop = tuple(bbox)
+                except TypeError:
+                    raise TypeError("view_frames: bbox must contain four integers.") from None
+                if len(crop) != 4:
+                    raise ValueError("view_frames: bbox must contain four coordinates.")
+                if any(not isinstance(value, int) or isinstance(value, bool) for value in crop):
+                    raise TypeError("view_frames: bbox coordinates must be integers.")
+                minrow, mincol, maxrow, maxcol = crop
+                if minrow > maxrow or mincol > maxcol:
+                    raise ValueError("view_frames: bbox minimum must not exceed its maximum.")
+
+            # Validate the complete request before accepting any images. In
+            # particular, a bad later index must not partially show a batch.
+            picked = []
+            picked_keys = set()
+            for raw in requested_indices:
+                if not isinstance(raw, int) or isinstance(raw, bool):
+                    raise TypeError("view_frames: history indices must be integers.")
+                index = raw + len(history) if raw < 0 else raw
+                if not 0 <= index < len(history):
+                    raise IndexError(
+                        f"view_frames: history index {raw} is out of range "
+                        f"(0..{len(history) - 1})."
+                    )
+                if crop is not None:
+                    frame = history[index].frame
+                    rows, cols = frame.shape if frame is not None else (0, 0)
+                    if not (0 <= minrow <= maxrow < rows and 0 <= mincol <= maxcol < cols):
+                        raise ValueError(
+                            f"view_frames: bbox {crop} is out of bounds for "
+                            f"history[{index}] ({rows} rows, {cols} columns)."
+                        )
+                key = (index, crop)
+                if key not in picked_keys and key not in _viewed_keys:
+                    picked.append({"index": index, "bbox": list(crop) if crop is not None else None})
+                    picked_keys.add(key)
+
+            room = max(0, _view_limit - len(_viewed_frames))
+            shown, skipped = picked[:room], picked[room:]
+            _viewed_frames.extend(shown)
+            _viewed_keys.update((item["index"], crop) for item in shown)
+            if shown:
+                # Stream accepted metadata so a later timeout or process
+                # failure cannot discard an already requested board.
+                _send({"type": "view_frames", "viewed_frames": shown})
+            for item in shown:
+                index = item["index"]
+                entry = history[index]
+                flags = [
+                    name
+                    for name in ("level_completed", "run_complete", "game_over")
+                    if (entry.result or {}).get(name)
+                ]
+                print(
+                    f"[view_frames] image of history[{index}]"
+                    + (f", bbox={crop}" if crop is not None else "")
+                    + f": board after {entry.action or 'start'}, level {entry.frame.level}, "
+                    f"step {entry.frame.step}"
+                    + (f" ({', '.join(flags)})" if flags else "")
+                )
+            if skipped:
+                print(
+                    f"[view_frames] skipped history indices {[item['index'] for item in skipped]}: "
+                    f"at most {_view_limit} images per python call."
+                )
+
+        runtime_globals["view_frames"] = view_frames
         if initial.get("animation_enabled"):
             # Globals rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
@@ -739,6 +827,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "stdout": stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
+                    "viewed_frames": list(_viewed_frames),
                 }
             )
         except MemoryError:
@@ -767,6 +856,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     ),
                     "stdout": stdout.getvalue()[-4000:],
                     "action_results": _json_safe(action_results),
+                    "viewed_frames": list(_viewed_frames),
                 }
             )
         except (
@@ -791,6 +881,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     "error": _sanitize_exception(exc),
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
+                    "viewed_frames": list(_viewed_frames),
                 }
             )
 
@@ -904,6 +995,7 @@ def run_sandboxed_python(
     initial_state: dict[str, Any],
     action_handler: Callable[..., dict[str, Any]],
     animation_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    view_frames_limit: int = 4,
     kept_functions: list[str] | None = None,
     retain_imports: bool = False,
     repair_hints: bool = False,
@@ -911,6 +1003,41 @@ def run_sandboxed_python(
     memory_limit_bytes = _sandbox_memory_limit_bytes()
     with tempfile.TemporaryDirectory(prefix="rgb_python_tool_") as sandbox_dir:
         host_action_results: list[dict[str, Any]] = []
+        host_viewed_frames: list[dict[str, Any]] = []
+        host_viewed_keys: set[tuple[int, tuple[int, ...] | None]] = set()
+        host_history = initial_state.get("history") or []
+        image_limit = max(0, int(view_frames_limit))
+
+        def collect_viewed_frames(message: dict[str, Any]) -> None:
+            for item in message.get("viewed_frames") or []:
+                if len(host_viewed_frames) >= image_limit:
+                    break
+                if not isinstance(item, dict):
+                    continue
+                index = item.get("index")
+                bbox = item.get("bbox")
+                if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                    continue
+                if index >= len(host_history):
+                    continue
+                if bbox is not None and (
+                    not isinstance(bbox, list) or len(bbox) != 4
+                    or any(not isinstance(value, int) or isinstance(value, bool) for value in bbox)
+                ):
+                    continue
+                if bbox is not None:
+                    frame = host_history[index].get("frame") or {}
+                    shape = frame.get("shape") or []
+                    if len(shape) != 2:
+                        continue
+                    minrow, mincol, maxrow, maxcol = bbox
+                    if not (0 <= minrow <= maxrow < shape[0] and 0 <= mincol <= maxcol < shape[1]):
+                        continue
+                key = (index, tuple(bbox) if bbox is not None else None)
+                if key not in host_viewed_keys:
+                    host_viewed_frames.append({"index": index, "bbox": bbox})
+                    host_viewed_keys.add(key)
+
         try:
             process = subprocess.Popen(
                 [sys.executable, "-I", "-S", "-c", _SANDBOX_BOOTSTRAP],
@@ -928,6 +1055,7 @@ def run_sandboxed_python(
                 "error": "Sandbox process could not start.",
                 "stdout": "",
                 "action_results": [],
+                "viewed_frames": [],
             }
         assert process.stdin is not None
         assert process.stdout is not None
@@ -951,6 +1079,7 @@ def run_sandboxed_python(
                 "retain_imports": retain_imports,
                 "repair_hints": repair_hints,
                 "animation_enabled": animation_handler is not None,
+                "view_frames_limit": image_limit,
                 "timeout_seconds": timeout_seconds,
                 "memory_limit_bytes": memory_limit_bytes,
                 "sandbox_cwd": sandbox_dir,
@@ -970,6 +1099,7 @@ def run_sandboxed_python(
                     "error": f"Tool timed out after {timeout_seconds}s",
                     "stdout": "",
                     "action_results": list(host_action_results),
+                    "viewed_frames": list(host_viewed_frames),
                 }
 
             try:
@@ -988,11 +1118,13 @@ def run_sandboxed_python(
                         "error": _memory_kill_error(memory_limit_bytes),
                         "stdout": "",
                         "action_results": list(host_action_results),
+                        "viewed_frames": list(host_viewed_frames),
                     }
                 return {
                     "error": _sanitize_host_error_text(stderr),
                     "stdout": "",
                     "action_results": list(host_action_results),
+                    "viewed_frames": list(host_viewed_frames),
                 }
 
             try:
@@ -1005,9 +1137,13 @@ def run_sandboxed_python(
                     "error": "Sandbox process returned an invalid response.",
                     "stdout": "",
                     "action_results": list(host_action_results),
+                    "viewed_frames": list(host_viewed_frames),
                 }
 
             msg_type = str(message.get("type", "")).strip()
+            if msg_type == "view_frames":
+                collect_viewed_frames(message)
+                continue
             if msg_type == "animation":
                 if animation_handler is None:
                     _send_json_line(
@@ -1049,6 +1185,8 @@ def run_sandboxed_python(
                     )
                     continue
                 raw_action_result = action_result_payload.get("action_result") or {}
+                updated_state = action_result_payload.get("state") or {}
+                host_history = updated_state.get("history") or []
                 if isinstance(raw_action_result, dict):
                     host_action_results.append(dict(raw_action_result))
                 _send_json_line(
@@ -1056,12 +1194,13 @@ def run_sandboxed_python(
                     {
                         "type": "action_result",
                         "action_result": raw_action_result,
-                        "state": action_result_payload.get("state") or {},
+                        "state": updated_state,
                     },
                 )
                 continue
 
             if msg_type in {"final", "error"}:
+                collect_viewed_frames(message)
                 _wait_for_process_exit(process)
                 return {
                     "stdout": str(message.get("stdout", "") or ""),
@@ -1069,6 +1208,7 @@ def run_sandboxed_python(
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "keepable_functions": list(message.get("keepable_functions") or []),
+                    "viewed_frames": list(host_viewed_frames),
                     **({"retention_rejected": message.get("retention_rejected", [])}
                        if kept_functions is not None else {}),
                 }
@@ -1078,4 +1218,5 @@ def run_sandboxed_python(
                 "error": "Sandbox process returned an unknown message type.",
                 "stdout": "",
                 "action_results": list(host_action_results),
+                "viewed_frames": list(host_viewed_frames),
             }

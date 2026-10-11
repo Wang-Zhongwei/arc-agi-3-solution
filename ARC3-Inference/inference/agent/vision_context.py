@@ -108,12 +108,61 @@ def intermediate_frame_parts(
     return parts
 
 
-def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
+# Padding around budgeted views. Pure blue is far from every ARC palette
+# color, unlike near-black, which reads as a dark game cell.
+VIEW_PADDING_RGB: tuple[int, int, int] = (0, 0, 200)
+
+
+def _budgeted_layout(
+    rows: int, cols: int, visual_token_limit: int,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the (canvas, rendered) pixel sizes of a budgeted view."""
+    # Qwen uses 32-pixel merged patches and a minimum area of 65,536
+    # pixels. An aligned 64-patch canvas prevents preprocessing from
+    # enlarging a narrow crop beyond the viewer's token budget.
+    canvases = [
+        (patch_cols * 32, (visual_token_limit // patch_cols) * 32)
+        for patch_cols in range(1, visual_token_limit + 1)
+        if visual_token_limit % patch_cols == 0
+    ]
+    canvas_cols, canvas_rows = max(
+        canvases, key=lambda size: min(size[0] / cols, size[1] / rows),
+    )
+    fit_scale = min(canvas_cols / cols, canvas_rows / rows)
+    # Integer enlargement preserves uniform, exact-color grid cells.
+    # Oversized inputs are reduced only as much as needed to fit.
+    if fit_scale >= 1:
+        fit_scale = int(fit_scale)
+    rendered_cols = max(1, min(canvas_cols, int(cols * fit_scale)))
+    rendered_rows = max(1, min(canvas_rows, int(rows * fit_scale)))
+    return (canvas_cols, canvas_rows), (rendered_cols, rendered_rows)
+
+
+def budgeted_view_padded(rows: int, cols: int, visual_token_limit: int) -> bool:
+    canvas, rendered = _budgeted_layout(rows, cols, visual_token_limit)
+    return canvas != rendered
+
+
+def frame_to_png_data_url(
+    frame: Frame, *, upscale: int | None = None,
+    bbox: tuple[int, int, int, int] | None = None,
+    visual_token_limit: int | None = None,
+) -> str:
     rows = len(frame.grid)
     cols = max((len(row) for row in frame.grid), default=0)
     if rows <= 0 or cols <= 0:
         raise ValueError("Cannot render an empty grid as an image.")
+    if bbox is not None:
+        if len(bbox) != 4 or any(type(value) is not int for value in bbox):
+            raise ValueError("bbox must contain four integer coordinates.")
+        min_row, min_col, max_row, max_col = bbox
+        if not (0 <= min_row <= max_row < rows and 0 <= min_col <= max_col < cols):
+            raise ValueError("bbox is outside the frame bounds.")
 
+    if visual_token_limit is not None and (
+        type(visual_token_limit) is not int or visual_token_limit < 1
+    ):
+        raise ValueError("visual_token_limit must be a positive integer.")
     scale = current_grid_image_upscale() if upscale is None else max(1, int(upscale))
     image = Image.new("RGB", (cols, rows), ARC_COLOR_MAP[0])
     pixels = image.load()
@@ -121,7 +170,19 @@ def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
         for col_idx in range(cols):
             value = row[col_idx] if col_idx < len(row) else 0
             pixels[col_idx, row_idx] = ARC_COLOR_MAP.get(int(value), ARC_COLOR_MAP[0])
-    if scale > 1:
+    if bbox is not None:
+        image = image.crop((min_col, min_row, max_col + 1, max_row + 1))
+        cols, rows = image.size
+    if visual_token_limit is not None:
+        (canvas_cols, canvas_rows), (rendered_cols, rendered_rows) = _budgeted_layout(
+            rows, cols, visual_token_limit,
+        )
+        image = image.resize((rendered_cols, rendered_rows), Image.Resampling.NEAREST)
+        canvas = Image.new("RGB", (canvas_cols, canvas_rows), VIEW_PADDING_RGB)
+        canvas.paste(image, ((canvas_cols - rendered_cols) // 2,
+                             (canvas_rows - rendered_rows) // 2))
+        image = canvas
+    elif scale > 1:
         image = image.resize((cols * scale, rows * scale), multimodal_resample())
 
     buffer = io.BytesIO()
