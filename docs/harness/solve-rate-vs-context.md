@@ -4,9 +4,9 @@ Question: on the 15 harder public games, does the chance of solving the current 
 
 ![Solve rate vs untrimmed context](images/solve-rate-vs-context.png)
 
-**Answer: no sharp boundary.** Level 1 holds at roughly 15-25% per 10k tokens from 30k to 118k. Level 2 climbs to about 9-11% by 90-140k, then sits near 5-8%. Level 3 stays at about 7-14% from 100k to 400k. None of the three curves steps down at the budget line.
+**Answer: level 1 dips at the trimming line; levels 2 and 3 do not.** Level 1 holds at roughly 15-25% per 10k tokens from 30k to 118k, then drops to about 8-9% in the next two windows. Level 2 climbs to about 9-11% by 90-140k, then sits near 5-8%. Level 3 stays at about 7-14% from 100k to 400k.
 
-The level-1 points just past 118k are lower: 49% of attempts solved within 90-118k vs 30% within 118-150k. Most of that comes from which games are still on level 1 by then: 21 of the 54 attempts are sk48. Comparing within the same game gives an odds ratio of 0.60 (95% CI 0.28-1.27, p = 0.18).
+The level-1 dip: 49% of attempts solved within 90-118k vs 30% within 118-150k (Fisher p = 0.019, optimistic because one attempt counts in several windows). Part of it comes from which games are still on level 1 by then: 21 of the 54 attempts past 118k are sk48. Comparing within the same game, the odds ratio is 0.60 (95% CI 0.28-1.27, p = 0.18). The direction fits trimming hurting level 1, but this sample cannot separate it from hard games remaining. A direct test would be an A/B run with a larger context budget, or with the first trim delayed.
 
 ## Data
 
