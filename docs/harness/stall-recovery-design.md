@@ -1,11 +1,11 @@
 # Recovering useful history and moving from thought to action
 
-Status: reminder policy proposed, 2026-10-11. Base: `allocation-vc-one-wave` at `415b436`.
-The frame viewer is implemented first as an always-available helper; the
-[standalone test](../../ARC3-Inference/configs/view-frames/README.md) uses a
-120-minute public runtime. The reminder policy below is not implemented.
+Status: 2026-10-11. Base: `allocation-vc-one-wave` at `d49a940` (PR #30 reverted).
+The [view tool](#view-tool-implemented) is implemented behind `ARC3_VIEW_TOOL`; its
+[test config](../../ARC3-Inference/configs/view-tool/README.md) uses a 120-minute public
+runtime. The other reminders below are proposals and are not implemented.
 
-When the latest level-up exchange is about to leave conversation context, give the agent a small, indexed route back to its evidence. Also trigger a review when level 1 remains uncleared, even though no previous level-up exists. If the review still produces no level-up, repeat the cue at the next actual history trim. When thinking per executed action becomes high, encourage a useful action. Tie the reminders to a concrete winning condition and a plan or search toward it.
+When conversation is trimmed, tell the agent which part of `history` left it and how to view it. Also trigger a review when level 1 remains uncleared, even though no previous level-up exists. If the review still produces no level-up, repeat the cue at the next actual history trim. When thinking per executed action becomes high, encourage a useful action. Tie the reminders to a concrete winning condition and a plan or search toward it.
 
 The change is an **addition to the regular user prompt**. Keep the normal state, action results, and event guidance, then append only the relevant reminder. Ordinary requests receive no extra text. Expose the history-viewing capability once in the tool reference.
 
@@ -39,32 +39,34 @@ The thinking column is total estimated thinking divided by total executed non-RE
 
 The prompt should encourage *informative* action, not merely increase the denominator. In `jonathanwang2022/animations-in-context/v01`, dc22 spent 424 actions in eight long LEFT/RIGHT alternations, each cycling between two visible states after removing the top/bottom four rows. Conversely, `ticbudja/thinking-budget-priority-four-waves/v03` solved m0r0 with a search over 288,283 states, a 38-action plan, and execution checks. In the same notebook's v01 sp80 run, all four inferred targets were simultaneously filled in animation frames 24–31 without completion: the winning condition needed revision. These cases support a direction of **specify the goal, test the model, search, execute, verify**.
 
-## History tool and trim trigger
+## View tool (implemented)
 
-Reuse `view_frames` from archived history-revisit commit `52c97a4`, extending it with an optional crop and making it always available. The allocation base retains runtime history without this viewer; the standalone implementation now exposes `view_frames(indices, bbox=None)` for a single index or an iterable of indexes:
+Behind `ARC3_VIEW_TOOL` (off by default). It extends `view_frames` from archived commit `52c97a4` with crops and renames it `view`:
 
 ```python
-view_frames(120)                            # one full frame
-view_frames(120, bbox=(8, 12, 31, 43))      # one cropped frame
-view_frames(range(117, 121))                # region of history; stop is exclusive
-view_frames(range(117, 121), bbox=(8, 12, 31, 43))
+view(120)                             # one full board
+view(120, bbox=(8, 12, 31, 43))       # one cropped board
+view(range(117, 121))                 # several boards; stop is exclusive
+view(range(117, 121), bbox=(8, 12, 31, 43))
 ```
 
-`bbox=None` displays the whole frame. A bbox is `(min_row, min_col, max_row, max_col)`, inclusive, matching segmentation coordinates. Apply it to each selected frame, validate its bounds before rendering, and label the image with its original global coordinates. Different crops of the same index are separate views and consume the same image limits; cropping does not change runtime history or action coordinates. Each image uses 64 visual tokens: full 64×64 boards use upscale 4, while crops receive a larger uniform scale within the same budget. Odd-sized crops are padded on a 32-pixel-aligned canvas so model preprocessing does not enlarge them past the limit. Image markers add two context tokens. Encourage bbox crops when the agent wants to focus on relevant objects or see details more clearly.
+A bbox is `(min_row, min_col, max_row, max_col)`, inclusive, matching segmentation coordinates. Labels keep the history index, action, level, step, completion flags, and crop. Each image uses 64 visual tokens; crops get a larger integer scale within that budget, and blue margins pad shapes that do not fill the aligned canvas. Limits are four images per Python call and eight per analyzer invocation. Viewing spends no game actions.
 
-For the latest successful level-up at history index `k`, suggest `start = max(0, k - 3)` and `stop = k + 1`: up to four frames covering the approach and transition. Each image carries its history index, action, level, and completion flags. The agent can inspect matching `history`/`transitions` results or request another range if needed. Restore the existing bounded rendering behavior; configure four images per call and eight per analyzer turn for the first experiment. Reading frames spends no game actions, but their images consume context.
+**Trim note.** The agent is not told about its last level-up or game over. Each opener records the latest history index when it was created. Once the oldest retained opener starts at `history[s]` with `s > 0`, a note follows the system prompt:
 
-`history[k - 1]` is the board before the winning action. `history[k]` is normally the next level's initial board, **not a saved solved board**. Label that boundary accurately. Runtime history persists after chat trimming; fatal actions and automatic RESET have separate entries.
+> Earlier conversation has been trimmed. It covered history[0:s], which remains in `history`. To review key moments there, such as level-ups or game overs, use `view` with a bbox.
 
-Record the latest clear's history index and the assistant/tool exchange that produced it. Detect imminent loss by comparing the planned retained messages with those source identities, using the provenance pattern in `0dc3b80`. Queue the cue when that exchange first loses its assistant or matching triggering tool result. A generic context-trim flag, elapsed turns, or image-window change is insufficient.
+The note carries no reasoning or images. It is built per request rather than stored, counts toward the context estimate, and changes only when trimming moves the start, so prefix caching is unaffected between trims. It replaces the latest-clear cue proposed earlier and the transition reminders of PR #30.
 
-Put the initial cue in the request that first omits the exchange, or the next request if eviction occurred while saving history after a response. Do not add a separate inference request before trimming. Send this initial cue once per latest-clear event, then use the recurrence rule below. A newer clear replaces the old event. Terminal `run_complete` requires no recovery request.
+`history[k - 1]` is the board before a winning action at `k`; `history[k]` is normally the next level's initial board, not a saved solved board. Runtime history persists after chat trimming; fatal actions and automatic RESET have separate entries.
+
+## Further proposals (not implemented)
 
 **Level-1 stall trigger:** after 20 completed analyzer invocations with accepted solver work and no level clear, queue the initial level-1 review cue once for that uncleared level; later cues follow the trim recurrence rule. Count each invocation once if it contains at least one accepted solver response. Include inspection-only and yield continuations so a thinking-only stall can trigger it; scheduler waits, invocations with only unsent/failed requests, and summary generation add zero. Death and RESET keep this count. This is a lack-of-clear trigger, not a claim that every invocation was unproductive. It operates independently of trimming and the thinking/action threshold.
 
-Without a prior clear, point to `history[0:min(4, len(history))]`: the initial board and earliest action results. It can contain only the initial frame when no action has executed; `view_frames(0)` remains valid. Label it as opening evidence, not a previous success. Compare that evidence with the current state and reconsider the model or winning condition. Cancel a pending level-1 cue if the level clears before delivery.
+Without a prior clear, point to `history[0:min(4, len(history))]`: the initial board and earliest action results. It can contain only the initial frame when no action has executed; `view(0)` remains valid. Label it as opening evidence, not a previous success. Compare that evidence with the current state and reconsider the model or winning condition. Cancel a pending level-1 cue if the level clears before delivery.
 
-**Repeat at later trims until a level-up:** a delivered recovery reminder starts a review round for the current level. If the resulting solver work still produces no level-up, each subsequent actual history trim queues another similar reminder. The latest-clear exchange need not be removed again: its range remains the reference, or use the opening range on level 1. Ask the agent to compare that evidence with observations since the previous review and revise its model, winning condition, or plan. Absence of a level-up does not establish that the preceding work was useless.
+**Repeat at later trims until a level-up:** a delivered recovery reminder starts a review round for the current level. If the resulting solver work still produces no level-up, each subsequent actual history trim queues another similar reminder. Point to the range named by the trim note, or to the opening range on level 1. Ask the agent to compare that evidence with observations since the previous review and revise its model, winning condition, or plan. Absence of a level-up does not establish that the preceding work was useless.
 
 An actual trim removes old conversation exchanges or replaces them with a summary; a trim-helper call with no eviction, image-window update, or redundant-control-only pruning does not count. Coalesce all cuts and overflow retries while preparing one inference request into one cue. After an accepted response, a later real trim can begin the next round. Failed or unsent requests retain the pending cue. A successful clear ends the round and cancels pending follow-ups; death and RESET preserve it.
 
@@ -84,23 +86,19 @@ For an ordinary turn, the current regular guidance is:
 
 Keep that regular prompt and append these lines only when their events occur. The numbers below are illustrative substitutions.
 
-**Latest-clear exchange leaving context:**
-
-> Your latest level-up exchange (level 2 → 3) is leaving conversation context. Its boards and actions remain in history[117:121]. Revisit that region with view_frames(range(117, 121)) and compare what led to success with this level.
-
 **Thinking/action threshold crossed:**
 
 > You have averaged 2,450 thinking tokens per executed action on this level (29,400 tokens / 12 actions). Prefer a short, verified action sequence now; if a rule is uncertain, choose a small action that tests it.
 
 **Level 1 remains uncleared:**
 
-> Level 1 remains uncleared after 20 analyzer invocations. Revisit its starting layout and earliest action effects with view_frames(range(0, 4)), and compare them with current_frame.
+> Level 1 remains uncleared after 20 analyzer invocations. Revisit its starting layout and earliest action effects with view(range(0, 4)), and compare them with current_frame.
 
-Use the available stop index in this example; if only the initial frame exists, suggest `view_frames(0)`. A crop is optional in every history cue, for example `view_frames(0, bbox=(8, 12, 31, 43))` when those bounds match the region of interest.
+Use the available stop index in this example; if only the initial frame exists, suggest `view(0)`. A crop is optional in every history cue, for example `view(0, bbox=(8, 12, 31, 43))` when those bounds match the region of interest.
 
 **Next trim with no level-up since the previous review:**
 
-> This level remains uncleared since the previous review, and more conversation history is being trimmed. Revisit history[117:121] with view_frames(range(117, 121)), compare it with current_frame and observations since that review, and reconsider your winning condition or action plan.
+> This level remains uncleared since the previous review, and more conversation history is being trimmed. Revisit history[117:121] with view(range(117, 121)), compare it with current_frame and observations since that review, and reconsider your winning condition or action plan.
 
 On level 1, substitute the opening-evidence range. Include the refreshed thinking/action line only when its threshold still holds.
 

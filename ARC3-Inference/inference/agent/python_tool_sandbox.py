@@ -625,37 +625,37 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             ]
 
         runtime_globals["action"] = action
-        # The host renders these boards after the snippet. Keep this helper
-        # available even when this call has no image room left.
+        # The host renders these boards after the snippet. With the view tool
+        # on, keep this helper available even when no image room is left.
         _viewed_frames = []
         _viewed_keys = set()
-        _view_limit = max(0, int(initial.get("view_frames_limit", 4)))
+        _view_limit = max(0, int(initial.get("view_limit") or 0))
 
-        def view_frames(indices, bbox=None):
+        def view(indices, bbox=None):
             history = runtime_globals.get("history") or []
             if not history:
-                raise IndexError("view_frames: history is empty.")
+                raise IndexError("view: history is empty.")
             if isinstance(indices, int) and not isinstance(indices, bool):
                 requested_indices = [indices]
             else:
                 try:
                     requested_indices = list(indices)
                 except TypeError:
-                    raise TypeError("view_frames: history indices must be integers.") from None
+                    raise TypeError("view: history indices must be integers.") from None
 
             crop = None
             if bbox is not None:
                 try:
                     crop = tuple(bbox)
                 except TypeError:
-                    raise TypeError("view_frames: bbox must contain four integers.") from None
+                    raise TypeError("view: bbox must contain four integers.") from None
                 if len(crop) != 4:
-                    raise ValueError("view_frames: bbox must contain four coordinates.")
+                    raise ValueError("view: bbox must contain four coordinates.")
                 if any(not isinstance(value, int) or isinstance(value, bool) for value in crop):
-                    raise TypeError("view_frames: bbox coordinates must be integers.")
+                    raise TypeError("view: bbox coordinates must be integers.")
                 minrow, mincol, maxrow, maxcol = crop
                 if minrow > maxrow or mincol > maxcol:
-                    raise ValueError("view_frames: bbox minimum must not exceed its maximum.")
+                    raise ValueError("view: bbox minimum must not exceed its maximum.")
 
             # Validate the complete request before accepting any images. In
             # particular, a bad later index must not partially show a batch.
@@ -663,11 +663,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             picked_keys = set()
             for raw in requested_indices:
                 if not isinstance(raw, int) or isinstance(raw, bool):
-                    raise TypeError("view_frames: history indices must be integers.")
+                    raise TypeError("view: history indices must be integers.")
                 index = raw + len(history) if raw < 0 else raw
                 if not 0 <= index < len(history):
                     raise IndexError(
-                        f"view_frames: history index {raw} is out of range "
+                        f"view: history index {raw} is out of range "
                         f"(0..{len(history) - 1})."
                     )
                 if crop is not None:
@@ -675,7 +675,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     rows, cols = frame.shape if frame is not None else (0, 0)
                     if not (0 <= minrow <= maxrow < rows and 0 <= mincol <= maxcol < cols):
                         raise ValueError(
-                            f"view_frames: bbox {crop} is out of bounds for "
+                            f"view: bbox {crop} is out of bounds for "
                             f"history[{index}] ({rows} rows, {cols} columns)."
                         )
                 key = (index, crop)
@@ -690,7 +690,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             if shown:
                 # Stream accepted metadata so a later timeout or process
                 # failure cannot discard an already requested board.
-                _send({"type": "view_frames", "viewed_frames": shown})
+                _send({"type": "view", "viewed_frames": shown})
             for item in shown:
                 index = item["index"]
                 entry = history[index]
@@ -700,7 +700,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     if (entry.result or {}).get(name)
                 ]
                 print(
-                    f"[view_frames] image of history[{index}]"
+                    f"[view] image of history[{index}]"
                     + (f", bbox={crop}" if crop is not None else "")
                     + f": board after {entry.action or 'start'}, level {entry.frame.level}, "
                     f"step {entry.frame.step}"
@@ -708,11 +708,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 )
             if skipped:
                 print(
-                    f"[view_frames] skipped history indices {[item['index'] for item in skipped]}: "
+                    f"[view] skipped history indices {[item['index'] for item in skipped]}: "
                     f"at most {_view_limit} images per python call."
                 )
 
-        runtime_globals["view_frames"] = view_frames
+        if initial.get("view_limit") is not None:
+            runtime_globals["view"] = view
         if initial.get("animation_enabled"):
             # Globals rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
@@ -995,7 +996,7 @@ def run_sandboxed_python(
     initial_state: dict[str, Any],
     action_handler: Callable[..., dict[str, Any]],
     animation_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    view_frames_limit: int = 4,
+    view_limit: int | None = 4,
     kept_functions: list[str] | None = None,
     retain_imports: bool = False,
     repair_hints: bool = False,
@@ -1006,7 +1007,7 @@ def run_sandboxed_python(
         host_viewed_frames: list[dict[str, Any]] = []
         host_viewed_keys: set[tuple[int, tuple[int, ...] | None]] = set()
         host_history = initial_state.get("history") or []
-        image_limit = max(0, int(view_frames_limit))
+        image_limit = max(0, int(view_limit or 0))
 
         def collect_viewed_frames(message: dict[str, Any]) -> None:
             for item in message.get("viewed_frames") or []:
@@ -1079,7 +1080,7 @@ def run_sandboxed_python(
                 "retain_imports": retain_imports,
                 "repair_hints": repair_hints,
                 "animation_enabled": animation_handler is not None,
-                "view_frames_limit": image_limit,
+                "view_limit": None if view_limit is None else image_limit,
                 "timeout_seconds": timeout_seconds,
                 "memory_limit_bytes": memory_limit_bytes,
                 "sandbox_cwd": sandbox_dir,
@@ -1141,7 +1142,7 @@ def run_sandboxed_python(
                 }
 
             msg_type = str(message.get("type", "")).strip()
-            if msg_type == "view_frames":
+            if msg_type == "view":
                 collect_viewed_frames(message)
                 continue
             if msg_type == "animation":

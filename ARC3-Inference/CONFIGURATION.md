@@ -97,31 +97,15 @@ Added images that show changed cells in their true palette colors while dimming 
 
 The original `MULTIMODAL_CONTEXT=current_grid` and `MULTIMODAL_UPSCALE` settings remain the basic image controls. The latter’s source default is 16; running at 10× is a notebook configuration choice, not a new fixed default. Filtering historical images changes request prefixes and can affect prefix reuse.
 
+### View tool
+
+| Setting | Default | Change |
+|---|---|---|
+| `ARC3_VIEW_TOOL` | Off | Adds `view(indices, bbox=None)` to the Python sandbox and documents it in the system prompt. It shows one or more `history` boards as images after the tool results, optionally cropped to an inclusive `bbox=(min_row, min_col, max_row, max_col)`. Viewing spends no actions. Once conversation has been trimmed, a note after the system prompt names the `history` range the trimmed conversation covered and suggests `view` with a bbox for key moments such as level-ups or game overs. The note carries no reasoning or images. |
+
+Limits are four images per Python call and eight per analyzer invocation. Each image uses 64 visual tokens (66 with its markers), independent of `MULTIMODAL_UPSCALE`: a full 64×64 board renders at 4× (256×256 pixels), and crops get the largest integer enlargement that fits a 32-pixel-aligned 64-patch canvas. Blue margins pad shapes that do not fill the canvas and are mentioned in the label only when present. Requested images survive snippet errors and stay pending until a model response accepts them.
+
 ### Boards between actions
-
-`view_frames(indices, bbox=None)` is always available inside Python. It displays
-one history index or an iterable of indexes as images after the tool results.
-Negative indexes are supported; index 0 is the initial board. An optional
-`bbox=(min_row, min_col, max_row, max_col)` crops each selected board using
-inclusive global coordinates. Indexes and bounds are validated before queuing
-any image in that request. Labels retain the history index, action, level, step,
-completion flags, and crop coordinates. Viewing spends no game actions.
-
-The fixed limits are four images per Python snippet and eight per analyzer
-invocation, with **64 visual tokens per image** independently of the current-board
-scale. A full 64×64 board uses upscale 4 (256×256 pixels). Crops use the largest
-uniform integer enlargement that fits a 32-pixel-aligned, 64-patch canvas;
-for example, a 16×16 crop uses upscale 16. The selected canvas follows the crop's
-aspect ratio. Blue outer margins are padding, not game cells, and are labelled only when present. Rendering uses
-nearest-neighbor scaling; oversized inputs are downsampled to fit. The pinned
-[model processor](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/blob/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/preprocessor_config.json)
-has 16-pixel patches, merge size 2, and minimum area 65,536 pixels, so this aligned
-canvas avoids further enlargement. Context accounting adds two image markers
-(66 tokens total). The prompt encourages bbox crops for focused, clearer views.
-Different crops of the same history index count separately. Requested images
-survive snippet errors and remain pending until an inference response accepts
-them; afterwards they follow ordinary context/image retention. Availability is
-independent of `MULTIMODAL_CONTEXT`. No enable flag is required.
 
 | Config field | Environment variable | Default | Behavior |
 |---|---|---|---|

@@ -52,7 +52,8 @@ from inference.agent.prompts import (
     PYTHON_ADDENDUM_TAIL,
     GAMEPLAY_CHANGED_ADDENDUM,
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
-    VIEW_FRAMES_ADDENDUM,
+    VIEW_TOOL_ADDENDUM,
+    TRIMMED_HISTORY_NOTE,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
     MULTIMODAL_CONTEXT_ADDENDUM,
@@ -85,9 +86,29 @@ from inference.utils.openai_compat import (
 
 log = logging.getLogger(__name__)
 
-_VIEW_FRAMES_CALL_LIMIT = 4
-_VIEW_FRAMES_TURN_LIMIT = 8
-_VIEW_FRAMES_TOKEN_LIMIT = 64
+_VIEW_CALL_LIMIT = 4
+_VIEW_TURN_LIMIT = 8
+_VIEW_TOKEN_LIMIT = 64
+# Private tag: the latest history index when a user message was created.
+_HISTORY_INDEX_KEY = "_arc3_history_index"
+
+
+def _view_tool_enabled() -> bool:
+    return _get_env_bool("ARC3_VIEW_TOOL", False)
+
+
+def _with_trimmed_history_note(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """After the system prompt, name the history range the conversation lost.
+
+    Only view-tool messages carry the tag, so this is a no-op otherwise.
+    """
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    start = next((m[_HISTORY_INDEX_KEY] for m in messages if _HISTORY_INDEX_KEY in m), 0)
+    if start <= 0:
+        return messages
+    note = {"role": "user", "content": TRIMMED_HISTORY_NOTE.format(start=start)}
+    return [messages[0], note, *messages[1:]]
 
 _LOCAL_ANALYZER_MODEL_ID = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "")
 _LOCAL_ANALYZER_BASE_URL = os.environ.get("LOCAL_ANALYZER_BASE_URL", "http://127.0.0.1:1234/v1")
@@ -1247,9 +1268,10 @@ def _strip_control_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Wire-safe copy: the private tag never leaves the process."""
     cleaned: list[dict[str, Any]] = []
     for message in messages:
-        if _CONTROL_MESSAGE_KEY in message:
+        if _CONTROL_MESSAGE_KEY in message or _HISTORY_INDEX_KEY in message:
             copy = dict(message)
             copy.pop(_CONTROL_MESSAGE_KEY, None)
+            copy.pop(_HISTORY_INDEX_KEY, None)
             cleaned.append(copy)
         else:
             cleaned.append(message)
@@ -2808,10 +2830,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
-    prompt += VIEW_FRAMES_ADDENDUM.format(
-        limit=_VIEW_FRAMES_CALL_LIMIT, turn_limit=_VIEW_FRAMES_TURN_LIMIT,
-        image_tokens=_VIEW_FRAMES_TOKEN_LIMIT,
-    )
+    if _view_tool_enabled():
+        prompt += VIEW_TOOL_ADDENDUM.format(
+            limit=_VIEW_CALL_LIMIT, turn_limit=_VIEW_TURN_LIMIT,
+        )
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
@@ -3670,7 +3692,7 @@ class ToolAgent:
         self._auto_diff_prev_frame: Frame | None = None
         self._pending_diff_image: dict[str, Any] | None = None
         self._context_was_trimmed = False
-        self._view_frames_turn_count = 0
+        self._view_turn_count = 0
         self._pending_view_messages: list[dict[str, Any]] = []
         self._has_evicted = False
         self._actions_at_level_start = 0
@@ -3775,7 +3797,7 @@ class ToolAgent:
         runtime_dir = state_path.parent
         if self._session_runtime_dir != runtime_dir:
             self._session_runtime_dir = runtime_dir
-            self._view_frames_turn_count = 0
+            self._view_turn_count = 0
             self._pending_view_messages = []
             self._priority_level_count_warned = False
             if _persistent_functions():
@@ -5663,12 +5685,12 @@ class ToolAgent:
             template_kwargs["enable_thinking"] = bool(enable_thinking)
         if template_kwargs:
             payload["chat_template_kwargs"] = template_kwargs
-        payload["messages"] = _strip_control_keys(
+        payload["messages"] = _strip_control_keys(_with_trimmed_history_note(
             _apply_summary_visibility(
                 payload.get("messages") or [],
                 evicted=getattr(self, "_has_evicted", False),
             )
-        )
+        ))
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
             return requests.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
@@ -6313,10 +6335,10 @@ class ToolAgent:
             initial_state=_serialized_runtime_state(),
             action_handler=_handle_action,
             animation_handler=_handle_animation if _animation_enabled() else None,
-            view_frames_limit=min(
-                _VIEW_FRAMES_CALL_LIMIT,
-                max(0, _VIEW_FRAMES_TURN_LIMIT - self._view_frames_turn_count),
-            ),
+            view_limit=min(
+                _VIEW_CALL_LIMIT,
+                max(0, _VIEW_TURN_LIMIT - self._view_turn_count),
+            ) if _view_tool_enabled() else None,
             kept_functions=self._retained_sources(),
             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
@@ -6375,18 +6397,18 @@ class ToolAgent:
             self._render_tool_payload(payload, truncate_fields=("stdout", "error", "result")),
             step_executed=step_executed,
             made_progress=made_progress,
-            images=self._view_frames_images(state_path, sandbox_result.get("viewed_frames")),
+            images=self._view_images(state_path, sandbox_result.get("viewed_frames")),
         )
 
-    def _view_frames_images(
+    def _view_images(
         self, state_path: Path, requests: Any,
     ) -> tuple[tuple[str, dict[str, Any]], ...]:
         """Render sandbox-selected history frames, including frames just executed."""
         if not requests:
             return ()
         room = min(
-            _VIEW_FRAMES_CALL_LIMIT,
-            max(0, _VIEW_FRAMES_TURN_LIMIT - self._view_frames_turn_count),
+            _VIEW_CALL_LIMIT,
+            max(0, _VIEW_TURN_LIMIT - self._view_turn_count),
         )
         _, history_entries = load_runtime_state(state_path)
         entries = [entry for entry in history_entries if entry.frame is not None]
@@ -6410,22 +6432,22 @@ class ToolAgent:
             if flags:
                 label += f" ({', '.join(flags)})"
             if bbox is not None:
-                label += f", bbox={bbox} (inclusive global coordinates)"
+                label += f", bbox={bbox}"
             if bbox is not None:
                 view_rows, view_cols = bbox[2] - bbox[0] + 1, bbox[3] - bbox[1] + 1
             else:
                 view_rows = len(entry.frame.grid)
                 view_cols = max((len(row) for row in entry.frame.grid), default=0)
-            if budgeted_view_padded(view_rows, view_cols, _VIEW_FRAMES_TOKEN_LIMIT):
-                label += "; blue outer margins are padding, not game cells"
+            if budgeted_view_padded(view_rows, view_cols, _VIEW_TOKEN_LIMIT):
+                label += "; blue margins are padding"
             images.append((label, {
                 "type": "image_url", "image_url": {
                     "url": frame_to_png_data_url(
-                        entry.frame, bbox=bbox, visual_token_limit=_VIEW_FRAMES_TOKEN_LIMIT,
+                        entry.frame, bbox=bbox, visual_token_limit=_VIEW_TOKEN_LIMIT,
                     ),
                 },
             }))
-        self._view_frames_turn_count += len(images)
+        self._view_turn_count += len(images)
         return tuple(images)
 
     def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]) -> _ToolDispatchResult:
@@ -6682,9 +6704,14 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        messages = _apply_summary_visibility(
+        messages = _with_trimmed_history_note(_apply_summary_visibility(
             messages, evicted=getattr(self, "_has_evicted", False)
-        )
+        ))
+        messages = [
+            {k: v for k, v in m.items() if k != _HISTORY_INDEX_KEY}
+            if _HISTORY_INDEX_KEY in m else m
+            for m in messages
+        ]
         image_tokens = 0
         if _image_token_estimate_enabled():
             messages, image_tokens = _split_messages_for_estimate(messages)
@@ -7175,7 +7202,7 @@ class ToolAgent:
             return None
         self._ensure_session(state_path)
         self._step_env_callback = step_env
-        self._view_frames_turn_count = 0
+        self._view_turn_count = 0
         if self._noop_repeat_guard is not None:
             solver_obj = getattr(step_env, "__self__", None)
             if solver_obj is not None:
@@ -7282,6 +7309,8 @@ class ToolAgent:
         # resumed invocation the short/state_only substitution happens here, so
         # transcribing `user_prompt` would report a full opener the model never
         # saw - and at a 60s yield budget that is most turns
+        if _view_tool_enabled():
+            opening_message[_HISTORY_INDEX_KEY] = len(history_entries) - 1
         append_transcript("USER PROMPT", _message_display_text(opening_message))
         if resuming_after_yield:
             # Tag EVERY resumption message, not just the short form. A yield
@@ -7363,17 +7392,14 @@ class ToolAgent:
                         if message is opening_message:
                             # Preserve the current-state opener and complete
                             # tool exchanges as well as the unsent views.
-                            preserve_recent = max(
-                                preserve_recent,
-                                len(self._without_transition_reminders(messages[index:])),
-                            )
+                            preserve_recent = max(preserve_recent, len(messages) - index)
                             break
                 messages = self._trim_messages_for_context(
                     messages, tools=tools,
                     preserve_recent=preserve_recent,
                 )
                 self._maybe_handover()
-                latest_request_messages = json.loads(json.dumps(messages))
+                latest_request_messages = json.loads(json.dumps(_with_trimmed_history_note(messages)))
                 latest_request_tools = json.loads(json.dumps(tools))
                 latest_request_tool_choice = tool_choice
                 latest_request_index = turn_count
@@ -7741,14 +7767,17 @@ class ToolAgent:
                         break
                 if pending_view_images:
                     # Never insert images between tool responses in one group.
-                    note = f"view_frames images ({len(pending_view_images)}):"
+                    note = f"view images ({len(pending_view_images)}):"
                     parts: list[dict[str, Any]] = [{"type": "text", "text": note}]
                     for label, image_part in pending_view_images:
                         parts.extend(({"type": "text", "text": label}, image_part))
-                    append_transcript("VIEW FRAMES", "\n".join(
+                    append_transcript("VIEW", "\n".join(
                         [note, *(label for label, _ in pending_view_images)],
                     ))
-                    view_message = {"role": "user", "content": parts}
+                    view_message = {
+                        "role": "user", "content": parts,
+                        _HISTORY_INDEX_KEY: len(load_runtime_state(state_path)[1]) - 1,
+                    }
                     self._pending_view_messages.append(view_message)
                     self._append_context_message(messages, view_message)
                 if yielded_control_reason is not None:
