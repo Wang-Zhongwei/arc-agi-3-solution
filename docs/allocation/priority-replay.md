@@ -254,8 +254,61 @@ Same budget, slots and control:
 
 **Summary.** Near its best half-life, every weighting (actions only, tokens only,
 $0.25$, $0.5$) is within about $0.5$ of the others, and the replay cannot rank
-them. Token-only is chosen because it has one parameter and the widest
-plateau.
+them.
+
+## Decay grid at $K = 15$, $G = 110$
+
+All three parameters of $C$ searched together:
+
+$$
+C = w \cdot 2^{-(a/h_a)^2} + (1 - w) \cdot 2^{-(s/h)^2},\qquad R = v\,C,
+$$
+
+with $w \in \{0, 0.25, 0.5, 0.75, 1\}$, $h_a \in \{43, \dots, 345\}$ and
+$h \in \{31\text{k}, \dots, 186\text{k}\}$ (10 values each, 320 settings). To
+match 15 streams on the roughly 110-game private pool ($K/G = 0.14$), each
+replay uses $K = 15$ on a pool of $G = 110$ trajectories drawn without
+replacement from the 275 (the same 25 games recur about 4 times per pool).
+Every setting is replayed on the same 100 pools; $\beta = 150\text{k}$,
+$\gamma = 35\text{k}$. The control is the current $C$ ($w = 0.25$, $h_a = 115$,
+$h = 62\text{k}$): 41.94, against 36.66 for uniform. Full tables in
+[`data/decay_grid.md`](data/decay_grid.md).
+
+Pools share trajectories, so the spread over pools understates the error.
+Uncertainties below are a leave-one-run-out jackknife (30 pools from the
+other 10 runs per replicate).
+
+| $w$ | Best setting | $\bar S$ | vs control |
+|---|---|---|---|
+| 0 (tokens only) | $h = 100\text{k}$ | 41.72 | −0.22 (jackknife −0.18 ± 0.13) |
+| 0.25 | $h_a = 144$, $h = 31\text{k}$ | 42.10 | +0.16 |
+| 0.5 | $h_a = 86$, $h = 46\text{k}$ | 42.11 | +0.17 (jackknife +0.19 ± 0.34) |
+| 0.75 | $h_a = 72$, $h = 55\text{k}$ | 41.96 | +0.01 |
+| 1 (actions only) | $h_a = 72$ | 41.77 | −0.18 (jackknife −0.18 ± 0.31) |
+
+Single-term profiles, difference vs control:
+
+| tokens only, $h$ | 31k | 46k | 55k | 62k | 70k | 78k | 86k | 100k | 124k | 186k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| | −2.53 | −1.48 | −0.83 | −0.54 | −0.35 | −0.25 | −0.32 | −0.22 | −0.48 | −0.92 |
+
+| actions only, $h_a$ | 43 | 58 | 72 | 86 | 100 | 115 | 144 | 173 | 230 | 345 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| | −1.77 | −0.57 | −0.18 | −0.19 | −0.31 | −0.42 | −0.52 | −0.73 | −0.98 | −1.06 |
+
+- The surface is flat near the control: the best of 320 settings is $+0.17$
+  ($+0.19 \pm 0.34$ by jackknife), and the control ranks 57th, within
+  $0.17$ of the top. At $w = 0.25$ and $0.5$, every cell with
+  $h_a = 86$–$144$ and $h = 31$–$86\text{k}$ is within $\pm 0.2$.
+- Selection does not carry over. Picking the best setting on runs 1–6 and
+  scoring it on runs 7–11 gives $+0.10$; the reverse gives $+0.64$ in sample
+  and $-0.53$ held out.
+- A single term costs about $0.2$: tokens only is best at $h = 78$–$100\text{k}$,
+  actions only at $h_a = 72$–$86$. Token-only $70\text{k}$ (the earlier choice)
+  is $-0.32 \pm 0.25$.
+- Short half-lives lose the most ($h \le 46\text{k}$ alone, or $h_a = 43$ at
+  any $w$: $-1$ to $-2.5$), and $h \ge 124\text{k}$ or $h_a \ge 173$ loses
+  $0.5$–$1$.
 
 ## Yield-UCB
 
@@ -311,13 +364,17 @@ $0.08$ corresponds to about $8.8$ active games, at a cost in throughput. So
 14 concurrent streams with 1 wave ($K/G = 14/110 \approx 0.13$) looks like the
 best choice; 4 waves gives $14/28 = 0.5$, near the control.
 
-Use token weight $1$ in $C$, with token half-life $h = 70\text{k}$
-($R = v\,2^{-(s/70\text{k})^2}$). It ties the mixed $C$ at $\beta = 150\text{k}$
-(−0.33 / −0.10 / −0.00 at $K = 3$ / $7$ / $14$) with one parameter instead of three.
+Keep the current $C$ ($w = 0.25$, $h_a = 115$, $h = 62\text{k}$). The
+three-parameter grid at $K = 15$, $G = 110$ finds nothing better outside
+noise (best $+0.19 \pm 0.34$), and the selected settings do not hold up on
+held-out runs. Tokens only is the simpler alternative at about $-0.2$; if
+used, set $h = 100\text{k}$ ($-0.18 \pm 0.13$) rather than $70\text{k}$
+($-0.32 \pm 0.25$).
 
 Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
-`ARC3_PRIORITY_ACTION_WEIGHT=0`, `ARC3_PRIORITY_TOKEN_SCALE=70000`,
-`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep
+`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep the default
+falloff (`ARC3_PRIORITY_ACTION_WEIGHT=0.25`, `ARC3_PRIORITY_ACTION_SCALE=115`,
+`ARC3_PRIORITY_TOKEN_SCALE=62000`), keep
 `ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$),
 `ARC3_MAX_ACTIVE_STREAMS=14`, and `kaggle.private_waves: 1`.
 
@@ -368,4 +425,5 @@ a level.
 python docs/allocation/scripts/extract_trajectories.py --runs-root ARC3-Inference/runs
 python docs/allocation/scripts/extract_thinking.py --runs-root ARC3-Inference/runs
 python docs/allocation/scripts/replay.py   # writes data/results.md
+python docs/allocation/scripts/decay_grid.py   # writes data/decay_grid.md (about 5 minutes)
 ```
