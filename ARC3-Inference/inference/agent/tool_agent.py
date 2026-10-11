@@ -128,6 +128,13 @@ def _level_transfer_guidance_enabled() -> bool:
     return _get_env_bool("ARC3_LEVEL_TRANSFER_GUIDANCE", False)
 
 
+def _levelup_board_image() -> bool:
+    """Show the solved board of the level just completed, as a death shows the
+    death board. Without it the opener after a level-up carries only the next
+    level's first board. ARC3_LEVELUP_BOARD_IMAGE defaults off."""
+    return _get_env_bool("ARC3_LEVELUP_BOARD_IMAGE", False)
+
+
 def _contains_tool_call_markup(*chunks: str) -> bool:
     for chunk in chunks:
         lowered = chunk.lower()
@@ -3665,6 +3672,9 @@ class ToolAgent:
         self._priority_next = self._priority_current
         self._kept_functions: dict[str, str] = {}
         self._last_animation_chain: list[Any] = []
+        self._level_end_grid: Any = None
+        self._pending_levelup_image: dict[str, Any] | None = None
+        self._last_shown_grid: Any = None
         self._last_action_gameplay_changed: bool | None = None
         self._pending_animation_image: dict[str, Any] | None = None
         self._pending_animation_image_label: str = ""
@@ -4758,6 +4768,19 @@ class ToolAgent:
             self._pending_animation_image = part
             self._pending_animation_image_label = label
 
+    def _prepare_levelup_board_image(self) -> None:
+        """Attach the board as the previous level was solved, shown before the
+        current grid image - only when its interior differs from the current
+        grid image of the last turn, which otherwise already showed it."""
+        grid, self._level_end_grid = self._level_end_grid, None
+        if grid is None or not _levelup_board_image():
+            return
+        border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+        interior = lambda g: [row[border:len(row) - border] for row in g[border:len(g) - border]]
+        if self._last_shown_grid is not None and interior(grid) == interior(self._last_shown_grid):
+            return
+        self._pending_levelup_image = current_grid_image_part(Frame(grid=grid, step=0, level=0))
+
     def _retained_function_context(self) -> str:
         """Optional prompt metadata must never interrupt game execution."""
         if not _persistent_functions():
@@ -4853,6 +4876,12 @@ class ToolAgent:
         self._pending_animation_samples = []
         self._pending_gameover_images = []
         self._pending_intermediate_images = []
+        levelup_part = self._pending_levelup_image
+        self._pending_levelup_image = None
+        if current_frame is not None:
+            self._last_shown_grid = current_frame.grid
+        if levelup_part is not None:
+            animation_samples.insert(0, ("Last level-complete image:", levelup_part))
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -4874,6 +4903,13 @@ class ToolAgent:
             {"type": "text", "text": f"{user_prompt}\n\nCurrent grid image (the board AFTER the automatic reset - this is what you act on now):" if gameover_images else f"{user_prompt}\n\nCurrent grid image:"},
             image_part,
         ]
+        if levelup_part is not None:
+            content = [
+                {"type": "text", "text": f"{user_prompt}\n\nLast level-complete image:"},
+                levelup_part,
+                {"type": "text", "text": "Current grid image:"},
+                image_part,
+            ]
         if diff_part is not None:
             content.append({"type": "text", "text": diff_label})
             content.append(diff_part)
@@ -5249,6 +5285,7 @@ class ToolAgent:
                     if _level_transfer_guidance_enabled()
                     else "You have progressed to a new level!"
                 )
+                self._prepare_levelup_board_image()
             else:
                 lines.append(
                     self._manual_reset_context_line(previous_step_summary)
@@ -6207,6 +6244,8 @@ class ToolAgent:
             raw_payload = self._step_env_callback(step_arguments)
             if not isinstance(raw_payload, dict):
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
+            if raw_payload.get("level_end_grid") is not None:
+                self._level_end_grid = raw_payload["level_end_grid"]
             if reset_exposed() and raw_payload.get("executed"):
                 # Use actual execution, not submitted batch size: a refused
                 # call does not consume the snippet's first-action allowance.

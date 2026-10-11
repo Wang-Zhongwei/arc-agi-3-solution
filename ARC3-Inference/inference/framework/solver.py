@@ -360,6 +360,24 @@ def _animation_chain(
     )
 
 
+def _level_end_grid(
+    state: taaf.game.GameState | None,
+) -> tuple[tuple[int, ...], ...] | None:
+    """The board as the level was solved, from a level-completing action.
+
+    The engine renders the solved board and then the next level's first board
+    within that one action, so raw.frame[-2] is the only frame showing it. TAAF
+    pads a lone transition frame with an all-green placeholder, which is not a
+    board, so that case returns None.
+    """
+    if state is None:
+        return None
+    frames = normalize_frames(getattr(state.raw, "frame", None))
+    if len(frames) < 2 or {cell for row in frames[-2] for cell in row} == {14}:
+        return None
+    return frames[-2]
+
+
 def _grid_from_state(state: taaf.game.GameState | None) -> tuple[tuple[int, ...], ...]:
     if state is None:
         return ()
@@ -1356,6 +1374,10 @@ class _HarnessGameSession:
             # the raw chain, for rendering an image in the opener. Dropped by
             # _compact_action_result, so it never reaches the model as text.
             payload["animation_chain"] = chain
+        level_end_grid = _level_end_grid(new_state) if level_completed else None
+        if level_end_grid is not None:
+            # raw payload only: _compact_action_result drops it, like animation_chain
+            payload["level_end_grid"] = level_end_grid
         # Store the individual action before step_env folds results into a batch.
         # Keep only compact metadata, without grids, animation chains, or clocks.
         payload["automatic"] = automatic
