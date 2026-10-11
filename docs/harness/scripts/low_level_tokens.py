@@ -271,6 +271,30 @@ def main(out_dir):
     fig.tight_layout()
     fig.savefig(f"{out_dir}/solve_rate_vs_tokens.png", dpi=150, facecolor="#fcfcfb")
 
+    # Figure 2b: the same solve rate for every level reached often enough
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6), sharex=True, sharey=True)
+    for ax, level in zip(axes.flat, range(1, 7)):
+        t = hazard_table(levels, level, upto=150_000)
+        keep = t.at_risk >= 15
+        ci = np.array([wilson(e, n) for e, n in zip(t.events, t.at_risk)])
+        x = (t.lo + BIN / 2) / 1000
+        ax.errorbar(x[keep], t.hazard[keep], yerr=[t.hazard[keep] - ci[keep, 0], ci[keep, 1] - t.hazard[keep]],
+                    fmt="o", color=SOLVED, markersize=4, linewidth=1, capsize=0)
+        d = levels[levels.level == level]
+        ax.set_title(f"Level {level}: {d.solved.sum()}/{len(d)} solved", color=INK, fontsize=10, loc="left")
+        ax.axvline(first_drop.median() / 1000, color=MUTED, linestyle="--", linewidth=1)
+        style(ax)
+    for ax in axes[1]:
+        ax.set_xlabel("generated tokens already spent on the level (k)", color=INK, fontsize=9)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("solved in the next 10k tokens\n(given unsolved so far)", color=INK, fontsize=9)
+    fig.suptitle("Later 15 games: solve rate per 10k tokens by level (bins with >= 15 attempts at risk; "
+                 "dashed = median first context drop)", color=INK, fontsize=11, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/solve_rate_by_level.png", dpi=150, facecolor="#fcfcfb")
+    for level in (3, 4, 5):
+        within_game_bands(levels, level, edges=(0, 20, 40, 60, 80, 100))
+
     # Figure 3: where each game ends
     last = levels.sort_values("level").groupby(["run", "game"]).tail(1)
     ends = last.assign(end=np.where(last.solved, "won", np.where(last.level == 1, "stuck on 1",
