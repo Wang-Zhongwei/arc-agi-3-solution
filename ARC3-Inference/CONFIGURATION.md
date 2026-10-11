@@ -234,6 +234,19 @@ The dimension estimate uses 32-pixel patches plus two image marker tokens. For e
 
 The original `LOCAL_ANALYZER_CONTEXT_WINDOW` and `LOCAL_ANALYZER_MAX_OUTPUT` still determine the ordinary prompt budget, reserving generation space plus a safety margin. A large context setting does not override a smaller assistant-message cap or a smaller server context limit.
 
+### Retaining the latest transitions after trimming
+
+| Config field | Environment | Default | Behavior |
+|---|---|---|---|
+| `context.retain_last_level_up` | `ARC3_RETAIN_LAST_LEVEL_UP` | `false` | Adds a reminder of the latest level-up or final win once its original exchange is evicted. Includes the board before the successful action. |
+| `context.retain_last_game_over` | `ARC3_RETAIN_LAST_GAME_OVER` | `false` | Adds a reminder of the latest game-over once its original exchange is evicted. Includes both boards immediately before and after the fatal action, before automatic RESET. |
+
+Reminders precede the recent original transcript, in event order. Each contains the executed actions, outcome, historical board labels, and the original reasoning from the assistant response that issued the actions. Reasoning is retained verbatim up to 2,048 tokens; longer text keeps its first 1,024 and last 1,024 tokens with `[Middle of reasoning omitted]` between them. Game-over reasoning is labeled as potentially containing mistaken assumptions.
+
+The implementation uses the serving model's [`/tokenize` and `/detokenize` APIs](https://docs.vllm.ai/en/v0.15.0/api/vllm/entrypoints/serve/tokenize/protocol/). If they are unavailable, it logs a warning and omits reasoning while retaining the action, outcome, and images. Partial Unicode characters at token boundaries are omitted to preserve the original text. Images use `multimodal.upscale`; reminder images are retained independently of `ARC3_HISTORY_IMAGE_KEEP`.
+
+Only the latest event of each enabled kind is retained. A newer event replaces the older reminder even while the newer exchange remains in the transcript. Reminders count toward the existing context budget, including image costs; trimming makes room by removing older complete exchanges. Rebuilding identical reminders does not trigger a scheduler handover. See [the design](../docs/context/trimming.md) for the prompt layout.
+
 ### Optional control-message pruning
 
 | Setting | Default | Behavior |

@@ -310,6 +310,12 @@ DEPLOYMENT_SLURM_LOCAL_SERVER_CONFIG ?= $(CONFIG_PATH)
 
 # ARC3_* harness settings (scheduler, gate, ...) forwarded to local runs and
 # into the Kaggle notebook's runtime environment.
+ifeq ($(origin ARC3_RETAIN_LAST_LEVEL_UP),undefined)
+ARC3_RETAIN_LAST_LEVEL_UP := $(shell $(CONFIG_VALUE) context.retain_last_level_up false)
+endif
+ifeq ($(origin ARC3_RETAIN_LAST_GAME_OVER),undefined)
+ARC3_RETAIN_LAST_GAME_OVER := $(shell $(CONFIG_VALUE) context.retain_last_game_over false)
+endif
 ARC3_HARNESS_ENV_JSON := $(shell $(CONFIG_VALUE) harness_env {})
 # Kaggle serving (kaggle.serving = vllm | pennyroyal, model/wheel sources, image).
 ARC3_KAGGLE_JSON := $(shell $(CONFIG_VALUE) kaggle {})
@@ -398,6 +404,8 @@ export LOCAL_ANALYZER_SITE_URL
 export LOCAL_ANALYZER_APP_NAME
 export MULTIMODAL_CONTEXT
 export ARC3_HARNESS_ENV_JSON
+export ARC3_RETAIN_LAST_LEVEL_UP
+export ARC3_RETAIN_LAST_GAME_OVER
 export ARC3_KAGGLE_JSON
 export ARC3_RUNPOD_JSON
 export MULTIMODAL_UPSCALE
