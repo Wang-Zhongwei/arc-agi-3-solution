@@ -30,6 +30,9 @@ GRANT = 35_000               # tokens per slot grant (median between context tri
 TOKENS_PER_MINUTE = 52_000   # v07: 25 games x 218k generated tokens in ~105 min; the UCB clock
 UCB_SCALES = (0.25, 1, 4, 16)  # multiples of UCB_DEFAULT_C
 CONCURRENCY = (1, 2, 3, 5, 7, 10, 14, 20, 25)  # slots K for the concurrency study (25 = every game)
+TOKEN_HALF_LIVES = (46_000, 55_000, 62_000, 70_000, 78_000, 86_000, 93_000, 108_000, 124_000)  # h, token-only C
+TOKEN_ONLY_SLOTS = (3, 7, 14)
+TOKEN_ONLY_BUDGET = 150_000
 CLOCK = {"spent": 0.0}       # tokens spent so far in the replayed run
 
 
@@ -107,6 +110,14 @@ def b0_no_eff(tr: Traj, t: float, pace: bool = False) -> float:
     L, s, a = tr.state(t)
     p = tr.pace(t) if pace else 1.0
     return value(tr, L) * hazard(s, a, p) / p
+
+
+def b0_tokens(h: float):
+    """B = 0, no efficiency, token-only falloff (ARC3_PRIORITY_ACTION_WEIGHT=0, TOKEN_SCALE=h): v·2^-(s/h)^2."""
+    def rank(tr: Traj, t: float) -> float:
+        L, s, _ = tr.state(t)
+        return value(tr, L) * 0.5 ** ((s / h) ** 2)
+    return rank
 
 
 def thinking_multiplier(t: float | None, ref: float = 2048.0) -> float:
@@ -236,6 +247,16 @@ def main() -> None:
         f"\nYield-UCB, elapsed minutes = tokens spent / {TOKENS_PER_MINUTE}. "
         "Mean score, difference vs uniform ± SE (runs better)",
         table(["policy"] + [f"β = {b // 1000}k, γ = {GRANT // 1000}k" for b in BUDGETS], rows),
+    ]) + "\n"
+    b = TOKEN_ONLY_BUDGET
+    ctrl = {k: [replay(trs, b0_no_eff, b, GRANT, k) for trs in runs.values()] for k in TOKEN_ONLY_SLOTS}
+    rows = [["v·C (control)"] + [f"{st.mean(ctrl[k]):.1f}" for k in TOKEN_ONLY_SLOTS]]
+    for h in TOKEN_HALF_LIVES:
+        sc = {k: [replay(trs, b0_tokens(h), b, GRANT, k) for trs in runs.values()] for k in TOKEN_ONLY_SLOTS}
+        rows.append([f"h = {h // 1000}k"] + [f"{st.mean(sc[k]):.1f}, {paired(sc[k], ctrl[k])}" for k in TOKEN_ONLY_SLOTS])
+    text += "\n".join([
+        f"\nToken-only falloff v·2^-(s/h)^2, β = {b // 1000}k: mean score, difference vs v·C at the same K ± SE (runs better)",
+        table(["ranking"] + [f"K = {k}, γ = {GRANT // 1000}k" for k in TOKEN_ONLY_SLOTS], rows),
     ]) + "\n"
     (DATA / "results.md").write_text(text)
     print(text)

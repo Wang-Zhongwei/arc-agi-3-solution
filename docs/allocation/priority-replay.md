@@ -166,6 +166,48 @@ Mean $\bar S$, then the paired difference vs $K = 14$ ($\gamma = 35\text{k}$):
   fewer concurrent sequences it usually generates fewer tokens per second,
   which costs budget $\beta$ directly; this replay cannot weigh that.
 
+## Token-only decay
+
+Our choice with the action term of $C$ removed (`ARC3_PRIORITY_ACTION_WEIGHT=0`,
+token weight $1$) and the token half-life $h$ (`ARC3_PRIORITY_TOKEN_SCALE`) swept:
+
+$$
+R = v \cdot 2^{-(s/h)^2}.
+$$
+
+Budget $\beta = 150\text{k}$, $\gamma = 35\text{k}$. $K = 3$ of $25$ ($K/G = 0.12$) is
+closest to the planned 14 streams on about 110 games. Mean $\bar S$, then the paired
+difference vs $v\,C$ (action weight $0.25$, $115$ actions, $62\text{k}$ tokens) at the same $K$:
+
+| Ranking | $K = 3$ | $K = 7$ | $K = 14$ |
+|---|---|---|---|
+| $v\,C$ (control) | 41.6 | 41.3 | 40.3 |
+| $h = 46\text{k}$ | 40.3, −1.30 ± 0.51 (3/11) | 40.4, −0.93 ± 0.41 (3/11) | 40.0, −0.36 ± 0.39 (6/11) |
+| $h = 55\text{k}$ | 41.1, −0.47 ± 0.55 (6/11) | 40.4, −0.89 ± 0.38 (3/11) | 39.9, −0.41 ± 0.47 (3/11) |
+| $h = 62\text{k}$ | 41.1, −0.42 ± 0.47 (4/11) | 40.7, −0.54 ± 0.28 (2/11) | 40.2, −0.10 ± 0.24 (3/11) |
+| $h = 70\text{k}$ | 41.2, −0.33 ± 0.38 (4/11) | 41.2, −0.10 ± 0.22 (3/11) | 40.3, −0.00 ± 0.18 (5/11) |
+| $h = 78\text{k}$ | 41.3, −0.31 ± 0.21 (3/11) | 41.0, −0.30 ± 0.17 (2/11) | 40.2, −0.17 ± 0.23 (3/11) |
+| $h = 86\text{k}$ | 41.3, −0.30 ± 0.28 (3/11) | 40.9, −0.39 ± 0.22 (2/11) | 40.3, −0.01 ± 0.31 (4/11) |
+| $h = 93\text{k}$ | 41.1, −0.51 ± 0.29 (3/11) | 41.0, −0.27 ± 0.17 (2/11) | 40.5, +0.19 ± 0.32 (4/11) |
+| $h = 108\text{k}$ | 40.6, −0.99 ± 0.56 (1/11) | 40.9, −0.41 ± 0.37 (3/11) | 40.4, +0.08 ± 0.28 (6/11) |
+| $h = 124\text{k}$ | 40.2, −1.38 ± 0.55 (0/11) | 40.7, −0.57 ± 0.38 (1/11) | 40.3, −0.05 ± 0.32 (4/11) |
+
+- The plateau is $h = 70$–$93\text{k}$, within $0.5$ of the control at every $K$
+  and within one SE. $h = 70\text{k}$ has the best mean over the three $K$
+  ($-0.33$, $-0.10$, $-0.00$).
+- The action term is worth at most about $0.3$ points; without it the token
+  half-life should be slightly longer than $62\text{k}$, since the action term
+  no longer shortens the falloff.
+- Both ends lose: $h \le 46\text{k}$ abandons levels too early, and
+  $h \ge 108\text{k}$ keeps stalled games ranked high. With no decay at all
+  ($R = v$) the loss is $-1.35$ at $K = 3$ and $-0.52$ at $K = 14$.
+- The shape does not help either (exploratory, $h$ swept $10$–$248\text{k}$):
+  an exponential falloff $2^{-s/h}$ peaks at $h = 31\text{k}$ ($-0.47$ at
+  $K = 3$) and $46\text{k}$ ($+0.16$ at $K = 14$); a sharper $2^{-(s/h)^4}$
+  peaks at $93\text{k}$ ($-0.59$ / $-0.06$). Neither is available as a setting.
+- The production `priority_value` (integer index, floored at 1) reproduces the
+  float replay to $0.1$ at $h = 62$, $78$ and $93\text{k}$.
+
 ## Yield-UCB
 
 `ARC3_SCHEDULER=ucb` (`ARC3-Inference/inference/agent/scheduling/ucb.py`)
@@ -220,7 +262,12 @@ $0.08$ corresponds to about $8.8$ active games, at a cost in throughput. So
 14 concurrent streams with 1 wave ($K/G = 14/110 \approx 0.13$) looks like the
 best choice; 4 waves gives $14/28 = 0.5$, near the control.
 
+Use token weight $1$ in $C$, with token half-life $h = 70\text{k}$
+($R = v\,2^{-(s/70\text{k})^2}$). It ties the mixed $C$ at $\beta = 150\text{k}$
+(−0.33 / −0.10 / −0.00 at $K = 3$ / $7$ / $14$) with one parameter instead of three.
+
 Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
+`ARC3_PRIORITY_ACTION_WEIGHT=0`, `ARC3_PRIORITY_TOKEN_SCALE=70000`,
 `ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep
 `ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$),
 `ARC3_MAX_ACTIVE_STREAMS=14`, and `kaggle.private_waves: 1`.
