@@ -17,4 +17,10 @@ Destination: `jonathanwang2022/view-tool`, source dataset
 
 [Version 1](https://www.kaggle.com/code/jonathanwang2022/view-tool) was pushed
 2026-10-11 from commit `f7722e4`; the bundle carries `ARC3_VIEW_TOOL=1` and its
-harness files match that commit. Status at push: `RUNNING`, not yet evaluated.
+harness files match that commit. It was cancelled after about 10 minutes of play,
+before the 15-stream priority gate rotated in the other 10 games (the baseline's
+did so at 16–20 minutes).
+
+[Version 2](https://www.kaggle.com/code/jonathanwang2022/view-tool) reruns `v1.json`
+unchanged, pushed 2026-10-11 from commit `faaef39` (harness identical to `f7722e4`).
+Status at push: `RUNNING`, not yet evaluated.
