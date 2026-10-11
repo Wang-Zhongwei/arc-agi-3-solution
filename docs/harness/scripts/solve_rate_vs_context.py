@@ -31,16 +31,23 @@ import statsmodels.formula.api as smf
 from scipy.stats import chi2
 
 RUNS_DIR = os.environ.get("RUNS_DIR", "ARC3-Inference/runs/kaggle")
-OUT = sys.argv[1] if len(sys.argv) > 1 else "docs/harness/images/solve-rate-vs-context.png"
+GAME_SET = os.environ.get("GAME_SET", "later15")  # later15 (harder) or first10
+OUT = sys.argv[1] if len(sys.argv) > 1 else (
+    "docs/harness/images/solve-rate-vs-context" + ("-first10" if GAME_SET == "first10" else "") + ".png")
 OUT_CURRENT = os.path.join(os.path.dirname(OUT), "solve-rate-vs-current-context.png")
 LATER15 = set("bp35 cd82 cn04 dc22 g50t ka59 lf52 ls20 m0r0 s5i5 sk48 sp80 su15 tn36 wa30".split())
+FIRST10 = set("ar25 ft09 lp85 r11l re86 sb26 sc25 tr87 tu93 vc33".split())
+GAMES, SET_LABEL = (FIRST10, "First 10 games") if GAME_SET == "first10" else (LATER15, "Later 15 games")
 BUDGET = 118272
 KEEP = ("[USER PROMPT]", "[THINKING]", "[ASSISTANT]", "[TOOL CALL", "[TOOL RESULT")
 HEADER = re.compile(r"^--- analysis_step=(\d+) \| action=(\d+) \|", re.M)
 WINDOW = 10_000
 TRIM_AT, TRIM_TO = 118_000, 58_000  # fitted; = budget and budget - 58*1024 drain
 MIN_AT_RISK = 20
-COLORS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a"}
+COLORS = {1: "#2a78d6", 2: "#eb6834", 3: "#1baf7a", "final": "#eda100"}
+N_LEVELS = dict(bp35=9, cd82=6, cn04=6, dc22=6, g50t=7, ka59=7, lf52=10, ls20=7, m0r0=6, s5i5=8, sk48=8,
+                sp80=6, su15=9, tn36=7, wa30=9,
+                ar25=8, ft09=6, lp85=8, r11l=6, re86=8, sb26=8, sc25=6, tr87=6, tu93=9, vc33=7)
 INK, MUTED = "#52514e", "#8a8984"
 
 
@@ -83,6 +90,9 @@ def daniel_base(run_dir):
     intermediate-frame images. Drops main's harness runs and the bp35-lordhansolo
     series."""
     if "/bp35-lordhansolo/" in run_dir + "/":
+        return False
+    # harness changes on top of Daniel's base that alter context or tools
+    if any(f"/{name}/" in run_dir + "/" for name in ("context-transition-reminders", "view-tool")):
         return False
     head = ""
     for path in glob.glob(f"{run_dir}/transcripts/*.txt")[:1]:
@@ -149,7 +159,7 @@ def attempts(coef):
             stem = os.path.basename(transcript)[:-4]
             game = stem.split("-")[0]
             events = f"{run_dir}/artifacts/{stem}_events.jsonl"
-            if game not in LATER15 or not os.path.exists(events):
+            if game not in GAMES or not os.path.exists(events):
                 continue
             steps = transcript_steps(transcript)
             if not steps:
@@ -196,7 +206,7 @@ def turns(coef, real=False):
             game = stem.split("-")[0]
             events = f"{run_dir}/artifacts/{stem}_events.jsonl"
             requests = f"{run_dir}/{stem}_requests.jsonl"
-            if game not in LATER15 or not os.path.exists(events) or (real and not os.path.exists(requests)):
+            if game not in GAMES or not os.path.exists(events) or (real and not os.path.exists(requests)):
                 continue
             steps = transcript_steps(transcript)
             if len(steps) < 2:
@@ -223,7 +233,8 @@ def turns(coef, real=False):
             level = 1
             for k in range(len(steps)):
                 up = k in solve_turn
-                rows.append(dict(attempt=f"{run_dir}|{game}", game=game, level=level, current=current[k],
+                rows.append(dict(attempt=f"{run_dir}|{game}", game=game, level=level, final=level == N_LEVELS[game],
+                                 current=current[k],
                                  added=ends[k] - starts[k], up=int(up), trimmed=bool(trimmed[k])))
                 if up:
                     level = solve_turn[k] + 1
@@ -252,6 +263,15 @@ def current_context_trend(d):
                                                        cov_kwds={"groups": pd.factorize(d.attempt)[0]})
     lo, hi = np.exp(fit.conf_int().loc["x"])
     return np.exp(fit.params.x), lo, hi, fit.pvalues.x, len(d), int(d.up.sum())
+
+
+def current_context_curvature(d):
+    """p-value of a quadratic term: an interior optimum needs it negative."""
+    d = d[d.added > 0].assign(x=lambda t: t.current / WINDOW - 8.5)
+    fit = smf.glm("up ~ x + I(x ** 2) + C(game) + C(level)", d, family=sm.families.Poisson(),
+                  offset=np.log(d.added / WINDOW)).fit(cov_type="cluster",
+                                                       cov_kwds={"groups": pd.factorize(d.attempt)[0]})
+    return fit.pvalues["I(x ** 2)"]
 
 
 def hazard(d, upto=400_000):
@@ -292,9 +312,11 @@ def main():
         x = (t.lo + WINDOW / 2) / 1000 + shift
         ax.errorbar(x, t.rate, yerr=[t.rate - ci[:, 0], ci[:, 1] - t.rate], fmt="o-", color=COLORS[level],
                     markersize=4, linewidth=1.2, elinewidth=0.8, label=f"level {level}")
-    ax.axvline(BUDGET / 1000, color=MUTED, linestyle="--", linewidth=1)
-    ax.text(BUDGET / 1000, 0.98, f" context budget {BUDGET / 1000:.0f}k: level 1 trimming starts", color=INK, fontsize=8,
-            va="top", transform=ax.get_xaxis_transform())
+    if GAME_SET != "first10":  # the first 10 games finish their levels long before 118k
+        ax.axvline(BUDGET / 1000, color=MUTED, linestyle="--", linewidth=1)
+        ax.text(BUDGET / 1000, 0.98, f" context budget {BUDGET / 1000:.0f}k: level 1 trimming starts", color=INK,
+                fontsize=8, va="top", transform=ax.get_xaxis_transform())
+    ax.set_ylim(bottom=0)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.grid(axis="y", color="#e6e5e1", linewidth=0.8)
@@ -303,7 +325,7 @@ def main():
     ax.set_xlabel("untrimmed context since the level started (k tokens; level 1: since game start)", color=INK, fontsize=9)
     ax.set_ylabel("solved in the next 10k\n(given unsolved so far)", color=INK, fontsize=9)
     ax.legend(frameon=False, fontsize=9, loc="upper right")
-    ax.set_title(f"Later 15 games: solve rate vs untrimmed context on the level (windows with >= {MIN_AT_RISK} attempts at risk)",
+    ax.set_title(f"{SET_LABEL}: solve rate vs untrimmed context on the level (windows with >= {MIN_AT_RISK} attempts at risk)",
                  color=INK, fontsize=11, loc="left")
     fig.tight_layout()
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
@@ -312,7 +334,8 @@ def main():
         t = hazard(df[df.level == level])
         t = t[t.at_risk >= MIN_AT_RISK]
         print(f"level {level}: " + " ".join(f"{lo // 1000}k:{r:.2f}({n})" for lo, r, n in zip(t.lo, t.rate, t.at_risk)))
-    plot_current(coef)
+    if GAME_SET != "first10":
+        plot_current(coef)
 
 
 def plot_current(coef):
@@ -320,21 +343,27 @@ def plot_current(coef):
     game's first trim so x is the sawtooth rather than time on the level."""
     sim = turns(coef)
     real = turns(coef, real=True)
-    fig, ax = plt.subplots(figsize=(10, 4.6))
-    for level, shift in ((2, -1.5), (3, 1.5)):
-        d = sim[(sim.level == level) & sim.trimmed]
+    series = [("level 1", lambda d: d.level == 1, COLORS[1], -2.4), ("level 2", lambda d: d.level == 2, COLORS[2], -0.8),
+              ("level 3", lambda d: d.level == 3, COLORS[3], 0.8), ("final level", lambda d: d.final, COLORS["final"], 2.4)]
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    for label, pick, color, shift in series:
+        d = sim[pick(sim) & sim.trimmed]
         t = rate_by_current(d)
         t = t[t.exposure >= 20]
         x = (t.lo + WINDOW / 2) / 1000 + shift
-        ax.errorbar(x, t.rate, yerr=[t.rate - t.ci_lo, t.ci_hi - t.rate], fmt="o-", color=COLORS[level],
-                    markersize=4, linewidth=1.2, elinewidth=0.8, label=f"level {level}")
-        print(f"level {level} by current context: " + " ".join(
+        ax.errorbar(x, t.rate, yerr=[t.rate - t.ci_lo, t.ci_hi - t.rate], fmt="o-", color=color,
+                    markersize=4, linewidth=1.2, elinewidth=0.8, label=label)
+        print(f"{label} by current context: " + " ".join(
             f"{a // 1000}k:{r:.3f}({e}/{x_:.0f})" for a, r, e, x_ in zip(t.lo, t.rate, t.events, t.exposure)))
-    for name, d in (("simulated, 30 runs", sim), ("real prompt_tokens, request-log runs", real)):
-        d = d[d.level.isin([2, 3]) & d.trimmed]
-        rr, lo, hi, p, n, k = current_context_trend(d)
-        print(f"levels 2-3 after first trim, {name}: rate ratio per +10k current context {rr:.3f} "
-              f"(95% CI {lo:.3f}-{hi:.3f}, p={p:.2g}); turns {n}, level-ups {k}")
+        for name, src in (("simulated", sim), ("real", real)):
+            dd = src[pick(src) & src.trimmed]
+            if dd.up.sum() < 10:
+                print(f"  {label}, {name}: {int(dd.up.sum())} level-ups, too few")
+                continue
+            rr, lo, hi, p, n, k = current_context_trend(dd)
+            q = current_context_curvature(dd)
+            print(f"  {label}, {name}: rate ratio per +10k {rr:.3f} (95% CI {lo:.3f}-{hi:.3f}, p={p:.2g}); "
+                  f"quadratic term p={q:.2g}; turns {n}, level-ups {k}")
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.grid(axis="y", color="#e6e5e1", linewidth=0.8)
@@ -345,7 +374,7 @@ def plot_current(coef):
     ax.set_ylabel("level-ups per 10k\nof added context", color=INK, fontsize=9)
     ax.set_ylim(bottom=0)
     ax.legend(frameon=False, fontsize=9, loc="upper right")
-    ax.set_title("Later 15 games: levels 2-3 vs current context (windows with >= 20 x 10k added)",
+    ax.set_title(f"{SET_LABEL}: level-up rate vs current context (windows with >= 20 x 10k added)",
                  color=INK, fontsize=11, loc="left")
     fig.tight_layout()
     fig.savefig(OUT_CURRENT, dpi=150, facecolor="#fcfcfb")

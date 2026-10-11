@@ -10,47 +10,63 @@ The level-1 dip: of attempts unsolved at 90k, 55/112 (49%) solved before 118k; o
 
 Before trimming, level 1 gets easier as context grows. From 30k to 118k, within the same game, the odds of solving in the next 10k rise 1.24x per +10k of untrimmed context (95% CI 1.12-1.36, p = 2e-5, errors clustered by attempt). Pooled across games the trend is flat (0.99, CI 0.92-1.08), because the mix shifts toward hard games as context grows. Together with the dip after the line, this points to retained context helping on level 1. A direct test would be an A/B run with a larger context budget on the hard games, or with the first trim delayed.
 
-## Levels 2-3 vs current context
+## Level-up rate vs current context
 
-The figure above cannot show trimming for levels 2 and 3, because each attempt starts at a different point of the context sawtooth. This one uses the current (trimmed) context instead, which cycles between about 58k and 118k, and keeps only turns after the game's first trim.
+The figure above cannot show trimming for levels after 1, because each attempt starts at a different point of the context sawtooth. This one uses the current (trimmed) context instead, which cycles between about 58k and 118k, and keeps only turns after the game's first trim. It shows levels 1-3 and each game's final level.
 
-![Levels 2-3 vs current context](images/solve-rate-vs-current-context.png)
+![Level-up rate vs current context](images/solve-rate-vs-current-context.png)
 
-**No trend with current context.**
-- Level 2 stays at about 0.06-0.08 level-ups per 10k of added context across 50-110k, with the two highest windows slightly lower (0.060, 0.051).
+**No optimal range within 50-118k for levels 1-3.** Within game and level, per +10k of current context (Poisson, the quadratic term tests for a peak):
+
+| Series | Rate ratio per +10k | 95% CI | Peak (quadratic) p | Level-ups |
+|---|---:|---:|---:|---:|
+| Level 1 | 0.96 | 0.76-1.22 | 0.51 | 24 |
+| Level 2 | 0.96 | 0.88-1.05 | 0.51 | 167 |
+| Level 3 | 0.98 | 0.91-1.06 | 0.27 | 199 |
+| Final level | 1.09 | 0.89-1.34 | 0.074 | 26 |
+
+- Level 2 stays at 0.05-0.08 per 10k across the range, slightly lower above 100k.
 - Level 3 moves between 0.06 and 0.12 with no direction.
-- Within game and level, the rate changes by a factor of 0.97 per +10k of current context (95% CI 0.92-1.03, p = 0.33; 10,899 turns, 384 level-ups).
-- On the runs that log real prompt sizes, the factor is 1.13 (CI 0.97-1.30, p = 0.11; 1,690 turns, 73 level-ups).
+- Level 1 has few attempts left after the first trim (24 level-ups), so its intervals are wide.
+- The final level is the only curve with a hump: 0.04-0.08 at 50-70k, 0.09-0.13 at 75-90k, 0.05-0.06 above 100k. The peak test is p = 0.074 on 26 level-ups, so it is a hint, not a finding.
+- On real prompt sizes (request-log runs), level 3 rises 1.26x per +10k (CI 1.02-1.55, p = 0.034, 34 level-ups) and level 2 is 1.05x (CI 0.79-1.41). Levels 1 and final have too few level-ups there.
 
-The current context is simulated for most runs, so it is noisy. That noise pulls any real trend toward flat. On real prompt sizes the hint is toward more context helping, the same direction as level 1, but it is not significant.
+The current context is simulated for most runs, so it is noisy, and that noise pulls any real trend toward flat.
 
 How it is measured:
 - **x:** the current context at the start of each turn. Only the request-log runs record it, so for the 30 runs it is simulated from the untrimmed estimate: it grows with each turn, and once it passes 118k it drops to 58k. Those values were fitted against server `prompt_tokens`: median error 3k tokens, but correlation only 0.60 inside the 50-118k band, because each trim lands a little differently and the phase drifts.
 - **y:** level-ups per 10k of context added while in that window. The bars are exact Poisson 95% intervals.
-- **Test:** a Poisson model with game and level fixed effects, offset by added context, errors clustered by game run.
+- **Test:** a Poisson model with game and level fixed effects, offset by added context, errors clustered by game run; a second fit adds a quadratic term.
 
 ## Does keeping the last level-up in context help?
 
 For levels 2 and 3, each turn is marked by whether the turn that completed the previous level is still in the trimmed context. After a trim, the context keeps roughly the newest (current - base) tokens, so the level-up is kept if the untrimmed context added since it fits in that.
 
-At the same tokens since the level-up, some attempts have already lost it to a trim and others have not, depending on where in the sawtooth the level began. The comparison uses only 20k bands where both cases occur, with game and level fixed effects, offset by added context, errors clustered by game run.
+At the same tokens since the level-up, some attempts have already lost it to a trim and others have not, depending on where in the sawtooth the level began. The columns cover 40-100k since the level-up, where both cases occur. The adjusted ratios compare within the same 20k band, game and level, offset by added context, errors clustered by game run.
 
 ![Last level-up kept vs trimmed away](images/levelup-in-context.png)
 
-| Data | Level-up rate, kept vs trimmed away | 95% CI | p | Level-ups |
+| Level | Kept vs trimmed away (adjusted) | 95% CI | p | Level-ups |
 |---|---:|---:|---:|---:|
-| Simulated trimming, 30 runs | 1.07 | 0.78-1.45 | 0.68 | 300 |
-| Real prompt sizes, request-log runs | 0.50 | 0.19-1.30 | 0.16 | 58 |
+| Level 2 | 0.93 | 0.56-1.54 | 0.77 | 132 |
+| Level 3 | 1.53 | 0.91-2.58 | 0.11 | 101 |
+| Levels 2-3 | 1.11 | 0.80-1.55 | 0.54 | 233 |
 
-Combined over 40-100k, the raw rates are 0.109 per 10k with the level-up kept (175 level-ups) vs 0.099 trimmed away (67), about 1.10x before adjusting for band.
+**No significant effect.** Level 2 shows no difference. Level 3 leans toward keeping the level-up helping, at 1.53x, but the interval includes 1. On the request-log runs with real prompt sizes, levels 2-3 come out at 0.48x (CI 0.15-1.53, 46 level-ups), the other way. Simulated trims mislabel some turns, which pulls the estimate toward 1. An A/B run of `context.retain_last_level_up` (PR #31) would settle it. Script: [`scripts/levelup_in_context.py`](scripts/levelup_in_context.py).
 
-**No detectable effect.** The larger simulated sample centres on no difference, the small real-data sample leans the other way, and the bands disagree in direction (simulated, per 10k added: 60-80k kept 0.116 vs trimmed 0.088; 80-100k kept 0.070 vs trimmed 0.105). Simulated trims mislabel some turns, which pulls the estimate toward 1. An A/B run of `context.retain_last_level_up` (PR #31) would settle it. Script: [`scripts/levelup_in_context.py`](scripts/levelup_in_context.py).
+## First 10 games
+
+The same figure for the 10 easier games (20 Daniel-harness runs that include them, 194 game runs):
+
+![First 10 games: solve rate vs untrimmed context](images/solve-rate-vs-context-first10.png)
+
+These games rarely meet trimming. Levels 1-3 are solved in 192/194, 191/192 and 188/191 attempts, at a median of 20-27k tokens into the level, far below the 118k budget. The solve rate peaks at 40-47% per 10k by 20-45k, against 15-25% for level 1 of the later 15. So any context effect is a later-15 question.
 
 ## Data
 
 - **Games:** the later 15 public games (bp35 cd82 cn04 dc22 g50t ka59 lf52 ls20 m0r0 s5i5 sk48 sp80 su15 tn36 wa30). The 10-game runs used the other 10.
 - **Runs:** every run in `ARC3-Inference/runs/kaggle` on Daniel's harness: 118,272-token budget, 3,072-token tool output, no sampled-animation or intermediate-frame images. That is 30 runs and 320 game runs. Short runs and the early-level-recovery arms are included; a run that ends mid-level counts that level as unsolved at that point.
-- **Excluded:** main's harness runs (1,024-token tool output, sampled animations or intermediate frames), the `bp35-lordhansolo` series, and runs with other budgets.
+- **Excluded:** the `context-transition-reminders` and `view-tool` runs (they change context or tools), main's harness runs (1,024-token tool output, sampled animations or intermediate frames), the `bp35-lordhansolo` series, and runs with other budgets.
 - **Sample size:** level 1 has 407 attempts (373 solved), level 2 has 373 (273 solved), level 3 has 273 (215 solved).
 
 ## Method
@@ -75,6 +91,7 @@ From the repo root:
 
 ```bash
 RUNS_DIR=<main checkout>/ARC3-Inference/runs/kaggle python3 docs/harness/scripts/solve_rate_vs_context.py
+RUNS_DIR=<main checkout>/ARC3-Inference/runs/kaggle GAME_SET=first10 python3 docs/harness/scripts/solve_rate_vs_context.py
 ```
 
 [`scripts/solve_rate_vs_context.py`](scripts/solve_rate_vs_context.py) writes both figures and prints the calibration, the run list and the per-window counts.

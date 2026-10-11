@@ -69,32 +69,47 @@ def build(real):
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "images", "levelup-in-context.png")
 
 
-def plot(d, fit_text):
-    bands = [(40, 60), (60, 80), (80, 100), (40, 100)]
-    fig, ax = plt.subplots(figsize=(9, 4.2))
-    ax.axvline(len(bands) - 1.5, color=m.MUTED, linewidth=0.8)
-    for i, (lo, hi) in enumerate(bands):
-        w = d[(d.since >= lo * 1000) & (d.since < hi * 1000)]
-        for kept, color, dx, label in ((1, m.COLORS[1], -0.12, "last level-up kept"), (0, m.COLORS[2], 0.12, "trimmed away")):
-            x = w[w.kept == kept]
+def adjusted(d):
+    """Kept vs trimmed rate ratio within the same 20k band, game and level."""
+    fit = smf.glm("up ~ kept + C(band) + C(game) + C(level)", d, family=sm.families.Poisson(),
+                  offset=np.log(d.added / 1e4)).fit(cov_type="cluster", cov_kwds={"groups": pd.factorize(d.attempt)[0]})
+    lo, hi = np.exp(fit.conf_int().loc["kept"])
+    return np.exp(fit.params.kept), lo, hi, fit.pvalues.kept
+
+
+def plot(d):
+    """Columns per level: level-ups per 10k added context (~ chance of leveling
+    up in the next 10k) with the last level-up kept vs trimmed away, over the
+    40-100k since the level-up where both cases occur."""
+    d = d[(d.since >= 40_000) & (d.since < 100_000)]
+    groups = [("Level 2", d[d.level == 2]), ("Level 3", d[d.level == 3]), ("Levels 2-3", d)]
+    ticks = []
+    fig, ax = plt.subplots(figsize=(8, 4.4))
+    width = 0.36
+    for i, (name, g) in enumerate(groups):
+        for kept, color, dx, label in ((1, m.COLORS[1], -width / 2, "last level-up kept"),
+                                       (0, m.COLORS[2], width / 2, "last level-up trimmed away")):
+            x = g[g.kept == kept]
             exp, k = x.added.sum() / 1e4, int(x.up.sum())
             r = k / exp
             ci = (chi2.ppf(0.025, 2 * k) / 2 / exp if k else 0.0, chi2.ppf(0.975, 2 * k + 2) / 2 / exp)
-            ax.errorbar(i + dx, r, yerr=[[r - ci[0]], [ci[1] - r]], fmt="o", color=color, markersize=7,
-                        linewidth=1.5, label=label if i == 0 else None)
-            ax.text(i + dx + 0.04, r, f"{k}/{exp:.0f}", color=m.INK, fontsize=8, va="center")
-    ax.set_xticks(range(len(bands)), [f"{lo}-{hi}k" for lo, hi in bands[:-1]] + ["combined 40-100k\n(raw, not band-adjusted)"])
-    ax.set_xlim(-0.5, len(bands) - 0.5)
+            ax.bar(i + dx, r, width=width * 0.92, color=color, label=label if i == 0 else None)
+            ax.errorbar(i + dx, r, yerr=[[r - ci[0]], [ci[1] - r]], fmt="none", ecolor=m.INK, elinewidth=1)
+            ax.text(i + dx, ci[1] + 0.004, f"{k} ups", color=m.INK, fontsize=8, ha="center")
+        rr, lo, hi, p = adjusted(g)
+        print(f"{name}, 40-100k: kept vs trimmed {rr:.2f} (95% CI {lo:.2f}-{hi:.2f}, p={p:.2g}); level-ups {int(g.up.sum())}")
+        ticks.append(f"{name}\nkept/trimmed {rr:.2f}x\n95% CI {lo:.2f}-{hi:.2f}, p={p:.2f}")
+    ax.set_xticks(range(len(groups)), ticks)
     ax.set_ylim(bottom=0)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.grid(axis="y", color="#e6e5e1", linewidth=0.8)
     ax.set_axisbelow(True)
     ax.tick_params(colors=m.INK, labelsize=9)
-    ax.set_xlabel("untrimmed context since the level-up (labels: level-ups / 10k added)", color=m.INK, fontsize=9)
-    ax.set_ylabel("level-ups per 10k\nof added context", color=m.INK, fontsize=9)
-    ax.legend(frameon=False, fontsize=9, loc="upper right")
-    ax.set_title(f"Levels 2-3, 30 runs (simulated trimming): {fit_text}", color=m.INK, fontsize=10, loc="left")
+    ax.set_ylabel("level-ups per 10k of added context\n(chance of leveling up in the next 10k)", color=m.INK, fontsize=9)
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
+    ax.set_title("Later 15 games, 30 runs: last level-up kept vs trimmed away (40-100k since the level-up)",
+                 color=m.INK, fontsize=10, loc="left")
     fig.tight_layout()
     fig.savefig(OUT, dpi=150, facecolor="#fcfcfb")
 
@@ -108,11 +123,9 @@ for name, real in (("simulated, 30 runs", False), ("real prompt_tokens, request-
     g["per10k"] = g.ups / g.exp
     print(g.round(3).to_string())
     overlap = d[d.groupby("band").kept.transform("nunique") == 2]
-    fit = smf.glm("up ~ kept + C(band) + C(game) + C(level)", overlap, family=sm.families.Poisson(),
-                  offset=np.log(overlap.added / 1e4)).fit(cov_type="cluster", cov_kwds={"groups": pd.factorize(overlap.attempt)[0]})
-    lo, hi = np.exp(fit.conf_int().loc["kept"])
-    print(f"rate ratio, level-up still in context vs trimmed away (same band of tokens since level-up, game, level): "
-          f"{np.exp(fit.params.kept):.2f} (95% CI {lo:.2f}-{hi:.2f}, p={fit.pvalues.kept:.2g}); "
-          f"overlap turns {len(overlap)}, level-ups {overlap.up.sum()}")
+    for label, sub in (("levels 2-3", overlap), ("level 2", overlap[overlap.level == 2]), ("level 3", overlap[overlap.level == 3])):
+        rr, lo, hi, p = adjusted(sub)
+        print(f"{label}: rate ratio, level-up still in context vs trimmed away (same band, game, level): "
+              f"{rr:.2f} (95% CI {lo:.2f}-{hi:.2f}, p={p:.2g}); turns {len(sub)}, level-ups {sub.up.sum()}")
     if not real:
-        plot(d, f"kept vs trimmed {np.exp(fit.params.kept):.2f}x (95% CI {lo:.2f}-{hi:.2f})")
+        plot(d)
