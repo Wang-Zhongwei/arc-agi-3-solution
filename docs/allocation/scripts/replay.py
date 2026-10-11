@@ -31,6 +31,8 @@ TOKENS_PER_MINUTE = 52_000   # v07: 25 games x 218k generated tokens in ~105 min
 UCB_SCALES = (0.25, 1, 4, 16)  # multiples of UCB_DEFAULT_C
 CONCURRENCY = (1, 2, 3, 5, 7, 10, 14, 20, 25)  # slots K for the concurrency study (25 = every game)
 TOKEN_HALF_LIVES = (46_000, 55_000, 62_000, 70_000, 78_000, 86_000, 93_000, 108_000, 124_000)  # h, token-only C
+ACTION_HALF_LIVES = (29, 58, 72, 86, 93, 115, 173, 345)  # h_a, action-only C
+HALF_WEIGHT_GRID = ((58, 86, 115, 173, 345), (46_000, 62_000, 70_000, 86_000, 108_000))  # (h_a, h) at weight 0.5
 TOKEN_ONLY_SLOTS = (3, 7, 14)
 TOKEN_ONLY_BUDGET = 150_000
 CLOCK = {"spent": 0.0}       # tokens spent so far in the replayed run
@@ -117,6 +119,22 @@ def b0_tokens(h: float):
     def rank(tr: Traj, t: float) -> float:
         L, s, _ = tr.state(t)
         return value(tr, L) * 0.5 ** ((s / h) ** 2)
+    return rank
+
+
+def b0_actions(h: float):
+    """B = 0, no efficiency, action-only falloff (ARC3_PRIORITY_ACTION_WEIGHT=1, ACTION_SCALE=h): v·2^-(a/h)^2."""
+    def rank(tr: Traj, t: float) -> float:
+        L, _, a = tr.state(t)
+        return value(tr, L) * 0.5 ** ((a / h) ** 2)
+    return rank
+
+
+def b0_mixed(w: float, ha: float, h: float):
+    """B = 0, no efficiency, C = w·2^-(a/h_a)^2 + (1 - w)·2^-(s/h)^2 (ARC3_PRIORITY_ACTION_WEIGHT=w)."""
+    def rank(tr: Traj, t: float) -> float:
+        L, s, a = tr.state(t)
+        return value(tr, L) * (w * 0.5 ** ((a / ha) ** 2) + (1 - w) * 0.5 ** ((s / h) ** 2))
     return rank
 
 
@@ -257,6 +275,27 @@ def main() -> None:
     text += "\n".join([
         f"\nToken-only falloff v·2^-(s/h)^2, β = {b // 1000}k: mean score, difference vs v·C at the same K ± SE (runs better)",
         table(["ranking"] + [f"K = {k}, γ = {GRANT // 1000}k" for k in TOKEN_ONLY_SLOTS], rows),
+    ]) + "\n"
+    rows = [rows[0], rows[1 + TOKEN_HALF_LIVES.index(70_000)]]
+    for h in ACTION_HALF_LIVES:
+        sc = {k: [replay(trs, b0_actions(h), b, GRANT, k) for trs in runs.values()] for k in TOKEN_ONLY_SLOTS}
+        rows.append([f"h_a = {h}"] + [f"{st.mean(sc[k]):.1f}, {paired(sc[k], ctrl[k])}" for k in TOKEN_ONLY_SLOTS])
+    text += "\n".join([
+        f"\nAction-only falloff v·2^-(a/h_a)^2, β = {b // 1000}k: mean score, difference vs v·C at the same K ± SE (runs better)",
+        table(["ranking"] + [f"K = {k}, γ = {GRANT // 1000}k" for k in TOKEN_ONLY_SLOTS], rows),
+    ]) + "\n"
+    has, hs = HALF_WEIGHT_GRID
+    rows = []
+    for ha in has:
+        cells = []
+        for h in hs:
+            sc = {k: [replay(trs, b0_mixed(0.5, ha, h), b, GRANT, k) for trs in runs.values()] for k in TOKEN_ONLY_SLOTS}
+            cells.append(" / ".join(f"{st.mean(sc[k]) - st.mean(ctrl[k]):+.2f}" for k in TOKEN_ONLY_SLOTS))
+        rows.append([f"h_a = {ha}"] + cells)
+    text += "\n".join([
+        f"\nWeight 0.5 / 0.5, β = {b // 1000}k, γ = {GRANT // 1000}k: difference vs v·C at K = "
+        + " / ".join(map(str, TOKEN_ONLY_SLOTS)),
+        table([""] + [f"h = {h // 1000}k" for h in hs], rows),
     ]) + "\n"
     (DATA / "results.md").write_text(text)
     print(text)

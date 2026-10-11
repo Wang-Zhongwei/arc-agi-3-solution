@@ -208,6 +208,55 @@ difference vs $v\,C$ (action weight $0.25$, $115$ actions, $62\text{k}$ tokens) 
 - The production `priority_value` (integer index, floored at 1) reproduces the
   float replay to $0.1$ at $h = 62$, $78$ and $93\text{k}$.
 
+**Action-only.** Action weight $1$ (`ARC3_PRIORITY_ACTION_WEIGHT=1`), action
+half-life $h_a$ (`ARC3_PRIORITY_ACTION_SCALE`) swept: $R = v \cdot 2^{-(a/h_a)^2}$.
+Same budget, slots and control:
+
+| Ranking | $K = 3$ | $K = 7$ | $K = 14$ |
+|---|---|---|---|
+| $v\,C$ (control) | 41.6 | 41.3 | 40.3 |
+| token-only, $h = 70\text{k}$ | 41.2, −0.33 ± 0.38 (4/11) | 41.2, −0.10 ± 0.22 (3/11) | 40.3, −0.00 ± 0.18 (5/11) |
+| $h_a = 29$ | 38.7, −2.89 ± 1.06 (1/11) | 39.1, −2.15 ± 0.81 (1/11) | 39.6, −0.71 ± 0.58 (4/11) |
+| $h_a = 58$ | 40.3, −1.27 ± 0.57 (1/11) | 40.6, −0.70 ± 0.38 (2/11) | 40.2, −0.14 ± 0.35 (3/11) |
+| $h_a = 72$ | 40.9, −0.69 ± 0.51 (3/11) | 41.2, −0.12 ± 0.24 (3/11) | 40.5, +0.19 ± 0.29 (5/11) |
+| $h_a = 86$ | 40.9, −0.71 ± 0.61 (1/11) | 41.3, −0.03 ± 0.35 (3/11) | 40.7, +0.33 ± 0.33 (5/11) |
+| $h_a = 93$ | 41.0, −0.60 ± 0.55 (3/11) | 41.3, −0.03 ± 0.44 (2/11) | 40.7, +0.36 ± 0.32 (5/11) |
+| $h_a = 115$ | 40.4, −1.21 ± 0.57 (1/11) | 40.5, −0.76 ± 0.41 (1/11) | 40.2, −0.16 ± 0.29 (4/11) |
+| $h_a = 173$ | 39.5, −2.08 ± 0.65 (0/11) | 39.8, −1.52 ± 0.49 (0/11) | 39.7, −0.67 ± 0.29 (2/11) |
+| $h_a = 345$ | 39.6, −1.97 ± 0.59 (0/11) | 40.0, −1.24 ± 0.39 (0/11) | 39.8, −0.55 ± 0.32 (2/11) |
+
+- The best band is $h_a = 72$–$93$. Against token-only $70\text{k}$ it is
+  $-0.3$ to $-0.4$ at $K = 3$ and $+0.2$ to $+0.4$ at $K = 14$, within one SE
+  both ways (paired SE $0.2$–$0.35$).
+- The band is narrower than the token one: $h_a = 58$ and $115$ already lose
+  about $1$ point at $K = 3$. The integer production index moves it by up to
+  $0.3$, because an action-only $C$ reaches the floor of $1$ sooner.
+
+**Equal weights.** $C = 0.5 \cdot 2^{-(a/h_a)^2} + 0.5 \cdot 2^{-(s/h)^2}$
+(`ARC3_PRIORITY_ACTION_WEIGHT=0.5`). Difference vs $v\,C$ at $K = 3$ / $7$ / $14$:
+
+| | $h = 46\text{k}$ | $h = 62\text{k}$ | $h = 70\text{k}$ | $h = 86\text{k}$ | $h = 108\text{k}$ |
+|---|---|---|---|---|---|
+| $h_a = 58$ | −0.78 / −0.58 / −0.05 | −0.37 / −0.26 / −0.29 | −1.02 / −0.57 / −0.13 | −0.52 / −0.61 / +0.14 | −0.81 / −0.01 / +0.25 |
+| $h_a = 86$ | −0.42 / −0.16 / +0.18 | −0.10 / −0.47 / +0.23 | −0.81 / −0.37 / +0.12 | −0.66 / −0.38 / +0.24 | −0.64 / −0.65 / −0.01 |
+| $h_a = 115$ | −0.15 / −0.05 / +0.28 | −0.97 / −0.15 / +0.14 | −0.80 / −0.68 / +0.22 | −0.94 / −0.99 / −0.02 | −1.40 / −0.89 / −0.20 |
+| $h_a = 173$ | −1.03 / −0.60 / +0.00 | −1.14 / −0.50 / +0.06 | −1.54 / −0.77 / −0.19 | −1.45 / −0.84 / −0.28 | −1.68 / −1.23 / −0.33 |
+| $h_a = 345$ | −1.35 / −0.70 / −0.04 | −1.53 / −0.73 / −0.04 | −1.60 / −1.04 / −0.63 | −1.61 / −0.94 / −0.38 | −1.96 / −1.52 / −0.66 |
+
+- No cell beats the control at $K = 3$. The best, $h_a = 115$, $h = 46\text{k}$
+  ($-0.15$ / $-0.05$ / $+0.28$) and $h_a = 86$, $h = 62\text{k}$
+  ($-0.10$ / $-0.47$ / $+0.23$), tie token-only $70\text{k}$.
+- Neighbouring cells differ by up to $0.8$ (e.g. $h_a = 115$: $-0.15$ at
+  $46\text{k}$, $-0.97$ at $62\text{k}$), more than any setting gains. With
+  $35\text{k}$ grants a small change in $C$ moves which games get the next
+  grant, so a single cell's result is mostly noise.
+- Long action half-lives ($h_a \ge 173$) lose at every $h$.
+
+**Summary.** Near its best half-life, every weighting (actions only, tokens only,
+$0.25$, $0.5$) is within about $0.5$ of the others, and the replay cannot rank
+them. Token-only is chosen because it has one parameter and the widest
+plateau.
+
 ## Yield-UCB
 
 `ARC3_SCHEDULER=ucb` (`ARC3-Inference/inference/agent/scheduling/ucb.py`)
