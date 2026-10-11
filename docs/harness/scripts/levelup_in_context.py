@@ -70,8 +70,9 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "images", "
 
 
 def plot(d, fit_text):
-    bands = [(40, 60), (60, 80), (80, 100)]
-    fig, ax = plt.subplots(figsize=(8, 4.2))
+    bands = [(40, 60), (60, 80), (80, 100), (40, 100)]
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+    ax.axvline(len(bands) - 1.5, color=m.MUTED, linewidth=0.8)
     for i, (lo, hi) in enumerate(bands):
         w = d[(d.since >= lo * 1000) & (d.since < hi * 1000)]
         for kept, color, dx, label in ((1, m.COLORS[1], -0.12, "last level-up kept"), (0, m.COLORS[2], 0.12, "trimmed away")):
@@ -82,7 +83,7 @@ def plot(d, fit_text):
             ax.errorbar(i + dx, r, yerr=[[r - ci[0]], [ci[1] - r]], fmt="o", color=color, markersize=7,
                         linewidth=1.5, label=label if i == 0 else None)
             ax.text(i + dx + 0.04, r, f"{k}/{exp:.0f}", color=m.INK, fontsize=8, va="center")
-    ax.set_xticks(range(len(bands)), [f"{lo}-{hi}k" for lo, hi in bands])
+    ax.set_xticks(range(len(bands)), [f"{lo}-{hi}k" for lo, hi in bands[:-1]] + ["combined 40-100k\n(raw, not band-adjusted)"])
     ax.set_xlim(-0.5, len(bands) - 0.5)
     ax.set_ylim(bottom=0)
     for side in ("top", "right"):

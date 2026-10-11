@@ -42,6 +42,8 @@ At the same tokens since the level-up, some attempts have already lost it to a t
 | Simulated trimming, 30 runs | 1.07 | 0.78-1.45 | 0.68 | 300 |
 | Real prompt sizes, request-log runs | 0.50 | 0.19-1.30 | 0.16 | 58 |
 
+Combined over 40-100k, the raw rates are 0.109 per 10k with the level-up kept (175 level-ups) vs 0.099 trimmed away (67), about 1.10x before adjusting for band.
+
 **No detectable effect.** The larger simulated sample centres on no difference, the small real-data sample leans the other way, and the bands disagree in direction (simulated, per 10k added: 60-80k kept 0.116 vs trimmed 0.088; 80-100k kept 0.070 vs trimmed 0.105). Simulated trims mislabel some turns, which pulls the estimate toward 1. An A/B run of `context.retain_last_level_up` (PR #31) would settle it. Script: [`scripts/levelup_in_context.py`](scripts/levelup_in_context.py).
 
 ## Data
