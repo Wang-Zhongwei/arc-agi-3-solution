@@ -46,3 +46,7 @@ Game slots equal engine sequences, so no game waits inside vLLM.
 
 This run changes three things at once (context band, streams, level-up board) against
 view-tool, so it tests the combination, not any one change.
+
+[Version 1](https://www.kaggle.com/code/jonathanwang2022/context-48-96k) was pushed
+2026-10-11 from commit `9bb7186`; the bundle carries the settings above and its harness
+files match that commit. Status at push: `RUNNING`, not yet evaluated.
