@@ -11,6 +11,10 @@ Run from the repo root:
 import glob, json, os, importlib.util, io, contextlib
 import numpy as np, pandas as pd
 import statsmodels.api as sm, statsmodels.formula.api as smf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.stats import chi2
 
 spec = importlib.util.spec_from_file_location("s", os.path.join(os.path.dirname(os.path.abspath(__file__)), "solve_rate_vs_context.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -62,6 +66,38 @@ def build(real):
     return pd.DataFrame(rows)
 
 
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "images", "levelup-in-context.png")
+
+
+def plot(d, fit_text):
+    bands = [(40, 60), (60, 80), (80, 100)]
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    for i, (lo, hi) in enumerate(bands):
+        w = d[(d.since >= lo * 1000) & (d.since < hi * 1000)]
+        for kept, color, dx, label in ((1, m.COLORS[1], -0.12, "last level-up kept"), (0, m.COLORS[2], 0.12, "trimmed away")):
+            x = w[w.kept == kept]
+            exp, k = x.added.sum() / 1e4, int(x.up.sum())
+            r = k / exp
+            ci = (chi2.ppf(0.025, 2 * k) / 2 / exp if k else 0.0, chi2.ppf(0.975, 2 * k + 2) / 2 / exp)
+            ax.errorbar(i + dx, r, yerr=[[r - ci[0]], [ci[1] - r]], fmt="o", color=color, markersize=7,
+                        linewidth=1.5, label=label if i == 0 else None)
+            ax.text(i + dx + 0.04, r, f"{k}/{exp:.0f}", color=m.INK, fontsize=8, va="center")
+    ax.set_xticks(range(len(bands)), [f"{lo}-{hi}k" for lo, hi in bands])
+    ax.set_xlim(-0.5, len(bands) - 0.5)
+    ax.set_ylim(bottom=0)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.grid(axis="y", color="#e6e5e1", linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.tick_params(colors=m.INK, labelsize=9)
+    ax.set_xlabel("untrimmed context since the level-up (labels: level-ups / 10k added)", color=m.INK, fontsize=9)
+    ax.set_ylabel("level-ups per 10k\nof added context", color=m.INK, fontsize=9)
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+    ax.set_title(f"Levels 2-3, 30 runs (simulated trimming): {fit_text}", color=m.INK, fontsize=10, loc="left")
+    fig.tight_layout()
+    fig.savefig(OUT, dpi=150, facecolor="#fcfcfb")
+
+
 for name, real in (("simulated, 30 runs", False), ("real prompt_tokens, request-log runs", True)):
     d = build(real)
     d = d[d.added > 0]
@@ -77,3 +113,5 @@ for name, real in (("simulated, 30 runs", False), ("real prompt_tokens, request-
     print(f"rate ratio, level-up still in context vs trimmed away (same band of tokens since level-up, game, level): "
           f"{np.exp(fit.params.kept):.2f} (95% CI {lo:.2f}-{hi:.2f}, p={fit.pvalues.kept:.2g}); "
           f"overlap turns {len(overlap)}, level-ups {overlap.up.sum()}")
+    if not real:
+        plot(d, f"kept vs trimmed {np.exp(fit.params.kept):.2f}x (95% CI {lo:.2f}-{hi:.2f})")

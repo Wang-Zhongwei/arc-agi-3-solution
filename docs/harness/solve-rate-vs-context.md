@@ -35,6 +35,8 @@ For levels 2 and 3, each turn is marked by whether the turn that completed the p
 
 At the same tokens since the level-up, some attempts have already lost it to a trim and others have not, depending on where in the sawtooth the level began. The comparison uses only 20k bands where both cases occur, with game and level fixed effects, offset by added context, errors clustered by game run.
 
+![Last level-up kept vs trimmed away](images/levelup-in-context.png)
+
 | Data | Level-up rate, kept vs trimmed away | 95% CI | p | Level-ups |
 |---|---:|---:|---:|---:|
 | Simulated trimming, 30 runs | 1.07 | 0.78-1.45 | 0.68 | 300 |
