@@ -17,3 +17,7 @@ The test derives from `configs/priority-one-wave-lorddraft/v1.json`. It enables 
 Destination: `jonathanwang2022/context-transition-reminders`; private source dataset: `jonathanwang2022/context-transition-reminders-src`.
 
 This is a functional test. The smaller context and extra logging mean its score is not a controlled A/B measure of the reminder feature. No performance improvement is claimed.
+
+Kaggle **version 1** was published on 2026-10-10 from commit `0dc3b80f4e6ee2242137ee7e341e64e4fd7fa79e` and confirmed `RUNNING`. Packaged feature files match that commit; setup exports both reminder flags as `true` and the context as `65536`. [Notebook](https://www.kaggle.com/code/jonathanwang2022/context-transition-reminders). No evaluated result is available at publication.
+
+A persistent completion monitor checks exact version `v1` every minute and retrieves output, logs, source provenance, and evaluation when it finishes. Its status is saved with the Drive-backed run in `runs/kaggle/jonathanwang2022/context-transition-reminders/v01/followup_status.json`; terminal failures also trigger artifact retrieval.
