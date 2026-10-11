@@ -99,6 +99,8 @@ CONFIG_FIELDS = {
     "MULTIMODAL_INTERMEDIATE_FRAMES": "multimodal.intermediate_frames",
     "MULTIMODAL_INTERMEDIATE_UPSCALE": "multimodal.intermediate_upscale",
     "MULTIMODAL_ANIMATION_UPSCALE": "multimodal.animation_upscale",
+    "ARC3_RETAIN_LAST_LEVEL_UP": "context.retain_last_level_up",
+    "ARC3_RETAIN_LAST_GAME_OVER": "context.retain_last_game_over",
 }
 # kaggle-duck sets the request timeout through the solver (--analyzer-timeout).
 _NOT_HANDED_TO_KAGGLE = frozenset({"LOCAL_ANALYZER_TIMEOUT"})
