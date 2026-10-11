@@ -10,6 +10,25 @@ The level-1 dip: of attempts unsolved at 90k, 55/112 (49%) solved before 118k; o
 
 Before trimming, level 1 gets easier as context grows. From 30k to 118k, within the same game, the odds of solving in the next 10k rise 1.24x per +10k of untrimmed context (95% CI 1.12-1.36, p = 2e-5, errors clustered by attempt). Pooled across games the trend is flat (0.99, CI 0.92-1.08), because the mix shifts toward hard games as context grows. Together with the dip after the line, this points to retained context helping on level 1. A direct test would be an A/B run with a larger context budget on the hard games, or with the first trim delayed.
 
+## Levels 2-3 vs current context
+
+The figure above cannot show trimming for levels 2 and 3, because each attempt starts at a different point of the context sawtooth. This one uses the current (trimmed) context instead, which cycles between about 58k and 118k, and keeps only turns after the game's first trim.
+
+![Levels 2-3 vs current context](images/solve-rate-vs-current-context.png)
+
+**No trend with current context.**
+- Level 2 stays at about 0.06-0.08 level-ups per 10k of added context across 50-110k, with the two highest windows slightly lower (0.060, 0.051).
+- Level 3 moves between 0.06 and 0.12 with no direction.
+- Within game and level, the rate changes by a factor of 0.97 per +10k of current context (95% CI 0.92-1.03, p = 0.33; 10,899 turns, 384 level-ups).
+- On the runs that log real prompt sizes, the factor is 1.13 (CI 0.97-1.30, p = 0.11; 1,690 turns, 73 level-ups).
+
+The current context is simulated for most runs, so it is noisy. That noise pulls any real trend toward flat. On real prompt sizes the hint is toward more context helping, the same direction as level 1, but it is not significant.
+
+How it is measured:
+- **x:** the current context at the start of each turn. Only the request-log runs record it, so for the 30 runs it is simulated from the untrimmed estimate: it grows with each turn, and once it passes 118k it drops to 58k. Those values were fitted against server `prompt_tokens`: median error 3k tokens, but correlation only 0.60 inside the 50-118k band, because each trim lands a little differently and the phase drifts.
+- **y:** level-ups per 10k of context added while in that window. The bars are exact Poisson 95% intervals.
+- **Test:** a Poisson model with game and level fixed effects, offset by added context, errors clustered by game run.
+
 ## Data
 
 - **Games:** the later 15 public games (bp35 cd82 cn04 dc22 g50t ka59 lf52 ls20 m0r0 s5i5 sk48 sp80 su15 tn36 wa30). The 10-game runs used the other 10.
@@ -41,4 +60,4 @@ From the repo root:
 RUNS_DIR=<main checkout>/ARC3-Inference/runs/kaggle python3 docs/harness/scripts/solve_rate_vs_context.py
 ```
 
-[`scripts/solve_rate_vs_context.py`](scripts/solve_rate_vs_context.py) writes the figure and prints the calibration, the run list and the per-window counts.
+[`scripts/solve_rate_vs_context.py`](scripts/solve_rate_vs_context.py) writes both figures and prints the calibration, the run list and the per-window counts.
