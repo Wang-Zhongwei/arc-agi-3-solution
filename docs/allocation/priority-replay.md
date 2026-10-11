@@ -364,17 +364,17 @@ $0.08$ corresponds to about $8.8$ active games, at a cost in throughput. So
 14 concurrent streams with 1 wave ($K/G = 14/110 \approx 0.13$) looks like the
 best choice; 4 waves gives $14/28 = 0.5$, near the control.
 
-Keep the current $C$ ($w = 0.25$, $h_a = 115$, $h = 62\text{k}$). The
-three-parameter grid at $K = 15$, $G = 110$ finds nothing better outside
-noise (best $+0.19 \pm 0.34$), and the selected settings do not hold up on
-held-out runs. Tokens only is the simpler alternative at about $-0.2$; if
-used, set $h = 100\text{k}$ ($-0.18 \pm 0.13$) rather than $70\text{k}$
-($-0.32 \pm 0.25$).
+For $C$, use $w = 0.5$, $h_a = 86$, $h = 46\text{k}$, the best cell of the
+three-parameter grid at $K = 15$, $G = 110$: $+0.17$ over the default
+$C$ ($w = 0.25$, $h_a = 115$, $h = 62\text{k}$), $+0.19 \pm 0.34$ by
+jackknife. The gain is within noise and grid selection did not hold up on
+held-out runs, so expect a tie rather than a gain. Single-term $C$ costs
+about $0.2$ (tokens only $70\text{k}$: $-0.32 \pm 0.25$).
 
 Settings: unset `ARC3_PRIORITY_TAIL_LOOKUP`, `ARC3_PRIORITY_TAIL_CAP=0`,
-`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$), keep the default
-falloff (`ARC3_PRIORITY_ACTION_WEIGHT=0.25`, `ARC3_PRIORITY_ACTION_SCALE=115`,
-`ARC3_PRIORITY_TOKEN_SCALE=62000`), keep
+`ARC3_PRIORITY_HUMAN_ACTIONS=1e9` (makes $e \approx 1$),
+`ARC3_PRIORITY_ACTION_WEIGHT=0.5`, `ARC3_PRIORITY_ACTION_SCALE=86`,
+`ARC3_PRIORITY_TOKEN_SCALE=46000`, keep
 `ARC3_PRIORITY_SCORE_NORMALIZATION=1` (gives $A \propto v$),
 `ARC3_MAX_ACTIVE_STREAMS=14`, and `kaggle.private_waves: 1`.
 
