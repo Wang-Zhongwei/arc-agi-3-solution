@@ -328,3 +328,47 @@ def test_agent_cache_follows_the_levelup_flag(monkeypatch, tmp_path):
     assert without is not with_snippets
     assert "LEVEL 1 CLEARED" not in tool_agent._message_display_text(without)
     assert "LEVEL 1 CLEARED" in tool_agent._message_display_text(with_snippets)
+
+
+# --- snippets without the recent chain (BATCHES=0, LEVELUP_FRAMES>0) --------------
+
+
+def test_snippets_only_close_with_a_gap_to_the_window():
+    assert _three(0, 2) == "\n".join([
+        "... step 1 ...",
+        "Level 1. Board after step 1:",
+        "<image 1:1>",
+        "→ step 2: RIGHT",
+        "Board after step 2:",
+        "<image 2:2>",
+        "→ steps 3–4: UP×2 · LEVEL 1 CLEARED",
+        "Board as level 1 was solved (shown during step 4, not in history):",
+        "<image 4:14>",
+        "Level 2. Board after step 4, the level 2 start:",
+        "<image 4:12>",
+        "→ step 5: LEFT",
+        "Board after step 5:",
+        "<image 5:5>",
+        "→ steps 6–7: LEFT, DOWN · LEVEL 2 CLEARED",
+        "Board as level 2 was solved (shown during step 7, not in history):",
+        "<image 7:15>",
+        "Level 3 starts after step 7.",
+        "... steps 8–10 ...",
+        "The conversation below continues after step 10.",
+    ])
+
+
+def test_no_trace_with_both_parts_off_or_no_level_up_yet():
+    assert ct.build_trace_message(_three_levels(), _THREE_BATCHES, _THREE_SOLVED, 10, 0, _image) is None
+    assert ct.build_trace_message(_three_levels(), _THREE_BATCHES, _THREE_SOLVED, 3, 0, _image, levelup_frames=2) is None
+
+
+def test_agent_runs_the_trace_on_the_levelup_flag_alone(monkeypatch, tmp_path):
+    agent = _agent(monkeypatch, tmp_path, batches="0")
+    monkeypatch.setenv("ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES", "2")
+    history = _turn(agent, 9, "opener")
+    assert history[0][ct.STEP_KEY] == 9
+    trace = agent._compressed_trace_messages(history)[0]
+    text = tool_agent._message_display_text(trace)
+    assert "LEVEL 1 CLEARED" in text
+    assert text.endswith("... steps 4–9 ...\nThe conversation below continues after step 9.")

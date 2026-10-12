@@ -38,8 +38,14 @@ def compressed_trace_batches() -> int:
 
 def compressed_trace_levelup_frames() -> int:
     """ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES: boards kept before each level-up older
-    than the recent batches; 0 (default) keeps none. Needs the trace on."""
+    than the recent batches; 0 (default) keeps none. Independent of the batch
+    count: with ARC3_COMPRESSED_TRACE_BATCHES=0 the trace holds only snippets."""
     return _env_count("ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES")
+
+
+def compressed_trace_enabled() -> bool:
+    """The trace is on when either part of it is: recent batches or level-up snippets."""
+    return compressed_trace_batches() > 0 or compressed_trace_levelup_frames() > 0
 
 
 @dataclass(frozen=True)
@@ -152,15 +158,22 @@ def render_trace(
     parts: list[list[Batch]],
     solved_boards: dict[int, Any],
     image_part: Callable[[Frame], dict[str, Any] | None],
+    *,
+    last_step: int | None = None,
+    ends_with_recent: bool = True,
 ) -> list[dict[str, Any]]:
     """Message content for the trace: text and image parts, board → actions → board.
 
-    `parts` are chronological runs of batches: level-up snippets, then the
-    recent chain last. Steps between parts, and before the first, are named by a
-    "... steps a–b ..." line. The recent chain's last batch ends where the
-    retained conversation starts, so its result is the first board of that
-    conversation and is not repeated here.
+    `parts` are chronological runs of batches: level-up snippets, then, when
+    `ends_with_recent`, the recent chain last. Steps between parts, and before
+    the first, are named by a "... steps a–b ..." line. The recent chain's last
+    batch ends where the retained conversation starts, so its result is the
+    first board of that conversation and is not repeated here. Without a recent
+    chain the trace closes with a gap line up to `last_step`, where the
+    conversation picks up.
     """
+    if last_step is None:
+        last_step = parts[-1][-1].end
     content: list[dict[str, Any]] = []
 
     def text(line: str) -> None:
@@ -183,13 +196,16 @@ def render_trace(
             text(f"... step {first} ..." if first == last else f"... steps {first}–{last} ...")
 
     batches = [b for part in parts for b in part]
-    recent = parts[-1]
+    # the recent chain's last batch shows no board after it
+    unboarded = parts[-1][-1] if ends_with_recent else None
     shows_solved = any(
         _result(entries[b.end]).get("level_completed") and solved_boards.get(b.end) is not None
-        for b in batches if b is not recent[-1]
+        for b in batches if b is not unboarded
     )
-    has_gap = parts[0][0].start > 1 or any(
-        later[0].start > earlier[-1].end + 1 for earlier, later in zip(parts, parts[1:])
+    has_gap = (
+        parts[0][0].start > 1
+        or any(later[0].start > earlier[-1].end + 1 for earlier, later in zip(parts, parts[1:]))
+        or (not ends_with_recent and parts[-1][-1].end < last_step)
     )
     text(
         "Earlier play, compressed: the boards and the actions between them, oldest first. "
@@ -207,7 +223,7 @@ def render_trace(
     level_starts: dict[int, Frame] = {}
     previous_end = 0
     for part_index, part in enumerate(parts):
-        is_recent = part_index == len(parts) - 1
+        is_recent = ends_with_recent and part_index == len(parts) - 1
         first = part[0].start - 1
         before = entries[first].frame
         if contiguous(part_index):
@@ -274,6 +290,9 @@ def render_trace(
             else:
                 board(f"Board after step {batch.end}:", after)
         previous_end = part[-1].end
+    if not ends_with_recent:
+        gap(previous_end + 1, last_step)
+        text(f"The conversation below continues after step {last_step}.")
     return content
 
 
@@ -289,20 +308,29 @@ def build_trace_message(
     """The trace message for play up to `last_step`, or None when there is none.
 
     The last `max_batches` batches form the recent chain; with `levelup_frames`
-    each earlier level-up adds a snippet of that many batches before it.
+    each earlier level-up adds a snippet of that many batches before it. Either
+    can be 0: with no recent chain every level-up up to `last_step` gets a
+    snippet, and with neither there is no trace.
 
     Returns None as well when `history` does not satisfy the indexing the trace
     quotes to the model (`history[n].frame.step == n`), rather than quote steps
     that point at the wrong board.
     """
-    if max_batches <= 0 or last_step <= 0 or len(entries) <= last_step:
+    if (max_batches <= 0 and levelup_frames <= 0) or last_step <= 0 or len(entries) <= last_step:
         return None
     if any(entries[n].frame is None or entries[n].frame.step != n for n in range(last_step + 1)):
         return None
     batches = segment_batches(entries, recorded, last_step)
     if not batches:
         return None
-    first_recent = max(0, len(batches) - max_batches)
-    parts = [*levelup_snippets(batches, entries, first_recent, levelup_frames), batches[first_recent:]]
-    content = render_trace(entries, parts, solved_boards, image_part)
+    first_recent = max(0, len(batches) - max_batches) if max_batches > 0 else len(batches)
+    recent = batches[first_recent:]
+    parts = levelup_snippets(batches, entries, first_recent, levelup_frames)
+    if recent:
+        parts.append(recent)
+    if not parts:
+        return None
+    content = render_trace(
+        entries, parts, solved_boards, image_part, last_step=last_step, ends_with_recent=bool(recent),
+    )
     return {"role": "user", "content": content, TRACE_MESSAGE_KEY: last_step}

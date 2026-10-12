@@ -158,8 +158,20 @@ Executed actions: RIGHT, RIGHT, UP.
 Implemented 2026-10-12. Besides the last *N* batches, the trace can keep how
 each earlier level was won: the last *k* boards before its level-up, the winning actions, and the
 solved board. A second flag sets *k*: `ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES`
-(0 = off, the default; the proposal is 2). It works only with
-`ARC3_COMPRESSED_TRACE_BATCHES` > 0.
+(0 = off, the default; the proposal is 2).
+
+The two flags are independent; the trace is on when either is above 0:
+
+| `…_BATCHES` | `…_LEVELUP_FRAMES` | Trace |
+|---|---|---|
+| 0 | 0 | off |
+| N | 0 | recent chain only |
+| N | k | snippets for level-ups older than the chain, then the chain |
+| 0 | k | snippets for every level-up so far, no recent chain |
+
+Without a recent chain the trace ends with a gap line up to where the window
+starts and "The conversation below continues after step s." A game with no
+level-up yet has no trace in that mode.
 
 - **What a snippet holds:** the level's last *k* action batches, each preceded
   by the board it started from, then `LEVEL k CLEARED` and the solved board.
@@ -226,6 +238,15 @@ The board after step 170 is the first board in the conversation below.
 
 [user]   ← first retained turn of the window, unchanged
 …
+```
+
+With `ARC3_COMPRESSED_TRACE_BATCHES=0` the same game would end after the level 2
+snippet:
+
+```text
+Level 3 starts after step 92.
+... steps 93–170 ...
+The conversation below continues after step 170.
 ```
 
 Here levels 1 and 2 were won before the recent chain, so each gets a snippet;

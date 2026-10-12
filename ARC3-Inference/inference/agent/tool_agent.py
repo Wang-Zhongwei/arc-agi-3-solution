@@ -40,6 +40,7 @@ from inference.agent.compressed_trace import (
     Batch as _TraceBatch,
     build_trace_message,
     compressed_trace_batches,
+    compressed_trace_enabled,
     compressed_trace_levelup_frames,
 )
 from inference.utils.retained_functions import function_signature
@@ -1259,7 +1260,7 @@ def _strip_control_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _strip_trace_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop the compressed-trace tags only, so the token estimate does not count
-    them; they exist only with ARC3_COMPRESSED_TRACE_BATCHES set."""
+    them; they exist only while the trace is on (either trace flag set)."""
     return [
         {k: v for k, v in m.items() if k not in _TRACE_KEYS}
         if any(key in m for key in _TRACE_KEYS) else m
@@ -4797,7 +4798,8 @@ class ToolAgent:
             self._pending_animation_image_label = label
 
     def _reset_trace_state(self) -> None:
-        """Per-game bookkeeping for the compressed trace (ARC3_COMPRESSED_TRACE_BATCHES)."""
+        """Per-game bookkeeping for the compressed trace (ARC3_COMPRESSED_TRACE_BATCHES,
+        ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES)."""
         self._trace_batches: list[_TraceBatch] = []
         # the solved board of each level, keyed by its winning step: the engine
         # shows it only inside that action, so it never reaches `history`
@@ -4811,13 +4813,13 @@ class ToolAgent:
         """Record the latest executed step on a message as it enters the
         conversation. Whatever message heads the retained history after a trim,
         its tag says which steps the trace has to cover."""
-        if compressed_trace_batches() > 0:
+        if compressed_trace_enabled():
             message.setdefault(_TRACE_STEP_KEY, int(getattr(self, "_trace_step_now", 0)))
 
     def _record_trace_batch(self, raw_payload: dict[str, Any]) -> None:
         """One `action([...])` call's executed steps. The solver's batch payload
         is a copy of its last executed action's, so `action_num` is the last step."""
-        if compressed_trace_batches() <= 0 or not raw_payload.get("executed"):
+        if not compressed_trace_enabled() or not raw_payload.get("executed"):
             return
         try:
             end = int(raw_payload.get("action_num"))
@@ -4843,9 +4845,9 @@ class ToolAgent:
         when a trim moves that start; between trims every request carries the
         identical message and the prefix cache holds.
         """
-        max_batches = compressed_trace_batches()
-        if max_batches <= 0 or not history:
+        if not compressed_trace_enabled() or not history:
             return []
+        max_batches = compressed_trace_batches()
         last_step = history[0].get(_TRACE_STEP_KEY)
         if not isinstance(last_step, int) or last_step <= 0:
             return []
@@ -6731,7 +6733,7 @@ class ToolAgent:
         messages = _apply_summary_visibility(
             messages, evicted=getattr(self, "_has_evicted", False)
         )
-        if compressed_trace_batches() > 0:
+        if compressed_trace_enabled():
             messages = _strip_trace_keys(messages)
         image_tokens = 0
         if _image_token_estimate_enabled():
