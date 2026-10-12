@@ -34,6 +34,13 @@ from inference.utils.animation import (
     describe_animation,
 )
 from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
+from inference.agent.compressed_trace import (
+    STEP_KEY as _TRACE_STEP_KEY,
+    TRACE_MESSAGE_KEY as _TRACE_MESSAGE_KEY,
+    Batch as _TraceBatch,
+    build_trace_message,
+    compressed_trace_batches,
+)
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
@@ -682,6 +689,8 @@ def _post_with_retries(
 
 
 _CONTROL_MESSAGE_KEY = "_arc3_control"
+_TRACE_KEYS = (_TRACE_MESSAGE_KEY, _TRACE_STEP_KEY)
+_PRIVATE_MESSAGE_KEYS = (_CONTROL_MESSAGE_KEY, *_TRACE_KEYS)
 
 _YIELD_RESUME_PROMPT_WITH_TOOLS = (
     "You yielded control on the turn time budget. Your tool results above are "
@@ -1237,16 +1246,32 @@ def _mark_control_message(message: dict[str, Any], kind: str = "resume") -> dict
 
 
 def _strip_control_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Wire-safe copy: the private tag never leaves the process."""
+    """Wire-safe copy: the private tags never leave the process."""
     cleaned: list[dict[str, Any]] = []
     for message in messages:
-        if _CONTROL_MESSAGE_KEY in message:
-            copy = dict(message)
-            copy.pop(_CONTROL_MESSAGE_KEY, None)
-            cleaned.append(copy)
+        if any(key in message for key in _PRIVATE_MESSAGE_KEYS):
+            cleaned.append({k: v for k, v in message.items() if k not in _PRIVATE_MESSAGE_KEYS})
         else:
             cleaned.append(message)
     return cleaned
+
+
+def _strip_trace_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the compressed-trace tags only, so the token estimate does not count
+    them; they exist only with ARC3_COMPRESSED_TRACE_BATCHES set."""
+    return [
+        {k: v for k, v in m.items() if k not in _TRACE_KEYS}
+        if any(key in m for key in _TRACE_KEYS) else m
+        for m in messages
+    ]
+
+
+def _is_trace_message(message: dict[str, Any]) -> bool:
+    return _TRACE_MESSAGE_KEY in message
+
+
+def _without_trace(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [m for m in messages if not _is_trace_message(m)]
 
 
 def _prune_control_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3673,6 +3698,7 @@ class ToolAgent:
         self._kept_functions: dict[str, str] = {}
         self._last_animation_chain: list[Any] = []
         self._level_end_grid: Any = None
+        self._reset_trace_state()
         self._pending_levelup_image: dict[str, Any] | None = None
         self._last_shown_grid: Any = None
         self._last_action_gameplay_changed: bool | None = None
@@ -3765,6 +3791,7 @@ class ToolAgent:
                 self._kept_functions = {}
                 self._retained_clear_notice = ""
             self._history_messages = []
+            self._reset_trace_state()
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
             self._last_call_reasoning_tokens = None
@@ -4767,6 +4794,89 @@ class ToolAgent:
         if part is not None:
             self._pending_animation_image = part
             self._pending_animation_image_label = label
+
+    def _reset_trace_state(self) -> None:
+        """Per-game bookkeeping for the compressed trace (ARC3_COMPRESSED_TRACE_BATCHES)."""
+        self._trace_batches: list[_TraceBatch] = []
+        # the solved board of each level, keyed by its winning step: the engine
+        # shows it only inside that action, so it never reaches `history`
+        self._trace_solved_boards: dict[int, Any] = {}
+        self._trace_step_now = 0
+        self._trace_state_path: Path | None = None
+        self._trace_cache: tuple[tuple[int, int], dict[str, Any] | None] | None = None
+        self._trace_logged_step: int | None = None
+
+    def _tag_trace_step(self, message: dict[str, Any]) -> None:
+        """Record the latest executed step on a message as it enters the
+        conversation. Whatever message heads the retained history after a trim,
+        its tag says which steps the trace has to cover."""
+        if compressed_trace_batches() > 0:
+            message.setdefault(_TRACE_STEP_KEY, int(getattr(self, "_trace_step_now", 0)))
+
+    def _record_trace_batch(self, raw_payload: dict[str, Any]) -> None:
+        """One `action([...])` call's executed steps. The solver's batch payload
+        is a copy of its last executed action's, so `action_num` is the last step."""
+        if compressed_trace_batches() <= 0 or not raw_payload.get("executed"):
+            return
+        try:
+            end = int(raw_payload.get("action_num"))
+            count = max(1, int(raw_payload.get("executed_count") or 1))
+        except (TypeError, ValueError):
+            return
+        skipped = raw_payload.get("skipped_actions")
+        if not hasattr(self, "_trace_batches"):
+            self._reset_trace_state()
+        self._trace_batches.append(_TraceBatch(
+            start=end - count + 1, end=end,
+            stop_reason=str(raw_payload.get("stop_reason") or ""),
+            skipped=len(skipped) if isinstance(skipped, list) else 0,
+        ))
+        if raw_payload.get("level_end_grid") is not None:
+            self._trace_solved_boards[end] = raw_payload["level_end_grid"]
+        self._trace_step_now = end
+
+    def _compressed_trace_messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The trace for play before `history[0]`, as a one-message list, or [].
+
+        Cached on the step the retained history starts at, so it is rebuilt only
+        when a trim moves that start; between trims every request carries the
+        identical message and the prefix cache holds.
+        """
+        max_batches = compressed_trace_batches()
+        if max_batches <= 0 or not history:
+            return []
+        last_step = history[0].get(_TRACE_STEP_KEY)
+        if not isinstance(last_step, int) or last_step <= 0:
+            return []
+        key = (last_step, max_batches)
+        cache = getattr(self, "_trace_cache", None)
+        if cache is None or cache[0] != key:
+            message = None
+            path = getattr(self, "_trace_state_path", None)
+            if path is not None:
+                try:
+                    _, entries = load_runtime_state(path)
+                    message = build_trace_message(
+                        entries,
+                        list(getattr(self, "_trace_batches", [])),
+                        dict(getattr(self, "_trace_solved_boards", {})),
+                        last_step, max_batches, current_grid_image_part,
+                    )
+                except Exception:
+                    log.warning("compressed trace build failed", exc_info=True)
+            cache = (key, message)
+            self._trace_cache = cache
+        return [cache[1]] if cache[1] is not None else []
+
+    def _log_trace_change(self, append_transcript) -> None:
+        """Write the trace to the transcript once each time it is rebuilt."""
+        cache = getattr(self, "_trace_cache", None)
+        message = cache[1] if cache else None
+        step = message.get(_TRACE_MESSAGE_KEY) if message else None
+        if step is None or step == getattr(self, "_trace_logged_step", None):
+            return
+        self._trace_logged_step = step
+        append_transcript("COMPRESSED TRACE", _message_display_text(message))
 
     def _prepare_levelup_board_image(self) -> None:
         """Attach the board as the previous level was solved, shown before the
@@ -6246,6 +6356,7 @@ class ToolAgent:
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             if raw_payload.get("level_end_grid") is not None:
                 self._level_end_grid = raw_payload["level_end_grid"]
+            self._record_trace_batch(raw_payload)
             if reset_exposed() and raw_payload.get("executed"):
                 # Use actual execution, not submitted batch size: a refused
                 # call does not consume the snippet's first-action allowance.
@@ -6420,6 +6531,7 @@ class ToolAgent:
         tokens and re-sent history are not new context. The summary exchange
         itself bypasses this helper and starts a fresh interval.
         """
+        self._tag_trace_step(message)
         messages.append(message)
         if _summary_interval_tokens() <= 0:
             return
@@ -6475,6 +6587,7 @@ class ToolAgent:
         )
         messages = [
             {"role": "system", "content": self._system_prompt},
+            *self._compressed_trace_messages(history),
             *history,
             request,
         ]
@@ -6571,6 +6684,8 @@ class ToolAgent:
         reply = _mark_control_message(
             {"role": "assistant", "content": text}, _SUMMARY_CONTROL_KIND
         )
+        self._tag_trace_step(request)
+        self._tag_trace_step(reply)
         if _summary_replaces_history():
             # only now, with a usable summary in hand - a failed or rejected one
             # returned above and left history untouched
@@ -6613,6 +6728,8 @@ class ToolAgent:
         messages = _apply_summary_visibility(
             messages, evicted=getattr(self, "_has_evicted", False)
         )
+        if compressed_trace_batches() > 0:
+            messages = _strip_trace_keys(messages)
         image_tokens = 0
         if _image_token_estimate_enabled():
             messages, image_tokens = _split_messages_for_estimate(messages)
@@ -6719,6 +6836,8 @@ class ToolAgent:
         reasons.append(reason)
 
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        # the trace is rebuilt per request, never stored with the history
+        messages = [messages[0], *_without_trace(messages[1:])] if messages else messages
         original_history = messages[1:]
         if _any_control_pruning_enabled():
             messages = _prune_control_messages(messages)
@@ -6728,7 +6847,7 @@ class ToolAgent:
             # retention slot
             messages = _apply_history_image_window(messages, keep_images)
         before_trim = len(messages)
-        trimmed = self._trim_messages_for_context(messages, tools=tools)
+        trimmed = _without_trace(self._trim_messages_for_context(messages, tools=tools))
         if not trimmed:
             if original_history:
                 self._note_history_evicted(f"history_cleared msgs={len(original_history)}")
@@ -6981,7 +7100,11 @@ class ToolAgent:
         if not messages:
             return []
         system_message = messages[0]
-        history = list(messages[1:])
+        history = _without_trace(messages[1:])
+        history_count = len(history)
+        # The trace is pinned after the system prompt: it is never evicted, only
+        # rebuilt below for wherever the retained history now starts.
+        head = [system_message, *self._compressed_trace_messages(history)]
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
         # capped at half the budget: a mis-set knob should cost history depth,
@@ -7027,7 +7150,7 @@ class ToolAgent:
 
         estimate_before: int | None = None
         while history:
-            used = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+            used = self._estimate_request_input_tokens([*head, *history], tools=tools)
             if estimate_before is None:
                 estimate_before = used
             over_budget = used > budget_tokens
@@ -7044,7 +7167,7 @@ class ToolAgent:
                 if not self._drop_oldest_history_block(probe, preserve_recent=preserve_recent):
                     break
                 after = self._estimate_request_input_tokens(
-                    [system_message, *probe], tools=tools
+                    [*head, *probe], tools=tools
                 )
                 if after < target_tokens:
                     break
@@ -7058,19 +7181,32 @@ class ToolAgent:
             if not self._drop_oldest_history_block(history, preserve_recent=preserve_recent):
                 break
         history = self._drop_until_first_user_message(history)
+        head = [system_message, *self._compressed_trace_messages(history)]
+        # The loop priced the trace for where history started; a trim that
+        # moves the start rebuilds it, and the new one can be larger (the first
+        # trim goes from no trace to a full one). Rare, so it pays one rebuild
+        # per extra block rather than one per block above. Without a drop the
+        # head is the one the loop already priced.
+        while (
+            len(history) != history_count and len(head) > 1 and history
+            and self._estimate_request_input_tokens([*head, *history], tools=tools) > budget_tokens
+            and self._drop_oldest_history_block(history, preserve_recent=preserve_recent)
+        ):
+            history = self._drop_until_first_user_message(history)
+            head = [system_message, *self._compressed_trace_messages(history)]
         # A dropped message invalidates the server's prefix for this
         # conversation, so the next request has to be prefilled from the
         # divergence point regardless. That makes it the one moment when
         # yielding the slot to another game costs nothing.
-        if len(history) != len(messages) - 1:
-            after = self._estimate_request_input_tokens([system_message, *history], tools=tools)
+        if len(history) != history_count:
+            after = self._estimate_request_input_tokens([*head, *history], tools=tools)
             self._note_history_evicted(
                 f"{'forced_drain' if force_drain else 'token_budget'}"
-                f" msgs={len(messages) - 1}->{len(history)}"
+                f" msgs={history_count}->{len(history)}"
                 f" est={estimate_before or 0}->{after}"
                 f" budget={budget_tokens} target={target_tokens}"
             )
-        return [system_message, *history]
+        return [*head, *history]
 
     def _force_reduce_messages(
         self,
@@ -7081,11 +7217,12 @@ class ToolAgent:
         if not messages:
             return []
         system_message = messages[0]
-        history = list(messages[1:])
+        history = _without_trace(messages[1:])
+        history_count = len(history)
         if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
             return list(messages)
-        self._note_history_evicted(f"force_reduce msgs={len(messages) - 1}->{len(history)}")
-        return [system_message, *history]
+        self._note_history_evicted(f"force_reduce msgs={history_count}->{len(history)}")
+        return [system_message, *self._compressed_trace_messages(history), *history]
 
     def analyze(
         self,
@@ -7112,6 +7249,9 @@ class ToolAgent:
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
         prompt_log = _resolve_prompt_log_path(state_path)
         current_frame, history_entries = load_runtime_state(state_path)
+        self._trace_state_path = state_path
+        if current_frame is not None:
+            self._trace_step_now = current_frame.step
         user_prompt = self._build_user_prompt(
             action_num,
             valid_actions=valid_actions,
@@ -7228,6 +7368,7 @@ class ToolAgent:
             tools=self._tools(state_path),
             preserve_recent=1,
         )
+        self._log_trace_change(append_transcript)
         step_executed = False
         turn_tool_call_count = 0
         captured_reasoning = ""
@@ -7268,6 +7409,7 @@ class ToolAgent:
                 tools = self._tools(state_path)
                 tool_choice = _request_tool_choice(tools)
                 messages = self._trim_messages_for_context(messages, tools=tools)
+                self._log_trace_change(append_transcript)
                 self._maybe_handover()
                 latest_request_messages = json.loads(json.dumps(messages))
                 latest_request_tools = json.loads(json.dumps(tools))

@@ -246,6 +246,14 @@ The original `LOCAL_ANALYZER_CONTEXT_WINDOW` and `LOCAL_ANALYZER_MAX_OUTPUT` sti
 
 Internal tags distinguish control messages without leaking those tags into requests. Pruning repairs the trailing user-message structure and records that the context has changed, so scheduling/prefix-state bookkeeping remains consistent.
 
+### Compressed play trace
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `ARC3_COMPRESSED_TRACE_BATCHES` | `0`: off | After the first history trim, pins one user message right after the system prompt: the last *N* action batches the window dropped, as board → actions → board, with run-length actions (`LEFT×3`), level-up, game-over and automatic-RESET marks, and the solved board of each cleared level. |
+
+The trace covers play up to the step the retained history starts at, so it never repeats what the window shows, and is rebuilt only when a trim moves that start. Between trims every request carries the identical message, keeping the prefix cache warm. Step n is `history[n]`; the trace is left out if `history` breaks that indexing. A batch is one `action([...])` call, so *N* counts calls, not steps. Each board image costs about 402 tokens at `MULTIMODAL_UPSCALE=10`; 30 batches are about 13k. The trace counts toward the context budget, and a trim that the rebuilt trace would push over budget drops further blocks. Design and template: [`docs/harness/compressed-trace-design.md`](../docs/harness/compressed-trace-design.md).
+
 ## 9. Rolling summaries
 
 Added periodic model-written summaries as a separate memory mechanism from the structured world-model sections.
@@ -619,6 +627,7 @@ All paths below are relative to `ARC3-Inference/`.
 | Area | Main source files |
 |---|---|
 | Prompts, context, summaries, memory, request loop | `inference/agent/prompts.py`, `inference/agent/tool_agent.py` |
+| Compressed play trace | `inference/agent/compressed_trace.py` — new; integration in `tool_agent.py` |
 | Action names and exposure | `inference/agent/action_names.py` |
 | Action execution, guard integration, budgets, resets | `inference/framework/solver.py` |
 | Runtime state and Python interface | `inference/agent/runtime_state.py`, `inference/agent/python_tool_sandbox.py` |
