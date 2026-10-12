@@ -23,13 +23,23 @@ _NO_OP_STOP = "no_op_action"
 _AUTOMATIC_RESET = "automatic_reset"
 
 
-def compressed_trace_batches() -> int:
-    """ARC3_COMPRESSED_TRACE_BATCHES: batches kept in the trace; 0 (default) is off."""
-    raw = os.environ.get("ARC3_COMPRESSED_TRACE_BATCHES", "").strip()
+def _env_count(name: str) -> int:
+    raw = os.environ.get(name, "").strip()
     try:
         return max(0, int(raw)) if raw else 0
     except ValueError:
         return 0
+
+
+def compressed_trace_batches() -> int:
+    """ARC3_COMPRESSED_TRACE_BATCHES: batches kept in the trace; 0 (default) is off."""
+    return _env_count("ARC3_COMPRESSED_TRACE_BATCHES")
+
+
+def compressed_trace_levelup_frames() -> int:
+    """ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES: boards kept before each level-up older
+    than the recent batches; 0 (default) keeps none. Needs the trace on."""
+    return _env_count("ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES")
 
 
 @dataclass(frozen=True)
@@ -115,94 +125,156 @@ def _run_count(run: str) -> int:
     return int(count) if sep and count.isdigit() else 1
 
 
+def levelup_snippets(batches: list[Batch], entries: list[HistoryEntry], first_recent: int, frames: int) -> list[list[Batch]]:
+    """For each level-up won before `batches[first_recent]`, that level's last
+    `frames` batches, oldest first. A level-up inside the recent batches stays
+    there and gets no snippet; a snippet ends at its level-up, so it never
+    overlaps the recent batches."""
+    if frames <= 0:
+        return []
+    snippets = []
+    for index in range(first_recent):
+        if not _result(entries[batches[index].end]).get("level_completed"):
+            continue
+        level = entries[batches[index].start - 1].frame.level
+        first = index
+        while (
+            first > 0 and index - first + 1 < frames
+            and entries[batches[first - 1].start - 1].frame.level == level
+        ):
+            first -= 1
+        snippets.append(batches[first:index + 1])
+    return snippets
+
+
 def render_trace(
     entries: list[HistoryEntry],
-    batches: list[Batch],
+    parts: list[list[Batch]],
     solved_boards: dict[int, Any],
     image_part: Callable[[Frame], dict[str, Any] | None],
 ) -> list[dict[str, Any]]:
     """Message content for the trace: text and image parts, board → actions → board.
 
-    The last batch ends where the retained conversation starts, so its result is
-    the first board of that conversation and is not repeated here.
+    `parts` are chronological runs of batches: level-up snippets, then the
+    recent chain last. Steps between parts, and before the first, are named by a
+    "... steps a–b ..." line. The recent chain's last batch ends where the
+    retained conversation starts, so its result is the first board of that
+    conversation and is not repeated here.
     """
-    parts: list[dict[str, Any]] = []
+    content: list[dict[str, Any]] = []
 
     def text(line: str) -> None:
-        if parts and parts[-1].get("type") == "text":
-            parts[-1]["text"] += "\n" + line
+        if content and content[-1].get("type") == "text":
+            content[-1]["text"] += "\n" + line
         else:
-            parts.append({"type": "text", "text": line})
+            content.append({"type": "text", "text": line})
 
     def board(label: str, frame: Frame) -> bool:
         image = image_part(frame)
         if image is None:
             return False
         text(label)
-        parts.append(image)
+        content.append(image)
         return True
 
+    def gap(first: int, last: int) -> None:
+        """Name skipped steps first..last; nothing when none were skipped."""
+        if first <= last:
+            text(f"... step {first} ..." if first == last else f"... steps {first}–{last} ...")
+
+    batches = [b for part in parts for b in part]
+    recent = parts[-1]
     shows_solved = any(
         _result(entries[b.end]).get("level_completed") and solved_boards.get(b.end) is not None
-        for b in batches[:-1]
+        for b in batches if b is not recent[-1]
+    )
+    has_gap = parts[0][0].start > 1 or any(
+        later[0].start > earlier[-1].end + 1 for earlier, later in zip(parts, parts[1:])
     )
     text(
         "Earlier play, compressed: the boards and the actions between them, oldest first. "
         "Your reasoning and tool output are not shown. Step n is `history[n]`; "
         "`history[0]` is the starting board."
         + (" A solved-level board is the only board here that is not in `history`." if shows_solved else "")
+        + (' A line "... steps a–b ..." marks steps left out.' if has_gap else "")
     )
     text("")
-    first = batches[0].start - 1
-    before = entries[first].frame
-    start_label = "Starting board, step 0" if first == 0 else f"Board after step {first}"
-    if not board(f"Level {before.level}. {start_label}:", before):
-        text(f"Level {before.level}.")
+
+    def contiguous(index: int) -> bool:
+        """Whether parts[index] starts right after parts[index - 1] ends."""
+        return 0 < index < len(parts) and parts[index][0].start == parts[index - 1][-1].end + 1
+
     level_starts: dict[int, Frame] = {}
-    for index, batch in enumerate(batches):
-        level = entries[batch.start - 1].frame.level
-        last = entries[batch.end]
-        result = _result(last)
-        steps = f"step {batch.start}" if batch.start == batch.end else f"steps {batch.start}–{batch.end}"
-        if batch.stop_reason == _AUTOMATIC_RESET:
-            text(f"→ {steps}: RESET (automatic), level {level} restarts")
+    previous_end = 0
+    for part_index, part in enumerate(parts):
+        is_recent = part_index == len(parts) - 1
+        first = part[0].start - 1
+        before = entries[first].frame
+        if contiguous(part_index):
+            # the snippet before ended at this level's start without showing it
+            label = f"Level {before.level}. Board after step {first}, the level {before.level} start:"
+            level_starts[before.level] = before
         else:
-            names = [str(entries[n].action) for n in range(batch.start, batch.end + 1)]
-            line = f"→ {steps}: {_actions_text(names)}"
-            if result.get("run_complete") or result.get("state") == "WIN":
-                line += " · GAME COMPLETE"
-            elif result.get("level_completed"):
-                line += f" · LEVEL {level} CLEARED"
+            gap(previous_end + 1, first)
+            label = f"Level {before.level}. " + (
+                "Starting board, step 0:" if first == 0 else f"Board after step {first}:"
+            )
+        if not board(label, before):
+            text(f"Level {before.level}.")
+        for index, batch in enumerate(part):
+            level = entries[batch.start - 1].frame.level
+            last = entries[batch.end]
+            result = _result(last)
+            steps = f"step {batch.start}" if batch.start == batch.end else f"steps {batch.start}–{batch.end}"
+            if batch.stop_reason == _AUTOMATIC_RESET:
+                text(f"→ {steps}: RESET (automatic), level {level} restarts")
+            else:
+                names = [str(entries[n].action) for n in range(batch.start, batch.end + 1)]
+                line = f"→ {steps}: {_actions_text(names)}"
+                if result.get("run_complete") or result.get("state") == "WIN":
+                    line += " · GAME COMPLETE"
+                elif result.get("level_completed"):
+                    line += f" · LEVEL {level} CLEARED"
+                elif result.get("game_over"):
+                    line += " · GAME OVER"
+                if batch.stop_reason == _NO_OP_STOP:
+                    line += (
+                        f" (stopped: no change, +{batch.skipped} skipped)" if batch.skipped
+                        else " (stopped: no change)"
+                    )
+                text(line)
+            if is_recent and index == len(part) - 1:
+                text(f"The board after step {batch.end} is the first board in the conversation below.")
+                break
+            after = last.frame
+            if result.get("level_completed"):
+                grid = solved_boards.get(batch.end)
+                if grid is None or not board(
+                    f"Board as level {level} was solved (shown during step {batch.end}, not in history):",
+                    Frame(grid=grid, step=batch.end, level=level),
+                ):
+                    text(f"Board as level {level} was solved: unavailable.")
+                if not is_recent and index == len(part) - 1:
+                    # a snippet ends at its level-up; the next part shows the
+                    # next level's boards, opening on its start when contiguous
+                    if not contiguous(part_index + 1):
+                        text(f"Level {after.level} starts after step {batch.end}.")
+                    continue
+                label = f"Level {after.level}. Board after step {batch.end}, the level {after.level} start:"
+                if not board(label, after):
+                    text(f"Level {after.level} starts after step {batch.end}.")
+                level_starts[after.level] = after
             elif result.get("game_over"):
-                line += " · GAME OVER"
-            if batch.stop_reason == _NO_OP_STOP:
-                line += (
-                    f" (stopped: no change, +{batch.skipped} skipped)" if batch.skipped
-                    else " (stopped: no change)"
-                )
-            text(line)
-        if index == len(batches) - 1:
-            text(f"The board after step {batch.end} is the first board in the conversation below.")
-            break
-        after = last.frame
-        if result.get("level_completed"):
-            grid = solved_boards.get(batch.end)
-            if grid is None or not board(
-                f"Board as level {level} was solved (shown during step {batch.end}, not in history):",
-                Frame(grid=grid, step=batch.end, level=level),
+                board(f"Board after step {batch.end}, the game-over board:", after)
+            elif (
+                batch.stop_reason == _AUTOMATIC_RESET and level in level_starts
+                and level_starts[level].grid == after.grid
             ):
-                text(f"Board as level {level} was solved: unavailable.")
-            label = f"Level {after.level}. Board after step {batch.end}, the level {after.level} start:"
-            if not board(label, after):
-                text(f"Level {after.level} starts after step {batch.end}.")
-            level_starts[after.level] = after
-        elif result.get("game_over"):
-            board(f"Board after step {batch.end}, the game-over board:", after)
-        elif batch.stop_reason == _AUTOMATIC_RESET and level in level_starts and level_starts[level].grid == after.grid:
-            text(f"Board after step {batch.end}: same as after step {level_starts[level].step}.")
-        else:
-            board(f"Board after step {batch.end}:", after)
-    return parts
+                text(f"Board after step {batch.end}: same as after step {level_starts[level].step}.")
+            else:
+                board(f"Board after step {batch.end}:", after)
+        previous_end = part[-1].end
+    return content
 
 
 def build_trace_message(
@@ -212,8 +284,12 @@ def build_trace_message(
     last_step: int,
     max_batches: int,
     image_part: Callable[[Frame], dict[str, Any] | None],
+    levelup_frames: int = 0,
 ) -> dict[str, Any] | None:
     """The trace message for play up to `last_step`, or None when there is none.
+
+    The last `max_batches` batches form the recent chain; with `levelup_frames`
+    each earlier level-up adds a snippet of that many batches before it.
 
     Returns None as well when `history` does not satisfy the indexing the trace
     quotes to the model (`history[n].frame.step == n`), rather than quote steps
@@ -223,8 +299,10 @@ def build_trace_message(
         return None
     if any(entries[n].frame is None or entries[n].frame.step != n for n in range(last_step + 1)):
         return None
-    batches = segment_batches(entries, recorded, last_step)[-max_batches:]
+    batches = segment_batches(entries, recorded, last_step)
     if not batches:
         return None
-    content = render_trace(entries, batches, solved_boards, image_part)
+    first_recent = max(0, len(batches) - max_batches)
+    parts = [*levelup_snippets(batches, entries, first_recent, levelup_frames), batches[first_recent:]]
+    content = render_trace(entries, parts, solved_boards, image_part)
     return {"role": "user", "content": content, TRACE_MESSAGE_KEY: last_step}

@@ -225,3 +225,106 @@ def test_disabled_leaves_messages_untouched(monkeypatch, tmp_path):
     agent._record_trace_batch({"executed": True, "action_num": 12, "executed_count": 1})
     assert agent._trace_batches == list(_RECORDED)  # unchanged: nothing recorded when off
     assert agent._trim_messages_for_context([system, *history]) == [system, *history]
+
+
+# --- level-up snippets (ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES) ---------------------
+
+
+def _three_levels():
+    """Level 1 won at step 4, level 2 at step 7; level 3 is being played."""
+    return [
+        _entry(0, 1, value=0),
+        _entry(1, 1, "RIGHT"),
+        _entry(2, 1, "RIGHT"),
+        _entry(3, 1, "UP"),
+        _entry(4, 2, "UP", value=12, level_completed=True),
+        _entry(5, 2, "LEFT"),
+        _entry(6, 2, "LEFT"),
+        _entry(7, 3, "DOWN", value=13, level_completed=True),
+        _entry(8, 3, "RIGHT"),
+        _entry(9, 3, "RIGHT"),
+        _entry(10, 3, "UP"),
+    ]
+
+
+_THREE_BATCHES = [Batch(1, 1), Batch(2, 2), Batch(3, 4), Batch(5, 5), Batch(6, 7), Batch(8, 8), Batch(9, 10)]
+_THREE_SOLVED = {4: _grid(14), 7: _grid(15)}
+
+
+def _three(max_batches, frames):
+    message = ct.build_trace_message(
+        _three_levels(), _THREE_BATCHES, _THREE_SOLVED, 10, max_batches, _image, levelup_frames=frames,
+    )
+    return _render(message["content"]).split("\n", 2)[2]  # drop the header and blank line
+
+
+def test_leading_gap_line_names_the_steps_left_out():
+    message = ct.build_trace_message(_history(), _RECORDED, _SOLVED, 9, 2, _image)
+    text = _render(message["content"])
+    assert text.split("\n")[0].endswith(' A line "... steps a–b ..." marks steps left out.')
+    assert text.split("\n")[2:4] == ["... steps 1–6 ...", "Level 2. Board after step 6:"]
+
+
+def test_snippets_are_prepended_and_contiguous_parts_join():
+    assert _three(2, 2) == "\n".join([
+        "... step 1 ...",
+        "Level 1. Board after step 1:",
+        "<image 1:1>",
+        "→ step 2: RIGHT",
+        "Board after step 2:",
+        "<image 2:2>",
+        "→ steps 3–4: UP×2 · LEVEL 1 CLEARED",
+        "Board as level 1 was solved (shown during step 4, not in history):",
+        "<image 4:14>",
+        "Level 2. Board after step 4, the level 2 start:",
+        "<image 4:12>",
+        "→ step 5: LEFT",
+        "Board after step 5:",
+        "<image 5:5>",
+        "→ steps 6–7: LEFT, DOWN · LEVEL 2 CLEARED",
+        "Board as level 2 was solved (shown during step 7, not in history):",
+        "<image 7:15>",
+        "Level 3. Board after step 7, the level 3 start:",
+        "<image 7:13>",
+        "→ step 8: RIGHT",
+        "Board after step 8:",
+        "<image 8:8>",
+        "→ steps 9–10: RIGHT, UP",
+        "The board after step 10 is the first board in the conversation below.",
+    ])
+
+
+def test_gap_between_a_snippet_and_the_recent_chain():
+    text = _three(1, 2)
+    assert "Level 3 starts after step 7.\n... step 8 ...\nLevel 3. Board after step 8:\n<image 8:8>" in text
+    assert text.endswith("→ steps 9–10: RIGHT, UP\nThe board after step 10 is the first board in the conversation below.")
+
+
+def test_level_up_inside_the_recent_chain_gets_no_snippet():
+    text = _three(4, 2)
+    assert text.count("LEVEL 1 CLEARED") == 1 and text.count("LEVEL 2 CLEARED") == 1
+    assert text.startswith("... step 1 ...\nLevel 1. Board after step 1:")  # the level 1 snippet
+    assert "Level 2. Board after step 4, the level 2 start:" in text  # chain opens on level 2
+
+
+def test_snippet_shorter_than_k_keeps_the_whole_level():
+    text = _three(1, 5)
+    assert text.startswith("Level 1. Starting board, step 0:\n<image 0:0>\n→ step 1: RIGHT")
+
+
+def test_frames_zero_matches_the_plain_trace():
+    plain = ct.build_trace_message(_three_levels(), _THREE_BATCHES, _THREE_SOLVED, 10, 2, _image)
+    zero = ct.build_trace_message(_three_levels(), _THREE_BATCHES, _THREE_SOLVED, 10, 2, _image, levelup_frames=0)
+    assert plain == zero
+    assert _render(plain["content"]).split("\n")[2] == "... steps 1–7 ..."
+
+
+def test_agent_cache_follows_the_levelup_flag(monkeypatch, tmp_path):
+    agent = _agent(monkeypatch, tmp_path, batches="1")
+    history = _turn(agent, 9, "opener")
+    without = agent._compressed_trace_messages(history)[0]
+    monkeypatch.setenv("ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES", "2")
+    with_snippets = agent._compressed_trace_messages(history)[0]
+    assert without is not with_snippets
+    assert "LEVEL 1 CLEARED" not in tool_agent._message_display_text(without)
+    assert "LEVEL 1 CLEARED" in tool_agent._message_display_text(with_snippets)

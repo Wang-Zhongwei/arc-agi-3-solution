@@ -153,6 +153,96 @@ Executed actions: RIGHT, RIGHT, UP.
 … (current board image: the board after step 170) …
 ```
 
+## Level-up snippets (optional)
+
+Implemented 2026-10-12. Besides the last *N* batches, the trace can keep how
+each earlier level was won: the last *k* boards before its level-up, the winning actions, and the
+solved board. A second flag sets *k*: `ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES`
+(0 = off, the default; the proposal is 2). It works only with
+`ARC3_COMPRESSED_TRACE_BATCHES` > 0.
+
+- **What a snippet holds:** the level's last *k* action batches, each preceded
+  by the board it started from, then `LEVEL k CLEARED` and the solved board.
+  With *k* = 2 that is two boards before the level-up plus the solved board.
+  A level won in fewer than *k* batches shows all of them.
+- **Which level-ups:** a level-up whose winning batch is among the recent *N*
+  batches stays where it is in the chain, with no snippet. Every older level-up
+  gets a snippet, prepended before the chain. A snippet's batches all end at or
+  before its level-up, so a prepended snippet never overlaps the chain.
+- **Order:** everything is chronological, oldest first: the prepended snippets
+  in game order, then the recent chain.
+- **Gaps:** wherever steps are left out, a literal line
+  `... steps a–b ...` names the skipped range, so the model knows play
+  continued in between and which `history` indices to look up. No gap line
+  when two parts are contiguous.
+- **Next level:** a snippet ends with a text line, `Level k+1 starts after step
+  w.`, without the start board's image; the next snippet or the recent chain
+  shows that level's boards.
+- **Caching:** the snippets are rebuilt with the rest of the trace, only at a
+  trim, so the prefix stays fixed between trims.
+
+### Example with k = 2
+
+Steps, actions and levels are illustrative. `<image>` is a board image. The
+line `⟨doc: …⟩` marks a cut in this document only; every other line, including
+the `... steps a–b ...` lines, is literal prompt text.
+
+```text
+[user]
+Earlier play, compressed: the boards and the actions between them, oldest
+first. Your reasoning and tool output are not shown. Step n is `history[n]`;
+`history[0]` is the starting board. A solved-level board is the only board
+here that is not in `history`. A line "... steps a–b ..." marks steps left out.
+
+... steps 1–21 ...
+Level 1. Board after step 21:
+<image>
+→ steps 22–24: UP×3
+Board after step 24:
+<image>
+→ steps 25–26: LEFT×2 · LEVEL 1 CLEARED
+Board as level 1 was solved (shown during step 26, not in history):
+<image>
+Level 2 starts after step 26.
+... steps 27–88 ...
+Level 2. Board after step 88:
+<image>
+→ step 89: MOUSE(row=21, col=31)
+Board after step 89:
+<image>
+→ steps 90–92: DOWN×3 · LEVEL 2 CLEARED
+Board as level 2 was solved (shown during step 92, not in history):
+<image>
+Level 3 starts after step 92.
+... steps 93–111 ...
+Level 3. Board after step 111:
+<image>
+→ steps 112–117: RIGHT×4, UP×2
+Board after step 117:
+<image>
+⟨doc: the recent chain continues as in the example above, 30 batches⟩
+→ steps 168–170: RIGHT×2, UP
+The board after step 170 is the first board in the conversation below.
+
+[user]   ← first retained turn of the window, unchanged
+…
+```
+
+Here levels 1 and 2 were won before the recent chain, so each gets a snippet;
+level 3 is still being played. The recent chain starts at step 112, so the gap
+line before it covers steps 93–111. If the recent chain had started at step 93,
+there would be no gap line between the level 2 snippet and the chain.
+
+The first line of the trace is a gap line because play before step 21 is left
+out; when the oldest kept board is the starting board (step 0), there is none.
+The same rule applies without snippets: a trace whose oldest kept board is
+after step 111 opens with `... steps 1–111 ...`. (The first version, run as
+compressed-trace v1, had no leading gap line.)
+
+On `level-up-board` v1 ls20 at step 297 with *N* = 30 and *k* = 2, the trace
+held three snippets (level-ups at steps 28, 126 and 203) and the recent chain
+from step 268: 36 images, about 15k tokens.
+
 ## Size
 
 | Part | Tokens | Count |
@@ -160,6 +250,7 @@ Executed actions: RIGHT, RIGHT, UP.
 | Board image at upscale 10 (`_IMAGE_TOKENS_FALLBACK`) | 402 | one per batch: the starting board, then the board after every batch but the last; +1 per level-up, −1 per restart identical to the level start |
 | Action line and image label, e.g. `→ steps 135–141: MOUSE(row=9, col=40), MOUSE(row=9, col=44), DOWN×5` | about 30–50 | one per batch |
 | **30 batches** | **about 13k** | |
+| Level-up snippet at k = 2 (two boards before, solved board) | about 1.3k | per earlier level-up; at most about 12k for a 10-level game |
 | Board as ASCII text instead (median of 5,655 frames, Qwen3.8 tokenizer) | 1,617 | four times an image, so not used |
 
 The server limits only video per prompt (`--limit-mm-per-prompt
@@ -209,3 +300,7 @@ Implementation notes:
 Flag: `ARC3_COMPRESSED_TRACE_BATCHES` (0 = off, default 0). Choices 2–4 are
 implemented as: earlier levels kept, no special keep for the last level-up,
 trim point unchanged.
+
+Second flag: `ARC3_COMPRESSED_TRACE_LEVELUP_FRAMES` (0 = off, default 0):
+boards kept before each earlier level-up, see
+[Level-up snippets](#level-up-snippets-optional).

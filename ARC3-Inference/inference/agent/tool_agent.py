@@ -40,6 +40,7 @@ from inference.agent.compressed_trace import (
     Batch as _TraceBatch,
     build_trace_message,
     compressed_trace_batches,
+    compressed_trace_levelup_frames,
 )
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
@@ -4803,7 +4804,7 @@ class ToolAgent:
         self._trace_solved_boards: dict[int, Any] = {}
         self._trace_step_now = 0
         self._trace_state_path: Path | None = None
-        self._trace_cache: tuple[tuple[int, int], dict[str, Any] | None] | None = None
+        self._trace_cache: tuple[tuple[int, int, int], dict[str, Any] | None] | None = None
         self._trace_logged_step: int | None = None
 
     def _tag_trace_step(self, message: dict[str, Any]) -> None:
@@ -4848,7 +4849,8 @@ class ToolAgent:
         last_step = history[0].get(_TRACE_STEP_KEY)
         if not isinstance(last_step, int) or last_step <= 0:
             return []
-        key = (last_step, max_batches)
+        levelup_frames = compressed_trace_levelup_frames()
+        key = (last_step, max_batches, levelup_frames)
         cache = getattr(self, "_trace_cache", None)
         if cache is None or cache[0] != key:
             message = None
@@ -4861,6 +4863,7 @@ class ToolAgent:
                         list(getattr(self, "_trace_batches", [])),
                         dict(getattr(self, "_trace_solved_boards", {})),
                         last_step, max_batches, current_grid_image_part,
+                        levelup_frames=levelup_frames,
                     )
                 except Exception:
                     log.warning("compressed trace build failed", exc_info=True)
