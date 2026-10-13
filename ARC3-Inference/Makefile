@@ -378,6 +378,8 @@ VIEW_RUNS_DIR ?= $(RUNS_DIR)
 # Discover local and downloaded Kaggle runs unless a run is explicitly selected.
 VIEW_RUN_DIR ?=
 VIEW_ENVIRONMENTS_DIR ?=
+# List only runs from the last N days; VIEW_DAYS=0 lists every run.
+VIEW_DAYS ?= 10
 
 export LOCAL_ANALYZER_BASE_URL
 export LOCAL_ANALYZER_PROVIDER
@@ -744,6 +746,7 @@ view:
 		--host "$(VIEW_HOST)" \
 		--port "$(VIEW_PORT)" \
 		--runs-dir "$(VIEW_RUNS_DIR)" \
+		--days "$(VIEW_DAYS)" \
 		$(if $(VIEW_RUN_DIR),--run-dir "$(VIEW_RUN_DIR)") \
 		$(if $(VIEW_ENVIRONMENTS_DIR),--environments-dir "$(VIEW_ENVIRONMENTS_DIR)")
 

@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from inference.tools.score_registry import load_score_registry
 from inference.utils.run_artifacts import is_selectable_run_dir_name, run_dir_sort_key
+from viewer import data as viewer_data
 from viewer.data import _artifact_metadata, _run_key, _viewer_data_paths, list_run_dirs
 from viewer.data import load_game_payload, load_game_shell_payload, load_game_step_payload, load_run_summary
 from viewer.thumbnails import game_thumbnail_png
@@ -734,7 +735,14 @@ def main() -> None:
         default=None,
         help="Offline ARC env files used for game thumbnails (default: configs/inference.json environment.environments_dir).",
     )
+    parser.add_argument(
+        "--days",
+        type=float,
+        default=10,
+        help="List only runs started in the last N days (0 lists every run).",
+    )
     args = parser.parse_args()
+    viewer_data.MAX_RUN_AGE_DAYS = args.days or None
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 

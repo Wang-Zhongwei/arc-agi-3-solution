@@ -5,6 +5,7 @@ import ast
 import json
 import re
 from collections import defaultdict
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -145,6 +146,51 @@ def find_latest_run_dir(base_dir: str | Path = "runs") -> Path | None:
     return candidates[-1] if candidates else None
 
 
+# Runs older than this many days are left out of the run lists (None: keep all).
+# Set by the server's --days option; an explicitly requested run still opens.
+MAX_RUN_AGE_DAYS: float | None = None
+_STARTED_LINE_RE = re.compile(r"^started:\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", re.M)
+_RUN_STARTED_CACHE: dict[tuple[str, int], datetime] = {}
+
+
+def run_started_at(path: Path) -> datetime:
+    """When a run started: its timestamped name, else the start the run itself
+    recorded (summary.txt, benchmark.json, deploy_meta.json), else its mtime."""
+    match = re.match(r"(\d{8}_\d{6})", path.name)
+    if match:
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S")
+    key = (str(path), path.stat().st_mtime_ns)
+    cached = _RUN_STARTED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    started = None
+    try:
+        found = _STARTED_LINE_RE.search((path / "summary.txt").read_text(errors="replace"))
+        started = found.group(1) if found else None
+    except OSError:
+        pass
+    for name, field in (("benchmark.json", "start_time"), ("deploy_meta.json", "started_at")):
+        if started:
+            break
+        try:
+            started = json.loads((path / name).read_text()).get(field)
+        except (OSError, ValueError, AttributeError):
+            pass
+    try:
+        result = datetime.fromisoformat(str(started).replace(" ", "T")[:19]) if started else None
+    except ValueError:
+        result = None
+    result = result or datetime.fromtimestamp(path.stat().st_mtime)
+    _RUN_STARTED_CACHE[key] = result
+    return result
+
+
+def _is_recent_run_dir(path: Path) -> bool:
+    if not MAX_RUN_AGE_DAYS:
+        return True
+    return run_started_at(path) >= datetime.now() - timedelta(days=MAX_RUN_AGE_DAYS)
+
+
 def list_run_dirs(base_dir: str | Path = "runs") -> list[Path]:
     """Return displayable Qwen 3.8-era run directories, newest first."""
     runs_dir = Path(base_dir)
@@ -154,7 +200,10 @@ def list_run_dirs(base_dir: str | Path = "runs") -> list[Path]:
     if direct_run_dir is not None:
         return [direct_run_dir]
     return sorted(
-        [path for path in iter_run_dirs(runs_dir) if _is_auto_selectable_run_dir(path)],
+        [
+            path for path in iter_run_dirs(runs_dir)
+            if _is_auto_selectable_run_dir(path) and _is_recent_run_dir(path)
+        ],
         key=run_dir_sort_key,
         reverse=True,
     )
