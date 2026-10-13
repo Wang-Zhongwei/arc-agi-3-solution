@@ -69,6 +69,7 @@ from inference.agent.prompts import (
     ACTION_INFO_ADDENDUM,
     UNDO_INFO_ADDENDUM,
     RESET_INFO_ADDENDUM,
+    GAME_PRIORS_ADDENDUM,
 )
 
 from inference.agent.vision_context import (
@@ -2918,6 +2919,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     )
     if _level_transfer_guidance_enabled():
         prompt = apply_level_transfer_system_guidance(prompt)
+    if _get_env_bool("ARC3_GAME_PRIORS", False):
+        # last section, after the tool rules: object and action priors to probe
+        # first (from duck-harness 6420079, which sirikilohit's 22.53 entry ran)
+        prompt += GAME_PRIORS_ADDENDUM
     return prompt
 
 

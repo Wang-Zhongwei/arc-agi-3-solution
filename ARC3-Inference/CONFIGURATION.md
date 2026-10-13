@@ -52,6 +52,7 @@ The descriptions clarify that action semantics depend on the game. MOUSE uses in
 | `ARC3_PREFER_TOOL_CALLS` | Off | Adds guidance about using Python inspection/computation rather than spending excessive deliberation without testing. |
 | `ARC3_DEDUPE_MULTICALL_LINE` | Off | Removes duplicated prompt wording about multiple action calls. This is text deduplication, not deduplication of tool execution. |
 | `ARC3_SYSTEM_PROMPT_PREFIX` | Empty | Prepends a custom system-prompt prefix for experiments. |
+| `ARC3_GAME_PRIORS` | Off | Appends a "Priors and probing" section at the end of the system prompt: every level is solvable from its starting layout, likely action and object roles to probe first, and when to stop probing. |
 
 With level-transfer guidance enabled, the old advice about re-grounding after a score increase is replaced: the model is explicitly informed of level transitions rather than being asked to infer them from score. Transition/terminal behavior is explained alongside the corresponding runtime information.
 
