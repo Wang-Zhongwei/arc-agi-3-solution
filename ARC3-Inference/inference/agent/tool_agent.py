@@ -5024,10 +5024,20 @@ class ToolAgent:
             image_part,
         ]
         if levelup_part is not None:
+            # the solved board sits right after the actions that produced it,
+            # before the line announcing the new level and its current board
+            split = -1
+            for marker in (LEVEL_START_USER_PROMPT.split(".", 1)[0], "You have progressed to a new level!"):
+                split = user_prompt.find(marker)
+                if split >= 0:
+                    break
+            if split < 0:
+                split = len(user_prompt)
+            before, after = user_prompt[:split].rstrip(), user_prompt[split:].strip()
             content = [
-                {"type": "text", "text": f"{user_prompt}\n\nLast level-complete image:"},
+                {"type": "text", "text": f"{before}\n\nLast level-complete image:" if before else "Last level-complete image:"},
                 levelup_part,
-                {"type": "text", "text": "Current grid image:"},
+                {"type": "text", "text": f"{after}\n\nCurrent grid image:" if after else "Current grid image:"},
                 image_part,
             ]
         if diff_part is not None:

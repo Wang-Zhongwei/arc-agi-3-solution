@@ -79,9 +79,11 @@ def test_levelup_opener_shows_solved_board_before_current(monkeypatch, tmp_path,
     assert _color(images[-1]) == vision.ARC_COLOR_MAP[4]
     if enabled:
         assert len(images) == 2
-        assert parts[0]["text"].endswith("\n\nLast level-complete image:")
+        assert parts[0]["text"].endswith("Last level-complete image:")
+        assert "You have progressed to a new level!" not in parts[0]["text"]
         assert _color(parts[1]) == vision.ARC_COLOR_MAP[3]
-        assert parts[2]["text"] == "Current grid image:"
+        assert parts[2]["text"].startswith("You have progressed to a new level!")
+        assert parts[2]["text"].endswith("\n\nCurrent grid image:")
     else:
         assert len(images) == 1
         assert "Last level-complete image:" not in parts[0]["text"]
