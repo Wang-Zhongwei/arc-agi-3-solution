@@ -396,15 +396,21 @@ def _level_number(game: taaf.game.Game) -> int:
 
 def _engine_action_names(game: taaf.game.Game) -> list[str]:
     names: list[str] = []
+    has_reset = False
     for action_id in game.current_state.available_actions:
         try:
             name = arcengine.GameAction.from_id(int(action_id)).name
         except Exception:
             continue
-        if name == "RESET" and not reset_exposed():
+        if name == "RESET":
+            has_reset = True
             continue
         if name not in names:
             names.append(name)
+    # taaf prepends RESET; list it after the game's controls so it reads as
+    # a last resort rather than the default option
+    if has_reset and reset_exposed():
+        names.append("RESET")
     return names
 
 
