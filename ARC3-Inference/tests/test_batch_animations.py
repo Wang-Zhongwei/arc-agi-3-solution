@@ -95,7 +95,7 @@ def _entry(position, action, transient=12, gameplay_changed=True):
 def test_one_animated_action_is_named_by_position():
     line = describe_animations([_entry(2, "MOUSE(row=58, col=25)")], executed_count=5)
     assert line.startswith("Action 2 of 5 (`MOUSE(row=58, col=25)`) animated over 2 frames.")
-    assert "`last_call_animations` shows them." in line
+    assert "`last_call_animations[-1]` shows them." in line
 
 
 def test_the_final_action_keeps_the_original_wording():
@@ -109,15 +109,15 @@ def test_earlier_animations_get_one_clause_and_the_last_the_full_sentence():
         item["frames"] = frames
     line = describe_animations(entries, executed_count=8)
     assert line == (
-        "Actions 2, 3 animated over 3, 5 frames. Action 5 of 8 (`C`) animated over 5 frames. "
-        "1 cell changed and changed back in row 3, cols 0-7. `last_call_animations` shows them."
+        "Actions 2, 3 animated over 3, 5 frames (`last_call_animations[:-1]`). Action 5 of 8 (`C`) animated over 5 frames. "
+        "1 cell changed and changed back in row 3, cols 0-7. `last_call_animations[-1]` shows them."
     )
 
 
 def test_one_earlier_animation_and_the_final_action():
     line = describe_animations([_entry(1, "A"), _entry(2, "B")], executed_count=2)
-    assert line.startswith("Action 1 animated over 2 frames. The last executed action (`B`) animated over 2 frames.")
-    assert line.endswith("`last_call_animations` shows them.")
+    assert line.startswith("Action 1 animated over 2 frames (`last_call_animations[:-1]`). The last executed action (`B`) animated over 2 frames.")
+    assert line.endswith("`last_call_animations[-1]` shows them.")
 
 
 def test_opener_names_the_animated_middle_action(monkeypatch, tmp_path):
@@ -275,3 +275,15 @@ def test_sandbox_exposes_every_animation_of_the_call():
         animation_handler=host,
     )
     assert out.get("result") == [[2, "UP", 2, False, 2], [4, "LEFT", 3, False, 3], ["frames", "timeline"]], out
+
+
+def test_records_store_boards_as_bytes_and_read_back_identically(session):
+    from inference.utils.animation import build_animation_frames, build_animation_view, pack_board
+
+    _run(session, arcengine.GameAction.ACTION1)
+    record = session.animation_records[-1]
+    assert all(isinstance(board, bytes) and len(board) == 64 for board in record["chain"])
+    grids = {**record, "chain": [BOARD, FLASH, BOARD]}
+    assert build_animation_frames(record) == build_animation_frames(grids)
+    assert build_animation_view(record) == build_animation_view(grids)
+    assert pack_board(FLASH)[3 * 8:4 * 8] == bytes([5] * 8)

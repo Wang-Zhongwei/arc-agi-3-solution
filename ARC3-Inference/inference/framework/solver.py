@@ -28,6 +28,7 @@ from taaf.solver import Solver
 from inference.utils.animation import (
     collapse_frames,
     normalize_frames,
+    pack_board,
     plain_motion,
     summarize_animation,
 )
@@ -131,8 +132,6 @@ NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4
 # something to where it ended up (utils.animation.plain_motion) as no animation;
 # "off" keeps every animation. Level-ups and deaths always keep theirs.
 ANIMATION_FILTER = os.environ.get("ARC3_ANIMATION_FILTER", "off").strip().lower()
-# Boards kept across one call's animations (about 36 KB each as tuples).
-ANIMATION_MAX_BOARDS = 300
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
 # The patch-110 rewordings, behind one switch. They replaced "changed nothing"
@@ -1375,19 +1374,13 @@ class _HarnessGameSession:
                 self.animation_records.append({
                     "position": batch_index,
                     "action_display": action_display,
-                    "chain": chain,
+                    # bytes, 4 KB a board: a call keeps every animation it made
+                    "chain": [pack_board(grid) for grid in chain],
+                    "width": len(chain[0][0]) if chain and chain[0] else 0,
                     "summary": animation_summary,
                     "step": self.action_count,
                     "level": _level_number(self.game),
                 })
-                # a long batch of animated moves must not pile up boards; the
-                # newest animations are the ones the opener describes in full
-                while (
-                    len(self.animation_records) > 1
-                    and sum(len(item["chain"]) for item in self.animation_records)
-                    > ANIMATION_MAX_BOARDS
-                ):
-                    self.animation_records.pop(0)
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )

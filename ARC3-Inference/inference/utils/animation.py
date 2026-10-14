@@ -242,7 +242,7 @@ def describe_animation(
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
-    where_to_look = "`last_call_animations`"
+    where_to_look = "`last_call_animations[-1]`"
 
     if game_over:
         # Follows the BAR RULE block, which has just walked the model through
@@ -302,7 +302,10 @@ def describe_animations(
     noun = "Action" if len(earlier) == 1 else "Actions"
     positions = ", ".join(str(item.get("position")) for item in earlier)
     frames = ", ".join(str(item.get("frames")) for item in earlier)
-    return f"{noun} {positions} animated over {frames} frames. {final}"
+    return (
+        f"{noun} {positions} animated over {frames} frames "
+        f"(`last_call_animations[:-1]`). {final}"
+    )
 
 
 def _color_char(value: int | None) -> str:
@@ -358,6 +361,24 @@ def _format_changes(
     return lines
 
 
+def pack_board(grid: Grid) -> bytes:
+    """One byte per cell, row-major: about 4 KB for a 64x64 board where the
+    tuple-of-tuples form takes 35 KB. Boards are rectangular."""
+    return bytes(cell for row in grid for cell in row)
+
+
+def _record_chain(record: dict[str, Any]) -> list[Grid]:
+    """The record's boards as grids, unpacking pack_board() bytes if stored so."""
+    chain = list(record.get("chain") or ())
+    if chain and isinstance(chain[0], bytes):
+        width = int(record.get("width") or 0)
+        chain = [
+            tuple(tuple(board[start:start + width]) for start in range(0, len(board), width))
+            for board in chain
+        ]
+    return chain
+
+
 def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Every distinct state the action passed through, as FrameView payloads.
 
@@ -371,7 +392,7 @@ def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]
     """
     if not record:
         return []
-    chain = list(record.get("chain") or ())
+    chain = _record_chain(record)
     if len(chain) <= 2:
         return []
     step = record.get("step") or 0
@@ -403,7 +424,7 @@ def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
     }
     if not record:
         return empty
-    chain: list[Grid] = list(record.get("chain") or ())
+    chain: list[Grid] = _record_chain(record)
     if len(chain) <= 2:
         return empty
 
