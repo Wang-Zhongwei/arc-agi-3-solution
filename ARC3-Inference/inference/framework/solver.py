@@ -527,7 +527,7 @@ class _HarnessGameSession:
     # engine can be told what that step cost, and so cannot answer "how much
     # has this game spent". This one is captured once and never moved.
     game_token_baseline: int = 0
-    # Every animated action of the latest call, in order (call_animations in the
+    # Every animated action of the latest call, in order (last_call_animations in the
     # sandbox). Not a history across calls: the model reads it in the turn that
     # follows, and older animations are almost never what it is asking about.
     animation_records: list[dict[str, Any]] = field(default_factory=list)

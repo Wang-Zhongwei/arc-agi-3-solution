@@ -242,7 +242,7 @@ def describe_animation(
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
-    where_to_look = "`call_animations`"
+    where_to_look = "`last_call_animations`"
 
     if game_over:
         # Follows the BAR RULE block, which has just walked the model through
@@ -279,7 +279,7 @@ def describe_animations(
     `gameplay_changed` and the summary keys. The last entry gets the full
     sentence; earlier ones get a single clause in front of it, since a long
     batch of moves can animate on most of its actions. All of them are in
-    `call_animations`. "" when no entry has transient cells.
+    `last_call_animations`. "" when no entry has transient cells.
     """
     entries = [item for item in animated if int(item.get("transient_pixels") or 0) > 0]
     if not entries:

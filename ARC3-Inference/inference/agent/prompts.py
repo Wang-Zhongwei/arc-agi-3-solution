@@ -171,32 +171,24 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 )
 
 ANIMATION_ADDENDUM_TIMELINE = (
-    "- Each entry's `timeline` is a diff timeline of its frames: it shows which cells "
-    "changed at each step. It is a dict with `action`, `frames` and `steps`, one "
-    "entry per step that changed anything. Each entry has `step`, `changed`, `bbox`, "
-    "and either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` "
-    "(a count per colour change, when there were too many cells to list).\n"
+    "- Each entry also has `timeline`, the cells that changed at each step: a dict with "
+    "`steps`, each step giving `step`, `changed`, `bbox`, and either `changes` "
+    "(`old>new @ (row,col) ...`) or `transitions` (counts per colour change).\n"
 )
 
 ANIMATION_FILTER_ADDENDUM = (
-    "- An action whose animation only shows objects one step along their path to where "
-    "they end up (a single in-between frame) counts as not animated: it is not announced "
-    "and not in `call_animations`.\n"
+    "- An animation with a single in-between frame that only slides objects to where "
+    "they end up is not counted as an animation.\n"
 )
 
 ANIMATION_ADDENDUM = (
-    "- One action can return a short animation. `current_frame` is its final frame.\n"
-    "- `call_animations` lists every action of the latest model-issued call that "
-    "animated, in order. Each entry is a dict with `position` (1-based, among the "
-    "call's executed actions), `action`, and `frames`: views with `.ascii`, `.shape` "
-    "and `.segmentation`, the same as `current_frame`. `frames[0]` is the first frame "
-    "of the animation and `frames[-1]` the board it settled on. Transient cells "
-    "changed and then changed BACK during an animation, so they appear in no frame "
-    "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
-    "in `history`. After a death the last entry is the FATAL action, not the "
-    "automatic reset that followed it. Crop `.ascii` yourself; printing a whole 64x64 "
-    "frame will not fit the tool budget. Empty when nothing animated, and reading it "
-    "costs no in-game action.\n"
+    "- An action can play a short animation; `current_frame` is its final frame. Cells "
+    "that change and change back during it appear in no other frame or history entry.\n"
+    "- `last_call_animations` lists, in order, the actions of your latest `action(...)` "
+    "call that animated. Each entry has `position` (1-based among the call's executed "
+    "actions), `action`, and `frames`: views like `current_frame`, ending with the board "
+    "the action settled on. After a death the last entry is the fatal action. Crop "
+    "`.ascii` before printing; reading it costs no action.\n"
 )
 
 MULTIMODAL_CONTEXT_ADDENDUM = (

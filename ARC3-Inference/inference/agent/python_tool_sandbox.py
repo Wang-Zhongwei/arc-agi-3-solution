@@ -630,7 +630,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         if initial.get("animation_enabled"):
             # A global rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
-            # reset and not the action that animated. call_animations is every
+            # reset and not the action that animated. last_call_animations is every
             # animated action of the latest call, in order, so the fatal action
             # stays its last entry. Empty when no action of that call animated.
             class _LazyAnimation:
@@ -671,8 +671,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 def __repr__(self):
                     return repr(self._get())
 
-            runtime_globals["call_animations"] = _LazyAnimation("calls", [])
-            _animation_views.append(runtime_globals["call_animations"])
+            runtime_globals["last_call_animations"] = _LazyAnimation("calls", [])
+            _animation_views.append(runtime_globals["last_call_animations"])
 
         _refresh_state(initial.get("state") or {})
 

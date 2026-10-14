@@ -136,7 +136,7 @@ def test_sampled_animation_caps_and_spreads_frames():
 def test_animation_samples_can_show_a_return_to_the_pre_action_board():
     chain = [frame(0, v).grid for v in [0, 1, 0, 2, 3]]
     parts = vision.animation_sampled_parts(chain)
-    assert [label for label, _ in parts] == [f"call_animations[-1]['frames'][{i}]:" for i in range(3)]
+    assert [label for label, _ in parts] == [f"last_call_animations[-1]['frames'][{i}]:" for i in range(3)]
     assert [image(part).getpixel((0, 0)) for _, part in parts] == [
         vision.ARC_COLOR_MAP[v] for v in [1, 0, 2]
     ]
@@ -159,7 +159,7 @@ def test_sampled_captions_index_the_exposed_animation_frames(values):
     exposed = build_animation_frames(record)
     timeline = build_animation_view(record)
     for label, part in vision.animation_sampled_parts(chain):
-        index = int(re.fullmatch(r"call_animations\[-1\]\['frames'\]\[(\d+)\]:", label).group(1))
+        index = int(re.fullmatch(r"last_call_animations\[-1\]\['frames'\]\[(\d+)\]:", label).group(1))
         expected = frame(27, exposed[index]['grid'][0][0], level=2)
         expected_image = vision.frame_to_png_data_url(expected, upscale=2)
         assert part['image_url']['url'] == expected_image
@@ -551,7 +551,7 @@ def test_chronological_order_across_animation_modes(monkeypatch, tmp_path, event
         assert any(part['type'] == 'image_url' for part in parts[animation + 1:outcome])
         for label in labels[animation + 1:outcome]:
             if label:
-                assert label.startswith(("call_animations[-1]['frames'][", 'Animation image', 'Fatal action animation image'))
+                assert label.startswith(("last_call_animations[-1]['frames'][", 'Animation image', 'Fatal action animation image'))
     else:
         assert outcome == animation + 1
     if event == 'death':

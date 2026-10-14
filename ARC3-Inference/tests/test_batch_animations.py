@@ -95,7 +95,7 @@ def _entry(position, action, transient=12, gameplay_changed=True):
 def test_one_animated_action_is_named_by_position():
     line = describe_animations([_entry(2, "MOUSE(row=58, col=25)")], executed_count=5)
     assert line.startswith("Action 2 of 5 (`MOUSE(row=58, col=25)`) animated over 2 frames.")
-    assert "`call_animations` shows them." in line
+    assert "`last_call_animations` shows them." in line
 
 
 def test_the_final_action_keeps_the_original_wording():
@@ -110,14 +110,14 @@ def test_earlier_animations_get_one_clause_and_the_last_the_full_sentence():
     line = describe_animations(entries, executed_count=8)
     assert line == (
         "Actions 2, 3 animated over 3, 5 frames. Action 5 of 8 (`C`) animated over 5 frames. "
-        "1 cell changed and changed back in row 3, cols 0-7. `call_animations` shows them."
+        "1 cell changed and changed back in row 3, cols 0-7. `last_call_animations` shows them."
     )
 
 
 def test_one_earlier_animation_and_the_final_action():
     line = describe_animations([_entry(1, "A"), _entry(2, "B")], executed_count=2)
     assert line.startswith("Action 1 animated over 2 frames. The last executed action (`B`) animated over 2 frames.")
-    assert line.endswith("`call_animations` shows them.")
+    assert line.endswith("`last_call_animations` shows them.")
 
 
 def test_opener_names_the_animated_middle_action(monkeypatch, tmp_path):
@@ -263,7 +263,7 @@ def test_sandbox_exposes_every_animation_of_the_call():
     out = run_sandboxed_python(
         code=(
             "result = [(e['position'], e['action'], len(e['frames']), e['frames'][0].ascii == current_frame.ascii,\n"
-            "           e['timeline']['frames']) for e in call_animations]\n"
+            "           e['timeline']['frames']) for e in last_call_animations]\n"
             "gone = []\n"
             "try:\n    last_animation_frames\nexcept NameError:\n    gone.append('frames')\n"
             "try:\n    last_animation_timeline\nexcept NameError:\n    gone.append('timeline')\n"

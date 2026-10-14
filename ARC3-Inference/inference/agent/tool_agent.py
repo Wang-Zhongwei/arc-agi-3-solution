@@ -2864,10 +2864,10 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         )
     if _animation_enabled():
         prompt += ANIMATION_ADDENDUM
-        if _animation_filter() == "motion":
-            prompt += ANIMATION_FILTER_ADDENDUM
         if _animation_timeline_enabled():
             prompt += ANIMATION_ADDENDUM_TIMELINE
+        if _animation_filter() == "motion":
+            prompt += ANIMATION_FILTER_ADDENDUM
     if current_grid_image_enabled():
         prompt += MULTIMODAL_CONTEXT_ADDENDUM
     if _AUTO_FRAME_DIFF:
@@ -4012,7 +4012,7 @@ class ToolAgent:
             ),
             # every animated action of the last call, renumbered to its place in
             # the turn's executed_actions; only the last call's, since
-            # call_animations is cleared by each call
+            # last_call_animations is cleared by each call
             "animated_actions": [
                 {**item, "position": int(item.get("position") or 0) + last_call_offset}
                 for item in (last.get("animated_actions") or [])
@@ -6324,7 +6324,7 @@ class ToolAgent:
         snippet_executed_actions = 0
 
         def _handle_animation(request: dict[str, Any]) -> list[dict[str, Any]]:
-            """call_animations: one entry per animated action of the latest call."""
+            """last_call_animations: one entry per animated action of the latest call."""
             if self._step_env_callback is None:
                 raise RuntimeError("Animation frames are not available in this session.")
             raw = self._step_env_callback({"query": "animation"})
