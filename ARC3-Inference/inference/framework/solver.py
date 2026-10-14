@@ -1223,6 +1223,21 @@ class _HarnessGameSession:
         final_payload["board_changed"] = any(
             bool(item.get("board_changed")) for item in executed_payloads
         )
+        # the call's last action that animated, which need not be its final
+        # one - the same action the animation record describes
+        animated = [
+            (position, item)
+            for position, item in enumerate(executed_payloads, start=1)
+            if item.get("animation")
+        ]
+        if animated:
+            position, item = animated[-1]
+            final_payload["animation"] = {
+                "action": str(item.get("action_display") or item.get("action_name") or ""),
+                "position": position,
+                **item["animation"],
+            }
+            final_payload["animation_chain"] = item.get("animation_chain")
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
@@ -1323,6 +1338,11 @@ class _HarnessGameSession:
         gameplay_changed = _interior_gameplay_changed(previous_grid, new_grid)
         no_op = gameplay_changed is False
         animation_summary = None
+        if ANIMATION_ENABLED and batch_index == 1 and not automatic:
+            # one record per call: cleared when its first action executes, then
+            # replaced only by actions that animate, so an animated MOUSE
+            # followed by inert actions is still the one described
+            self.animation_record = None
         if ANIMATION_ENABLED and action.id.name != "RESET":
             # The auto-reset after a death runs through here too. Letting it
             # touch the record would clear the fatal action's animation before
@@ -1331,21 +1351,17 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
-            # ONE record, replaced by every executed action - animated or not.
             # A no-op that animated is the case this exists for, and the guards
-            # refuse the NEXT action without executing it, so the record still
+            # refuse the NEXT call without executing it, so the record still
             # describes the animated one when the model reads the opener.
-            self.animation_record = (
-                {
+            if animation_summary:
+                self.animation_record = {
                     "action_display": action_display,
                     "chain": chain,
                     "summary": animation_summary,
                     "step": self.action_count,
                     "level": _level_number(self.game),
                 }
-                if animation_summary
-                else None
-            )
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )

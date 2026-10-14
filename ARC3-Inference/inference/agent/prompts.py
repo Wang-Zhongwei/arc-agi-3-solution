@@ -181,8 +181,9 @@ ANIMATION_ADDENDUM_TIMELINE = (
 
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
-    "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
-    "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
+    "- When an action of the latest model-issued call animated, `last_action_call_result['animation']` "
+    "reports the last such action's `action`, `position` (1-based in the call), `frames`, `transient_pixels` "
+    "and `transient_bbox`; it need not be the final action. Transient cells "
     "changed and then changed BACK during the animation, so they appear in no frame "
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
     "in `history`.\n"

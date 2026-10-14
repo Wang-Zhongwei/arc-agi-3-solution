@@ -3932,6 +3932,14 @@ class ToolAgent:
         start_action_num = None
         if end_action_num is not None and total_executed > 0:
             start_action_num = max(1, end_action_num - total_executed + 1)
+        animation = last.get("animation") or None
+        animation_position = animation_gameplay_changed = None
+        if animation:
+            in_call = int(animation.get("position") or 0)
+            animation_position = in_call + total_executed - int(last.get("executed_count") or 1)
+            flags = last.get("gameplay_changed_per_action") or []
+            if 0 < in_call <= len(flags):
+                animation_gameplay_changed = flags[in_call - 1]
 
         return {
             "start_action_num": start_action_num,
@@ -3972,12 +3980,14 @@ class ToolAgent:
                 for item in executed_results
                 if item.get("stop_reason") == "no_op_action"
             ],
-            # the animation of the last executed action, which is what
-            # last_animation_frames / last_animation_timeline will return when asked
-            "animation": (executed_results[-1].get("animation") if executed_results else None),
-            "animation_action": (
-                executed_results[-1].get("action_display") if executed_results else None
-            ),
+            # the last call's last animated action (not necessarily its final
+            # one), which is what last_animation_frames / last_animation_timeline
+            # will return when asked
+            "animation": animation,
+            "animation_action": (animation or {}).get("action") or last.get("action_display"),
+            # its place among the turn's executed actions, and its own flag
+            "animation_position": animation_position,
+            "animation_gameplay_changed": animation_gameplay_changed,
             "guard_stops": [
                 {
                     "kind": item.get("stop_reason"),
@@ -5341,14 +5351,24 @@ class ToolAgent:
                 else:
                     lines.append("That sequence produced no change anywhere on the board.")
             if _animation_enabled() and not previous_step_summary.get("game_over"):
+                executed_count = int(previous_step_summary.get("executed_count") or 1)
+                position = previous_step_summary.get("animation_position") or executed_count
+                earlier = position < executed_count
                 animation_line = describe_animation(
                     previous_step_summary.get("animation"),
                     action_display=previous_step_summary.get("animation_action"),
                     # the animated action's own flag, not the sequence's: an
                     # inert SPACE at the end of a batch that moved other things
                     # still hid everything it did
-                    gameplay_changed=self._last_action_gameplay_changed,
+                    gameplay_changed=(
+                        previous_step_summary.get("animation_gameplay_changed")
+                        if earlier else self._last_action_gameplay_changed
+                    ),
                     timeline=_animation_timeline_enabled(),
+                    subject=(
+                        f"Action {position} of {executed_count}" if earlier
+                        else "The last executed action"
+                    ),
                 )
                 if animation_line:
                     lines.append(animation_line)

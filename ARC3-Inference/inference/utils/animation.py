@@ -145,6 +145,7 @@ def describe_animation(
     gameplay_changed: bool | None,
     game_over: bool = False,
     timeline: bool = True,
+    subject: str = "The last executed action",
 ) -> str:
     """The opener line, or "" when there is nothing worth saying.
 
@@ -182,13 +183,13 @@ def describe_animation(
         )
     if gameplay_changed is False:
         return (
-            f"The last executed action{name} animated over {frames} frames and left the "
+            f"{subject}{name} animated over {frames} frames and left the "
             f"board area unchanged, but it was not a no-op: {cells}{where}. "
             "Whatever this action did is visible only there - "
             f"read {where_to_look} before concluding it failed."
         )
     return (
-        f"The last executed action{name} animated over {frames} frames. "
+        f"{subject}{name} animated over {frames} frames. "
         f"{cells[0].upper()}{cells[1:]}{where}. {where_to_look} shows them."
     )
 
