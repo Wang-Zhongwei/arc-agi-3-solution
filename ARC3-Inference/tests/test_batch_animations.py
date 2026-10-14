@@ -287,3 +287,24 @@ def test_records_store_boards_as_bytes_and_read_back_identically(session):
     assert build_animation_frames(record) == build_animation_frames(grids)
     assert build_animation_view(record) == build_animation_view(grids)
     assert pack_board(FLASH)[3 * 8:4 * 8] == bytes([5] * 8)
+
+
+def test_entries_carry_plain_motion_only_when_the_filter_is_on(session, monkeypatch):
+    slide = _slide(start=2, end=8)  # 1 column per frame: 6 frames, never dropped
+
+    class _Game2(_Game):
+        def execute_action(self, action, **_):
+            if action.id == arcengine.GameAction.ACTION4:
+                frames = slide[1:]
+            else:  # ACTION1: a flash elsewhere that settles back
+                frames = [_board(sprites=[(7, 8, 3)], flash=[(1, 1)]), slide[-1]]
+            self.current_state = self._state(frames)
+            return self.current_state
+
+    monkeypatch.setattr(solver_module, "NOOP_GUARD_BORDER_WIDTH", 0)
+    for setting, expected in (("off", [None, None]), ("motion", [True, False])):
+        monkeypatch.setattr(solver_module, "ANIMATION_FILTER", setting)
+        session.game = _Game2()
+        session.game.current_state = session.game._state([slide[0]])
+        _run(session, arcengine.GameAction.ACTION4, arcengine.GameAction.ACTION1)
+        assert [r.get("plain_motion") for r in session.animation_records] == expected

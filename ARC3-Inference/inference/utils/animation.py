@@ -119,6 +119,24 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
     return summary
 
 
+def _patch_count(cells: Sequence[tuple[int, int]]) -> int:
+    """Number of 8-connected patches the cells form."""
+    remaining = set(cells)
+    count = 0
+    while remaining:
+        count += 1
+        stack = [remaining.pop()]
+        while stack:
+            r, c = stack.pop()
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    neighbour = (r + dr, c + dc)
+                    if neighbour in remaining:
+                        remaining.remove(neighbour)
+                        stack.append(neighbour)
+    return count
+
+
 def plain_motion(
     chain: Sequence[Grid],
     *,
@@ -127,6 +145,7 @@ def plain_motion(
     max_shift: int = 10,
     max_cells: int = 400,
     min_explained: float = 0.9,
+    max_patches: int = 2,
 ) -> bool:
     """Whether an animation only slid something to where it ended up.
 
@@ -137,6 +156,9 @@ def plain_motion(
     on the after board anyway, and the first and last steps of a slide carry
     them (what the sprite leaves behind or how it settles). That is a sprite
     moving along its path, which the before and after boards already convey.
+    A step may also change at most `max_patches` separate (8-connected)
+    patches: a sliding sprite changes one, or two when it jumps clear of
+    where it was, while a mechanism lights up several places at once.
 
     Deliberately narrow, so anything else counts as worth reporting: nothing
     changed overall, a flash or ripple, an effect away from what moved, several
@@ -177,6 +199,8 @@ def plain_motion(
         if len(changed) > max_cells:
             return False
         if any(not (top <= r <= bottom and left <= c <= right) for r, c in changed):
+            return False
+        if _patch_count(changed) > max_patches:
             return False
         transient = [cell for cell in changed if cell not in persistent]
         if not transient:

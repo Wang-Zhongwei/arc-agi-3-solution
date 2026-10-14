@@ -177,8 +177,10 @@ ANIMATION_ADDENDUM_TIMELINE = (
 )
 
 ANIMATION_FILTER_ADDENDUM = (
-    "- An animation with a single in-between frame that only slides objects to where "
-    "they end up is not counted as an animation.\n"
+    "- Each entry also has `plain_motion`: True when its in-between frames only carry "
+    "the board smoothly from before to after (objects sliding, the view scrolling), "
+    "adding nothing the two boards don't show. Such an animation with a single "
+    "in-between frame is not counted as an animation.\n"
 )
 
 ANIMATION_ADDENDUM = (

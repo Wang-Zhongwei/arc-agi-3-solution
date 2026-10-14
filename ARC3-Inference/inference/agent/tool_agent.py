@@ -6338,6 +6338,8 @@ class ToolAgent:
                     "action": record.get("action_display"),
                     "frames": build_animation_frames(record),
                 }
+                if "plain_motion" in record:
+                    entry["plain_motion"] = record["plain_motion"]
                 if _animation_timeline_enabled():
                     entry["timeline"] = build_animation_view(record)
                 entries.append(entry)

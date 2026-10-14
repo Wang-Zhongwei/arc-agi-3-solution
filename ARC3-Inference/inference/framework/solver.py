@@ -128,9 +128,10 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "on",
 )
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
-# "motion" treats a 2-frame animation (one hidden frame) that only slid
-# something to where it ended up (utils.animation.plain_motion) as no animation;
-# "off" keeps every animation. Level-ups and deaths always keep theirs.
+# "motion" judges each animation with utils.animation.plain_motion: a plain
+# 2-frame one (one hidden frame) counts as no animation, and every other one
+# carries a plain_motion flag in last_call_animations. "off" does neither.
+# Level-ups and deaths are never plain.
 ANIMATION_FILTER = os.environ.get("ARC3_ANIMATION_FILTER", "off").strip().lower()
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
@@ -1358,17 +1359,18 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
-            if (
+            # ARC3_ANIMATION_FILTER=motion judges each animation once; level-ups
+            # and deaths are never plain
+            plain = bool(
                 animation_summary
                 and ANIMATION_FILTER == "motion"
-                # one hidden frame of a plain slide says nothing the before and
-                # after boards don't: reported as no animation at all, and it
-                # leaves the record to the call's last real animation
-                and animation_summary.get("frames") == 2
                 and not new_state.just_won_level
                 and raw_state != arcengine.GameState.GAME_OVER
                 and plain_motion(chain, border=NOOP_GUARD_BORDER_WIDTH)
-            ):
+            )
+            if plain and animation_summary.get("frames") == 2:
+                # one hidden frame of a plain slide says nothing the before and
+                # after boards don't: reported as no animation at all
                 animation_summary = None
             if animation_summary:
                 self.animation_records.append({
@@ -1378,6 +1380,7 @@ class _HarnessGameSession:
                     "chain": [pack_board(grid) for grid in chain],
                     "width": len(chain[0][0]) if chain and chain[0] else 0,
                     "summary": animation_summary,
+                    **({"plain_motion": plain} if ANIMATION_FILTER == "motion" else {}),
                     "step": self.action_count,
                     "level": _level_number(self.game),
                 })
