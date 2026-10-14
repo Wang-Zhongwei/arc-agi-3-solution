@@ -3997,8 +3997,16 @@ class ToolAgent:
                 for item in executed_results
                 if item.get("stop_reason") == "no_op_action"
             ],
-            # the animation of the last executed action, for the opener
-            "animation": (executed_results[-1].get("animation") if executed_results else None),
+            # the final executed action's animation, for the opener and images:
+            # the last call's last animated action when that is its final one
+            "animation": next(
+                (
+                    {key: item[key] for key in ("frames", "transient_pixels", "transient_bbox") if key in item}
+                    for item in (last.get("animated_actions") or [])[-1:]
+                    if int(item.get("position") or 0) == int(last.get("executed_count") or 1)
+                ),
+                None,
+            ),
             "animation_action": (
                 executed_results[-1].get("action_display") if executed_results else None
             ),
@@ -6240,7 +6248,7 @@ class ToolAgent:
             compact["stopped_early"] = bool(payload.get("stopped_early"))
         # blocked_action names the refused action for the next turn's opener;
         # without it the model was told "the sequence was stopped before None"
-        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation", "animated_actions"):
+        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animated_actions"):
             if passthrough_key in payload:
                 compact[passthrough_key] = payload.get(passthrough_key)
         if payload.get("stop_reason"):

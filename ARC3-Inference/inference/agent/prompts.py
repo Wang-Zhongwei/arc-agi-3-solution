@@ -188,8 +188,8 @@ ANIMATION_FILTER_ADDENDUM = (
 
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
-    "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
-    "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
+    "- `last_action_call_result['animated_actions']` lists every action of the latest model-issued call that animated, "
+    "each with `position`, `action`, `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
     "changed and then changed BACK during the animation, so they appear in no frame "
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
     "in `history`.\n"

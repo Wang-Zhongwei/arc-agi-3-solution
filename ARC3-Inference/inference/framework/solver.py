@@ -1230,22 +1230,21 @@ class _HarnessGameSession:
         final_payload["board_changed"] = any(
             bool(item.get("board_changed")) for item in executed_payloads
         )
-        if len(executed_payloads) > 1:
-            # every action of the batch that animated, by its 1-based position:
-            # `animation` above is the final action's only, so an animated
-            # MOUSE followed by inert actions went unreported
-            animated_actions = [
-                {
-                    "position": position,
-                    "action": str(item.get("action_display") or item.get("action_name") or ""),
-                    "gameplay_changed": item.get("gameplay_changed"),
-                    **item["animation"],
-                }
-                for position, item in enumerate(executed_payloads, start=1)
-                if item.get("animation")
-            ]
-            if animated_actions:
-                final_payload["animated_actions"] = animated_actions
+        # every action of the call that animated, by its 1-based position: the
+        # one animation summary the model reads. `animation` (the final
+        # action's own) stays on the raw payload only.
+        animated_actions = [
+            {
+                "position": position,
+                "action": str(item.get("action_display") or item.get("action_name") or ""),
+                "gameplay_changed": item.get("gameplay_changed"),
+                **item["animation"],
+            }
+            for position, item in enumerate(executed_payloads, start=1)
+            if item.get("animation")
+        ]
+        if animated_actions:
+            final_payload["animated_actions"] = animated_actions
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason

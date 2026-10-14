@@ -308,3 +308,19 @@ def test_entries_carry_plain_motion_only_when_the_filter_is_on(session, monkeypa
         session.game.current_state = session.game._state([slide[0]])
         _run(session, arcengine.GameAction.ACTION4, arcengine.GameAction.ACTION1)
         assert [r.get("plain_motion") for r in session.animation_records] == expected
+
+
+def test_the_agent_sees_animated_actions_only(session, tmp_path):
+    agent = tool_agent.ToolAgent(model="test-model", base_url="http://127.0.0.1:8001/v1", provider="vllm")
+    A = arcengine.GameAction
+    single = agent._compact_action_result(session.step_env({"actions": [{"action": "ACTION1"}]}))
+    assert "animation" not in single
+    assert [(e["position"], e["action"]) for e in single["animated_actions"]] == [(1, "UP")]
+    # the opener still gets the final action's animation, derived from the list
+    assert agent._summarize_step_sequence([single])["animation"]["frames"] == 2
+
+    inert_last = agent._compact_action_result(
+        session.step_env({"actions": [{"action": "ACTION1"}, {"action": "ACTION2"}]}))
+    assert [e["position"] for e in inert_last["animated_actions"]] == [1]
+    summary = agent._summarize_step_sequence([inert_last])
+    assert summary["animation"] is None and summary["animated_actions"][0]["action"] == "UP"
