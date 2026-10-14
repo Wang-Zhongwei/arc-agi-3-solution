@@ -4201,6 +4201,12 @@ class ToolAgent:
         if not (_AUTO_FRAME_DIFF or _DIFF_IMAGE):
             # reached only when the inventory knob alone kept us here
             return []
+        # After a deliberate RESET the board before it is gone: diff from the
+        # board RESET returned, so the diff shows only what came after it, and
+        # a turn ending on RESET has nothing to show
+        reset_frame = self._last_manual_reset_frame(previous_frame, previous_step_summary)
+        if reset_frame is not None:
+            previous_frame = reset_frame
         prev_step = getattr(previous_frame, "step", None)
         cur_step = getattr(current_frame, "step", None)
         span = f"step {prev_step} -> {cur_step}"
@@ -4219,8 +4225,9 @@ class ToolAgent:
                     f"Diff image ({span}): cells that changed keep their true color; "
                     "unchanged cells dimmed to dark navy."
                 ) if frame_layout else (
-                    f"Diff image ({span}): cells that changed since your previous "
-                    "analyzer turn in their new true color; unchanged cells dimmed "
+                    f"Diff image ({span}): cells that changed since your "
+                    f"{'RESET' if reset_frame is not None else 'previous analyzer turn'} "
+                    "in their new true color; unchanged cells dimmed "
                     "to dark navy (an off-palette color)."
                 )
                 self._pending_diff_image = part
@@ -5158,6 +5165,23 @@ class ToolAgent:
             "under 'Working world model carried from earlier turns' - write the COMPLETE "
             "updated section; any fact you omit is permanently lost."
         ]
+
+    def _last_manual_reset_frame(
+        self, previous_frame: Frame, summary: dict[str, Any] | None
+    ) -> Frame | None:
+        """The board returned by this turn's last model-issued RESET, if any."""
+        if not summary or not reset_exposed() or "RESET" not in [
+            str(name).strip().upper() for name in summary.get("executed_actions") or []
+        ]:
+            return None
+        since = getattr(previous_frame, "step", None)
+        for entry in reversed(getattr(self, "_prompt_history_entries", [])):
+            if since is not None and entry.frame.step <= since:
+                break
+            result = entry.result or {}
+            if (result.get("action_name") or entry.action).upper() == "RESET" and not result.get("automatic"):
+                return entry.frame
+        return None
 
     @staticmethod
     def _manual_reset_context_line(summary: dict[str, Any]) -> str | None:
