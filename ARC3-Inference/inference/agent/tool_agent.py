@@ -32,6 +32,7 @@ from inference.utils.animation import (
     build_animation_frames,
     build_animation_view,
     describe_animation,
+    describe_animations,
 )
 from inference.agent.action_names import reset_exposed, to_engine_action, to_model_action, undo_exposure_mode
 from inference.agent.compressed_trace import (
@@ -143,6 +144,28 @@ def _levelup_board_image() -> bool:
     death board. Without it the opener after a level-up carries only the next
     level's first board. ARC3_LEVELUP_BOARD_IMAGE defaults off."""
     return _get_env_bool("ARC3_LEVELUP_BOARD_IMAGE", False)
+
+
+def _grouped_actions(names: list[str]) -> str:
+    """Consecutive repeats as one entry: RIGHT, RIGHT, RIGHT, UP -> RIGHTx3, UP.
+
+    The whole sequence, never a first-N prefix: grouped, a long batch is short,
+    and the actions an animation line numbers must all be there to count."""
+    runs: list[list[Any]] = []
+    for name in names:
+        if runs and runs[-1][0] == name:
+            runs[-1][1] += 1
+        else:
+            runs.append([name, 1])
+    return ", ".join(name if count == 1 else f"{name}x{count}" for name, count in runs)
+
+
+# Caption of that image. Bare, it read as one more board to act on; the model
+# should take it as the record of what a solved level looked like.
+LEVELUP_IMAGE_LABEL = (
+    "Last level-complete image (the previous level at the moment it was solved, "
+    "i.e. the state that won it; compare it with the new level's board):"
+)
 
 
 def _contains_tool_call_markup(*chunks: str) -> bool:
@@ -3932,6 +3955,8 @@ class ToolAgent:
         start_action_num = None
         if end_action_num is not None and total_executed > 0:
             start_action_num = max(1, end_action_num - total_executed + 1)
+        # actions executed by earlier calls this turn, before the last call's
+        last_call_offset = max(0, total_executed - int(last.get("executed_count") or 1))
 
         return {
             "start_action_num": start_action_num,
@@ -3978,6 +4003,13 @@ class ToolAgent:
             "animation_action": (
                 executed_results[-1].get("action_display") if executed_results else None
             ),
+            # every animated action of the last call, renumbered to its place in
+            # the turn's executed_actions; only the last call's, since the record
+            # behind last_animation_timeline is cleared by each call
+            "animated_actions": [
+                {**item, "position": int(item.get("position") or 0) + last_call_offset}
+                for item in (last.get("animated_actions") or [])
+            ],
             "guard_stops": [
                 {
                     "kind": item.get("stop_reason"),
@@ -5001,7 +5033,7 @@ class ToolAgent:
         if current_frame is not None:
             self._last_shown_grid = current_frame.grid
         if levelup_part is not None:
-            animation_samples.insert(0, ("Last level-complete image:", levelup_part))
+            animation_samples.insert(0, (LEVELUP_IMAGE_LABEL, levelup_part))
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -5035,7 +5067,7 @@ class ToolAgent:
                 split = len(user_prompt)
             before, after = user_prompt[:split].rstrip(), user_prompt[split:].strip()
             content = [
-                {"type": "text", "text": f"{before}\n\nLast level-complete image:" if before else "Last level-complete image:"},
+                {"type": "text", "text": f"{before}\n\n{LEVELUP_IMAGE_LABEL}" if before else LEVELUP_IMAGE_LABEL},
                 levelup_part,
                 {"type": "text", "text": f"{after}\n\nCurrent grid image:" if after else "Current grid image:"},
                 image_part,
@@ -5204,11 +5236,7 @@ class ToolAgent:
         lines.append(f"The code executed {normalized} {label} in the previous sequence.")
         rendered = summary.get("executed_actions") or []
         if rendered:
-            prefix = (
-                "Executed actions:" if len(rendered) <= 10
-                else "Executed actions (first 10):"
-            )
-            lines.append(f"{prefix} {', '.join(str(a) for a in rendered[:10])}.")
+            lines.append(f"Executed actions: {_grouped_actions([str(a) for a in rendered])}.")
         changed = summary.get("gameplay_changed")
         if _report_gameplay_changed():
             if changed is True:
@@ -5292,8 +5320,7 @@ class ToolAgent:
             if isinstance(executed_actions, list):
                 rendered_actions = [str(name).strip() for name in executed_actions if str(name).strip()]
             if rendered_actions:
-                action_prefix = "Executed actions (first 10):" if len(rendered_actions) > 10 else "Executed actions:"
-                lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
+                lines.append(f"Executed actions: {_grouped_actions(rendered_actions)}.")
             else:
                 lines.append("Executed actions: none.")
             self._prompt_image_anchors["actions"] = lines[-1]
@@ -5317,7 +5344,12 @@ class ToolAgent:
                 else:
                     lines.append("That sequence produced no change anywhere on the board.")
             if _animation_enabled() and not previous_step_summary.get("game_over"):
-                animation_line = describe_animation(
+                animated_actions = previous_step_summary.get("animated_actions")
+                animation_line = describe_animations(
+                    animated_actions,
+                    executed_count=int(previous_step_summary.get("executed_count") or 1),
+                    timeline=_animation_timeline_enabled(),
+                ) if animated_actions else describe_animation(
                     previous_step_summary.get("animation"),
                     action_display=previous_step_summary.get("animation_action"),
                     # the animated action's own flag, not the sequence's: an
@@ -6212,7 +6244,7 @@ class ToolAgent:
             compact["stopped_early"] = bool(payload.get("stopped_early"))
         # blocked_action names the refused action for the next turn's opener;
         # without it the model was told "the sequence was stopped before None"
-        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation"):
+        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation", "animated_actions"):
             if passthrough_key in payload:
                 compact[passthrough_key] = payload.get(passthrough_key)
         if payload.get("stop_reason"):

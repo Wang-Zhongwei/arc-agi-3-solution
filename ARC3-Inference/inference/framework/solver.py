@@ -520,9 +520,9 @@ class _HarnessGameSession:
     # engine can be told what that step cost, and so cannot answer "how much
     # has this game spent". This one is captured once and never moved.
     game_token_baseline: int = 0
-    # The last executed action's animation, or None. One record, not a
-    # history: the model reads it via animation() in the turn that follows,
-    # and older animations are almost never what it is asking about.
+    # The animation of the latest call's last animated action, or None. One
+    # record, not a history: the model reads it via animation() in the turn
+    # that follows, and older animations are almost never what it is asking about.
     animation_record: dict[str, Any] | None = None
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
@@ -1223,6 +1223,22 @@ class _HarnessGameSession:
         final_payload["board_changed"] = any(
             bool(item.get("board_changed")) for item in executed_payloads
         )
+        if len(executed_payloads) > 1:
+            # every action of the batch that animated, by its 1-based position:
+            # `animation` above is the final action's only, so an animated
+            # MOUSE followed by inert actions went unreported
+            animated_actions = [
+                {
+                    "position": position,
+                    "action": str(item.get("action_display") or item.get("action_name") or ""),
+                    "gameplay_changed": item.get("gameplay_changed"),
+                    **item["animation"],
+                }
+                for position, item in enumerate(executed_payloads, start=1)
+                if item.get("animation")
+            ]
+            if animated_actions:
+                final_payload["animated_actions"] = animated_actions
         final_payload["stopped_early"] = len(executed_payloads) < batch_size
         if stop_reason is not None:
             final_payload["stop_reason"] = stop_reason
@@ -1323,6 +1339,14 @@ class _HarnessGameSession:
         gameplay_changed = _interior_gameplay_changed(previous_grid, new_grid)
         no_op = gameplay_changed is False
         animation_summary = None
+        if ANIMATION_ENABLED and batch_index == 1 and not automatic:
+            # ONE record per call: the last action of the call that animated.
+            # Cleared when the call's first action executes rather than by
+            # every action, so an animated MOUSE in the middle of a batch
+            # survives the inert actions after it. A no-op that animated is
+            # still covered: the guards refuse the NEXT call without executing
+            # anything, so the record still describes the animated one.
+            self.animation_record = None
         if ANIMATION_ENABLED and action.id.name != "RESET":
             # The auto-reset after a death runs through here too. Letting it
             # touch the record would clear the fatal action's animation before
@@ -1331,21 +1355,14 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
-            # ONE record, replaced by every executed action - animated or not.
-            # A no-op that animated is the case this exists for, and the guards
-            # refuse the NEXT action without executing it, so the record still
-            # describes the animated one when the model reads the opener.
-            self.animation_record = (
-                {
+            if animation_summary:
+                self.animation_record = {
                     "action_display": action_display,
                     "chain": chain,
                     "summary": animation_summary,
                     "step": self.action_count,
                     "level": _level_number(self.game),
                 }
-                if animation_summary
-                else None
-            )
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )
