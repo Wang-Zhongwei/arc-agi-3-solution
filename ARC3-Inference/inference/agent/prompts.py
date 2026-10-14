@@ -171,16 +171,16 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 )
 
 ANIMATION_ADDENDUM_TIMELINE = (
-    "- Each entry's `timeline` is a diff timeline of its frames: it "
+    "- Each `last_call_animations` entry also has `timeline`, a diff timeline of its frames: it "
     "shows which cells changed at each step. It is a dict with `action`, `frames` and "
-    "`steps`, one entry per step that changed anything. Each entry has `step`, "
+    "`steps`, one item per step that changed anything. Each step has `step`, "
     "`changed`, `bbox`, and "
     "either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` (a "
     "count per colour change, when there were too many cells to list).\n"
 )
 
 ANIMATION_FILTER_ADDENDUM = (
-    "- Each entry also has `plain_motion`: True when its in-between frames only carry "
+    "- Each `last_call_animations` entry also has `plain_motion`: True when its in-between frames only carry "
     "the board smoothly from before to after (objects sliding, the view scrolling), "
     "adding nothing the two boards don't show. Such an animation with a single "
     "in-between frame is not counted as an animation.\n"
@@ -189,7 +189,8 @@ ANIMATION_FILTER_ADDENDUM = (
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- `last_action_call_result['animated_actions']` lists every action of the latest model-issued call that animated, "
-    "each with `position`, `action`, `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
+    "in the same order as `last_call_animations` below, each with `position`, `action`, `frames` (a count), "
+    "`transient_pixels` and `transient_bbox`. Transient cells "
     "changed and then changed BACK during the animation, so they appear in no frame "
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
     "in `history`.\n"
