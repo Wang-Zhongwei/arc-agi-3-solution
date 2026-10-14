@@ -161,14 +161,6 @@ def _grouped_actions(names: list[str]) -> str:
     return ", ".join(name if count == 1 else f"{name}x{count}" for name, count in runs)
 
 
-# Caption of that image. Bare, it read as one more board to act on; the model
-# should take it as the record of what a solved level looked like.
-LEVELUP_IMAGE_LABEL = (
-    "Last level-complete image (the previous level at the moment it was solved, "
-    "i.e. the state that won it; compare it with the new level's board):"
-)
-
-
 def _contains_tool_call_markup(*chunks: str) -> bool:
     for chunk in chunks:
         lowered = chunk.lower()
@@ -5040,7 +5032,7 @@ class ToolAgent:
         if current_frame is not None:
             self._last_shown_grid = current_frame.grid
         if levelup_part is not None:
-            animation_samples.insert(0, (LEVELUP_IMAGE_LABEL, levelup_part))
+            animation_samples.insert(0, ("Last level-complete image:", levelup_part))
         if animation_part is not None:
             # the animation image only ever fires when nothing inside the board
             # moved, which is precisely when the diff image shows the ticking
@@ -5074,7 +5066,7 @@ class ToolAgent:
                 split = len(user_prompt)
             before, after = user_prompt[:split].rstrip(), user_prompt[split:].strip()
             content = [
-                {"type": "text", "text": f"{before}\n\n{LEVELUP_IMAGE_LABEL}" if before else LEVELUP_IMAGE_LABEL},
+                {"type": "text", "text": f"{before}\n\nLast level-complete image:" if before else "Last level-complete image:"},
                 levelup_part,
                 {"type": "text", "text": f"{after}\n\nCurrent grid image:" if after else "Current grid image:"},
                 image_part,

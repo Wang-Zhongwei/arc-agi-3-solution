@@ -79,14 +79,14 @@ def test_levelup_opener_shows_solved_board_before_current(monkeypatch, tmp_path,
     assert _color(images[-1]) == vision.ARC_COLOR_MAP[4]
     if enabled:
         assert len(images) == 2
-        assert parts[0]["text"].endswith(tool_agent.LEVELUP_IMAGE_LABEL)
+        assert parts[0]["text"].endswith("Last level-complete image:")
         assert "You have progressed to a new level!" not in parts[0]["text"]
         assert _color(parts[1]) == vision.ARC_COLOR_MAP[3]
         assert parts[2]["text"].startswith("You have progressed to a new level!")
         assert parts[2]["text"].endswith("\n\nCurrent grid image:")
     else:
         assert len(images) == 1
-        assert "Last level-complete image" not in parts[0]["text"]
+        assert "Last level-complete image:" not in parts[0]["text"]
     assert agent._level_end_grid is None
 
 
@@ -94,7 +94,7 @@ def test_levelup_image_skipped_when_interior_matches_last_turn(monkeypatch, tmp_
     fringe_only = tuple((5,) * 64 if r < 4 else (3,) * 64 for r in range(64))
     agent, parts = _opener(monkeypatch, tmp_path, True, last_shown=fringe_only)
     assert sum(part["type"] == "image_url" for part in parts) == 1
-    assert "Last level-complete image" not in parts[0]["text"]
+    assert "Last level-complete image:" not in parts[0]["text"]
     moved = tuple((3,) * 64 if r != 30 else (5,) * 64 for r in range(64))
     agent, parts = _opener(monkeypatch, tmp_path, True, last_shown=moved)
     assert sum(part["type"] == "image_url" for part in parts) == 2
