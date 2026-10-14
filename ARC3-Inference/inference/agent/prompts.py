@@ -171,39 +171,32 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 )
 
 ANIMATION_ADDENDUM_TIMELINE = (
-    "- `last_animation_timeline` is a diff timeline of those frames: it "
-    "shows which cells changed at each step. It is a dict with `action`, `frames` and "
-    "`steps`, one entry per step that changed anything. Each entry has `step`, "
-    "`changed`, `bbox`, and "
-    "either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` (a "
-    "count per colour change, when there were too many cells to list).\n"
+    "- Each entry's `timeline` is a diff timeline of its frames: it shows which cells "
+    "changed at each step. It is a dict with `action`, `frames` and `steps`, one "
+    "entry per step that changed anything. Each entry has `step`, `changed`, `bbox`, "
+    "and either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` "
+    "(a count per colour change, when there were too many cells to list).\n"
 )
 
 ANIMATION_FILTER_ADDENDUM = (
-    "- An animation that only slides objects along their path to where they end up "
-    "is not announced in the next message; `last_action_call_result` still reports it, "
-    "marked `plain_motion: true`.\n"
+    "- An action whose animation only shows objects one step along their path to where "
+    "they end up (a single in-between frame) counts as not animated: it is not announced "
+    "and not in `call_animations`.\n"
 )
 
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
-    "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
-    "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
-    "changed and then changed BACK during the animation, so they appear in no frame "
+    "- `call_animations` lists every action of the latest model-issued call that "
+    "animated, in order. Each entry is a dict with `position` (1-based, among the "
+    "call's executed actions), `action`, and `frames`: views with `.ascii`, `.shape` "
+    "and `.segmentation`, the same as `current_frame`. `frames[0]` is the first frame "
+    "of the animation and `frames[-1]` the board it settled on. Transient cells "
+    "changed and then changed BACK during an animation, so they appear in no frame "
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
-    "in `history`.\n"
-    "- Any action in a multi-action call can animate, not only the final one. "
-    "`last_action_call_result['animated_actions']` lists each one that did, with its "
-    "`position` in the call, and the next message names them.\n"
-    "- `last_animation_frames` is the frames of the latest call's last action that "
-    "animated (earlier animations of that call are not kept), as views with "
-    "`.ascii`, `.shape` and `.segmentation`, the same as `current_frame`. Index 0 is "
-    "the first frame of the animation and the last entry is the board it settled on. "
-    "After a death these are the frames of the FATAL action, not of the automatic "
-    "reset that followed it. Crop "
-    "their `.ascii` yourself; printing a whole 64x64 frame will not fit the tool "
-    "budget. Empty when the action did not animate, and reading them costs no "
-    "in-game action.\n"
+    "in `history`. After a death the last entry is the FATAL action, not the "
+    "automatic reset that followed it. Crop `.ascii` yourself; printing a whole 64x64 "
+    "frame will not fit the tool budget. Empty when nothing animated, and reading it "
+    "costs no in-game action.\n"
 )
 
 MULTIMODAL_CONTEXT_ADDENDUM = (

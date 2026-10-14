@@ -195,7 +195,7 @@ def animation_sampled_parts(chain: list[Any]) -> list[tuple[str, dict[str, Any]]
         previous = grid
     candidates = [candidates[i] for i in _sample_indices(len(candidates))]
     return [
-        (f"last_animation_frames[{index - 1}]:",
+        (f"call_animations[-1]['frames'][{index - 1}]:",
          {"type": "image_url", "image_url": {"url": frame_to_png_data_url(
              Frame(grid=grid, step=0, level=1), upscale=auxiliary_image_upscale("animation"),
          )}})

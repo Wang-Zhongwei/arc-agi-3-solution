@@ -4005,15 +4005,14 @@ class ToolAgent:
                 for item in executed_results
                 if item.get("stop_reason") == "no_op_action"
             ],
-            # the animation of the last executed action, which is what
-            # last_animation_frames / last_animation_timeline will return when asked
+            # the animation of the last executed action, for the opener
             "animation": (executed_results[-1].get("animation") if executed_results else None),
             "animation_action": (
                 executed_results[-1].get("action_display") if executed_results else None
             ),
             # every animated action of the last call, renumbered to its place in
-            # the turn's executed_actions; only the last call's, since the record
-            # behind last_animation_timeline is cleared by each call
+            # the turn's executed_actions; only the last call's, since
+            # call_animations is cleared by each call
             "animated_actions": [
                 {**item, "position": int(item.get("position") or 0) + last_call_offset}
                 for item in (last.get("animated_actions") or [])
@@ -5352,29 +5351,21 @@ class ToolAgent:
                 else:
                     lines.append("That sequence produced no change anywhere on the board.")
             if _animation_enabled() and not previous_step_summary.get("game_over"):
-                # ARC3_ANIMATION_FILTER=motion: the solver tags animations that
-                # only slid something to where it ended up; they stay in
-                # last_action_call_result but are not announced
-                last_animation = previous_step_summary.get("animation") or {}
-                plain = bool(last_animation.get("plain_motion"))
                 animated_actions = previous_step_summary.get("animated_actions")
                 animation_line = describe_animations(
-                    [item for item in animated_actions if not item.get("plain_motion")],
+                    animated_actions,
                     executed_count=int(previous_step_summary.get("executed_count") or 1),
-                    timeline=_animation_timeline_enabled(),
-                ) if animated_actions else "" if plain else describe_animation(
+                ) if animated_actions else describe_animation(
                     previous_step_summary.get("animation"),
                     action_display=previous_step_summary.get("animation_action"),
                     # the animated action's own flag, not the sequence's: an
                     # inert SPACE at the end of a batch that moved other things
                     # still hid everything it did
                     gameplay_changed=self._last_action_gameplay_changed,
-                    timeline=_animation_timeline_enabled(),
                 )
                 if animation_line:
                     lines.append(animation_line)
-                if not plain:
-                    self._prepare_animation_image(previous_step_summary)
+                self._prepare_animation_image(previous_step_summary)
                 if self._pending_animation_samples and not animation_line:
                     animation_line = "Last action animation (sampled):"
                     lines.append(animation_line)
@@ -5505,7 +5496,6 @@ class ToolAgent:
                     # still hid everything it did
                     gameplay_changed=self._last_action_gameplay_changed,
                         game_over=True,
-                        timeline=_animation_timeline_enabled(),
                     )
                     if death_animation_line:
                         lines.append(death_animation_line)
@@ -6333,17 +6323,25 @@ class ToolAgent:
         terminal_action_result: dict[str, Any] | None = None
         snippet_executed_actions = 0
 
-        def _handle_animation(request: dict[str, Any]) -> dict[str, Any]:
+        def _handle_animation(request: dict[str, Any]) -> list[dict[str, Any]]:
+            """call_animations: one entry per animated action of the latest call."""
             if self._step_env_callback is None:
-                return {"error": "Animation frames are not available in this session."}
+                raise RuntimeError("Animation frames are not available in this session.")
             raw = self._step_env_callback({"query": "animation"})
-            record = raw.get("record") if isinstance(raw, dict) else None
-            record = record if isinstance(record, dict) else None
-            if str(request.get("kind") or "") == "frames":
-                return build_animation_frames(record)
-            if not _animation_timeline_enabled():
-                return {}
-            return build_animation_view(record)
+            records = raw.get("records") if isinstance(raw, dict) else None
+            entries = []
+            for record in records or []:
+                if not isinstance(record, dict):
+                    continue
+                entry = {
+                    "position": record.get("position"),
+                    "action": record.get("action_display"),
+                    "frames": build_animation_frames(record),
+                }
+                if _animation_timeline_enabled():
+                    entry["timeline"] = build_animation_view(record)
+                entries.append(entry)
+            return entries
 
         def _handle_action(
             actions: list[dict[str, Any]], *, stale_after: str | None = None

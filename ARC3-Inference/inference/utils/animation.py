@@ -223,7 +223,6 @@ def describe_animation(
     action_display: str | None,
     gameplay_changed: bool | None,
     game_over: bool = False,
-    timeline: bool = True,
     subject: str = "The last executed action",
 ) -> str:
     """The opener line, or "" when there is nothing worth saying.
@@ -243,12 +242,7 @@ def describe_animation(
     )
     where = _bbox_phrase(summary.get("transient_bbox"))
     name = f" (`{action_display}`)" if action_display else ""
-    # point at whichever accessor is actually available
-    where_to_look = (
-        "`last_animation_timeline`"
-        if timeline
-        else "`last_animation_frames`"
-    )
+    where_to_look = "`call_animations`"
 
     if game_over:
         # Follows the BAR RULE block, which has just walked the model through
@@ -277,51 +271,38 @@ def describe_animations(
     animated: Sequence[dict[str, Any]],
     *,
     executed_count: int,
-    timeline: bool = True,
 ) -> str:
     """The opener line for a sequence, naming WHICH actions animated.
 
     `animated` holds one entry per animated action of the latest call, with
     its 1-based `position` among the executed actions, `action`,
-    `gameplay_changed` and the summary keys. Only the last entry is kept for
-    `last_animation_timeline` / `last_animation_frames`; the line says so when
-    there were more. "" when no entry has transient cells.
+    `gameplay_changed` and the summary keys. The last entry gets the full
+    sentence; earlier ones get a single clause in front of it, since a long
+    batch of moves can animate on most of its actions. All of them are in
+    `call_animations`. "" when no entry has transient cells.
     """
     entries = [item for item in animated if int(item.get("transient_pixels") or 0) > 0]
     if not entries:
         return ""
     last = entries[-1]
-    if len(entries) == 1:
-        position = int(last.get("position") or executed_count)
-        return describe_animation(
-            last,
-            action_display=last.get("action"),
-            gameplay_changed=last.get("gameplay_changed"),
-            timeline=timeline,
-            subject=(
-                "The last executed action"
-                if position >= executed_count
-                else f"Action {position} of {executed_count}"
-            ),
-        )
-    where_to_look = "`last_animation_timeline`" if timeline else "`last_animation_frames`"
-    parts = []
-    for item in entries:
-        transient = int(item.get("transient_pixels") or 0)
-        cells = "1 cell changed and changed back" if transient == 1 else (
-            f"{transient} cells changed and changed back"
-        )
-        name = f" (`{item.get('action')}`)" if item.get("action") else ""
-        parts.append(
-            f"Action {item.get('position')} of {executed_count}{name} animated over "
-            f"{item.get('frames')} frames: {cells}"
-            f"{_bbox_phrase(item.get('transient_bbox'))}."
-        )
-    return (
-        " ".join(parts)
-        + f" {where_to_look} shows action {last.get('position')} only; the earlier "
-        "animations are not kept."
+    position = int(last.get("position") or executed_count)
+    final = describe_animation(
+        last,
+        action_display=last.get("action"),
+        gameplay_changed=last.get("gameplay_changed"),
+        subject=(
+            "The last executed action"
+            if position >= executed_count
+            else f"Action {position} of {executed_count}"
+        ),
     )
+    earlier = entries[:-1]
+    if not earlier:
+        return final
+    noun = "Action" if len(earlier) == 1 else "Actions"
+    positions = ", ".join(str(item.get("position")) for item in earlier)
+    frames = ", ".join(str(item.get("frames")) for item in earlier)
+    return f"{noun} {positions} animated over {frames} frames. {final}"
 
 
 def _color_char(value: int | None) -> str:

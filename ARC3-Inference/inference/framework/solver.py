@@ -127,10 +127,12 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "on",
 )
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
-# "motion" tags animations that only slid something to where it ended up
-# (utils.animation.plain_motion) so the opener can leave them out; "off" tags
-# nothing. Level-ups and deaths are never tagged.
+# "motion" treats a 2-frame animation (one hidden frame) that only slid
+# something to where it ended up (utils.animation.plain_motion) as no animation;
+# "off" keeps every animation. Level-ups and deaths always keep theirs.
 ANIMATION_FILTER = os.environ.get("ARC3_ANIMATION_FILTER", "off").strip().lower()
+# Boards kept across one call's animations (about 36 KB each as tuples).
+ANIMATION_MAX_BOARDS = 300
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
 # The patch-110 rewordings, behind one switch. They replaced "changed nothing"
@@ -525,10 +527,10 @@ class _HarnessGameSession:
     # engine can be told what that step cost, and so cannot answer "how much
     # has this game spent". This one is captured once and never moved.
     game_token_baseline: int = 0
-    # The animation of the latest call's last animated action, or None. One
-    # record, not a history: the model reads it via animation() in the turn
-    # that follows, and older animations are almost never what it is asking about.
-    animation_record: dict[str, Any] | None = None
+    # Every animated action of the latest call, in order (call_animations in the
+    # sandbox). Not a history across calls: the model reads it in the turn that
+    # follows, and older animations are almost never what it is asking about.
+    animation_records: list[dict[str, Any]] = field(default_factory=list)
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -1057,7 +1059,7 @@ class _HarnessGameSession:
             return {
                 "executed": False,
                 "query": "animation",
-                "record": self.animation_record if ANIMATION_ENABLED else None,
+                "records": list(self.animation_records) if ANIMATION_ENABLED else [],
             }
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
@@ -1345,13 +1347,10 @@ class _HarnessGameSession:
         no_op = gameplay_changed is False
         animation_summary = None
         if ANIMATION_ENABLED and batch_index == 1 and not automatic:
-            # ONE record per call: the last action of the call that animated.
-            # Cleared when the call's first action executes rather than by
-            # every action, so an animated MOUSE in the middle of a batch
-            # survives the inert actions after it. A no-op that animated is
-            # still covered: the guards refuse the NEXT call without executing
-            # anything, so the record still describes the animated one.
-            self.animation_record = None
+            # One list per call, cleared when the call's first action executes.
+            # A no-op that animated is still covered: the guards refuse the
+            # NEXT call without executing anything, so the list survives it.
+            self.animation_records = []
         if ANIMATION_ENABLED and action.id.name != "RESET":
             # The auto-reset after a death runs through here too. Letting it
             # touch the record would clear the fatal action's animation before
@@ -1360,26 +1359,38 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
+            if (
+                animation_summary
+                and ANIMATION_FILTER == "motion"
+                # one hidden frame of a plain slide says nothing the before and
+                # after boards don't: reported as no animation at all, and it
+                # leaves the record to the call's last real animation
+                and animation_summary.get("frames") == 2
+                and not new_state.just_won_level
+                and raw_state != arcengine.GameState.GAME_OVER
+                and plain_motion(chain, border=NOOP_GUARD_BORDER_WIDTH)
+            ):
+                animation_summary = None
             if animation_summary:
-                self.animation_record = {
+                self.animation_records.append({
+                    "position": batch_index,
                     "action_display": action_display,
                     "chain": chain,
                     "summary": animation_summary,
                     "step": self.action_count,
                     "level": _level_number(self.game),
-                }
+                })
+                # a long batch of animated moves must not pile up boards; the
+                # newest animations are the ones the opener describes in full
+                while (
+                    len(self.animation_records) > 1
+                    and sum(len(item["chain"]) for item in self.animation_records)
+                    > ANIMATION_MAX_BOARDS
+                ):
+                    self.animation_records.pop(0)
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )
-        if (
-            animation_summary
-            and ANIMATION_FILTER == "motion"
-            and not level_completed
-            and raw_state != arcengine.GameState.GAME_OVER
-            and plain_motion(chain, border=NOOP_GUARD_BORDER_WIDTH)
-        ):
-            # the same dict as record["summary"] and payload["animation"]
-            animation_summary["plain_motion"] = True
         payload = {
             "executed": True,
             "action_num": self.action_count,

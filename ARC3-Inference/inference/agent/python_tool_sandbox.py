@@ -610,28 +610,29 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 raise RuntimeError(str(reply.get("error", "animation failed")))
             if reply.get("type") != "animation_result":
                 raise RuntimeError("Invalid animation response from sandbox host.")
-            payload = reply.get("animation")
-            if kind != "frames":
-                return payload or {}
-            return [
-                FrameView(
-                    ascii=item.get("ascii", ""),
-                    step=item.get("step", 0),
-                    level=item.get("level", 0),
-                    shape=item.get("shape", (0, 0)),
-                    grid=item.get("grid", ()),
-                )
-                for item in (payload or [])
-            ]
+            entries = []
+            for entry in reply.get("animation") or []:
+                entry = dict(entry)
+                entry["frames"] = [
+                    FrameView(
+                        ascii=item.get("ascii", ""),
+                        step=item.get("step", 0),
+                        level=item.get("level", 0),
+                        shape=item.get("shape", (0, 0)),
+                        grid=item.get("grid", ()),
+                    )
+                    for item in entry.get("frames") or []
+                ]
+                entries.append(entry)
+            return entries
 
         runtime_globals["action"] = action
         if initial.get("animation_enabled"):
-            # Globals rather than attributes on last_transition: after a death
+            # A global rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
-            # reset and not the action that animated. The record is simply
-            # "the last executed action that animated", and naming it that way
-            # removes the mismatch. Empty when the last executed action
-            # returned a single frame.
+            # reset and not the action that animated. call_animations is every
+            # animated action of the latest call, in order, so the fatal action
+            # stays its last entry. Empty when no action of that call animated.
             class _LazyAnimation:
                 def __init__(self, kind, empty):
                     self._kind = kind
@@ -670,10 +671,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 def __repr__(self):
                     return repr(self._get())
 
-            runtime_globals["last_animation_frames"] = _LazyAnimation("frames", [])
-            runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", {})
-            _animation_views.extend((runtime_globals["last_animation_frames"],
-                                     runtime_globals["last_animation_timeline"]))
+            runtime_globals["call_animations"] = _LazyAnimation("calls", [])
+            _animation_views.append(runtime_globals["call_animations"])
 
         _refresh_state(initial.get("state") or {})
 
