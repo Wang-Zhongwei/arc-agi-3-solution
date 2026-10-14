@@ -119,6 +119,85 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
     return summary
 
 
+def plain_motion(
+    chain: Sequence[Grid],
+    *,
+    border: int = 4,
+    pad: int = 2,
+    max_shift: int = 10,
+    max_cells: int = 400,
+    min_explained: float = 0.9,
+) -> bool:
+    """Whether an animation only slid something to where it ended up.
+
+    True when every step inside the border is a rigid translation and stays
+    within `pad` of the cells the action changed overall. A step counts as a
+    translation when one shift explains at least `min_explained` of its
+    changed cells, not counting cells the action changed for good: those are
+    on the after board anyway, and the first and last steps of a slide carry
+    them (what the sprite leaves behind or how it settles). That is a sprite
+    moving along its path, which the before and after boards already convey.
+
+    Deliberately narrow, so anything else counts as worth reporting: nothing
+    changed overall, a flash or ripple, an effect away from what moved, several
+    objects moving differently, a step larger than `max_cells` (a full-board
+    flash), or a sprite over a patterned background, whose vacated cells no
+    shift explains.
+    """
+    if len(chain) <= 2:
+        return False
+    rows = len(chain[0])
+
+    def interior_diff(a: Grid, b: Grid) -> list[tuple[int, int]]:
+        return [
+            (r, c)
+            for r in range(border, rows - border)
+            for c in range(border, len(a[r]) - border)
+            if a[r][c] != b[r][c]
+        ]
+
+    net = interior_diff(chain[0], chain[-1])
+    if not net:
+        return False
+    persistent = set(net)
+    top = min(r for r, _ in net) - pad
+    bottom = max(r for r, _ in net) + pad
+    left = min(c for _, c in net) - pad
+    right = max(c for _, c in net) + pad
+    shifts = [
+        (dr, dc)
+        for dr in range(-max_shift, max_shift + 1)
+        for dc in range(-max_shift, max_shift + 1)
+        if (dr, dc) != (0, 0)
+    ]
+    for a, b in zip(chain, chain[1:]):
+        changed = interior_diff(a, b)
+        if not changed:
+            continue
+        if len(changed) > max_cells:
+            return False
+        if any(not (top <= r <= bottom and left <= c <= right) for r, c in changed):
+            return False
+        transient = [cell for cell in changed if cell not in persistent]
+        if not transient:
+            continue
+        # one stray cell is not an effect; a 3-cell sprite step can't afford 10%
+        needed = min(min_explained * len(transient), len(transient) - 1)
+        for dr, dc in shifts:
+            explained = sum(
+                1
+                for r, c in transient
+                if 0 <= r - dr < rows
+                and 0 <= c - dc < len(a[r - dr])
+                and b[r][c] == a[r - dr][c - dc]
+            )
+            if explained >= needed:
+                break
+        else:
+            return False
+    return True
+
+
 def _bbox_phrase(bbox: Sequence[int] | None) -> str:
     """Where the transient cells are, collapsing degenerate ranges.
 

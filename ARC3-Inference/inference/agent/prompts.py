@@ -179,6 +179,12 @@ ANIMATION_ADDENDUM_TIMELINE = (
     "count per colour change, when there were too many cells to list).\n"
 )
 
+ANIMATION_FILTER_ADDENDUM = (
+    "- An animation that only slides objects along their path to where they end up "
+    "is not announced in the next message; `last_action_call_result` still reports it, "
+    "marked `plain_motion: true`.\n"
+)
+
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "

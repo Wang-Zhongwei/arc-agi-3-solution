@@ -64,6 +64,7 @@ from inference.agent.prompts import (
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
+    ANIMATION_FILTER_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
@@ -2564,6 +2565,11 @@ def _persistent_functions() -> bool:
     return _get_env_bool("ARC3_PERSISTENT_FUNCTIONS", False)
 
 
+def _animation_filter() -> str:
+    """ARC3_ANIMATION_FILTER: "motion" leaves plain slides out of the opener."""
+    return os.environ.get("ARC3_ANIMATION_FILTER", "off").strip().lower()
+
+
 def _animation_enabled() -> bool:
     """Whether intermediate animation frames are captured and offered.
 
@@ -2858,6 +2864,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         )
     if _animation_enabled():
         prompt += ANIMATION_ADDENDUM
+        if _animation_filter() == "motion":
+            prompt += ANIMATION_FILTER_ADDENDUM
         if _animation_timeline_enabled():
             prompt += ANIMATION_ADDENDUM_TIMELINE
     if current_grid_image_enabled():
@@ -5344,12 +5352,17 @@ class ToolAgent:
                 else:
                     lines.append("That sequence produced no change anywhere on the board.")
             if _animation_enabled() and not previous_step_summary.get("game_over"):
+                # ARC3_ANIMATION_FILTER=motion: the solver tags animations that
+                # only slid something to where it ended up; they stay in
+                # last_action_call_result but are not announced
+                last_animation = previous_step_summary.get("animation") or {}
+                plain = bool(last_animation.get("plain_motion"))
                 animated_actions = previous_step_summary.get("animated_actions")
                 animation_line = describe_animations(
-                    animated_actions,
+                    [item for item in animated_actions if not item.get("plain_motion")],
                     executed_count=int(previous_step_summary.get("executed_count") or 1),
                     timeline=_animation_timeline_enabled(),
-                ) if animated_actions else describe_animation(
+                ) if animated_actions else "" if plain else describe_animation(
                     previous_step_summary.get("animation"),
                     action_display=previous_step_summary.get("animation_action"),
                     # the animated action's own flag, not the sequence's: an
@@ -5360,7 +5373,8 @@ class ToolAgent:
                 )
                 if animation_line:
                     lines.append(animation_line)
-                self._prepare_animation_image(previous_step_summary)
+                if not plain:
+                    self._prepare_animation_image(previous_step_summary)
                 if self._pending_animation_samples and not animation_line:
                     animation_line = "Last action animation (sampled):"
                     lines.append(animation_line)

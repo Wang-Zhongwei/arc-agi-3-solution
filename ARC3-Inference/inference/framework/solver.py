@@ -28,6 +28,7 @@ from taaf.solver import Solver
 from inference.utils.animation import (
     collapse_frames,
     normalize_frames,
+    plain_motion,
     summarize_animation,
 )
 from inference.agent.action_names import (
@@ -126,6 +127,10 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "on",
 )
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
+# "motion" tags animations that only slid something to where it ended up
+# (utils.animation.plain_motion) so the opener can leave them out; "off" tags
+# nothing. Level-ups and deaths are never tagged.
+ANIMATION_FILTER = os.environ.get("ARC3_ANIMATION_FILTER", "off").strip().lower()
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
 # The patch-110 rewordings, behind one switch. They replaced "changed nothing"
@@ -1366,6 +1371,15 @@ class _HarnessGameSession:
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )
+        if (
+            animation_summary
+            and ANIMATION_FILTER == "motion"
+            and not level_completed
+            and raw_state != arcengine.GameState.GAME_OVER
+            and plain_motion(chain, border=NOOP_GUARD_BORDER_WIDTH)
+        ):
+            # the same dict as record["summary"] and payload["animation"]
+            animation_summary["plain_motion"] = True
         payload = {
             "executed": True,
             "action_num": self.action_count,
