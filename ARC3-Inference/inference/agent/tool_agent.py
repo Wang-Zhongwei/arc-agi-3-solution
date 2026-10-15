@@ -2859,8 +2859,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
             " Alongside the current grid image you receive a diff image: cells that "
             "changed since your previous analyzer turn are shown in their new true "
             "color; unchanged cells are dimmed to a dark navy that is not a game "
-            "color. Use it to locate change at a glance. There is no diff image after "
-            "a turn in which you issued RESET."
+            "color. Use it to locate change at a glance."
         )
     prompt += VISUAL_GAME_ADDENDUM
     if _get_env_bool("ARC3_ACTION_INFO", False):
