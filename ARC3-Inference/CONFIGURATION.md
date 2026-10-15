@@ -53,6 +53,7 @@ The descriptions clarify that action semantics depend on the game. MOUSE uses in
 | `ARC3_DEDUPE_MULTICALL_LINE` | Off | Removes duplicated prompt wording about multiple action calls. This is text deduplication, not deduplication of tool execution. |
 | `ARC3_SYSTEM_PROMPT_PREFIX` | Empty | Prepends a custom system-prompt prefix for experiments. |
 | `ARC3_GAME_PRIORS` | Off | Appends a "Priors and probing" section at the end of the system prompt: every level is solvable from its starting layout, likely action and object roles to probe first, and when to stop probing. |
+| `ARC3_COMPACT_PROMPT` | Off | Replaces the system prompt with a compact rewrite (about half the text, ported from dangthuygiang's v222f notebook; `inference/agent/compact_prompt.py`), with the same flag gating plus our RESET line. Also shortens the `python` tool description, uses the compact level-clear message (with `ARC3_LEVEL_TRANSFER_GUIDANCE`), drops the per-turn "Use Python to inspect…" / "Focus on what changed…" / "Ground yourself…" lines (memory sections off), and writes executed actions run-length (`MOUSE(row=6, col=32)x3`, 12 runs, then `(+N more, omitted)`). The tool budget, time limit and automatic-RESET internals are no longer described up front. |
 
 With level-transfer guidance enabled, the old advice about re-grounding after a score increase is replaced: the model is explicitly informed of level transitions rather than being asked to infer them from score. Transition/terminal behavior is explained alongside the corresponding runtime information.
 

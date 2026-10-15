@@ -44,6 +44,12 @@ from inference.agent.compressed_trace import (
     compressed_trace_levelup_frames,
 )
 from inference.utils.retained_functions import function_signature
+from inference.agent.compact_prompt import (
+    COMPACT_LEVEL_START_USER_PROMPT,
+    COMPACT_PYTHON_TOOL_DESCRIPTION,
+    build_compact_system_prompt,
+    run_length_actions,
+)
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
     LEVEL_START_USER_PROMPT,
@@ -139,6 +145,23 @@ def _level_transfer_guidance_enabled() -> bool:
     ARC3_LEVEL_TRANSFER_GUIDANCE defaults off, preserving the original prompts.
     """
     return _get_env_bool("ARC3_LEVEL_TRANSFER_GUIDANCE", False)
+
+
+def _compact_prompt() -> bool:
+    """The compact system prompt, tool description and turn messages
+    (compact_prompt.py). ARC3_COMPACT_PROMPT defaults off."""
+    return _get_env_bool("ARC3_COMPACT_PROMPT", False)
+
+
+def _level_start_user_prompt() -> str:
+    return COMPACT_LEVEL_START_USER_PROMPT if _compact_prompt() else LEVEL_START_USER_PROMPT
+
+
+def _executed_actions_line(rendered: list[str]) -> str:
+    if _compact_prompt():
+        return f"Executed actions: {run_length_actions(rendered)}."
+    prefix = "Executed actions (first 10):" if len(rendered) > 10 else "Executed actions:"
+    return f"{prefix} {', '.join(rendered[:10])}."
 
 
 def _levelup_board_image() -> bool:
@@ -2830,6 +2853,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     _prefix = os.environ.get("ARC3_SYSTEM_PROMPT_PREFIX", "").strip()
     if _prefix:
         prompt = f"{_prefix}\n\n{prompt}"
+    if _compact_prompt():
+        return _build_compact_system_prompt(_prefix)
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
     if _explain_gameplay_changed():
@@ -2925,6 +2950,47 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     if _get_env_bool("ARC3_GAME_PRIORS", False):
         # last section, after the tool rules: object and action priors to probe
         # first (from duck-harness 6420079, which sirikilohit's 22.53 entry ran)
+        prompt += GAME_PRIORS_ADDENDUM
+    return prompt
+
+
+def _build_compact_system_prompt(prefix: str) -> str:
+    # the tool budget, time limit and automatic-RESET internals are not described:
+    # each reports itself in the tool result or turn message when it applies
+    prompt = build_compact_system_prompt(
+        gameplay_changed_border=(
+            f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
+            if _explain_gameplay_changed() else None
+        ),
+        animation=_animation_enabled(),
+        animation_timeline=_animation_timeline_enabled(),
+        current_grid_image=current_grid_image_enabled(),
+        diff_image=_DIFF_IMAGE,
+        undo=undo_exposure_mode() == "on",
+        reset=reset_exposed(),
+        frame_diff_hint=frame_diff_enabled() and _get_env_bool("ARC3_FRAME_DIFF_HINT", False),
+        persistent_lifetime=(
+            {
+                "game": "throughout this game, including across level changes; they are "
+                        "cleared when a new game starts",
+                "levelup": "on the same level; they are cleared when the level changes",
+            }.get(
+                _persistent_functions_scope(),
+                "in this analyzer turn, including yield resumptions; they are cleared at "
+                "the start of the next turn",
+            )
+            if _persistent_functions() else None
+        ),
+        persistent_import_guidance=(
+            "Supported explicit top-level imports used by retained functions are restored "
+            "with them; imports inside a function also work."
+            if _get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False) else
+            "Put needed imports inside the function."
+        ),
+    )
+    if prefix:
+        prompt = f"{prefix}\n\n{prompt}"
+    if _get_env_bool("ARC3_GAME_PRIORS", False):
         prompt += GAME_PRIORS_ADDENDUM
     return prompt
 
@@ -5040,7 +5106,7 @@ class ToolAgent:
             # the solved board sits right after the actions that produced it,
             # before the line announcing the new level and its current board
             split = -1
-            for marker in (LEVEL_START_USER_PROMPT.split(".", 1)[0], "You have progressed to a new level!"):
+            for marker in (_level_start_user_prompt().split(".", 1)[0], "You have progressed to a new level!"):
                 split = user_prompt.find(marker)
                 if split >= 0:
                     break
@@ -5217,11 +5283,7 @@ class ToolAgent:
         lines.append(f"The code executed {normalized} {label} in the previous sequence.")
         rendered = summary.get("executed_actions") or []
         if rendered:
-            prefix = (
-                "Executed actions:" if len(rendered) <= 10
-                else "Executed actions (first 10):"
-            )
-            lines.append(f"{prefix} {', '.join(str(a) for a in rendered[:10])}.")
+            lines.append(_executed_actions_line([str(a) for a in rendered]))
         changed = summary.get("gameplay_changed")
         if _report_gameplay_changed():
             if changed is True:
@@ -5305,8 +5367,7 @@ class ToolAgent:
             if isinstance(executed_actions, list):
                 rendered_actions = [str(name).strip() for name in executed_actions if str(name).strip()]
             if rendered_actions:
-                action_prefix = "Executed actions (first 10):" if len(rendered_actions) > 10 else "Executed actions:"
-                lines.append(f"{action_prefix} {', '.join(rendered_actions[:10])}.")
+                lines.append(_executed_actions_line(rendered_actions))
             else:
                 lines.append("Executed actions: none.")
             self._prompt_image_anchors["actions"] = lines[-1]
@@ -5424,7 +5485,7 @@ class ToolAgent:
                 lines.append("You have completed the run!")
             elif previous_step_summary.get("level_transition"):
                 lines.append(
-                    LEVEL_START_USER_PROMPT
+                    _level_start_user_prompt()
                     if _level_transfer_guidance_enabled()
                     else "You have progressed to a new level!"
                 )
@@ -5585,7 +5646,10 @@ class ToolAgent:
         # revise a world model it was never shown, and replies carrying any
         # assistant text dropped from 76% to 43%. That arm keeps the first
         # sentence without its world-model clause.
-        if _memory_sections_disabled():
+        if _compact_prompt() and _memory_sections_disabled():
+            # the system prompt's loop and "how to play" sections carry this
+            pass
+        elif _memory_sections_disabled():
             lines.append(
                 "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
             )
@@ -5608,7 +5672,9 @@ class ToolAgent:
         if knowledge_lines:
             lines.extend(knowledge_lines)
             lines.append("end of world model. ")
-        if action_num == 0:
+        if _compact_prompt():
+            pass
+        elif action_num == 0:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
             )
@@ -5635,7 +5701,10 @@ class ToolAgent:
                 "type": "function",
                 "function": {
                     "name": "python",
-                    "description": _PYTHON_TOOL_DESCRIPTION,
+                    "description": (
+                        COMPACT_PYTHON_TOOL_DESCRIPTION if _compact_prompt()
+                        else _PYTHON_TOOL_DESCRIPTION
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {

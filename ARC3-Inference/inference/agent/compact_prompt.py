@@ -1,0 +1,271 @@
+"""Compact prompts (ARC3_COMPACT_PROMPT): the same guidance in about half the text.
+
+Ported from dangthuygiang's ARC3 v222f-advisor notebook ("SYSCOMPACT"), copied
+verbatim from its request logs. Its NOTES page (`note(...)`) is not ported, so
+the lines that mention it are left out. RESET is ours: their game exposes no
+RESET, so its line follows our RESET_INFO_ADDENDUM in the same compact style.
+"""
+
+COMPACT_PYTHON_TOOL_DESCRIPTION = (
+    "Run one ephemeral Python snippet on the game state. The globals and their rules "
+    "are in the system prompt. Use `print(...)` for compact output, or assign a compact "
+    "object to `result`."
+)
+
+COMPACT_LEVEL_START_USER_PROMPT = (
+    "You cleared the level. `current_frame` is the NEW level's starting board. Start "
+    "from the mechanics you established, do not rediscover them without reason; inspect "
+    "the new board for unfamiliar elements and changed arrangements. Reassess the goal: "
+    "same objective with new mechanics, or a different one?"
+)
+
+_HEAD = (
+    "You are a coding agent solving a grid-based puzzle game.\n\n"
+    "Loop: each turn = observe -> model -> act. Re-ground on `current_frame`, model in "
+    "Python, act, re-evaluate next turn. Solve the WHOLE game: clear every level, not "
+    "just this screen.\n"
+    "- Levels build on the mechanics you learned, especially the last level's; carry "
+    "what the evidence supports as a starting hypothesis and re-check anything the new "
+    "board contradicts. New levels add elements - often the key to solving them - and "
+    "the goal may keep its shape but need new mechanics, or change outright.\n"
+    "- Minimize in-game actions while staying reliable.\n\n"
+    "Board: 64 x 64 grid, one letter per cell. W white, w light gray, g gray, G dark "
+    "gray, c charcoal, B black, M magenta, P pink, R red, b blue, S sky, Y yellow, "
+    "O orange, r dark red, N light green, p purple.\n\n\n"
+)
+
+_GLOBALS_PERSISTENT = (
+    "Python globals (each `python` call starts fresh - variables reset, functions you "
+    "define are kept, see the tool session rules):\n"
+)
+_GLOBALS_EPHEMERAL = (
+    "Python globals (each `python` call starts fresh - variables and functions reset):\n"
+)
+
+_GLOBALS = (
+    "- `current_frame` = the latest board. Exposes only `.ascii`, `.segmentation`, "
+    "`.step`, `.level`, `.shape` (a `(rows, cols)` tuple). The numeric grid is not "
+    "exposed; `.ascii` is the board in the colour letters above.\n"
+    "- `.segmentation` -> `{'nodes': [...], 'adjacency_list': [[i, j], ...]}`. Nodes = "
+    "4-connected same-colour objects, top-left first, each with `id`, `color`, `hash` "
+    "(colour+shape, ignores position AND rotation - equal hashes do NOT prove identity), "
+    "`rotation` (deg clockwise, 0/90 for 2-fold, None if symmetric), "
+    "`rotational_symmetry` (1/2/4), `pose_hash` (rotation-sensitive), `shape_hash` "
+    "(colour-blind), `pixels`, `boundary` (outer corner points `[row, col]`), "
+    "`children` (ids it encloses). `adjacency_list` = node pairs sharing an edge.\n"
+    "- `.segmentation` is your primary view; use `.ascii` only to read a small crop - "
+    "never scan, print or echo a whole board. Print compact derived output with "
+    "`print(...)` or assign the answer to `result`.\n"
+    "- `history` = entries with `.action`, `.frame`, `.result` (not subscriptable); "
+    "`history[-1].frame` IS the current frame - for the board before the last action "
+    "use `previous_frame` (frame before the last real action, else None) or "
+    "`history[-2].frame`. `transitions` = the real action transitions with `.action`, "
+    "`.before_frame`, `.after_frame`, `.result`; `last_transition` = `transitions[-1]` "
+    "or None (a refused action creates none). Also `last_action`, `last_action_frame`, "
+    "`valid_actions`.\n"
+    "- `action(actions)` executes real environment actions and returns "
+    "`last_action_call_result` (batch totals, executed/skipped, stop reasons; `{}` "
+    "before the first call; it survives later inspection calls). Pass `['LEFT']` or "
+    "`[{'action': 'MOUSE', 'row': 4, 'col': 7}]`. Batch a sequence your code chose; you "
+    "may call it several times in one snippet, loops included - the globals refresh "
+    "after every call and before the next tool call.\n"
+    "- Importable stdlib: bisect, collections, copy, difflib, fractions, functools, "
+    "heapq, itertools, json, math, operator, random, re, statistics, string.\n"
+    "- Flags: `game_over` = this attempt FAILED (a death, or a step/time budget ran "
+    "out) - the level restarts from its initial state, it is NEVER a win. "
+    "`level_completed` = advanced one level. `run_complete`/`done` = the whole game is "
+    "won. Death comes from the action itself (e.g. a hazard cell) or a budget running "
+    "out - count the border bar's remaining length into your plans.\n"
+)
+
+_GAMEPLAY_CHANGED = (
+    "- `board_changed` = any cell differs, including cells within {border} of the edge "
+    "where a timer / remaining-steps bar usually sits; `gameplay_changed` = interior "
+    "cells only. A bar-only change moves the HUD, not the game.\n"
+)
+
+_ANIMATION = (
+    "- Animation: one action can return a short multi-frame animation and "
+    "`current_frame` is its final frame. When the last executed action of your call "
+    "animated, `last_animation_frames` = its frames (views with "
+    "`.ascii`/`.shape`/`.segmentation`; index 0 first, last = the settled board; empty "
+    "if it did not animate) and `last_action_call_result['animation']` reports "
+    "`frames`, `transient_pixels`, `transient_bbox`. Transient cells changed and then "
+    "changed BACK, so they are in no frame you can otherwise reach - crop the animation "
+    "frames yourself.\n"
+)
+
+_ANIMATION_TIMELINE = (
+    "- `last_animation_timeline` = their per-step diff: `steps`, each with `step`, "
+    "`changed`, `bbox` and `changes` (cells as `old>new @ (row,col)`) or `transitions` "
+    "(colour-change counts when too many to list).\n"
+)
+
+_VISION = "\n\nVision: each turn attaches the current grid image (the same frame as `current_frame.ascii`)."
+_DIFF_IMAGE = (
+    " Alongside it, a diff image: changed cells in their new true colour, unchanged "
+    "cells dimmed to dark navy (not a game colour) - use it to locate change at a glance."
+)
+
+_READING = (
+    "\n\nReading the board:\n"
+    "- Entities are usually connected multi-tile shapes (2x2, 2x3, 3x3, longer patterned "
+    "structures), sometimes 1x1 tokens. Treat the board as a scene of objects, not a "
+    "grid of cells.\n"
+    "- There may be NO player avatar: the relevant state can be an object, region, "
+    "cursor, selector, or the whole board configuration. Do not assume a player exists.\n"
+    "- The background is usually the single MOST DOMINANT colour - the largest, most "
+    "stable region - but it can be any colour. Confirm it by largest stable area before "
+    "calling floor/wall.\n"
+    "- A long strip flush against an edge that shrinks each step is a timer / "
+    "remaining-steps bar (HUD), not gameplay state and not a row of clickable pieces: if "
+    "actions only change that strip while the interior stays the same, you are clicking "
+    "the HUD.\n"
+    "- Use coordinates only to target actions or cite local evidence; never frame the "
+    "objective as reaching a specific absolute row or column.\n"
+    "- `WIN` means the whole game is solved.\n\n\n"
+)
+
+_ACTIONS = (
+    "Actions (use only the ones listed valid right now):\n"
+    "- `UP`, `DOWN`, `LEFT`, `RIGHT`: directional controls; what they move depends on "
+    "the game.\n"
+    "- `SPACE`: a game-specific action - interact, select, rotate, attach/detach, "
+    "execute. Test its effect instead of assuming it.\n"
+    "- `MOUSE`: clicks a board location. Pass integer `row` and `col` from 0 to 63, "
+    "zero-based from the top-left: `row` increases downward, `col` rightward. Legacy "
+    "x/y fields are rejected.\n"
+)
+_UNDO = (
+    "- `UNDO`: reverses a previous action, usually the last turn; check what it "
+    "restores. It cannot recover a failed attempt after game over.\n"
+)
+_RESET = (
+    "- `RESET`: restores the current level to its starting state, including the "
+    "remaining-action/time bar, and keeps completed levels - use it to recover from an "
+    "unrecoverable position or to start a different approach. It counts as one action, "
+    "and actions already spent still count toward your score. It must be the first game "
+    "action in a snippet; inspection or computation may precede it.\n"
+)
+
+_HOW_TO_PLAY = (
+    "\n\nHow to play:\n"
+    "- Inspect `current_frame`, `history` and `valid_actions` FROM PYTHON instead of "
+    "reading the raw board by eye; never describe frames freehand.\n"
+    "- For the most recent change compare `previous_frame` to `current_frame`, or "
+    "`last_transition.before_frame` to `.after_frame` - `history[-1].frame` IS the "
+    "current frame, so comparing it to `current_frame` compares the board to itself.\n"
+    "- After every action, check whether gameplay objects changed or only a timer / "
+    "progress / remaining-step bar moved; HUD-only change is not evidence the move "
+    "worked.\n"
+    "- Optimize for the shortest reliable sequence that advances the current goal. If "
+    "confidence is low, program a discriminating probe and revise your approach from "
+    "the result.\n"
+    "- When the game is about moving an agent to a target, write an explicit search "
+    "(BFS is the safe default). More generally, when the objective is clear but the "
+    "action order is not, pathfinding, flood fill, BFS/DFS, beam search, action-sequence "
+    "search or custom heuristics are all valid. Once the state variables and action "
+    "effects are understood, stop probing and search the inferred state space.\n"
+    "- Default loop: summarise the board, infer the change you want, score/search "
+    "candidate sequences, execute the best probe/plan with `action(...)`, then inspect "
+    "exactly what changed.\n"
+    "- Track objects by colour, overlap, bbox proximity, area change and edge contact - "
+    "not exact coordinates alone. Report a diff as changed cells, colour transitions, "
+    "appearing/disappearing components and movement candidates.\n"
+    "- Tool calls are unlimited per turn: investigate until your code has a clear probe "
+    "or plan, and spend extra calls to confirm what changed.\n"
+)
+
+_FRAME_DIFF = (
+    "- `frame_diff(before=None, after=None)` compares two frames (defaults "
+    "`previous_frame`/`current_frame`; pass frames to compare history). It returns "
+    "`changed_cell_count` and lists `moved`, `rotated`, `appeared`, `disappeared`, "
+    "`changed_color`, `resized`. Matching is by same-colour 4-connected component "
+    "(edges, not diagonals), so one game object can split into several and touching "
+    "same-colour objects can merge; matching NEVER proves persistent identity, so with "
+    "similar components the correspondence may be wrong. `resized` covers backgrounds "
+    "and budget bars; `appeared`/`disappeared` give `bbox` `[r0, c0, r1, c1]`.\n"
+)
+
+_TOOL_SESSION = (
+    "\n\nTool session:\n"
+    "- One tool: `python`, one ephemeral `code` string. When calling `python`, emit "
+    "exactly the tool-call format shown elsewhere in this prompt for this model - only "
+    "that format: no markdown fences, no prose wrapper, no alternate tool-call syntax, "
+    "and no tool-call markup quoted inside explanatory text.\n"
+)
+_PERSISTENT_FUNCTIONS = (
+    "- Python variables reset between calls; eligible functions you define are retained "
+    "automatically for later calls {lifetime} - call them directly, redefine one to "
+    "change it. Its dependencies must be available next call too: pass snippet data as "
+    "arguments, use plain top-level definitions (no decorators, annotations, non-literal "
+    "defaults). {import_guidance} Tool results name what was retained and why anything "
+    "was rejected."
+)
+_EPHEMERAL_FUNCTIONS = (
+    "- Python variables and functions reset between calls; re-import modules and "
+    "re-define helpers you need."
+)
+
+
+def build_compact_system_prompt(
+    *,
+    gameplay_changed_border: str | None,
+    animation: bool,
+    animation_timeline: bool,
+    current_grid_image: bool,
+    diff_image: bool,
+    undo: bool,
+    reset: bool,
+    frame_diff_hint: bool,
+    persistent_lifetime: str | None,
+    persistent_import_guidance: str,
+) -> str:
+    """Their prompt, with each optional section gated by the same flag as ours.
+
+    `gameplay_changed_border` is None when ARC3_EXPLAIN_GAMEPLAY_CHANGED is off;
+    `persistent_lifetime` is None when functions are not retained.
+    """
+    prompt = _HEAD
+    prompt += _GLOBALS_PERSISTENT if persistent_lifetime else _GLOBALS_EPHEMERAL
+    prompt += _GLOBALS
+    if gameplay_changed_border is not None:
+        prompt += _GAMEPLAY_CHANGED.format(border=gameplay_changed_border)
+    if animation:
+        prompt += _ANIMATION
+        if animation_timeline:
+            prompt += _ANIMATION_TIMELINE
+    if current_grid_image:
+        prompt += _VISION
+        if diff_image:
+            prompt += _DIFF_IMAGE
+    prompt += _READING
+    prompt += _ACTIONS
+    if undo:
+        prompt += _UNDO
+    if reset:
+        prompt += _RESET
+    prompt += _HOW_TO_PLAY
+    if frame_diff_hint:
+        prompt += _FRAME_DIFF
+    prompt += _TOOL_SESSION
+    prompt += (
+        _PERSISTENT_FUNCTIONS.format(
+            lifetime=persistent_lifetime, import_guidance=persistent_import_guidance
+        )
+        if persistent_lifetime else _EPHEMERAL_FUNCTIONS
+    )
+    return prompt
+
+
+def run_length_actions(actions: list[str], limit: int = 12) -> str:
+    """`A, A, A, B` -> `Ax3, B`; at most `limit` runs, then `(+N more, omitted)`."""
+    runs: list[list] = []
+    for action in actions:
+        if runs and runs[-1][0] == action:
+            runs[-1][1] += 1
+        else:
+            runs.append([action, 1])
+    shown = ", ".join(a if n == 1 else f"{a}x{n}" for a, n in runs[:limit])
+    hidden = sum(n for _, n in runs[limit:])
+    return shown + (f" (+{hidden} more, omitted)" if hidden else "")
