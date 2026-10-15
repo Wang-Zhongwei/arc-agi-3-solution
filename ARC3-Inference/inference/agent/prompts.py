@@ -282,9 +282,8 @@ WORLD_MODEL_NOTES_ADDENDUM = (
     "in your thinking or your reply. Write only what changed and the evidence for it.\n"
     "- Your updates are kept in `world_model.md` for this game, with every line tagged by the "
     "level and action count it was written at, e.g. `[L2 s57]`. Read it from Python with "
-    "`open('world_model.md')` when you need what you established earlier, and filter it by "
-    "tag or content like grep, e.g. `[l for l in open('world_model.md') if l.startswith('[L2 ')]` "
-    "or `import re; re.findall(r'^.*ACTION3.*$', open('world_model.md').read(), re.M)`.\n"
+    "`open('world_model.md')` when you need what you established earlier; filter by tag or "
+    "content with `re` (`import re` first).\n"
 )
 
 DEATH_GUARD_ADDENDUM = (
