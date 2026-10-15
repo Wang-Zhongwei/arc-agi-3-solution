@@ -275,6 +275,22 @@ WORLD_MODEL_FREE_ADDENDUM = (
     "result.\n"
 )
 
+WORLD_MODEL_NOTES_ADDENDUM = (
+    "\n\nWorld-model notes:\n"
+    "- When your understanding of how this game works changes - a rule confirmed or refuted, "
+    "a new mechanic, a revised goal - you may record the change in a `<world_model>` block, "
+    "in your thinking or in your reply. Put the opening `<world_model>` and closing "
+    "`</world_model>` tags on their own lines. Write what changed and the evidence for it; "
+    "there is no need to write a block every turn.\n"
+    "- Each block is appended to a notes log kept for the whole game, across levels, tagged "
+    "with the level and action count it was written at, e.g. `[L2 s57]`. The last complete "
+    "block of a response is the one saved.\n"
+    "- The log is never shown to you automatically. In Python, this game's log is the "
+    "string `world_model_notes`; read it when you want to recall what you established earlier, "
+    "for example after a level change or when your recent history no longer shows it. "
+    "Earlier entries may be outdated: later entries and fresh evidence take precedence.\n"
+)
+
 DEATH_GUARD_ADDENDUM = (
     "- An action that ended a previous attempt from this EXACT board state is refused before "
     "execution: it raises `KnownDeathActionError`, nothing runs, and no attempt is lost. "

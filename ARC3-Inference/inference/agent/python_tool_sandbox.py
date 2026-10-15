@@ -456,6 +456,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["death_ledger"] = state_payload.get("death_ledger") or {"attempts": []}
             runtime_globals["last_action_call_result"] = action_result
+            # only the initial state carries it (ARC3_WORLD_MODEL_NOTES); the
+            # log cannot change during a tool call, so refreshes leave it alone
+            if "world_model_notes" in state_payload:
+                runtime_globals["world_model_notes"] = str(state_payload.get("world_model_notes") or "")
 
         # Both refusals derive from BaseException, not Exception, so a
         # defensive `except Exception:` around action(...) - which models write

@@ -53,6 +53,7 @@ The descriptions clarify that action semantics depend on the game. MOUSE uses in
 | `ARC3_DEDUPE_MULTICALL_LINE` | Off | Removes duplicated prompt wording about multiple action calls. This is text deduplication, not deduplication of tool execution. |
 | `ARC3_SYSTEM_PROMPT_PREFIX` | Empty | Prepends a custom system-prompt prefix for experiments. |
 | `ARC3_GAME_PRIORS` | Off | Appends a "Priors and probing" section at the end of the system prompt: every level is solvable from its starting layout, likely action and object roles to probe first, and when to stop probing. |
+| `ARC3_WORLD_MODEL_NOTES` | Off | Adds a "World-model notes" system-prompt section. The model may write a `<world_model>` block, in thinking or reply, whenever its understanding changes; the last complete block of each completion (opening tag at line start, outside tool calls, not identical to the previous entry) is appended to a per-game log as `[L<level> s<action count>] ...`. The log is never injected into context: the model reads it from Python as the string `world_model_notes`. Each game's log is also written to `artifacts/<game run>_world_model.md`. Independent of `ARC3_MEMORY_SECTIONS`. |
 
 With level-transfer guidance enabled, the old advice about re-grounding after a score increase is replaced: the model is explicitly informed of level transitions rather than being asked to infer them from score. Transition/terminal behavior is explained alongside the corresponding runtime information.
 

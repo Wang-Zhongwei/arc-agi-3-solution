@@ -55,6 +55,7 @@ from inference.agent.prompts import (
     GAME_OVERVIEW_ADDENDUM,
     WORLD_MODEL_ADDENDUM,
     WORLD_MODEL_FREE_ADDENDUM,
+    WORLD_MODEL_NOTES_ADDENDUM,
     FRAME_DIFF_HINT_ADDENDUM,
     STEP_VERIFICATION_ADDENDUM,
     PYTHON_ADDENDUM_HEAD,
@@ -83,6 +84,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import RawJSON, frame_diff_enabled, run_sandboxed_python
+from inference.agent.world_model_notes import extract_world_model, format_note, note_body, render_notes
 from inference.agent.runtime_state import (
     Frame, HistoryEntry, RUNTIME_STATE_FILENAME, debug_artifacts_enabled, load_runtime_state,
     runtime_state_exists,
@@ -146,6 +148,14 @@ def _levelup_board_image() -> bool:
     death board. Without it the opener after a level-up carries only the next
     level's first board. ARC3_LEVELUP_BOARD_IMAGE defaults off."""
     return _get_env_bool("ARC3_LEVELUP_BOARD_IMAGE", False)
+
+
+def _world_model_notes_enabled() -> bool:
+    """`<world_model>` blocks the model writes are logged per game and readable
+    from Python as `world_model_notes`; see inference/agent/world_model_notes.py.
+    ARC3_WORLD_MODEL_NOTES defaults off: no prompt section, no extraction, and
+    no `world_model_notes` global."""
+    return _get_env_bool("ARC3_WORLD_MODEL_NOTES", False)
 
 
 def _contains_tool_call_markup(*chunks: str) -> bool:
@@ -2892,6 +2902,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     if _get_env_bool("ARC3_STEP_VERIFICATION_HINT", False):
         # General checks during action sequences and targeted probes when search fails.
         prompt += STEP_VERIFICATION_ADDENDUM
+    if _world_model_notes_enabled():
+        prompt += WORLD_MODEL_NOTES_ADDENDUM
     # only describe the guards that are actually armed: prompt weight spent on a
     # mechanism that cannot fire is weight the model reads and cannot use, and an
     # exception it is told about but never sees is worse than silence
@@ -3777,6 +3789,7 @@ class ToolAgent:
         self._last_step_summary: dict[str, Any] | None = None
         self._last_action_call_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
+        self._world_model_notes: list[str] = []
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -3811,6 +3824,7 @@ class ToolAgent:
             self._last_step_summary = None
             self._last_action_call_result = None
             self._summarized_knowledge = _empty_world_model()
+            self._world_model_notes = []
             self._turns_without_wm_update = 0
             self._pending_wm_rebuild_reason = ""
             self._pending_wm_revise_reason = ""
@@ -4004,6 +4018,26 @@ class ToolAgent:
     # wording nor the fallback it carried ever reached a transcript. Two
     # patches were spent revising text no model ever read. What it uniquely
     # provided is now rendered inline in _build_user_prompt.
+
+    def _record_world_model_note(self, state_path: Path, reasoning: str, content: str) -> None:
+        body = extract_world_model(reasoning, content)
+        if not body:
+            return
+        if self._world_model_notes and note_body(self._world_model_notes[-1]) == body:
+            return
+        frame, _ = load_runtime_state(state_path)
+        level = frame.level if frame is not None else 1
+        step = frame.step if frame is not None else 0
+        self._world_model_notes.append(format_note(level, step, body))
+        # mirror to disk next to the analyzer transcript for later analysis;
+        # the model reads the log from the sandbox global, not this file
+        run_stem = state_path.stem.removesuffix(Path(RUNTIME_STATE_FILENAME).stem).rstrip("_")
+        try:
+            (state_path.parent / f"{run_stem or state_path.stem}_world_model.md").write_text(
+                render_notes(self._world_model_notes) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            log.warning("could not write world-model notes: %s", exc)
 
     def _update_summarized_knowledge_from_assistant(self, content: str) -> list[str]:
         if _memory_sections_disabled():
@@ -6469,7 +6503,11 @@ class ToolAgent:
         sandbox_result = run_sandboxed_python(
             code=code,
             timeout_seconds=self._python_timeout,
-            initial_state=_serialized_runtime_state(),
+            initial_state=(
+                {**_serialized_runtime_state(), "world_model_notes": render_notes(self._world_model_notes)}
+                if _world_model_notes_enabled()
+                else _serialized_runtime_state()
+            ),
             action_handler=_handle_action,
             animation_handler=_handle_animation if _animation_enabled() else None,
             kept_functions=self._retained_sources(),
@@ -7634,6 +7672,8 @@ class ToolAgent:
                     response_meta,
                 )
                 assistant_message: dict[str, Any] = {"role": "assistant"}
+                if _world_model_notes_enabled():
+                    self._record_world_model_note(state_path, reasoning or "", content or "")
 
                 if reasoning:
                     captured_reasoning = reasoning
