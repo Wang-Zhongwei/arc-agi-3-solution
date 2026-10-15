@@ -2859,7 +2859,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
             " Alongside the current grid image you receive a diff image: cells that "
             "changed since your previous analyzer turn are shown in their new true "
             "color; unchanged cells are dimmed to a dark navy that is not a game "
-            "color. Use it to locate change at a glance."
+            "color. Use it to locate change at a glance. There is no diff image after "
+            "a turn in which you issued RESET."
         )
     prompt += VISUAL_GAME_ADDENDUM
     if _get_env_bool("ARC3_ACTION_INFO", False):
@@ -4193,6 +4194,14 @@ class ToolAgent:
             self._prev_level_start_frame = self._cur_level_start_frame
             self._cur_level_start_frame = current_frame
         if previous_step_summary and previous_step_summary.get("game_over"):
+            return []
+        if previous_step_summary and not previous_step_summary.get("stale") and "RESET" in [
+            str(name).strip().upper() for name in previous_step_summary.get("executed_actions") or []
+        ]:
+            # A RESET the model issued restores the level's start board, so a
+            # diff from the previous turn's board mixes what the reset undid
+            # with what came after it. Automatic resets after a death never
+            # reach executed_actions, and that turn already returned above.
             return []
         if level_changed:
             if not _level_inventory_enabled():
