@@ -123,3 +123,17 @@ def test_sandbox_open_serves_nothing_else(code, message):
 def test_sandbox_has_no_open_when_off():
     out = _run_sandbox("open('world_model.md')")
     assert "open" in str(out.get("error") or out), out
+
+
+def test_prompt_examples_run_as_written():
+    # the filter examples the prompt shows must run verbatim in the sandbox
+    import re
+
+    from inference.agent.prompts import WORLD_MODEL_NOTES_ADDENDUM
+
+    examples = re.findall(r"`(\[l for l.*?|import re;.*?)`", WORLD_MODEL_NOTES_ADDENDUM)
+    assert len(examples) == 2, examples
+    for example in examples:
+        out = _run_sandbox(f"result = {example}" if example.startswith("[") else
+                           example.replace("import re; ", "import re\nresult = "), world_model_md=NOTES)
+        assert out.get("result"), (example, out)

@@ -284,7 +284,7 @@ WORLD_MODEL_NOTES_ADDENDUM = (
     "level and action count it was written at, e.g. `[L2 s57]`. Read it from Python with "
     "`open('world_model.md')` when you need what you established earlier, and filter it by "
     "tag or content like grep, e.g. `[l for l in open('world_model.md') if l.startswith('[L2 ')]` "
-    "or `re.findall(r'^.*ACTION3.*$', open('world_model.md').read(), re.M)`.\n"
+    "or `import re; re.findall(r'^.*ACTION3.*$', open('world_model.md').read(), re.M)`.\n"
 )
 
 DEATH_GUARD_ADDENDUM = (
