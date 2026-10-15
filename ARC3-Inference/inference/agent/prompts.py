@@ -283,7 +283,7 @@ WORLD_MODEL_NOTES_ADDENDUM = (
     "- Your updates are kept in `world_model.md` for this game, with every line tagged by the "
     "level and action count it was written at, e.g. `[L2 s57]`. Read it from Python with "
     "`open('world_model.md')` when you need what you established earlier; filter by tag or "
-    "content with `re` (`import re` first).\n"
+    "content with `re`.\n"
 )
 
 DEATH_GUARD_ADDENDUM = (

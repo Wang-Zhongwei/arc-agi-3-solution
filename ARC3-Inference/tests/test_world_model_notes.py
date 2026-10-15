@@ -129,4 +129,4 @@ def test_sandbox_has_no_open_when_off():
 def test_prompt_points_at_re_for_filtering():
     from inference.agent.prompts import WORLD_MODEL_NOTES_ADDENDUM
 
-    assert "with `re` (`import re` first)" in WORLD_MODEL_NOTES_ADDENDUM
+    assert "with `re`." in WORLD_MODEL_NOTES_ADDENDUM
