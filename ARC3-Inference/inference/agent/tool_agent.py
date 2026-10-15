@@ -3915,6 +3915,8 @@ class ToolAgent:
                 verdict = "RUN COMPLETE"
             elif item.get("level_completed"):
                 verdict = "LEVEL COMPLETED"
+            elif item.get("gameplay_changed") is False and item.get("no_op") is False:
+                verdict = "effect (animation only; the board area ended unchanged)"
             elif item.get("gameplay_changed") is False:
                 verdict = (
                     "NO-OP (executed, no change inside the board area)"
@@ -6201,11 +6203,18 @@ class ToolAgent:
         self._guard_hook_trace = []
         if not trace:
             return
-        verdicts = raw_payload.get("gameplay_changed_per_action")
+        # an action that only animated counts as having changed something:
+        # the same rule as the solver's no_op and the stale-state flag
+        no_ops = raw_payload.get("no_op_per_action")
+        verdicts = (
+            [not item for item in no_ops] if isinstance(no_ops, list) and no_ops
+            else raw_payload.get("gameplay_changed_per_action")
+        )
         if not isinstance(verdicts, list) or not verdicts:
             if len(trace) != 1 or not compact_payload.get("executed"):
                 return
-            verdicts = [compact_payload.get("gameplay_changed")]
+            no_op = compact_payload.get("no_op")
+            verdicts = [compact_payload.get("gameplay_changed") if no_op is None else not no_op]
         for (state_hash, action_sig), changed in zip(trace, verdicts):
             if reset_exposed() and action_sig == "RESET":
                 # Retain its position in the trace so following verdicts stay
@@ -6252,7 +6261,7 @@ class ToolAgent:
             compact["stopped_early"] = bool(payload.get("stopped_early"))
         # blocked_action names the refused action for the next turn's opener;
         # without it the model was told "the sequence was stopped before None"
-        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation"):
+        for passthrough_key in ("no_op_action_index", "no_op_action", "skipped_actions", "gameplay_changed_per_action", "no_op_per_action", "action_trace", "no_op", "fatal_action", "blocked_action", "action_echo", "animation"):
             if passthrough_key in payload:
                 compact[passthrough_key] = payload.get(passthrough_key)
         if payload.get("stop_reason"):
@@ -6453,7 +6462,10 @@ class ToolAgent:
                 # Use actual execution, not submitted batch size: a refused
                 # call does not consume the snippet's first-action allowance.
                 snippet_executed_actions += max(1, int(raw_payload.get("executed_count") or 1))
-            if _animation_enabled():
+            if _animation_enabled() and raw_payload.get("executed"):
+                # A refused call executed nothing, so it must not overwrite the
+                # last executed action's chain and flag (it used to blank both,
+                # flipping the opener's wording for an animated no-op).
                 # Held on the agent, not routed through the sandbox: the chain
                 # is dropped by compaction so the raw grids never become text,
                 # which also meant it never reached the summary. It is only

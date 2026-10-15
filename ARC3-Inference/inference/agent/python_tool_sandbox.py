@@ -589,11 +589,17 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 # into the snippet's own stdout, so a loop can see what its
                 # call did without waiting for the next turn's opener
                 print(_echo)
-            gameplay_changed = action_result.get("gameplay_changed")
-            if gameplay_changed is True:
+            # no_op is the solver's verdict on the call's last executed action:
+            # no change inside the board area AND no animation there. An action
+            # that only animated did something, so it neither arms the flag nor
+            # leaves it armed.
+            _no_op = action_result.get("no_op")
+            if _no_op is None and "gameplay_changed" in action_result:
+                _no_op = action_result.get("gameplay_changed") is False
+            if _no_op is False and action_result.get("executed"):
                 # a real change means the snippet's beliefs are current again
                 del _stale_state[:]
-            if gameplay_changed is False and action_result.get("executed"):
+            if _no_op and action_result.get("executed"):
                 _executed = action_result.get("executed_actions")
                 _name = (
                     _executed[-1]

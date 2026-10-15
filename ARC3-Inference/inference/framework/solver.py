@@ -26,6 +26,7 @@ from taaf.deploy_kaggle import KaggleTarget
 from taaf.solver import Solver
 
 from inference.utils.animation import (
+    _transient_cells,
     collapse_frames,
     normalize_frames,
     summarize_animation,
@@ -207,6 +208,8 @@ def _action_verdict(item: dict) -> str:
     if item.get("level_completed"):
         return "LEVEL COMPLETED"
     changed = item.get("gameplay_changed")
+    if changed is False and item.get("no_op") is False:
+        return "effect (animation only; the board ended unchanged)"
     if changed is False:
         return (
             "NO-OP (executed, no change inside the board area)"
@@ -1208,7 +1211,7 @@ class _HarnessGameSession:
                 BATCH_NOOP_BLOCK
                 and NOOP_GUARD_BORDER_WIDTH > 0
                 and batch_size >= 2
-                and not payload.get("gameplay_changed", True)
+                and payload.get("no_op")
             ):
                 stop_reason = "no_op_action"
                 break
@@ -1264,6 +1267,9 @@ class _HarnessGameSession:
             )
             final_payload["gameplay_changed_per_action"] = [
                 bool(item.get("gameplay_changed", True)) for item in executed_payloads
+            ]
+            final_payload["no_op_per_action"] = [
+                bool(item.get("no_op")) for item in executed_payloads
             ]
         if ACTION_ECHO:
             echo = _build_action_echo(requested_displays, executed_payloads, stop_reason)
@@ -1348,6 +1354,19 @@ class _HarnessGameSession:
         board_changed = previous_grid != new_grid
         gameplay_changed = _interior_gameplay_changed(previous_grid, new_grid)
         no_op = gameplay_changed is False
+        if no_op:
+            # An action whose animation changed cells inside the board area and
+            # changed them back did something - a run button that plays a
+            # program and reverts, a click that flashes the board - so it is not
+            # a no-op for the guards: nothing the snippet planned went stale,
+            # and repeating it is often the point (tn36's run button; dc22,
+            # turn 64, a 2,995-cell flash refused on its deliberate second press).
+            border = NOOP_GUARD_BORDER_WIDTH
+            no_op = not any(
+                border <= row < len(new_grid) - border
+                and border <= col < len(new_grid[row]) - border
+                for row, col in _transient_cells(_animation_chain(previous_grid, new_state))
+            )
         animation_summary = None
         if ANIMATION_ENABLED and action.id.name != "RESET":
             # The auto-reset after a death runs through here too. Letting it
