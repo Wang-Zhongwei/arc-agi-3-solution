@@ -416,9 +416,19 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 after.segmentation.get("nodes", []),
             )
 
+        # The sandbox's own copy of the history: the host sends it whole once,
+        # then only the entries appended after each action. Kept apart from the
+        # `history` global, which the snippet is free to mutate.
+        _history_items = []
+
         def _refresh_state(state_payload):
             current_frame = _frame_from_payload(state_payload.get("current_frame"))
-            history = _history_from_payload(state_payload.get("history"))
+            if "history_tail" in state_payload:
+                start = int(state_payload.get("history_start") or 0)
+                _history_items[start:] = _history_from_payload(state_payload.get("history_tail"))
+            else:
+                _history_items[:] = _history_from_payload(state_payload.get("history"))
+            history = list(_history_items)
             last_action_call_result = state_payload.get("last_action_call_result")
             action_result = (
                 dict(last_action_call_result) if isinstance(last_action_call_result, dict) else {}
@@ -867,8 +877,34 @@ def _sandbox_env() -> dict[str, str]:
     }
 
 
+class RawJSON(str):
+    """Text that is already JSON, written verbatim by _send_json_line.
+
+    The host caches each history entry's serialized view, so a state message
+    is a string join instead of a fresh json.dumps of every board."""
+
+
+def _json_line(payload: dict[str, Any]) -> str:
+    raws: list[str] = []
+
+    def swap(value: Any) -> Any:
+        # dict values only: RawJSON sits in the state dict, and walking lists
+        # would mean walking every board of a plain-history payload
+        if isinstance(value, RawJSON):
+            raws.append(value)
+            return f"\x00raw{len(raws) - 1}\x00"
+        if isinstance(value, dict):
+            return {key: swap(item) for key, item in value.items()}
+        return value
+
+    text = json.dumps(swap(payload), ensure_ascii=False)
+    for index, raw in enumerate(raws):
+        text = text.replace(json.dumps(f"\x00raw{index}\x00"), raw, 1)
+    return text
+
+
 def _send_json_line(handle: Any, payload: dict[str, Any]) -> None:
-    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    handle.write(_json_line(payload) + "\n")
     handle.flush()
 
 

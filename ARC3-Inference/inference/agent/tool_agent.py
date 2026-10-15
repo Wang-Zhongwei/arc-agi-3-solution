@@ -82,7 +82,7 @@ from inference.agent.vision_context import (
     intermediate_frame_parts,
 )
 
-from inference.agent.python_tool_sandbox import frame_diff_enabled, run_sandboxed_python
+from inference.agent.python_tool_sandbox import RawJSON, frame_diff_enabled, run_sandboxed_python
 from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
@@ -6239,6 +6239,27 @@ class ToolAgent:
             compact["error"] = payload.get("error")
         return compact
 
+    def _history_view_json(self, entries: list[HistoryEntry]) -> RawJSON:
+        """The sandbox's view of `entries` as a JSON array, each entry
+        serialized once: entries never change after they are appended, and
+        rebuilding all of them for every tool call and action grew with the
+        whole history."""
+        cache: dict[int, tuple[HistoryEntry, str]] = self.__dict__.setdefault("_history_json_cache", {})
+        if len(cache) > 4 * len(entries) + 1000:
+            # keyed by identity, so entries re-read from the file never hit;
+            # drop the stale ones rather than let them accumulate
+            cache.clear()
+        parts: list[str] = []
+        for entry in entries:
+            hit = cache.get(id(entry))
+            if hit is None or hit[0] is not entry:
+                view = _ascii_history_view_payload([entry])
+                hit = (entry, json.dumps(view[0], ensure_ascii=False) if view else "")
+                cache[id(entry)] = hit
+            if hit[1]:
+                parts.append(hit[1])
+        return RawJSON("[" + ",".join(parts) + "]")
+
     def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]) -> _ToolDispatchResult:
         self._ensure_session(state_path)
         code = str(arguments.get("code", "")).rstrip()
@@ -6251,6 +6272,9 @@ class ToolAgent:
 
         current_frame, history_entries = load_runtime_state(state_path)
         valid_actions = list(_normalize_valid_actions(self._current_valid_actions))
+        # history entries the sandbox already holds: the first state carries the
+        # whole history, every later one only what was appended since
+        sandbox_history: list[int] = []
 
         def _serialized_runtime_state(
             *,
@@ -6259,6 +6283,14 @@ class ToolAgent:
         ) -> dict[str, Any]:
             refreshed_frame, refreshed_history = load_runtime_state(state_path)
             current_frame_payload = _ascii_frame_view_payload(refreshed_frame)
+            if sandbox_history and sandbox_history[0] <= len(refreshed_history):
+                history_fields: dict[str, Any] = {
+                    "history_start": sandbox_history[0],
+                    "history_tail": self._history_view_json(refreshed_history[sandbox_history[0]:]),
+                }
+            else:
+                history_fields = {"history": self._history_view_json(refreshed_history)}
+            sandbox_history[:] = [len(refreshed_history)]
             if isinstance(next_valid_actions, list):
                 sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
             else:
@@ -6270,7 +6302,7 @@ class ToolAgent:
             )
             return {
                 "current_frame": current_frame_payload,
-                "history": _ascii_history_view_payload(refreshed_history),
+                **history_fields,
                 "valid_actions": sanitized_actions,
                 "death_ledger": (
                     self._death_ledger_payload()

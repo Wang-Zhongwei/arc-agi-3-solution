@@ -40,6 +40,7 @@ from inference.agent.runtime_state import (
     Frame,
     HistoryEntry,
     RUNTIME_STATE_FILENAME,
+    discard_runtime_state,
     write_runtime_state,
 )
 from inference.agent.tool_agent import (
@@ -793,7 +794,7 @@ class _HarnessGameSession:
             if run.solver_note is None:
                 run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
-            self.state_path.unlink(missing_ok=True)
+            discard_runtime_state(self.state_path)
             self._write_analysis_html()
             self.write_viewer_payload()
 
