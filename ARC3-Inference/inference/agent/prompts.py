@@ -276,19 +276,15 @@ WORLD_MODEL_FREE_ADDENDUM = (
 )
 
 WORLD_MODEL_NOTES_ADDENDUM = (
-    "\n\nWorld-model notes:\n"
-    "- When your understanding of how this game works changes - a rule confirmed or refuted, "
-    "a new mechanic, a revised goal - you may record the change in a `<world_model>` block, "
-    "in your thinking or in your reply. Put the opening `<world_model>` and closing "
-    "`</world_model>` tags on their own lines. Write what changed and the evidence for it; "
-    "there is no need to write a block every turn.\n"
-    "- Each block is appended to a notes log kept for the whole game, across levels, tagged "
-    "with the level and action count it was written at, e.g. `[L2 s57]`. The last complete "
-    "block of a response is the one saved.\n"
-    "- The log is never shown to you automatically. In Python, this game's log is the "
-    "string `world_model_notes`; read it when you want to recall what you established earlier, "
-    "for example after a level change or when your recent history no longer shows it. "
-    "Earlier entries may be outdated: later entries and fresh evidence take precedence.\n"
+    "\n\nWorld model:\n"
+    "- When your understanding of the game changes - a rule confirmed or refuted, a new "
+    "mechanic, a revised goal - emit the update in a `<world_model>...</world_model>` block, "
+    "in your thinking or your reply. Write only what changed and the evidence for it.\n"
+    "- Your updates are kept in `world_model.md` for this game, with every line tagged by the "
+    "level and action count it was written at, e.g. `[L2 s57]`. Read it from Python with "
+    "`open('world_model.md')` when you need what you established earlier, and filter it by "
+    "tag or content like grep, e.g. `[l for l in open('world_model.md') if l.startswith('[L2 ')]` "
+    "or `re.findall(r'^.*ACTION3.*$', open('world_model.md').read(), re.M)`.\n"
 )
 
 DEATH_GUARD_ADDENDUM = (

@@ -456,10 +456,23 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["death_ledger"] = state_payload.get("death_ledger") or {"attempts": []}
             runtime_globals["last_action_call_result"] = action_result
-            # only the initial state carries it (ARC3_WORLD_MODEL_NOTES); the
-            # log cannot change during a tool call, so refreshes leave it alone
-            if "world_model_notes" in state_payload:
-                runtime_globals["world_model_notes"] = str(state_payload.get("world_model_notes") or "")
+            # ARC3_WORLD_MODEL_NOTES: only the initial state carries the file,
+            # which cannot change during a tool call. `open` serves this one
+            # read-only, in-memory file and nothing else, so the sandbox still
+            # has no file I/O.
+            if "world_model_md" in state_payload:
+                notes_text = str(state_payload.get("world_model_md") or "")
+
+                def open(file, mode="r", *args, **kwargs):
+                    if os.path.basename(str(file)) != "world_model.md":
+                        raise FileNotFoundError(f"{file!r}: the only readable file is 'world_model.md'")
+                    if any(flag in str(mode) for flag in "wax+"):
+                        raise PermissionError(
+                            "world_model.md is read-only: it is maintained from your <world_model> updates"
+                        )
+                    return io.StringIO(notes_text)
+
+                runtime_globals["__builtins__"]["open"] = open
 
         # Both refusals derive from BaseException, not Exception, so a
         # defensive `except Exception:` around action(...) - which models write

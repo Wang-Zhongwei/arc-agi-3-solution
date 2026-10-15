@@ -84,7 +84,7 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import RawJSON, frame_diff_enabled, run_sandboxed_python
-from inference.agent.world_model_notes import extract_world_model, format_note, note_body, render_notes
+from inference.agent.world_model_notes import NOTES_FILENAME, extract_world_model, render_notes
 from inference.agent.runtime_state import (
     Frame, HistoryEntry, RUNTIME_STATE_FILENAME, debug_artifacts_enabled, load_runtime_state,
     runtime_state_exists,
@@ -151,10 +151,10 @@ def _levelup_board_image() -> bool:
 
 
 def _world_model_notes_enabled() -> bool:
-    """`<world_model>` blocks the model writes are logged per game and readable
-    from Python as `world_model_notes`; see inference/agent/world_model_notes.py.
+    """`<world_model>` updates the model emits are kept per game in
+    `world_model.md`, readable from Python; see inference/agent/world_model_notes.py.
     ARC3_WORLD_MODEL_NOTES defaults off: no prompt section, no extraction, and
-    no `world_model_notes` global."""
+    no readable file."""
     return _get_env_bool("ARC3_WORLD_MODEL_NOTES", False)
 
 
@@ -3789,7 +3789,7 @@ class ToolAgent:
         self._last_step_summary: dict[str, Any] | None = None
         self._last_action_call_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
-        self._world_model_notes: list[str] = []
+        self._world_model_notes: list[tuple[int, int, str]] = []
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -4023,18 +4023,18 @@ class ToolAgent:
         body = extract_world_model(reasoning, content)
         if not body:
             return
-        if self._world_model_notes and note_body(self._world_model_notes[-1]) == body:
+        if self._world_model_notes and self._world_model_notes[-1][2] == body:
             return
         frame, _ = load_runtime_state(state_path)
         level = frame.level if frame is not None else 1
         step = frame.step if frame is not None else 0
-        self._world_model_notes.append(format_note(level, step, body))
-        # mirror to disk next to the analyzer transcript for later analysis;
-        # the model reads the log from the sandbox global, not this file
+        self._world_model_notes.append((level, step, body))
+        # the same file the model opens in the sandbox, kept with the run's
+        # artifacts for later analysis
         run_stem = state_path.stem.removesuffix(Path(RUNTIME_STATE_FILENAME).stem).rstrip("_")
         try:
-            (state_path.parent / f"{run_stem or state_path.stem}_world_model.md").write_text(
-                render_notes(self._world_model_notes) + "\n", encoding="utf-8"
+            (state_path.parent / f"{run_stem or state_path.stem}_{NOTES_FILENAME}").write_text(
+                render_notes(self._world_model_notes), encoding="utf-8"
             )
         except OSError as exc:
             log.warning("could not write world-model notes: %s", exc)
@@ -6504,7 +6504,7 @@ class ToolAgent:
             code=code,
             timeout_seconds=self._python_timeout,
             initial_state=(
-                {**_serialized_runtime_state(), "world_model_notes": render_notes(self._world_model_notes)}
+                {**_serialized_runtime_state(), "world_model_md": render_notes(self._world_model_notes)}
                 if _world_model_notes_enabled()
                 else _serialized_runtime_state()
             ),
