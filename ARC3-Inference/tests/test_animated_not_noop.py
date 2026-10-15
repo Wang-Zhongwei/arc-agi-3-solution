@@ -1,4 +1,4 @@
-"""An action that only animated inside the board area is not a no-op for the guards."""
+"""An action whose animation changed enough of the board area is not a no-op for the guards."""
 
 import time
 from types import SimpleNamespace
@@ -47,6 +47,8 @@ class _Game:
 def session(monkeypatch):
     monkeypatch.setattr(solver_module, "BATCH_NOOP_BLOCK", True)
     monkeypatch.setattr(solver_module, "NOOP_GUARD_BORDER_WIDTH", 4)
+    # a one-row flash on this 16x16 board covers 8 cells inside the border
+    monkeypatch.setattr(solver_module, "ANIMATION_EFFECT_MIN_CELLS", 8)
     session = object.__new__(_HarnessGameSession)
     session.solver = SimpleNamespace(max_runtime_s_per_game=None)
     session.game = _Game()
@@ -68,7 +70,14 @@ def test_an_animated_action_does_not_stop_the_batch(session):
     assert result["executed_count"] == 2 and result["stop_reason"] == "no_op_action"
     assert result["gameplay_changed_per_action"] == [False, False]
     assert result["no_op_per_action"] == [False, True]
-    assert "1: UP -> effect (animation only; the board area ended unchanged)" in result["action_trace"]
+    assert result["action_trace"][0].startswith("1: UP -> effect (animation only;")
+
+
+def test_a_flash_below_the_cell_threshold_is_still_a_no_op(session, monkeypatch):
+    monkeypatch.setattr(solver_module, "ANIMATION_EFFECT_MIN_CELLS", 9)
+    result = session.step_env({"actions": [{"action": "ACTION1"}, {"action": "ACTION2"}]})
+    assert result["executed_count"] == 1 and result["no_op_per_action"] == [True]
+    assert "NO-OP" in result["action_trace"][0]
 
 
 def test_a_flash_only_in_the_border_is_still_a_no_op(session):

@@ -129,6 +129,9 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "on",
 )
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
+# Cells inside the board area an action's animation must change and change back
+# for an action that leaves the board unchanged to count as having an effect.
+ANIMATION_EFFECT_MIN_CELLS = max(1, int(os.environ.get("ARC3_ANIMATION_EFFECT_CELLS", "200")))
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
 # The patch-110 rewordings, behind one switch. They replaced "changed nothing"
@@ -1355,18 +1358,24 @@ class _HarnessGameSession:
         gameplay_changed = _interior_gameplay_changed(previous_grid, new_grid)
         no_op = gameplay_changed is False
         if no_op:
-            # An action whose animation changed cells inside the board area and
-            # changed them back did something - a run button that plays a
-            # program and reverts, a click that flashes the board - so it is not
-            # a no-op for the guards: nothing the snippet planned went stale,
-            # and repeating it is often the point (tn36's run button; dc22,
-            # turn 64, a 2,995-cell flash refused on its deliberate second press).
+            # An action whose animation changed enough of the board area and
+            # changed it back did something - a run button that plays a program
+            # and reverts, a beam, a screen wipe - so it is not a no-op for the
+            # guards: nothing the snippet planned went stale, and repeating it is
+            # often the point (tn36's run button; dc22, turn 64, a 2,995-cell
+            # flash refused on its deliberate second press). Small flashes are
+            # the game saying nothing happened - a ripple where a click hit
+            # nothing, a bump against a wall - and stay no-ops: in
+            # reset-daniel-context v1 the 200-cell cut kept 42 of 45 mechanics
+            # and 0 of 45 such rejections.
             border = NOOP_GUARD_BORDER_WIDTH
-            no_op = not any(
-                border <= row < len(new_grid) - border
-                and border <= col < len(new_grid[row]) - border
+            animated_cells = sum(
+                1
                 for row, col in _transient_cells(_animation_chain(previous_grid, new_state))
+                if border <= row < len(new_grid) - border
+                and border <= col < len(new_grid[row]) - border
             )
+            no_op = animated_cells < ANIMATION_EFFECT_MIN_CELLS
         animation_summary = None
         if ANIMATION_ENABLED and action.id.name != "RESET":
             # The auto-reset after a death runs through here too. Letting it

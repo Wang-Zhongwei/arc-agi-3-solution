@@ -3916,7 +3916,7 @@ class ToolAgent:
             elif item.get("level_completed"):
                 verdict = "LEVEL COMPLETED"
             elif item.get("gameplay_changed") is False and item.get("no_op") is False:
-                verdict = "effect (animation only; the board area ended unchanged)"
+                verdict = "effect (animation only; the board ended unchanged)"
             elif item.get("gameplay_changed") is False:
                 verdict = (
                     "NO-OP (executed, no change inside the board area)"
