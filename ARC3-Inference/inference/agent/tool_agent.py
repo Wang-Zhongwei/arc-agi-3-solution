@@ -3238,6 +3238,28 @@ def _resolve_analyzer_model(model: str) -> AnalyzerModelConfig:
     return AnalyzerModelConfig(provider=provider, base_url=base_url, model_id=requested)
 
 
+def _merge_repeated_stops(stops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per distinct stop, with `count` = how often it occurred.
+
+    A snippet that keeps calling action() with the same plan after a guard
+    refused it collects the identical refusal on every call, and the opener
+    printed one identical note per call (tn36, last-animation v1, turn 40:
+    the same stale-state note three times)."""
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for stop in stops:
+        key = (stop.get("kind"), stop.get("action"), stop.get("index"), tuple(stop.get("skipped") or []))
+        if key in merged:
+            merged[key]["count"] += 1
+        else:
+            merged[key] = {**stop, "count": 1}
+    return list(merged.values())
+
+
+def _repeat_note(stop: dict[str, Any], what: str) -> str:
+    count = int(stop.get("count") or 1)
+    return f" This {what} {count} times in that turn." if count > 1 else ""
+
+
 def _append_transcript_section(log_path: Path, label: str, content: str) -> None:
     rendered_content = content.strip()
     if not rendered_content or not debug_artifacts_enabled():
@@ -3967,7 +3989,7 @@ class ToolAgent:
                 bool(item.get("gameplay_changed")) for item in executed_results
             ),
             "stop_reason": last.get("stop_reason"),
-            "no_op_stops": [
+            "no_op_stops": _merge_repeated_stops([
                 {
                     "action": item.get("no_op_action"),
                     "index": item.get("no_op_action_index"),
@@ -3976,14 +3998,14 @@ class ToolAgent:
                 }
                 for item in executed_results
                 if item.get("stop_reason") == "no_op_action"
-            ],
+            ]),
             # the animation of the last executed action, which is what
             # last_animation_frames / last_animation_timeline will return when asked
             "animation": (executed_results[-1].get("animation") if executed_results else None),
             "animation_action": (
                 executed_results[-1].get("action_display") if executed_results else None
             ),
-            "guard_stops": [
+            "guard_stops": _merge_repeated_stops([
                 {
                     "kind": item.get("stop_reason"),
                     "action": item.get("blocked_action"),
@@ -3996,7 +4018,7 @@ class ToolAgent:
                 # executed_results before this point
                 for item in action_results
                 if item.get("stop_reason") in ("known_noop", "known_death", "stale_state")
-            ],
+            ]),
         }
 
     # _describe_last_outcome removed. It built an outcome sentence and was
@@ -5358,6 +5380,7 @@ class ToolAgent:
                     f"LAST of them - only the first {max(0, int(stop.get('index') or 1) - 1)} "
                     "executed action(s) moved anything. Do not count submitted or executed "
                     "actions to update your position; re-locate from current_frame."
+                    + _repeat_note(stop, "happened")
                 )
                 trace = stop.get("trace") or []
                 if trace:
@@ -5387,6 +5410,7 @@ class ToolAgent:
                         +
                         f"paths it had computed may have been wrong.{skipped_text} Re-ground on "
                         "the current board before planning again."
+                        + _repeat_note(stop, "stop was hit")
                     )
                 elif stop.get("kind") == "known_death":
                     lines.append(
@@ -5394,6 +5418,7 @@ class ToolAgent:
                         "action ended a previous attempt from that exact board state, so it was "
                         f"NOT executed and the attempt is intact.{skipped_text} Plan a different "
                         "move, or repeat it deliberately if you now believe it is safe."
+                        + _repeat_note(stop, "stop was hit")
                     )
                 else:
                     lines.append(
@@ -5404,6 +5429,7 @@ class ToolAgent:
                            "action already changed nothing in that exact board state, so it was ")
                         +
                         f"NOT executed and no action was spent.{skipped_text}"
+                        + _repeat_note(stop, "stop was hit")
                     )
                 trace = stop.get("trace") or []
                 if trace:
