@@ -40,6 +40,7 @@ from inference.agent.runtime_state import (
     Frame,
     HistoryEntry,
     RUNTIME_STATE_FILENAME,
+    debug_artifacts_enabled,
     discard_runtime_state,
     write_runtime_state,
 )
@@ -499,6 +500,23 @@ def _write_transcript_html(transcript_path: Path, html_path: Path, title: str) -
     html_path.write_text(body, encoding="utf-8")
 
 
+def _configure_debug_artifacts(solver: Any) -> None:
+    """Turn debug artifacts off for competition reruns and submission runs.
+
+    An explicit ARC3_DEBUG_ARTIFACTS wins. Otherwise a private run - where
+    only the score survives - writes no transcripts, prompt snapshots, viewer
+    events, analysis page or runtime-state file: every game is a thread of
+    this process, and that I/O only takes time from the games."""
+    if os.environ.get("ARC3_DEBUG_ARTIFACTS", "").strip():
+        return
+    runtime = getattr(solver, "runtime_environment", None)
+    if isinstance(runtime, KaggleTarget) and (
+        runtime.is_competition_rerun or runtime.actual_run_as_submission
+    ):
+        os.environ["ARC3_DEBUG_ARTIFACTS"] = "off"
+        log.info("private run: debug artifacts off (ARC3_DEBUG_ARTIFACTS=off)")
+
+
 @dataclass
 class _HarnessGameSession:
     solver: "HarnessSolver"
@@ -721,7 +739,7 @@ class _HarnessGameSession:
                     analysis_step = retry_analysis_step
 
                 self.write_runtime_state()
-                transcript_before = self._read_transcript_bytes()
+                transcript_before = self._transcript_size()
                 try:
                     result = self.analyzer.analyze(
                         self.state_path,
@@ -734,7 +752,10 @@ class _HarnessGameSession:
                         should_stop=self.should_stop,
                     )
                 finally:
-                    transcript_delta = self._transcript_delta_since(transcript_before)
+                    transcript_delta = (
+                        self._transcript_delta_since(transcript_before)
+                        if debug_artifacts_enabled() else ""
+                    )
                     if transcript_delta.strip():
                         self._append_analysis_viewer_event(
                             analysis_step, transcript_delta
@@ -806,7 +827,7 @@ class _HarnessGameSession:
             self.game.finish_game()
 
     def _write_analysis_html(self) -> None:
-        if self.solver.job_dir is None:
+        if self.solver.job_dir is None or not debug_artifacts_enabled():
             return
         _write_transcript_html(
             self.transcript_path,
@@ -814,22 +835,20 @@ class _HarnessGameSession:
             f"{self.game.game_run.game_id if self.game.game_run else self.game_index} analysis",
         )
 
-    def _read_transcript_bytes(self) -> bytes:
+    def _transcript_size(self) -> int:
         try:
-            return self.transcript_path.read_bytes()
+            return self.transcript_path.stat().st_size
         except OSError:
-            return b""
+            return 0
 
-    def _transcript_delta_since(self, previous_transcript: bytes) -> str:
+    def _transcript_delta_since(self, previous_size: int) -> str:
+        # The transcript is append-only, so the turn's text starts where the
+        # file ended before it. Reading and comparing the whole file twice per
+        # turn grew with the game; a shorter file means it was replaced.
         try:
-            current_size = self.transcript_path.stat().st_size
-            previous_size = len(previous_transcript)
             with self.transcript_path.open("rb") as file:
-                if current_size >= previous_size:
-                    current_prefix = file.read(previous_size)
-                    if current_prefix == previous_transcript:
-                        return file.read().decode("utf-8", errors="replace").strip()
-                    file.seek(0)
+                if self.transcript_path.stat().st_size >= previous_size:
+                    file.seek(previous_size)
                 return file.read().decode("utf-8", errors="replace").strip()
         except OSError:
             return ""
@@ -847,6 +866,8 @@ class _HarnessGameSession:
         }
 
     def _append_initial_viewer_event(self) -> None:
+        if not debug_artifacts_enabled():
+            return
         if self.viewer_events:
             return
         frame = self.current_frame()
@@ -865,6 +886,8 @@ class _HarnessGameSession:
     def _append_analysis_viewer_event(
         self, analysis_step: int, transcript: str
     ) -> None:
+        if not debug_artifacts_enabled():
+            return
         frame = self.current_frame()
         self.viewer_events.append(
             {
@@ -880,6 +903,8 @@ class _HarnessGameSession:
     def _append_action_viewer_event(
         self, payload: dict[str, Any], frame: Frame
     ) -> None:
+        if not debug_artifacts_enabled():
+            return
         self.viewer_events.append(
             {
                 **self._base_viewer_event(frame),
@@ -901,7 +926,7 @@ class _HarnessGameSession:
         )
 
     def write_viewer_payload(self) -> None:
-        if self.solver.job_dir is None:
+        if self.solver.job_dir is None or not debug_artifacts_enabled():
             return
         self.viewer_data_path.parent.mkdir(parents=True, exist_ok=True)
         run = self.game.game_run
@@ -1597,6 +1622,7 @@ class HarnessSolver(Solver):
         # attributes always exist by the time a game asks for a slot.
         self._warmup_remaining = WARMUP_ACTION_GAMES
         self._warmup_lock = threading.Lock()
+        _configure_debug_artifacts(self)
         if self.start_local_server:
             self._start_local_servers()
         self._worker_pool = ThreadPoolExecutor(
@@ -1959,6 +1985,7 @@ class HarnessSolver(Solver):
             transcript_path = self._transcripts_dir() / f"{run_stem}.txt"
             analysis_relpath = f"solver_analysis/{run_stem}.html"
             analyzer = self._make_analyzer(game, index, local_server)
+            _configure_debug_artifacts(self)
             session = _HarnessGameSession(
                 solver=self,
                 game=game,

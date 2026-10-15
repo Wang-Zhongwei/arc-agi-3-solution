@@ -43,7 +43,7 @@ def make_session(monkeypatch, tmp_path, *, elapsed, results, on_call=None):
     session.analyzer = SimpleNamespace(_timeout=900)
     for name in ("write_runtime_state", "write_viewer_payload", "_write_analysis_html"):
         setattr(session, name, lambda: None)
-    session._read_transcript_bytes = lambda: b""
+    session._transcript_size = lambda: 0
     session._transcript_delta_since = lambda before: ""
     session._append_analysis_viewer_event = lambda step, delta: None
     session.calls = []

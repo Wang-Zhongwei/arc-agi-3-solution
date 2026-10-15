@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -130,6 +131,24 @@ def _live_key(path: Path) -> str:
     return str(Path(path).resolve())
 
 
+def debug_artifacts_enabled() -> bool:
+    """ARC3_DEBUG_ARTIFACTS: transcripts, prompt snapshots, viewer events, the
+    analysis page and the runtime-state file. On unless set to off - which
+    the solver does by itself for competition reruns and submission runs,
+    where nobody reads them and their I/O only competes with the games."""
+    return os.environ.get("ARC3_DEBUG_ARTIFACTS", "on").strip().lower() not in {
+        "0", "off", "false", "no",
+    }
+
+
+def runtime_state_exists(path: Path) -> bool:
+    """Whether a state was published for `path`, in memory or on disk."""
+    with _LIVE_LOCK:
+        if _live_key(path) in _LIVE_STATE:
+            return True
+    return Path(path).exists()
+
+
 def load_runtime_state(path: Path) -> tuple[Frame | None, list[HistoryEntry]]:
     with _LIVE_LOCK:
         live = _LIVE_STATE.get(_live_key(path))
@@ -171,7 +190,7 @@ def write_runtime_state(
         due = flush or last is None or now - last >= RUNTIME_STATE_FILE_INTERVAL_SECONDS
         if due:
             _LAST_FILE_WRITE[key] = now
-    if not due:
+    if not due or not debug_artifacts_enabled():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {

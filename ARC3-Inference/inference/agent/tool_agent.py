@@ -83,7 +83,10 @@ from inference.agent.vision_context import (
 )
 
 from inference.agent.python_tool_sandbox import RawJSON, frame_diff_enabled, run_sandboxed_python
-from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
+from inference.agent.runtime_state import (
+    Frame, HistoryEntry, RUNTIME_STATE_FILENAME, debug_artifacts_enabled, load_runtime_state,
+    runtime_state_exists,
+)
 from inference.utils.openai_compat import (
     assemble_streamed_chat_response,
     build_chat_payload,
@@ -3237,7 +3240,7 @@ def _resolve_analyzer_model(model: str) -> AnalyzerModelConfig:
 
 def _append_transcript_section(log_path: Path, label: str, content: str) -> None:
     rendered_content = content.strip()
-    if not rendered_content:
+    if not rendered_content or not debug_artifacts_enabled():
         return
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"[{label}]\n")
@@ -3555,6 +3558,8 @@ def _write_prompt_log_snapshot(
     tool_choice: str | None,
     transcript: str,
 ) -> None:
+    if not debug_artifacts_enabled():
+        return
     rendered_messages = "\n\n".join(_render_prompt_log_message(message) for message in messages)
     rendered_tools: list[str] = []
     for tool in tools or []:
@@ -7288,7 +7293,7 @@ class ToolAgent:
         request_timeout_seconds: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> AnalyzerTurnResult | None:
-        if not state_path.exists():
+        if not runtime_state_exists(state_path):
             return None
         self._ensure_session(state_path)
         self._step_env_callback = step_env

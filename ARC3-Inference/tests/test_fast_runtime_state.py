@@ -78,3 +78,51 @@ def test_sandbox_sees_the_same_history_as_a_full_refresh(tmp_path):
         [9, 8, 7, 8, 7, 8, ascii2],
         [10, 9, 8, 9, 8, 9, ascii2],
     ], payload
+
+
+def test_debug_artifacts_off_keeps_state_in_memory_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC3_DEBUG_ARTIFACTS", "off")
+    path = tmp_path / "state.json"
+    entries = [HistoryEntry("", frame(0))]
+    write_runtime_state(path, current_frame=entries[-1].frame, history=entries, flush=True)
+    assert not path.exists()
+    assert runtime_state.runtime_state_exists(path)  # the turn entry point still sees it
+    assert load_runtime_state(path)[0].step == 0
+    discard_runtime_state(path)
+    assert not runtime_state.runtime_state_exists(path)
+
+
+def test_debug_artifacts_off_skips_transcripts_and_prompt_snapshots(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC3_DEBUG_ARTIFACTS", "off")
+    log = tmp_path / "t.txt"
+    tool_agent._append_transcript_section(log, "THINKING", "text")
+    tool_agent._write_prompt_log_snapshot(
+        tmp_path / "p.txt", model_id="m", base_url="u", display_action_num=1, analysis_step=1,
+        request_index=0, messages=[{"role": "user", "content": "x"}], tools=None, tool_choice=None, transcript="",
+    )
+    assert not log.exists() and not (tmp_path / "p.txt").exists()
+    monkeypatch.setenv("ARC3_DEBUG_ARTIFACTS", "on")
+    tool_agent._append_transcript_section(log, "THINKING", "text")
+    assert log.read_text() == "[THINKING]\ntext\n\n"
+
+
+def test_private_runs_turn_debug_artifacts_off(monkeypatch):
+    from types import SimpleNamespace
+    from inference.framework import solver as solver_module
+
+    class _Target(solver_module.KaggleTarget):
+        def __init__(self, rerun):
+            object.__setattr__(self, "is_competition_rerun", rerun)
+            object.__setattr__(self, "actual_run_as_submission", False)
+
+    # recorded by monkeypatch so teardown restores it: the solver writes
+    # os.environ directly
+    monkeypatch.setenv("ARC3_DEBUG_ARTIFACTS", "")
+    solver_module._configure_debug_artifacts(SimpleNamespace(runtime_environment=_Target(False)))
+    assert runtime_state.debug_artifacts_enabled()
+    solver_module._configure_debug_artifacts(SimpleNamespace(runtime_environment=_Target(True)))
+    assert not runtime_state.debug_artifacts_enabled()
+    # an explicit setting wins
+    monkeypatch.setenv("ARC3_DEBUG_ARTIFACTS", "on")
+    solver_module._configure_debug_artifacts(SimpleNamespace(runtime_environment=_Target(True)))
+    assert runtime_state.debug_artifacts_enabled()
