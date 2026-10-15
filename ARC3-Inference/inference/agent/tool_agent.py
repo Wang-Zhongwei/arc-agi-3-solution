@@ -3790,6 +3790,7 @@ class ToolAgent:
         self._last_action_call_result: dict[str, Any] | None = None
         self._summarized_knowledge = _empty_world_model()
         self._world_model_notes: list[tuple[int, int, str]] = []
+        self._scratch_files: dict[str, str] = {}
 
     def _headers(self) -> dict[str, str]:
         api_key = (
@@ -3825,6 +3826,7 @@ class ToolAgent:
             self._last_action_call_result = None
             self._summarized_knowledge = _empty_world_model()
             self._world_model_notes = []
+            self._scratch_files = {}
             self._turns_without_wm_update = 0
             self._pending_wm_rebuild_reason = ""
             self._pending_wm_revise_reason = ""
@@ -4023,12 +4025,23 @@ class ToolAgent:
         body = extract_world_model(reasoning, content)
         if not body:
             return
-        if self._world_model_notes and self._world_model_notes[-1][2] == body:
-            return
         frame, _ = load_runtime_state(state_path)
         level = frame.level if frame is not None else 1
         step = frame.step if frame is not None else 0
-        self._world_model_notes.append((level, step, body))
+        self._append_world_model_notes(state_path, [(level, step, body)])
+
+    def _append_world_model_notes(self, state_path: Path, notes: list[tuple[int, int, str]]) -> None:
+        """Updates from `<world_model>` blocks or from the model writing to
+        world_model.md in Python, tagged where they were written."""
+        added = False
+        for level, step, body in notes:
+            body = str(body).strip()
+            if not body or (self._world_model_notes and self._world_model_notes[-1][2] == body):
+                continue
+            self._world_model_notes.append((int(level), int(step), body))
+            added = True
+        if not added:
+            return
         # the same file the model opens in the sandbox, kept with the run's
         # artifacts for later analysis
         run_stem = state_path.stem.removesuffix(Path(RUNTIME_STATE_FILENAME).stem).rstrip("_")
@@ -6504,7 +6517,11 @@ class ToolAgent:
             code=code,
             timeout_seconds=self._python_timeout,
             initial_state=(
-                {**_serialized_runtime_state(), "world_model_md": render_notes(self._world_model_notes)}
+                {
+                    **_serialized_runtime_state(),
+                    "world_model_md": render_notes(self._world_model_notes),
+                    "scratch_files": self._scratch_files,
+                }
                 if _world_model_notes_enabled()
                 else _serialized_runtime_state()
             ),
@@ -6514,6 +6531,14 @@ class ToolAgent:
             retain_imports=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
             repair_hints=_get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
         )
+
+        if _world_model_notes_enabled() and isinstance(sandbox_result.get("scratch_files"), dict):
+            self._scratch_files = dict(sandbox_result["scratch_files"])
+        if _world_model_notes_enabled() and sandbox_result.get("world_model_appends"):
+            self._append_world_model_notes(state_path, [
+                tuple(item) for item in sandbox_result["world_model_appends"]
+                if isinstance(item, list) and len(item) == 3
+            ])
 
         action_results = [
             item

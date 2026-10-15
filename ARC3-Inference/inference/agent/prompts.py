@@ -278,10 +278,11 @@ WORLD_MODEL_FREE_ADDENDUM = (
 WORLD_MODEL_NOTES_ADDENDUM = (
     "\n\nWorld model:\n"
     "- When your understanding of the game changes - a rule confirmed or refuted, a new "
-    "mechanic, a revised goal - emit the update in a `<world_model>...</world_model>` block, "
-    "in your thinking or your reply. Write only what changed and the evidence for it.\n"
-    "- Your updates are kept in `world_model.md` for this game, with every line tagged by the "
-    "level and action count it was written at, e.g. `[L2 s57]`. Read it from Python with "
+    "mechanic, a revised goal - record the update: emit a `<world_model>...</world_model>` block "
+    "in your thinking or your reply, or append it from Python with "
+    "`open('world_model.md', 'a').write(...)`. Write only what changed and the evidence for it.\n"
+    "- `world_model.md` keeps your updates for this game, every line tagged automatically with "
+    "the level and action count it was written at, e.g. `[L2 s57]`. Read it with "
     "`open('world_model.md')` when you need what you established earlier; filter by tag or "
     "content with `re`.\n"
 )

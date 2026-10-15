@@ -29,8 +29,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     import io
     import json
     import os
+    import re
     import sys
     import traceback
+    import weakref
 
     try:
         import resource
@@ -420,6 +422,117 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         # then only the entries appended after each action. Kept apart from the
         # `history` global, which the snippet is free to mutate.
         _history_items = []
+        # ARC3_WORLD_MODEL_NOTES gives the snippet an in-memory `open`; the
+        # sandbox still has no file I/O. It serves:
+        # - world_model.md: every write mode appends, never truncates. Each new
+        #   line is tagged with the level and step current when it completes
+        #   and sent back to the host. A line already in the file (a read,
+        #   edited and written back) is skipped, as is a copied-back tag.
+        # - /dev/null: writes vanish, reads are empty.
+        # - any other path: a scratch file kept for the rest of the game, the
+        #   persistence the model reached for with /tmp/*.json in v1.
+        _wm_text = [""]
+        _wm_appends = []
+        _scratch = {}
+        _scratch_changed = [False]
+        _open_writers = weakref.WeakSet()
+        _wm_tag = re.compile(r"^\s*\[L\d+ s\d+\]\s*")
+        _scratch_file_limit = 1_000_000
+        _scratch_total_limit = 4_000_000
+
+        def _wm_add_line(line):
+            body = _wm_tag.sub("", line).strip()
+            if not body or body in {_wm_tag.sub("", old).strip() for old in _wm_text[0].splitlines()}:
+                return
+            frame = runtime_globals.get("current_frame")
+            level = int(getattr(frame, "level", 1) or 1)
+            step = int(getattr(frame, "step", 0) or 0)
+            _wm_appends.append([level, step, body])
+            _wm_text[0] += f"[L{level} s{step}] {body}\n"
+
+        class _WorldModelWriter(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self._pending = ""
+                _open_writers.add(self)
+
+            def write(self, text):
+                text = str(text)
+                *lines, self._pending = (self._pending + text).split("\n")
+                for line in lines:
+                    _wm_add_line(line)
+                return len(text)
+
+            def flush(self):
+                if self._pending:
+                    _wm_add_line(self._pending)
+                    self._pending = ""
+
+            def close(self):
+                self.flush()
+                super().close()
+
+        class _ScratchWriter(io.StringIO):
+            def __init__(self, path, base):
+                super().__init__()
+                self._path, self._base, self._size = path, base, len(base)
+                self._others = sum(len(text) for key, text in _scratch.items() if key != path)
+                _open_writers.add(self)
+                self.flush()
+
+            def write(self, text):
+                text = str(text)
+                self._size += len(text)
+                if self._size > _scratch_file_limit or self._others + self._size > _scratch_total_limit:
+                    raise OSError(28, "No space left on device (scratch files: 1 MB each, 4 MB in total)")
+                return super().write(text)
+
+            def flush(self):
+                if not self.closed:
+                    _scratch[self._path] = self._base + self.getvalue()
+                    _scratch_changed[0] = True
+
+            def close(self):
+                self.flush()
+                super().close()
+
+        class _NullWriter(io.StringIO):
+            def write(self, text):
+                return len(str(text))
+
+        def _sandbox_open(file, mode="r", *args, **kwargs):
+            if not isinstance(file, str):
+                raise TypeError("open() takes a file path string in this sandbox")
+            mode = str(mode)
+            if "b" in mode:
+                raise ValueError("binary mode is not supported in this sandbox; open the file in text mode")
+            writing = any(flag in mode for flag in "wax+")
+            path = os.path.normpath(file)
+            if os.path.basename(path) == "world_model.md":
+                return _WorldModelWriter() if writing else io.StringIO(_wm_text[0])
+            if path == os.devnull:
+                return _NullWriter() if writing else io.StringIO("")
+            if not writing:
+                if path not in _scratch:
+                    raise FileNotFoundError(2, "No such file or directory", file)
+                return io.StringIO(_scratch[path])
+            if "x" in mode and path in _scratch:
+                raise FileExistsError(17, "File exists", file)
+            keep = "a" in mode or ("+" in mode and "w" not in mode)
+            return _ScratchWriter(path, _scratch.get(path, "") if keep else "")
+
+        def _file_payload():
+            for writer in list(_open_writers):
+                try:
+                    writer.flush()
+                except Exception:
+                    pass
+            payload = {}
+            if _wm_appends:
+                payload["world_model_appends"] = _wm_appends
+            if _scratch_changed[0]:
+                payload["scratch_files"] = _scratch
+            return payload
 
         def _refresh_state(state_payload):
             current_frame = _frame_from_payload(state_payload.get("current_frame"))
@@ -456,23 +569,15 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
             runtime_globals["death_ledger"] = state_payload.get("death_ledger") or {"attempts": []}
             runtime_globals["last_action_call_result"] = action_result
-            # ARC3_WORLD_MODEL_NOTES: only the initial state carries the file,
-            # which cannot change during a tool call. `open` serves this one
-            # read-only, in-memory file and nothing else, so the sandbox still
-            # has no file I/O.
+            # ARC3_WORLD_MODEL_NOTES: only the initial state carries the files,
+            # which change only through this snippet's own writes.
             if "world_model_md" in state_payload:
-                notes_text = str(state_payload.get("world_model_md") or "")
-
-                def open(file, mode="r", *args, **kwargs):
-                    if os.path.basename(str(file)) != "world_model.md":
-                        raise FileNotFoundError(f"{file!r}: the only readable file is 'world_model.md'")
-                    if any(flag in str(mode) for flag in "wax+"):
-                        raise PermissionError(
-                            "world_model.md is read-only: it is maintained from your <world_model> updates"
-                        )
-                    return io.StringIO(notes_text)
-
-                runtime_globals["__builtins__"]["open"] = open
+                _wm_text[0] = str(state_payload.get("world_model_md") or "")
+                _scratch.update({
+                    str(path): str(text)
+                    for path, text in (state_payload.get("scratch_files") or {}).items()
+                })
+                runtime_globals["__builtins__"]["open"] = _sandbox_open
 
         # Both refusals derive from BaseException, not Exception, so a
         # defensive `except Exception:` around action(...) - which models write
@@ -763,6 +868,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "final",
                     **_collect_retention_payload(),
+                    **_file_payload(),
                     "stdout": stdout.getvalue(),
                     "result": _json_safe(runtime_globals.get("result")),
                     "action_results": _json_safe(action_results),
@@ -785,6 +891,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "error",
                     **retention,
+                    **_file_payload(),
                     "error": (
                         f"MemoryError: the snippet exceeded the sandbox memory limit ({limit_text}) "
                         "and was stopped; nothing after the failing line ran. Do not materialize "
@@ -815,6 +922,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 {
                     "type": "error",
                     **_collect_retention_payload(),
+                    **_file_payload(),
                     "error": _sanitize_exception(exc),
                     "stdout": stdout.getvalue(),
                     "action_results": _json_safe(action_results),
@@ -1122,6 +1230,9 @@ def run_sandboxed_python(
                     "error": str(message.get("error", "") or ""),
                     "action_results": list(message.get("action_results") or host_action_results),
                     "keepable_functions": list(message.get("keepable_functions") or []),
+                    "world_model_appends": list(message.get("world_model_appends") or []),
+                    **({"scratch_files": message["scratch_files"]}
+                       if isinstance(message.get("scratch_files"), dict) else {}),
                     **({"retention_rejected": message.get("retention_rejected", [])}
                        if kept_functions is not None else {}),
                 }
