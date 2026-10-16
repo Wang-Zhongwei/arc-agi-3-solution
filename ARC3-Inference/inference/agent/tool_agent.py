@@ -4194,14 +4194,6 @@ class ToolAgent:
             self._cur_level_start_frame = current_frame
         if previous_step_summary and previous_step_summary.get("game_over"):
             return []
-        if previous_step_summary and not previous_step_summary.get("stale") and "RESET" in [
-            str(name).strip().upper() for name in previous_step_summary.get("executed_actions") or []
-        ]:
-            # A RESET the model issued restores the level's start board, so a
-            # diff from the previous turn's board mixes what the reset undid
-            # with what came after it. Automatic resets after a death never
-            # reach executed_actions, and that turn already returned above.
-            return []
         if level_changed:
             if not _level_inventory_enabled():
                 # still clear the diff image: a cross-level diff has no meaning
