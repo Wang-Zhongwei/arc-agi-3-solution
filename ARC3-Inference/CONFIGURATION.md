@@ -117,6 +117,7 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 | Setting | Default | Change |
 |---|---|---|
 | `ARC3_ANIMATION` | Off | Enables animation capture, summaries, and model inspection support. |
+| `ARC3_ANIMATION_MIN_FRAMES` | `2` | Under animation support, an action counts as animated only if it passed through at least this many distinct frames (pre-action board excluded). Shorter ones are treated as not animated: no `animation` entry, opener line, `last_animation_frames` or `last_animation_timeline`. `2` keeps every animation; `4` drops animations of 3 or fewer frames. |
 | `ARC3_ANIMATION_TIMELINE` | On, under animation support | Provides the compressed timeline accessible through Python. Does not automatically paste the full timeline into the user prompt. |
 | `ARC3_ANIMATION_IMAGE` | `off` | Applies to ordinary and fatal actions. `sampled` shows up to eight changed interior frames in chronological order, excluding start/end boards, evenly sampled when longer. No transient-pixel or unchanged-gameplay gate in sampled mode; existing diff images remain. `peak` shows one real frame with many transient cells; `composite` combines transient information across time. Peak/composite require transient activity and, for ordinary actions, an unchanged gameplay area. Fatal-action images appear in the post-death opener after automatic RESET. |
 

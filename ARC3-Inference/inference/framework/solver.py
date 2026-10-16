@@ -127,6 +127,11 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "yes",
     "on",
 )
+# An action counts as animated only when it passed through at least this many
+# distinct frames (pre-action board excluded). Shorter animations - mostly click
+# flashes and one-step moves - are treated as no animation at all: no
+# `animation` entry, no opener line, no frames or timeline. 2 keeps every one.
+ANIMATION_MIN_FRAMES = max(2, int(os.environ.get("ARC3_ANIMATION_MIN_FRAMES", "2")))
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
@@ -360,6 +365,18 @@ def _animation_chain(
     return collapse_frames(
         previous_grid, normalize_frames(getattr(state.raw, "frame", None))
     )
+
+
+def _counted_animation_summary(
+    chain: list[tuple[tuple[int, ...], ...]],
+    min_frames: int | None = None,
+) -> dict[str, Any] | None:
+    """`summarize_animation`, or None when the action passed through fewer than
+    ARC3_ANIMATION_MIN_FRAMES distinct frames - then it counts as not animated."""
+    summary = summarize_animation(chain)
+    if summary and summary["frames"] < (ANIMATION_MIN_FRAMES if min_frames is None else min_frames):
+        return None
+    return summary
 
 
 def _level_end_grid(
@@ -1356,7 +1373,7 @@ class _HarnessGameSession:
             # frames matter most, since the board it now sees is the restarted
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
-            animation_summary = summarize_animation(chain)
+            animation_summary = _counted_animation_summary(chain)
             # ONE record, replaced by every executed action - animated or not.
             # A no-op that animated is the case this exists for, and the guards
             # refuse the NEXT action without executing it, so the record still
