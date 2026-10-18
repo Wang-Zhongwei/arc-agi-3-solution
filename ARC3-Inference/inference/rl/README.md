@@ -14,7 +14,7 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | Loss | Only on assistant tokens of the selected (game, level); drop `uncertain` requests | Everything else is context. |
 | LoRA targets | `self_attn.{q,k,v,o}_proj` and `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}`: 228 modules, 26.1M parameters at r=16. Optional: shared expert MLP. Frozen: routed experts, QSA indexer, PLE, vision | All BF16 in the deployed checkpoint, so merging costs nothing. The layers [ms-swift's recipe](https://swift.readthedocs.io/en/v4.5/BestPractices/Qwen3_8-Flash-Next-Best-Practice.html) targets too (`linear_qkv linear_proj in_proj out_proj`). |
 | Base | Intel W4A16 AutoRound checkpoint, the one we deploy | Routed experts identical to serving; 68.5 GiB on the GPU. |
-| Hardware | 1×H200 (141 GB); PLE table in host RAM | Weights fit; activation budget still to measure. |
+| Hardware | 1×H200 (141 GB); PLE table and layer checkpoints in host RAM | Weights take 68.5 GiB; checkpoints are ~98 GB at 100K. |
 | Merge | W′ = W + (α/r)BA on the BF16 attention/GDN tensors, swapped into a copy of the W4A16 checkpoint, config unchanged | Same kernels, so no serving slowdown. Check MTP draft acceptance after merging. Lord's mixed checkpoint keeps attention in FP8, where requantizing may round small updates away. |
 | Sparse attention | Train through QSA with a frozen indexer, using our chunked implementation | Serving uses QSA; NeMo AutoModel also freezes the indexer. |
 
@@ -31,6 +31,7 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | [context_rebuild.py](context_rebuild.py) | Rebuild every request's messages from a transcript |
 | [validate_rebuild.py](validate_rebuild.py) | Compare rebuilds with `*_requests.jsonl` |
 | [smoke_lora.py](smoke_lora.py) | Load W4A16 + LoRA, time forward/backward on real packed samples |
+| [qsa.py](qsa.py) | Chunked QSA for training, replacing transformers' reference ([test](../../tests/test_qsa.py)) |
 | [pod/smoke_pod.sh](pod/smoke_pod.sh) | The smoke test as one pod job |
 | [data/python_tool.json](data/python_tool.json) | The harness's tool schema |
 
@@ -38,7 +39,8 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 
 - Rebuild checked on the 10 runs with request logs (17,979 requests): on runs without non-main features, 98.3–100% of windows exact among non-`uncertain` requests; message content ≥ 99.7% exact ([summary](../../../docs/RL/data/context_rebuild_validation.json)).
 - Samples: 32K/64K/100K targets give 33,811 / 64,893 / 99,072 tokens with 15 / 32 / 55 images.
-- Smoke test on 1×H200: the model loads (68.5 GiB, PLE on CPU) and LoRA attaches; the first 32K step OOMs inside transformers' QSA reference. A chunked QSA is being validated on CPU against it.
+- Smoke test on 1×H200, first attempt: the model loads (68.5 GiB, PLE on CPU) and LoRA attaches; the first 32K step OOMs inside transformers' QSA reference.
+- Since then: chunked QSA, activation offload and chunked cross-entropy, all checked against the reference on a tiny model on CPU. Next: rerun the smoke test.
 
 ## Existing training paths for this model
 

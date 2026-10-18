@@ -16,6 +16,7 @@ their token count and vision cost matter here, not their content.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import platform
 import re
@@ -29,8 +30,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from torch.utils.checkpoint import checkpoint
 
 from inference.rl.context_rebuild import estimate_tokens, rebuild
+from inference.rl.qsa import patch_qsa_attention
 
 ATTENTION_GDN = r".*\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj))$"
 SHARED_EXPERT = r"|.*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$"
@@ -169,17 +172,34 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
-def step(model, sample, device) -> dict[str, Any]:
+def chunked_cross_entropy(lm_head, hidden, targets, chunk: int = 2048):
+    """Mean cross-entropy of lm_head(hidden) without holding all [K, 248K] logits at once."""
+    def piece(h, t):
+        return F.cross_entropy(lm_head(h).float(), t, reduction="sum")
+
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, targets.numel(), chunk):
+        total = total + checkpoint(piece, hidden[start:start + chunk], targets[start:start + chunk],
+                                   use_reentrant=False)
+    return total / targets.numel()
+
+
+def step(model, sample, device, offload: bool = False) -> dict[str, Any]:
+    """One forward + backward. `offload` keeps the tensors saved for backward (with layer
+    checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU."""
     labels = sample["labels"][0].to(device)
     targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
     inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
     for i in range(torch.cuda.device_count()):
         torch.cuda.reset_peak_memory_stats(i)
     _sync()
     t0 = time.perf_counter()
-    # logits only where a target follows: full [length, 248K] logits would not fit
-    out = model(**inputs, logits_to_keep=targets - 1, use_cache=False)
-    loss = F.cross_entropy(out.logits[0].float(), labels[targets])
+    saved = (torch.autograd.graph.save_on_cpu(pin_memory=torch.cuda.is_available()) if offload
+             else contextlib.nullcontext())
+    with saved:
+        hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
+        loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
     _sync()
     t1 = time.perf_counter()
     loss.backward()
@@ -188,7 +208,7 @@ def step(model, sample, device) -> dict[str, Any]:
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
     model.zero_grad(set_to_none=True)
-    return dict(tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()),
+    return dict(tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()), offload=offload,
                 images=int(sample["image_grid_thw"].shape[0]) if "image_grid_thw" in sample else 0,
                 loss=round(float(loss), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
                 tokens_per_s=round(sample["input_ids"].shape[1] / (t2 - t0), 1),
@@ -200,7 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--tools", type=Path, required=True, help="tool schema as sent by the harness (JSON list)")
-    parser.add_argument("--lengths", default="32768,65536,100000")
+    parser.add_argument("--lengths", default="32768,32768o,65536o,100000o",
+                        help="target lengths, run in order; suffix o = offload saved activations to host memory")
     parser.add_argument("--repeats", type=int, default=2, help="steps per length; the first includes warm-up")
     parser.add_argument("--loss-replies", type=int, default=8)
     parser.add_argument("--rank", type=int, default=16)
@@ -208,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", default="auto", help="AutoRound kernel backend (auto, torch, tritonv2, ...)")
     parser.add_argument("--attn", default="sdpa", help="attn_implementation")
     parser.add_argument("--no-checkpointing", action="store_true")
+    parser.add_argument("--reference-qsa", action="store_true", help="keep transformers' QSA (dense mask, slow)")
+    parser.add_argument("--qsa-chunk", type=int, default=512, help="queries per chunk in our QSA")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
 
@@ -230,8 +253,9 @@ def main(argv: list[str] | None = None) -> int:
     processor = AutoProcessor.from_pretrained(args.model)
     tools = json.loads(args.tools.read_text())
     game = rebuild(args.transcript.read_text(encoding="utf-8"))
+    specs = [x.strip() for x in args.lengths.split(",") if x.strip()]
     samples = {}
-    for length in sorted(int(x) for x in args.lengths.split(",")):
+    for length in sorted({int(x.rstrip("o")) for x in specs}):
         request = pick_request(game, length)
         if request is None:
             continue
@@ -241,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
     report["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
+    if not args.reference_qsa:
+        patch_qsa_attention(args.qsa_chunk)
     t0 = time.perf_counter()
     kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map=gpu_device_map(args.model),
                                   attn_implementation=args.attn)
@@ -273,25 +299,28 @@ def main(argv: list[str] | None = None) -> int:
     device = model.get_input_embeddings().weight.device
 
     report["steps"] = {}
-    for length, sample in samples.items():
+    for spec in specs:
+        length, offload = int(spec.rstrip("o")), spec.endswith("o")
+        if length not in samples:
+            continue
         results = []
         for _ in range(args.repeats):
             try:
-                results.append(step(model, sample, device))
-                print(length, results[-1], flush=True)
+                results.append(step(model, samples[length], device, offload=offload))
+                print(spec, results[-1], flush=True)
             except torch.cuda.OutOfMemoryError as exc:
-                results.append(dict(error="oom", detail=str(exc)[:500], peak_gb=peak_gb()))
-                print(length, "OOM", flush=True)
+                where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}" for f in traceback.extract_tb(exc.__traceback__)[-6:]]
+                results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb()))
+                print(spec, "OOM", where, flush=True)
                 break
             except Exception as exc:  # record it and keep the earlier numbers
                 results.append(dict(error=type(exc).__name__, detail=traceback.format_exc()[-3000:]))
-                print(length, "ERROR", traceback.format_exc(), flush=True)
+                print(spec, "ERROR", traceback.format_exc(), flush=True)
                 break
-        report["steps"][str(length)] = results
+        report["steps"][spec] = results
         save()
+        model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
-        if results and "error" in results[-1]:
-            break
 
     # one optimizer step: the AdamW state is part of the training footprint
     params = [p for p in model.parameters() if p.requires_grad]

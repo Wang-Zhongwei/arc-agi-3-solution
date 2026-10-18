@@ -11,7 +11,7 @@ WORK=${WORK:-/workspace/smoke}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 TRANSCRIPT=${TRANSCRIPT:-$WORK/game.txt}
-LENGTHS=${LENGTHS:-32768,65536,100000}
+LENGTHS=${LENGTHS:-32768,32768o,65536o,100000o}  # o = offload checkpoints to host memory
 cd "$WORK"
 mkdir -p results
 rm -f DONE FAILED
@@ -56,7 +56,7 @@ run() {  # name, extra args
     nvidia-smi --query-gpu=memory.used --format=csv,noheader > "results/$name.gpu_before.txt"
     python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
         --tools inference/rl/data/python_tool.json --lengths "$LENGTHS" --out "results/$name.json" "$@" \
-        > "results/$name.log" 2>&1
+        > "results/$name.log" 2>&1 < /dev/null
     local status=$?
     log "$name exited $status"; tail -5 "results/$name.log"
     return $status
@@ -64,7 +64,7 @@ run() {  # name, extra args
 # default kernels first; if loading or the backward fails, retry on AutoRound's plain torch backend
 run auto || run torch_backend --backend torch || fail "both backends failed, see results/*.log"
 # shared expert LoRA on top, if the base run worked
-run shared_expert --shared-expert || log "shared_expert variant failed (base result still valid)"
+LENGTHS=100000o run shared_expert --shared-expert || log "shared_expert variant failed (base result still valid)"
 
 log "all done"
 date -u > DONE

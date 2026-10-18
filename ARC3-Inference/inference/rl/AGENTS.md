@@ -29,8 +29,15 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 
 ## QSA sparse attention
 
-- transformers' QSA is a reference implementation: a Python loop over every query plus a dense [N, N] mask. It OOMs at 32K tokens (the failing 2.13 GiB allocation is 33,811² bf16) and would be far too slow anyway. Train through the chunked replacement instead (`qsa.py`, being validated).
+- transformers' QSA is a reference implementation: a Python loop over every query plus a dense [N, N] mask. It OOMs at 32K tokens (the failing 2.13 GiB allocation is 33,811² bf16) and would be far too slow anyway. Train through [qsa.py](qsa.py) (`patch_qsa_attention`), which chunks queries, gathers each query's ~2,051 selected keys and checkpoints each chunk.
+- [tests/test_qsa.py](../../tests/test_qsa.py) checks it against the reference on a tiny model: identical selections, attention output, logits with an image, and gradients. At the real budget (512 blocks) selections match up to blocks tied at the cut-off: several blocks often score exactly 0 after the relu, and topk breaks such ties arbitrarily (as any kernel does).
+- Use the model's own `apply_rotary_pos_emb`: RoPE covers only the first 25% of each head (interleaved M-RoPE).
 - The indexer stays frozen (no LoRA; topk has no gradient), as in NeMo AutoModel.
+
+## Activation memory
+
+- Hyper-connections widen the residual to 4 × 2,560, so each layer's checkpointed input is N × 10,240: ~31.5 GB over 48 layers at 32K, ~98 GB at 100K, next to 68.5 GiB of weights. Offload them to host memory (`step(offload=True)`, the `o` suffix in `smoke_lora --lengths`); the backward recompute runs outside `save_on_cpu`, so only the checkpoints move.
+- Never build [K, vocab] logits at once (10K trained positions × 248,320 = 10 GB in fp32): `chunked_cross_entropy` checkpoints the lm_head + loss per 2,048 positions. Both changes are exact (loss and gradients equal to 1e-9 on the tiny model).
 
 ## Pods (RunPod)
 
