@@ -24,6 +24,8 @@ rm -f DONE FAILED
 echo $$ > run.pid  # stop with: kill $(cat run.pid); never pkill -f, which also matches the ssh command
 # the loader's many small copies fragment the caching allocator (OOM at 67 GiB used, 73 GiB reserved-free)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# fla's GDN backward needs tilelang on Hopper with torch 2.8's Triton 3.4 (fla #640), and tilelang JIT-compiles with nvcc
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=/usr/local/cuda/bin:$PATH
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 fail() { log "FAILED: $*"; echo "$*" > FAILED; exit 1; }
 
@@ -31,15 +33,15 @@ log "phase 1: python packages"
 # the image's system Python is externally managed (PEP 668): a venv that still sees its torch
 [ -x "$VENV/bin/python" ] || python3 -m venv --system-site-packages "$VENV" || fail "venv"
 export PATH="$VENV/bin:$PATH"
-if ! python -c "import transformers, peft, auto_round, fla; assert transformers.__version__ == '5.20.1'" 2>/dev/null; then
+if ! python -c "import transformers, peft, auto_round, fla, tilelang; assert transformers.__version__ == '5.20.1'" 2>/dev/null; then
     python -m pip install -q -U pip
     python -m pip install -q "transformers==5.20.1" peft accelerate auto-round kernels flash-linear-attention \
-        hf_transfer pillow numpy torchvision || fail "pip install"
+        tilelang hf_transfer pillow numpy torchvision || fail "pip install"
 fi
 python - <<'PY' | tee results/env.txt
 import torch, transformers, peft
 print("torch", torch.__version__, "cuda", torch.version.cuda, "transformers", transformers.__version__, "peft", peft.__version__)
-for m in ("auto_round", "fla", "kernels", "causal_conv1d"):
+for m in ("auto_round", "fla", "tilelang", "kernels", "causal_conv1d"):
     try:
         mod = __import__(m); print(m, getattr(mod, "__version__", "ok"))
     except Exception as e:

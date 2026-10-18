@@ -189,6 +189,10 @@ def chunked_cross_entropy(lm_head, hidden, targets, chunk: int = 2048):
 def step(model, sample, device, offload: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU."""
+    # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
+    # training mode: without this every activation is kept (OOM on the GPU, or on the host
+    # with offload). Dropout is 0 everywhere, so this changes nothing else.
+    model.train()
     labels = sample["labels"][0].to(device)
     targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
     inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
@@ -382,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     model.config.use_cache = False
     if not args.no_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()  # layers are checkpointed only in training mode
+    report["checkpointed_layers"] = sum(1 for m in model.modules() if getattr(m, "gradient_checkpointing", False))
     lora = LoraConfig(r=args.rank, lora_alpha=2 * args.rank, lora_dropout=0.0, bias="none",
                       target_modules=ATTENTION_GDN + (SHARED_EXPERT if args.shared_expert else ""))
     model = get_peft_model(model, lora)

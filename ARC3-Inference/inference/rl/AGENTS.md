@@ -26,6 +26,7 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, or loading OOMs from fragmentation (66.6 GiB allocated, 72.7 GiB reserved but unused).
 - AutoRound unfuses the 48×512 experts (~3 min) and picks `auto_round:tritonv2_zp`. A full load takes ~5 min and holds 68.5 GiB on the GPU. The gptqmodel backend it suggests is inference-only.
 - Without `causal_conv1d`, GDN's short convolution falls back to the PyTorch reference (a warning). fla 0.5.2 covers the delta rule.
+- GDN backward on Hopper: torch 2.8 ships Triton 3.4, whose gated `chunk_bwd_dqkwg` is wrong on sm90, so fla raises (fla #640). Install `tilelang` (0.1.15 keeps torch 2.8) and export `CUDA_HOME=/usr/local/cuda` so it finds nvcc. fla checks for tilelang at import, so a running process must be restarted. The first backward JIT-compiles for ~1 min.
 
 ## QSA sparse attention
 
@@ -35,6 +36,8 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - The indexer stays frozen (no LoRA; topk has no gradient), as in NeMo AutoModel.
 
 ## Activation memory
+
+- Call `model.train()`: `from_pretrained` returns an eval-mode model, and transformers' `GradientCheckpointingLayer` checkpoints only in training mode. Otherwise `gradient_checkpointing_enable()` silently does nothing: 32K OOMed on the GPU at 137.6 GiB, and with offload all activations went to pinned host memory and the cgroup OOM-killed the process (`/sys/fs/cgroup/memory.events`: `oom_kill`). `smoke_lora` reports `checkpointed_layers`.
 
 - Hyper-connections widen the residual to 4 × 2,560, so each layer's checkpointed input is N × 10,240: ~31.5 GB over 48 layers at 32K, ~98 GB at 100K, next to 68.5 GiB of weights. Offload them to host memory (`step(offload=True)`, the `o` suffix in `smoke_lora --lengths`); the backward recompute runs outside `save_on_cpu`, so only the checkpoints move.
 - Never build [K, vocab] logits at once (10K trained positions × 248,320 = 10 GB in fp32): `chunked_cross_entropy` checkpoints the lm_head + loss per 2,048 positions. Both changes are exact (loss and gradients equal to 1e-9 on the tiny model).
