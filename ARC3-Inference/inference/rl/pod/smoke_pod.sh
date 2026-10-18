@@ -13,7 +13,7 @@ WORK=${WORK:-/workspace/smoke}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 TRANSCRIPT=${TRANSCRIPT:-$WORK/game.txt}
-LENGTHS=${LENGTHS:-32768o,65536o,100000o}  # o = offload checkpoints to host memory
+LENGTHS=${LENGTHS:-32768o,65536o}  # o = offload checkpoints to host memory
 BACKEND=${BACKEND:-auto}                         # AutoRound kernel backend
 KEEP_SERVER=${KEEP_SERVER:-0}
 VENV=${VENV:-/workspace/venv}
@@ -58,7 +58,7 @@ log "phase 3: model server (loads once, ~5 min)"
 rm -f "$JOBS/STOP"
 if ! { [ -s server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null; }; then
     nohup python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
-        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json \
+        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json --use-kernels \
         > results/server.log 2>&1 < /dev/null &
     echo $! > server.pid
 fi
@@ -67,14 +67,15 @@ submit() {  # name, job json; skipped when already queued, running or done
     if [ -e "$JOBS/$name.job" ] || [ -e "$JOBS/$name.running" ] || [ -e "$JOBS/$name.done" ]; then return 0; fi
     echo "$2" > "$JOBS/$name.tmp" && mv "$JOBS/$name.tmp" "$JOBS/$name.job"
 }
-submit 01_base "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
-submit 03_shared_expert '{"lengths": "32768o", "repeats": 1, "adapter": "shared_expert"}'
+# the longest real request first (cd82, ~110K tokens): fail fast if it does not fit
+submit 01_longest '{"lengths": "130000o", "repeats": 1, "transcript": "game_long.txt"}'
+submit 02_speed "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
 
 log "phase 4: jobs (GPU utilization and power sampled every second into results/gpu.csv)"
 nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,memory.used --format=csv,noheader \
     -l 1 > results/gpu.csv 2>/dev/null &
 sampler=$!
-while [ ! -e "$JOBS/03_shared_expert.done" ]; do
+while [ ! -e "$JOBS/02_speed.done" ]; do
     kill -0 "$(cat server.pid)" 2>/dev/null || { kill $sampler; fail "model server exited, see results/server.log"; }
     sleep 20
 done

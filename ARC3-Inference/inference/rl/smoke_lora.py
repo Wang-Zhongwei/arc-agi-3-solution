@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
+from inference.rl import layer_patches
 from inference.rl.context_rebuild import estimate_tokens, rebuild
 from inference.rl.qsa import patch_qsa_attention
 
@@ -197,6 +198,22 @@ def host_memory_gb() -> dict[str, float]:
     return out
 
 
+def host_memory_available_gb() -> float | None:
+    """Memory this container can still allocate (cgroup v2 limit minus anonymous memory), in GiB."""
+    try:
+        limit = open("/sys/fs/cgroup/memory.max").read().strip()
+        if limit == "max":
+            return None
+        anon = next(int(line.split()[1]) for line in open("/sys/fs/cgroup/memory.stat") if line.startswith("anon "))
+        return (int(limit) - anon) / 2**30
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+class HostMemoryError(RuntimeError):
+    pass
+
+
 def step(model, sample, device, offload: bool = False, profile: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU."""
@@ -204,6 +221,12 @@ def step(model, sample, device, offload: bool = False, profile: bool = False) ->
     # training mode: without this every activation is kept (OOM on the GPU, or on the host
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
     model.train()
+    if offload:
+        # every layer's checkpointed input (tokens x 4 x 2560 bf16) goes to host memory
+        need = sample["input_ids"].shape[1] * 4 * 2560 * 2 * 48 / 2**30 * 1.15 + 8
+        available = host_memory_available_gb()
+        if available is not None and need > available:
+            raise HostMemoryError(f"offload needs ~{need:.0f} GiB of host memory, {available:.0f} GiB available")
     labels = sample["labels"][0].to(device)
     targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
     inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
@@ -260,6 +283,13 @@ def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int,
     return samples
 
 
+def current_token_chunk(model) -> int | None:
+    for module in model.modules():
+        if hasattr(module, "_rft_token_chunk"):
+            return module._rft_token_chunk
+    return None
+
+
 def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
               profile: bool = False) -> dict[str, list]:
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised."""
@@ -270,18 +300,41 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
             continue
         results = []
         for _ in range(repeats):
-            try:
-                results.append(step(model, samples[length], device, offload=offload, profile=profile))
-                print(spec, results[-1], flush=True)
-            except torch.cuda.OutOfMemoryError as exc:
-                where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
-                         for f in traceback.extract_tb(exc.__traceback__)[-6:]]
-                results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb()))
-                print(spec, "OOM", where, str(exc)[:160], flush=True)
-                break
-            except Exception as exc:  # record it and keep the other numbers
-                results.append(dict(error=type(exc).__name__, detail=traceback.format_exc()[-3000:]))
-                print(spec, "ERROR", traceback.format_exc(), flush=True)
+            start_chunk = current_token_chunk(model)
+            retries = 2
+            while True:
+                try:
+                    result = step(model, samples[length], device, offload=offload, profile=profile)
+                    result["token_chunk"] = current_token_chunk(model)
+                    results.append(result)
+                    print(spec, results[-1], flush=True)
+                    break
+                except torch.cuda.OutOfMemoryError as exc:
+                    where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
+                             for f in traceback.extract_tb(exc.__traceback__)[-6:]]
+                    results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb(),
+                                        token_chunk=current_token_chunk(model)))
+                    print(spec, "OOM", where, str(exc)[:160], flush=True)
+                    model.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    chunk = current_token_chunk(model)
+                    if retries and chunk and chunk > 1024:  # smaller token chunks need less memory
+                        retries -= 1
+                        layer_patches.configure(model, token_chunk=chunk // 2)
+                        print(spec, "retrying with token_chunk", chunk // 2, flush=True)
+                        continue
+                    break
+                except HostMemoryError as exc:
+                    results.append(dict(error="host_memory", detail=str(exc)))
+                    print(spec, "SKIPPED", exc, flush=True)
+                    break
+                except Exception:  # record it and keep the other numbers
+                    results.append(dict(error="exception", detail=traceback.format_exc()[-3000:]))
+                    print(spec, "ERROR", traceback.format_exc(), flush=True)
+                    break
+            if start_chunk:
+                layer_patches.configure(model, token_chunk=start_chunk)
+            if results and "error" in results[-1]:
                 break
         steps[spec] = results
         save(steps)
@@ -382,12 +435,14 @@ def serve(model, device, args, processor, tools, game) -> None:
     """Keep the loaded model and run job files dropped in args.serve until a STOP file appears.
 
     A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
-    "adapter": "default" | "shared_expert", "profile": false}. qsa.py and this module are reloaded before
+    "adapter": "default" | "shared_expert", "profile": false, "transcript": "other_game.txt",
+    "token_chunk": 8192, "expert_tile": 128}. qsa.py and this module are reloaded before
     each job, so code fixes need no 5-minute model reload. Results go to NAME.result.json."""
     import importlib
 
     jobs = args.serve
     jobs.mkdir(parents=True, exist_ok=True)
+    games, default_game = {}, game
     print("serving jobs from", jobs, flush=True)
     while not (jobs / "STOP").exists():
         pending = sorted(jobs.glob("*.job"))
@@ -402,8 +457,18 @@ def serve(model, device, args, processor, tools, game) -> None:
             job = json.loads(running.read_text())
             result["job"] = job
             qsa_module = importlib.reload(importlib.import_module("inference.rl.qsa"))
+            patches = importlib.reload(importlib.import_module("inference.rl.layer_patches"))
             module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
             qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk))
+            if not args.no_layer_patches:
+                result["layer_patches"] = patches.patch_for_training(
+                    model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile))
+            if job.get("transcript"):
+                if job["transcript"] not in games:
+                    games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))
+                game = games[job["transcript"]]
+            else:
+                game = default_game
             result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
             if "layer_profile" in job:
                 spec = job["layer_profile"]
@@ -449,6 +514,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reference-qsa", action="store_true", help="keep transformers' QSA (dense mask, slow)")
     parser.add_argument("--qsa-chunk", type=int, default=256, help="queries per chunk in our QSA")
     parser.add_argument("--serve", type=Path, help="after loading, run job files from this directory (see serve)")
+    parser.add_argument("--no-layer-patches", action="store_true",
+                        help="keep transformers' decoder layers and AutoRound's experts loop")
+    parser.add_argument("--token-chunk", type=int, default=8192, help="tokens per chunk in patched decoder layers")
+    parser.add_argument("--expert-tile", type=int, default=128, help="experts dequantized per grouped GEMM")
+    parser.add_argument("--use-kernels", action="store_true", help="load hub kernels (causal-conv1d) via use_kernels")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
 
@@ -484,7 +554,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend != "auto":
         from transformers import AutoRoundConfig
         kwargs["quantization_config"] = AutoRoundConfig(backend=args.backend)
-    model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
+    if args.use_kernels:
+        kwargs["use_kernels"] = True
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
+    except Exception as exc:  # hub kernels are optional
+        if not kwargs.pop("use_kernels", False):
+            raise
+        report["use_kernels_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        print("use_kernels failed, loading without:", report["use_kernels_error"], flush=True)
+        model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
     report["load"] = dict(seconds=round(time.perf_counter() - t0, 1), memory_gb=memory_gb())
     kinds = {}
     for name, module in model.named_modules():
@@ -510,6 +589,16 @@ def main(argv: list[str] | None = None) -> int:
                           modules=sum(1 for n, _ in model.named_modules() if n.endswith("lora_A")))
     print("lora", report["lora"], flush=True)
     device = model.get_input_embeddings().weight.device
+    if not args.no_layer_patches:
+        report["layer_patches"] = layer_patches.patch_for_training(model, args.token_chunk, args.expert_tile)
+        report["experts_check"] = layer_patches.check_experts(model)
+        print("layer patches", report["layer_patches"], "experts check", report["experts_check"], flush=True)
+        if report["experts_check"]["max_rel_error"] > 0.05:  # grouped experts disagree: keep AutoRound's
+            for module in model.modules():
+                if hasattr(module, "_rft_previous_implementation"):
+                    module.config._experts_implementation = module._rft_previous_implementation
+            report["layer_patches"]["grouped_experts"] = "disabled: check failed"
+    save()
 
     if args.serve:
         serve(model, device, args, processor, tools, game)
