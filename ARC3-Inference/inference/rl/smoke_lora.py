@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import platform
 import re
@@ -198,16 +199,25 @@ def host_memory_gb() -> dict[str, float]:
     return out
 
 
+CGROUP_MEMORY = (  # (limit file, stat file, anonymous-memory key)
+    ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.stat", "anon"),  # cgroup v2
+    ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_rss"),  # v1 (some secure-cloud hosts)
+)
+
+
 def host_memory_available_gb() -> float | None:
-    """Memory this container can still allocate (cgroup v2 limit minus anonymous memory), in GiB."""
-    try:
-        limit = open("/sys/fs/cgroup/memory.max").read().strip()
-        if limit == "max":
+    """Memory this container can still allocate (cgroup limit minus anonymous memory), in GiB.
+    Page cache, including the memory-mapped PLE table, is reclaimable and not counted."""
+    for limit_file, stat_file, anon_key in CGROUP_MEMORY:
+        try:
+            limit = open(limit_file).read().strip()
+            anon = next(int(line.split()[1]) for line in open(stat_file) if line.startswith(anon_key + " "))
+        except (OSError, StopIteration, ValueError):
+            continue
+        if limit == "max" or int(limit) >= 2**60:  # unlimited
             return None
-        anon = next(int(line.split()[1]) for line in open("/sys/fs/cgroup/memory.stat") if line.startswith("anon "))
         return (int(limit) - anon) / 2**30
-    except (OSError, StopIteration, ValueError):
-        return None
+    return None
 
 
 class HostMemoryError(RuntimeError):
@@ -560,12 +570,17 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["quantization_config"] = AutoRoundConfig(backend=args.backend)
     if args.use_kernels:
         kwargs["use_kernels"] = True
+    model = None
     try:
         model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
     except Exception as exc:  # hub kernels are optional
         if not kwargs.pop("use_kernels", False):
             raise
         report["use_kernels_error"] = f"{type(exc).__name__}: {exc}"[:500]
+    if model is None:
+        # retry outside the except block: its traceback keeps the failed model (~70 GB on the GPU) alive
+        gc.collect()
+        torch.cuda.empty_cache()
         print("use_kernels failed, loading without:", report["use_kernels_error"], flush=True)
         model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
     if not args.ple_in_ram:

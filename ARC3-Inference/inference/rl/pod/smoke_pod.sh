@@ -55,10 +55,12 @@ hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" > results/d
 log "checkpoint ready in $(( $(date +%s) - start ))s: $(du -sh "$MODEL_DIR" | cut -f1)"
 
 log "phase 3: model server (loads once, ~5 min)"
+# no --use-kernels: the hub kernels it pulls (activation, mamba-ssm) are inference kernels, and kernels 0.17
+# refuses them when the Hub's publisher-trust lookup fails; torch's short-conv fallback is fine for training
 rm -f "$JOBS/STOP"
 if ! { [ -s server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null; }; then
     nohup python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
-        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json --use-kernels \
+        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json \
         > results/server.log 2>&1 < /dev/null &
     echo $! > server.pid
 fi

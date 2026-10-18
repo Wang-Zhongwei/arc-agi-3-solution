@@ -25,7 +25,10 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - Do not use `device_map="auto"` with the AutoRound W4A16 checkpoint. It sizes the routed experts as BF16 (~242 GB) before AutoRound swaps in INT4, and offloads all of them to CPU (log: "requires 62757274136 bytes of buffer for offloaded layers"). Use `gpu_device_map` in [smoke_lora.py](smoke_lora.py): everything on `cuda:0` except `_no_placement_params`, i.e. the single 102.5 GB PLE n-gram table, which stays in host RAM and is looked up there.
 - Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, or loading OOMs from fragmentation (66.6 GiB allocated, 72.7 GiB reserved but unused).
 - AutoRound unfuses the 48×512 experts (~3 min) and picks `auto_round:tritonv2_zp`. A full load takes ~5 min and holds 68.5 GiB on the GPU. The gptqmodel backend it suggests is inference-only.
-- Without `causal_conv1d`, GDN's short convolution falls back to the PyTorch reference (a warning). fla 0.5.2 covers the delta rule.
+- Without `causal_conv1d`, GDN's short convolution falls back to the PyTorch reference (a warning). That is fine for training: a whole GDN layer takes 0.68 s forward + backward at 64K. fla 0.5.2 covers the delta rule.
+- Do not pass `use_kernels=True`. kernels 0.17.2 refused `kernels-community/activation` because its publisher-trust lookup on the Hub failed, the kernels it pulls (activation, mamba-ssm) are inference kernels, and the error comes only after the full 4-minute load.
+- Never retry `from_pretrained` inside the `except` block: the traceback keeps the failed model (~70 GB on the GPU) alive, and the second load ran with 130 GB in use. Retry after the block, after `gc.collect()` and `torch.cuda.empty_cache()`.
+- Memory-map the PLE table ([ple_mmap.py](ple_mmap.py): `install()` before loading, `attach()` after). Loaded normally it holds ~105 GB of anonymous host memory (~233 GB peak during the load); mapped, the process holds 2.9 GB after loading and the table's pages are reclaimable cache.
 - GDN backward on Hopper: torch 2.8 ships Triton 3.4, whose gated `chunk_bwd_dqkwg` is wrong on sm90, so fla raises (fla #640). Install `tilelang` (0.1.15 keeps torch 2.8) and export `CUDA_HOME=/usr/local/cuda` so it finds nvcc. fla checks for tilelang at import, so a running process must be restarted. The first backward JIT-compiles for ~1 min.
 
 ## QSA sparse attention
@@ -34,6 +37,8 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - [tests/test_qsa.py](../../tests/test_qsa.py) checks it against the reference on a tiny model: identical selections, attention output, logits with an image, and gradients. At the real budget (512 blocks) selections match up to blocks tied at the cut-off: several blocks often score exactly 0 after the relu, and topk breaks such ties arbitrarily (as any kernel does).
 - Use the model's own `apply_rotary_pos_emb`: RoPE covers only the first 25% of each head (interleaved M-RoPE).
 - The indexer stays frozen (no LoRA; topk has no gradient), as in NeMo AutoModel.
+- Gather each query's keys and values with `index_select`, not advanced indexing. `k[idx]` backpropagates through a sort-based `index_put` that took 4.8 s of a QSA layer's 7.3 s forward + backward at 64K; `index_select`'s atomic `index_add` brings the layer to 3.6 s.
+- Both gathers accumulate the K/V gradient in BF16: 1.7% relative error against FP32 on one real-size chunk, 0.33% with FP32 accumulation. The same 64K step gave LoRA gradient norms 0.248 (sort-based) and 0.293 (atomic); the cause is not yet known.
 
 ## Activation memory
 
@@ -41,8 +46,9 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 
 - Hyper-connections widen the residual to 4 × 2,560, so each layer's checkpointed input is N × 10,240: ~31.5 GB over 48 layers at 32K, ~98 GB at 100K, next to 68.5 GiB of weights. Offload them to host memory (`step(offload=True)`, the `o` suffix in `smoke_lora --lengths`); the backward recompute runs outside `save_on_cpu`, so only the checkpoints move.
 - Offload to pageable memory (`save_on_cpu(pin_memory=False)`). PyTorch's pinned host allocator rounds each block up to a power of two and keeps it cached: after a 32K and a 64K step it held ~144 GB next to the 102.5 GB PLE table, and the pod's 251 GB cgroup OOM-killed the server. At 100K every layer's 2 GB checkpoint would take a 4 GB pinned block.
-- AutoRound's MoE (`moe_experts_interface.linear_loop_experts_forward`) gathers all N × top-10 token rows at once (4.7 GiB at 100K) and loops over the 512 unfused experts: memory grows ~0.9 MB per token and the forward is CPU-bound. Chunk the MoE block over tokens before training 100K samples on one H200.
-- Sample `nvidia-smi --query-gpu=utilization.gpu,utilization.memory,power.draw -l 1` during steps to see the bottleneck; a whole-model `torch.profiler` run with `profile_memory` grew host memory by 55 GiB and kept a billed GPU idle for 20 minutes.
+- AutoRound's MoE (`moe_experts_interface.linear_loop_experts_forward`) gathers all N × top-10 token rows at once (4.7 GiB at 100K) and loops over the 512 unfused experts: memory grew ~0.9 MB per token and 100K OOMed. [layer_patches.py](layer_patches.py) replaces it with grouped GEMMs over tiles of 128 experts and runs the per-token parts of each layer in 8,192-token checkpointed chunks; `check_experts` compares it with AutoRound's INT4 path at startup (0.3% max error on the H200). 123K tokens now peak at 129 GiB.
+- Pageable offload is only as fast as the host's first-touch page faults. GPU → host copies into freshly allocated memory ran at 1.7 GiB/s on the US-NC-1 secure host (THP `madvise`), ~35 s of the 58 s forward at 64K, against 16.5 GiB/s into a reused buffer; `THP_MEM_ALLOC_ENABLE=1` only reaches 3.4 GiB/s. An earlier host did ~25 GiB/s. Reuse host buffers across steps.
+- Sample `nvidia-smi --query-gpu=utilization.gpu,utilization.memory,power.draw -l 1` during steps to see the bottleneck; a whole-model `torch.profiler` run with `profile_memory` grew host memory by 55 GiB and kept a billed GPU idle for 20 minutes. To see where the time goes, run a `layer_profile` job instead: one layer at a time with CUDA events and a one-layer profiler pass, ~2 minutes.
 - Never build [K, vocab] logits at once (10K trained positions × 248,320 = 10 GB in fp32): `chunked_cross_entropy` checkpoints the lm_head + loss per 2,048 positions. Both changes are exact (loss and gradients equal to 1e-9 on the tiny model).
 
 ## Pods (RunPod)
@@ -56,3 +62,6 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - A failed run does not stop the pod. Delete pods you created as soon as they sit idle.
 - Before uploading code, run its path on a tiny random `qwen4_exp` on CPU: every pod retry costs a 5-minute reload. Then run `smoke_lora --serve`, which keeps the model loaded and hot-reloads code per job.
 - Choose the cheapest GPU that fits: a single GPU or LoRA data parallel needs no SXM/NVLink (H200 NVL, community cloud are cheaper).
+- Some secure hosts run cgroup v1: the limit is `/sys/fs/cgroup/memory/memory.limit_in_bytes` and anonymous memory is `total_rss` in `memory.stat`. Read both layouts (`smoke_lora.CGROUP_MEMORY`), or memory checks silently pass.
+- The first step on a fresh server includes tilelang/Triton JIT and autotuning (~1 min); compare speeds on steps after a warm-up at the same length.
+- The job server checks `STOP` only between jobs, so jobs queued before the current one ends still run. To keep the model loaded for follow-up jobs after `smoke_pod.sh` writes `STOP`, remove it and let a helper write it after the last job.
