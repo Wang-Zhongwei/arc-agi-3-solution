@@ -105,7 +105,7 @@ def tokenize(processor, text: str, images: list[Image.Image], loss_replies: int)
         pieces += [(text[cursor:s], False), (text[s:e], True)]
         cursor = e
     pieces.append((text[cursor:], False))
-    ids, labels, pixel_values, grids, used = [], [], [], [], 0
+    ids, labels, types, pixel_values, grids, used = [], [], [], [], [], 0
     for piece, train in pieces:
         if not piece:
             continue
@@ -114,15 +114,46 @@ def tokenize(processor, text: str, images: list[Image.Image], loss_replies: int)
         used += n
         piece_ids = batch["input_ids"][0]
         ids.append(piece_ids)
+        # marks image tokens for the multimodal RoPE; the model refuses images without it
+        types.append(batch["mm_token_type_ids"][0])
         labels.append(piece_ids.clone() if train else torch.full_like(piece_ids, -100))
         if n:
             pixel_values.append(batch["pixel_values"])
             grids.append(batch["image_grid_thw"])
-    out = {"input_ids": torch.cat(ids)[None], "labels": torch.cat(labels)[None]}
+    out = {"input_ids": torch.cat(ids)[None], "labels": torch.cat(labels)[None],
+           "mm_token_type_ids": torch.cat(types)[None]}
     if pixel_values:
         out["pixel_values"] = torch.cat(pixel_values)
         out["image_grid_thw"] = torch.cat(grids)
     return out
+
+
+def gpu_device_map(model_path: str) -> dict[str, Any]:
+    """Everything on cuda:0 except the model's `_no_placement_params` (the ~95 GiB PLE
+    n-gram tables), which stay on CPU where the n-gram lookup then runs.
+
+    device_map="auto" cannot be used: it sizes the routed experts as BF16 (~242 GB)
+    before AutoRound swaps them for INT4, and so offloads all of them to CPU."""
+    from transformers import AutoConfig, AutoModelForImageTextToText
+
+    with torch.device("meta"):
+        skeleton = AutoModelForImageTextToText.from_config(AutoConfig.from_pretrained(model_path))
+    skip = tuple(getattr(skeleton, "_no_placement_params", None) or ())
+    device_map: dict[str, Any] = {}
+
+    def place(module, prefix):
+        full = lambda name: f"{prefix}.{name}" if prefix else name
+        if not any(full(n).endswith(skip) for n, _ in module.named_parameters()) if skip else True:
+            device_map[prefix] = 0
+            return
+        for name, _ in [*module.named_parameters(recurse=False), *module.named_buffers(recurse=False)]:
+            if not full(name).endswith(skip):
+                device_map[full(name)] = 0
+        for name, child in module.named_children():
+            place(child, full(name))
+
+    place(skeleton, "")
+    return device_map
 
 
 def memory_gb() -> dict[str, float]:
@@ -133,21 +164,26 @@ def peak_gb() -> dict[str, float]:
     return {f"cuda:{i}": round(torch.cuda.max_memory_allocated(i) / 2**30, 2) for i in range(torch.cuda.device_count())}
 
 
+def _sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def step(model, sample, device) -> dict[str, Any]:
     labels = sample["labels"][0].to(device)
     targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
     inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
     for i in range(torch.cuda.device_count()):
         torch.cuda.reset_peak_memory_stats(i)
-    torch.cuda.synchronize()
+    _sync()
     t0 = time.perf_counter()
     # logits only where a target follows: full [length, 248K] logits would not fit
     out = model(**inputs, logits_to_keep=targets - 1, use_cache=False)
     loss = F.cross_entropy(out.logits[0].float(), labels[targets])
-    torch.cuda.synchronize()
+    _sync()
     t1 = time.perf_counter()
     loss.backward()
-    torch.cuda.synchronize()
+    _sync()
     t2 = time.perf_counter()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
@@ -171,8 +207,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shared-expert", action="store_true", help="also put LoRA on the shared expert MLP")
     parser.add_argument("--backend", default="auto", help="AutoRound kernel backend (auto, torch, tritonv2, ...)")
     parser.add_argument("--attn", default="sdpa", help="attn_implementation")
-    parser.add_argument("--max-gpu-memory", default="100GiB",
-                        help="weight budget per GPU; the ~95 GiB PLE n-gram table stays on CPU when it does not fit")
     parser.add_argument("--no-checkpointing", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
@@ -208,9 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
     t0 = time.perf_counter()
-    max_memory = {i: args.max_gpu_memory for i in range(torch.cuda.device_count())}
-    max_memory["cpu"] = "1000GiB"
-    kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map="auto", max_memory=max_memory,
+    kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map=gpu_device_map(args.model),
                                   attn_implementation=args.attn)
     if args.backend != "auto":
         from transformers import AutoRoundConfig
