@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
-from inference.rl import layer_patches
+from inference.rl import layer_patches, ple_mmap
 from inference.rl.context_rebuild import estimate_tokens, rebuild
 from inference.rl.qsa import patch_qsa_attention
 
@@ -519,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token-chunk", type=int, default=8192, help="tokens per chunk in patched decoder layers")
     parser.add_argument("--expert-tile", type=int, default=128, help="experts dequantized per grouped GEMM")
     parser.add_argument("--use-kernels", action="store_true", help="load hub kernels (causal-conv1d) via use_kernels")
+    parser.add_argument("--ple-in-ram", action="store_true",
+                        help="load the 102.5 GB PLE table into host RAM instead of memory-mapping the checkpoint")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
 
@@ -548,6 +550,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.reference_qsa:
         patch_qsa_attention(args.qsa_chunk)
+    if not args.ple_in_ram:
+        ple_mmap.install()  # before the device map and the load: transformers then skips the table's shards
     t0 = time.perf_counter()
     kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map=gpu_device_map(args.model),
                                   attn_implementation=args.attn)
@@ -564,7 +568,9 @@ def main(argv: list[str] | None = None) -> int:
         report["use_kernels_error"] = f"{type(exc).__name__}: {exc}"[:500]
         print("use_kernels failed, loading without:", report["use_kernels_error"], flush=True)
         model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
-    report["load"] = dict(seconds=round(time.perf_counter() - t0, 1), memory_gb=memory_gb())
+    if not args.ple_in_ram:
+        report["ple_mmap"] = ple_mmap.attach(model, args.model)
+    report["load"] = dict(seconds=round(time.perf_counter() - t0, 1), memory_gb=memory_gb(), host_gb=host_memory_gb())
     kinds = {}
     for name, module in model.named_modules():
         for key, pattern in (("attention", r"self_attn\.q_proj$"), ("gdn", r"linear_attn\.in_proj_qkv$"),
