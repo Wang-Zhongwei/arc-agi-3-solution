@@ -25,9 +25,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-_ORIGINAL_FORWARD = None
-
-
 def _rope(x, cos, sin):
     """The model's own rotary embedding (it rotates only the first cos.shape[-1] dims).
 
@@ -93,19 +90,25 @@ def select_tokens(indexer, hidden_states, cos, sin, chunk_size: int) -> torch.Te
 def _attend_chunk(q, k, v, idx, scaling):
     """q [C, H, D]; k, v [N, Hkv, D]; idx [C, S] (-1 = none) -> [C, H, D].
 
-    Each query is its own SDPA batch row over its S gathered keys."""
+    Each query is one SDPA batch row whose H // Hkv heads sharing a key/value head
+    are laid out as that row's query positions (the same math as GQA). SDPA's
+    `enable_gqa` would instead expand the gathered keys per head, and with a mask
+    the math kernel also upcasts them: 24 GiB for a 512-query chunk."""
+    c, h, d = q.shape
+    hkv = k.shape[1]
     safe = idx.clamp(min=0)
     keys, values = k[safe].transpose(1, 2), v[safe].transpose(1, 2)  # [C, Hkv, S, D]
     mask = (idx >= 0)[:, None, None, :]
-    out = F.scaled_dot_product_attention(q[:, :, None, :], keys, values, attn_mask=mask, scale=scaling,
-                                         enable_gqa=True)
-    return out[:, :, 0, :]
+    out = F.scaled_dot_product_attention(q.reshape(c, hkv, h // hkv, d), keys, values, attn_mask=mask,
+                                         scale=scaling)
+    return out.reshape(c, h, d)
 
 
 def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
     if past_key_values is not None or hidden_states.shape[0] != 1:
-        return _ORIGINAL_FORWARD(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
-    chunk = getattr(self, "_qsa_chunk_size", 512)
+        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values,
+                                      **kwargs)
+    chunk = getattr(self, "_qsa_chunk_size", 256)
     n = hidden_states.shape[1]
     cos, sin = (x[:, -n:, :] for x in position_embeddings)
     selected = select_tokens(self.indexer, hidden_states, cos, sin, chunk)
@@ -131,19 +134,21 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     return self.o_proj(output)[None], None
 
 
-def patch_qsa_attention(chunk_size: int = 512) -> None:
-    """Route qwen4_exp full-attention layers through qsa_forward."""
-    global _ORIGINAL_FORWARD
+def patch_qsa_attention(chunk_size: int = 256) -> None:
+    """Route qwen4_exp full-attention layers through qsa_forward. Safe to call again after
+    reloading this module: transformers' forward is kept on the class, not here."""
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
-    if _ORIGINAL_FORWARD is None:
-        _ORIGINAL_FORWARD = m.Qwen4ExpTextAttention.forward
-    m.Qwen4ExpTextAttention.forward = qsa_forward
-    m.Qwen4ExpTextAttention._qsa_chunk_size = chunk_size
+    cls = m.Qwen4ExpTextAttention
+    if not hasattr(cls, "_hf_forward"):
+        cls._hf_forward = cls.forward
+    cls.forward = qsa_forward
+    cls._qsa_chunk_size = chunk_size
 
 
 def unpatch_qsa_attention() -> None:
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
-    if _ORIGINAL_FORWARD is not None:
-        m.Qwen4ExpTextAttention.forward = _ORIGINAL_FORWARD
+    cls = m.Qwen4ExpTextAttention
+    if hasattr(cls, "_hf_forward"):
+        cls.forward = cls._hf_forward

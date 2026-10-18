@@ -2,9 +2,11 @@
 # One-shot LoRA smoke test on a GPU pod: install, fetch the checkpoint, run, collect.
 #
 # Upload this directory (inference/rl + a transcript) to $WORK and launch once:
-#   nohup bash inference/rl/pod/smoke_pod.sh > smoke_pod.log 2>&1 &
-# Every phase is skipped when already done, so a relaunch resumes. Results land
-# in $WORK/results/; $WORK/DONE or $WORK/FAILED marks the end.
+#   ssh ... 'cd /workspace/smoke; nohup bash inference/rl/pod/smoke_pod.sh > smoke_pod.log 2>&1 < /dev/null &' < /dev/null
+# Every phase is skipped when already done, so a relaunch resumes. The model is
+# loaded once by a job server (smoke_lora --serve); more jobs can be dropped into
+# $WORK/jobs as NAME.job while it runs (KEEP_SERVER=1 keeps it up after the
+# default jobs). Results land in $WORK/results/; $WORK/DONE or $WORK/FAILED marks the end.
 set -uo pipefail
 
 WORK=${WORK:-/workspace/smoke}
@@ -12,11 +14,14 @@ MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 TRANSCRIPT=${TRANSCRIPT:-$WORK/game.txt}
 LENGTHS=${LENGTHS:-32768,32768o,65536o,100000o}  # o = offload checkpoints to host memory
+BACKEND=${BACKEND:-auto}                         # AutoRound kernel backend
+KEEP_SERVER=${KEEP_SERVER:-0}
+VENV=${VENV:-/workspace/venv}
+JOBS=$WORK/jobs
 cd "$WORK"
-mkdir -p results
+mkdir -p results "$JOBS"
 rm -f DONE FAILED
 echo $$ > run.pid  # stop with: kill $(cat run.pid); never pkill -f, which also matches the ssh command
-VENV=${VENV:-/workspace/venv}
 # the loader's many small copies fragment the caching allocator (OOM at 67 GiB used, 73 GiB reserved-free)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -43,28 +48,34 @@ PY
 
 log "phase 2: checkpoint $MODEL_REPO"
 start=$(date +%s)
+# 52 s on US-NC-1 but 665 s on US-CO-1: pin the pod's data center or use a network volume
 hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" > results/download.log 2>&1 || fail "download"
 log "checkpoint ready in $(( $(date +%s) - start ))s: $(du -sh "$MODEL_DIR" | cut -f1)"
 
-log "phase 3: smoke runs"
-run() {  # name, extra args
-    local name=$1; shift
-    if [ -s "results/$name.json" ] && python -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if 'after_optimizer_step_gb' in d else 1)" "results/$name.json"; then
-        log "$name already complete"; return 0
-    fi
-    log "run $name: $*"
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader > "results/$name.gpu_before.txt"
-    python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
-        --tools inference/rl/data/python_tool.json --lengths "$LENGTHS" --out "results/$name.json" "$@" \
-        > "results/$name.log" 2>&1 < /dev/null
-    local status=$?
-    log "$name exited $status"; tail -5 "results/$name.log"
-    return $status
+log "phase 3: model server (loads once, ~5 min)"
+rm -f "$JOBS/STOP"
+if ! { [ -s server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null; }; then
+    nohup python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
+        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json \
+        > results/server.log 2>&1 < /dev/null &
+    echo $! > server.pid
+fi
+submit() {  # name, job json; skipped when already queued, running or done
+    local name=$1
+    if [ -e "$JOBS/$name.job" ] || [ -e "$JOBS/$name.running" ] || [ -e "$JOBS/$name.done" ]; then return 0; fi
+    echo "$2" > "$JOBS/$name.tmp" && mv "$JOBS/$name.tmp" "$JOBS/$name.job"
 }
-# default kernels first; if loading or the backward fails, retry on AutoRound's plain torch backend
-run auto || run torch_backend --backend torch || fail "both backends failed, see results/*.log"
-# shared expert LoRA on top, if the base run worked
-LENGTHS=100000o run shared_expert --shared-expert || log "shared_expert variant failed (base result still valid)"
+submit 01_base "{\"lengths\": \"$LENGTHS\"}"
+submit 02_shared_expert '{"lengths": "100000o", "adapter": "shared_expert"}'
 
-log "all done"
+log "phase 4: jobs"
+while [ ! -e "$JOBS/02_shared_expert.done" ]; do
+    kill -0 "$(cat server.pid)" 2>/dev/null || fail "model server exited, see results/server.log"
+    sleep 20
+done
+cp "$JOBS"/*.result.json results/
+if [ "$KEEP_SERVER" != 1 ]; then
+    touch "$JOBS/STOP"
+fi
+log "all done (server $( [ "$KEEP_SERVER" = 1 ] && echo "still serving $JOBS" || echo stopping))"
 date -u > DONE

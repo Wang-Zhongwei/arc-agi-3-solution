@@ -121,8 +121,8 @@ def test_selection_matches_reference(setup):
 def test_attention_output_matches_reference(setup):
     _, _, _, c = setup
     with torch.no_grad():
-        reference, _ = qsa._ORIGINAL_FORWARD(c["module"], c["hidden"], c["pos"], c["mask"]) \
-            if qsa._ORIGINAL_FORWARD else m.Qwen4ExpTextAttention.forward(c["module"], c["hidden"], c["pos"], c["mask"])
+        hf_forward = getattr(m.Qwen4ExpTextAttention, "_hf_forward", m.Qwen4ExpTextAttention.forward)
+        reference, _ = hf_forward(c["module"], c["hidden"], c["pos"], c["mask"])
         c["module"]._qsa_chunk_size = 64
         ours, _ = qsa.qsa_forward(c["module"], c["hidden"], c["pos"], c["mask"])
     torch.testing.assert_close(ours, reference, rtol=1e-5, atol=1e-5)

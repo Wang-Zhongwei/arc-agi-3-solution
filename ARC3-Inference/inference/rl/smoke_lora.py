@@ -156,6 +156,8 @@ def gpu_device_map(model_path: str) -> dict[str, Any]:
             place(child, full(name))
 
     place(skeleton, "")
+    if not torch.cuda.is_available():  # CPU dry runs of this script
+        device_map = {key: "cpu" for key in device_map}
     return device_map
 
 
@@ -215,6 +217,103 @@ def step(model, sample, device, offload: bool = False) -> dict[str, Any]:
                 lora_params_with_grad=len(grads), lora_grad_norm=norm, peak_gb=peak_gb())
 
 
+def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int, dict[str, torch.Tensor]]:
+    """One packed sample per distinct target length in `specs` (e.g. "65536o")."""
+    samples = {}
+    for length in sorted({int(x.rstrip("o")) for x in specs}):
+        request = pick_request(game, length)
+        if request is None:
+            continue
+        chat, images = to_chat(request.messages + [request.reply])
+        text = processor.apply_chat_template(chat, tools=tools, tokenize=False, preserve_thinking=True)
+        samples[length] = tokenize(processor, text, images, loss_replies)
+    return samples
+
+
+def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None) -> dict[str, list]:
+    """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised."""
+    steps: dict[str, list] = {}
+    for spec in specs:
+        length, offload = int(spec.rstrip("o")), spec.endswith("o")
+        if length not in samples:
+            continue
+        results = []
+        for _ in range(repeats):
+            try:
+                results.append(step(model, samples[length], device, offload=offload))
+                print(spec, results[-1], flush=True)
+            except torch.cuda.OutOfMemoryError as exc:
+                where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
+                         for f in traceback.extract_tb(exc.__traceback__)[-6:]]
+                results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb()))
+                print(spec, "OOM", where, str(exc)[:160], flush=True)
+                break
+            except Exception as exc:  # record it and keep the other numbers
+                results.append(dict(error=type(exc).__name__, detail=traceback.format_exc()[-3000:]))
+                print(spec, "ERROR", traceback.format_exc(), flush=True)
+                break
+        steps[spec] = results
+        save(steps)
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+    return steps
+
+
+def use_adapter(model, name: str, rank: int) -> dict[str, int]:
+    """Switch to LoRA adapter `name` ("default" = attention + GDN, "shared_expert" adds the shared expert MLP)."""
+    from peft import LoraConfig
+
+    if name not in model.peft_config:
+        targets = ATTENTION_GDN + (SHARED_EXPERT if name == "shared_expert" else "")
+        model.add_adapter(name, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.0, bias="none",
+                                           target_modules=targets))
+    model.set_adapter(name)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return dict(adapter=name, trainable_params=trainable)
+
+
+def serve(model, device, args, processor, tools, game) -> None:
+    """Keep the loaded model and run job files dropped in args.serve until a STOP file appears.
+
+    A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
+    "adapter": "default" | "shared_expert"}. qsa.py and this module are reloaded before
+    each job, so code fixes need no 5-minute model reload. Results go to NAME.result.json."""
+    import importlib
+
+    jobs = args.serve
+    jobs.mkdir(parents=True, exist_ok=True)
+    print("serving jobs from", jobs, flush=True)
+    while not (jobs / "STOP").exists():
+        pending = sorted(jobs.glob("*.job"))
+        if not pending:
+            time.sleep(2)
+            continue
+        job_path = pending[0]
+        running = job_path.with_suffix(".running")
+        job_path.rename(running)
+        result: dict[str, Any] = dict(job=job_path.stem)
+        try:
+            job = json.loads(running.read_text())
+            result["job"] = job
+            qsa_module = importlib.reload(importlib.import_module("inference.rl.qsa"))
+            module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
+            qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk))
+            result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
+            specs = [x.strip() for x in job["lengths"].split(",") if x.strip()]
+            samples = module.build_samples(processor, tools, game, specs, job.get("loss_replies", args.loss_replies))
+            result["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
+            print("job", job_path.stem, job, result["lora"], flush=True)
+            out = jobs / f"{job_path.stem}.result.json"
+            save = lambda steps: out.write_text(json.dumps(dict(result, steps=steps), indent=1))
+            result["steps"] = module.run_specs(model, device, samples, specs, job.get("repeats", args.repeats), save)
+        except Exception:
+            result["error"] = traceback.format_exc()[-3000:]
+            print("job", job_path.stem, "ERROR", result["error"], flush=True)
+        (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
+        running.rename(job_path.with_suffix(".done"))
+        print("job", job_path.stem, "done", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True)
@@ -230,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--attn", default="sdpa", help="attn_implementation")
     parser.add_argument("--no-checkpointing", action="store_true")
     parser.add_argument("--reference-qsa", action="store_true", help="keep transformers' QSA (dense mask, slow)")
-    parser.add_argument("--qsa-chunk", type=int, default=512, help="queries per chunk in our QSA")
+    parser.add_argument("--qsa-chunk", type=int, default=256, help="queries per chunk in our QSA")
+    parser.add_argument("--serve", type=Path, help="after loading, run job files from this directory (see serve)")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
 
@@ -254,14 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     tools = json.loads(args.tools.read_text())
     game = rebuild(args.transcript.read_text(encoding="utf-8"))
     specs = [x.strip() for x in args.lengths.split(",") if x.strip()]
-    samples = {}
-    for length in sorted({int(x.rstrip("o")) for x in specs}):
-        request = pick_request(game, length)
-        if request is None:
-            continue
-        chat, images = to_chat(request.messages + [request.reply])
-        text = processor.apply_chat_template(chat, tools=tools, tokenize=False, preserve_thinking=True)
-        samples[length] = tokenize(processor, text, images, args.loss_replies)
+    samples = {} if args.serve else build_samples(processor, tools, game, specs, args.loss_replies)
     report["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
@@ -298,29 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     print("lora", report["lora"], flush=True)
     device = model.get_input_embeddings().weight.device
 
-    report["steps"] = {}
-    for spec in specs:
-        length, offload = int(spec.rstrip("o")), spec.endswith("o")
-        if length not in samples:
-            continue
-        results = []
-        for _ in range(args.repeats):
-            try:
-                results.append(step(model, samples[length], device, offload=offload))
-                print(spec, results[-1], flush=True)
-            except torch.cuda.OutOfMemoryError as exc:
-                where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}" for f in traceback.extract_tb(exc.__traceback__)[-6:]]
-                results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb()))
-                print(spec, "OOM", where, flush=True)
-                break
-            except Exception as exc:  # record it and keep the earlier numbers
-                results.append(dict(error=type(exc).__name__, detail=traceback.format_exc()[-3000:]))
-                print(spec, "ERROR", traceback.format_exc(), flush=True)
-                break
-        report["steps"][spec] = results
-        save()
-        model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
+    if args.serve:
+        serve(model, device, args, processor, tools, game)
+        return 0
+
+    report["steps"] = run_specs(model, device, samples, specs, args.repeats,
+                                lambda steps: (report.__setitem__("steps", steps), save()))
 
     # one optimizer step: the AdamW state is part of the training footprint
     params = [p for p in model.parameters() if p.requires_grad]

@@ -46,6 +46,6 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - Start background jobs as `ssh ... 'cd DIR; nohup CMD > log 2>&1 < /dev/null &' < /dev/null`. With `cd DIR && nohup CMD &` the whole list runs in a subshell that holds ssh's stdout, and ssh never returns.
 - Stop jobs by PID (`run.pid`). `pkill -f NAME` over ssh also matches and kills the ssh command itself.
 - `free` inside a pod shows the host. The pod's RAM is RunPod's `gpu.memory` (251 GB on 1×H200; the PLE table takes ~102 GB of it).
-- Direct SSH (needed for scp) shows up in the REST `publicIp` and `portMappings` about a minute after creation. The 181 GB checkpoint downloads in ~1 min with `hf_transfer`.
+- Direct SSH (needed for scp) shows up in the REST `publicIp` and `portMappings` about a minute after creation. The 181 GB checkpoint download speed depends on the data center: 52 s on US-NC-1, 665 s on US-CO-1 (both `hf_transfer`). Pin `dataCenterIds` to a fast one, or keep the checkpoint on a network volume.
 - A failed run does not stop the pod. Delete pods you created as soon as they sit idle.
 - Before uploading code, run its path on a tiny random `qwen4_exp` on CPU: every pod retry costs a 5-minute reload.
