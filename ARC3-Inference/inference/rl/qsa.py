@@ -97,7 +97,11 @@ def _attend_chunk(q, k, v, idx, scaling):
     c, h, d = q.shape
     hkv = k.shape[1]
     safe = idx.clamp(min=0)
-    keys, values = k[safe].transpose(1, 2), v[safe].transpose(1, 2)  # [C, Hkv, S, D]
+    # index_select backpropagates through an atomic index_add; advanced indexing (k[safe]) goes through a
+    # sort-based index_put, which took 66% of a QSA layer's forward + backward at 64K tokens
+    flat = safe.reshape(-1)
+    keys = k.index_select(0, flat).view(c, -1, hkv, d).transpose(1, 2)  # [C, Hkv, S, D]
+    values = v.index_select(0, flat).view(c, -1, hkv, d).transpose(1, 2)
     mask = (idx >= 0)[:, None, None, :]
     out = F.scaled_dot_product_attention(q.reshape(c, hkv, h // hkv, d), keys, values, attn_mask=mask,
                                          scale=scaling)
