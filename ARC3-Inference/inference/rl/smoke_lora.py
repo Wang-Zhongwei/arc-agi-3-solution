@@ -171,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shared-expert", action="store_true", help="also put LoRA on the shared expert MLP")
     parser.add_argument("--backend", default="auto", help="AutoRound kernel backend (auto, torch, tritonv2, ...)")
     parser.add_argument("--attn", default="sdpa", help="attn_implementation")
+    parser.add_argument("--max-gpu-memory", default="100GiB",
+                        help="weight budget per GPU; the ~95 GiB PLE n-gram table stays on CPU when it does not fit")
     parser.add_argument("--no-checkpointing", action="store_true")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
     args = parser.parse_args(argv)
@@ -206,7 +208,10 @@ def main(argv: list[str] | None = None) -> int:
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
     t0 = time.perf_counter()
-    kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map="auto", attn_implementation=args.attn)
+    max_memory = {i: args.max_gpu_memory for i in range(torch.cuda.device_count())}
+    max_memory["cpu"] = "1000GiB"
+    kwargs: dict[str, Any] = dict(dtype=torch.bfloat16, device_map="auto", max_memory=max_memory,
+                                  attn_implementation=args.attn)
     if args.backend != "auto":
         from transformers import AutoRoundConfig
         kwargs["quantization_config"] = AutoRoundConfig(backend=args.backend)
@@ -219,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             if key not in kinds and re.search(pattern, name):
                 kinds[key] = f"{name}: {type(module).__module__}.{type(module).__name__}"
     report["modules"] = kinds
+    report["ple_devices"] = sorted({str(p.device) for n, p in model.named_parameters() if "ngram_embedding" in n})
     print("loaded", report["load"], json.dumps(kinds, indent=1), flush=True)
     save()
 
