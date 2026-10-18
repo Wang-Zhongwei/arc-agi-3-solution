@@ -40,6 +40,7 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - Call `model.train()`: `from_pretrained` returns an eval-mode model, and transformers' `GradientCheckpointingLayer` checkpoints only in training mode. Otherwise `gradient_checkpointing_enable()` silently does nothing: 32K OOMed on the GPU at 137.6 GiB, and with offload all activations went to pinned host memory and the cgroup OOM-killed the process (`/sys/fs/cgroup/memory.events`: `oom_kill`). `smoke_lora` reports `checkpointed_layers`.
 
 - Hyper-connections widen the residual to 4 × 2,560, so each layer's checkpointed input is N × 10,240: ~31.5 GB over 48 layers at 32K, ~98 GB at 100K, next to 68.5 GiB of weights. Offload them to host memory (`step(offload=True)`, the `o` suffix in `smoke_lora --lengths`); the backward recompute runs outside `save_on_cpu`, so only the checkpoints move.
+- Offload to pageable memory (`save_on_cpu(pin_memory=False)`). PyTorch's pinned host allocator rounds each block up to a power of two and keeps it cached: after a 32K and a 64K step it held ~144 GB next to the 102.5 GB PLE table, and the pod's 251 GB cgroup OOM-killed the server. At 100K every layer's 2 GB checkpoint would take a 4 GB pinned block.
 - Never build [K, vocab] logits at once (10K trained positions × 248,320 = 10 GB in fp32): `chunked_cross_entropy` checkpoints the lm_head + loss per 2,048 positions. Both changes are exact (loss and gradients equal to 1e-9 on the tiny model).
 
 ## Pods (RunPod)

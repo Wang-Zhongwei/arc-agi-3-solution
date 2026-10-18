@@ -13,7 +13,7 @@ WORK=${WORK:-/workspace/smoke}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 TRANSCRIPT=${TRANSCRIPT:-$WORK/game.txt}
-LENGTHS=${LENGTHS:-32768,32768o,65536o,100000o}  # o = offload checkpoints to host memory
+LENGTHS=${LENGTHS:-32768o,65536o,100000o}  # o = offload checkpoints to host memory
 BACKEND=${BACKEND:-auto}                         # AutoRound kernel backend
 KEEP_SERVER=${KEEP_SERVER:-0}
 VENV=${VENV:-/workspace/venv}
@@ -67,11 +67,12 @@ submit() {  # name, job json; skipped when already queued, running or done
     if [ -e "$JOBS/$name.job" ] || [ -e "$JOBS/$name.running" ] || [ -e "$JOBS/$name.done" ]; then return 0; fi
     echo "$2" > "$JOBS/$name.tmp" && mv "$JOBS/$name.tmp" "$JOBS/$name.job"
 }
-submit 01_base "{\"lengths\": \"$LENGTHS\"}"
-submit 02_shared_expert '{"lengths": "100000o", "adapter": "shared_expert"}'
+submit 01_profile '{"lengths": "16384", "repeats": 1, "profile": true}'
+submit 02_base "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
+submit 03_shared_expert '{"lengths": "32768o", "repeats": 1, "adapter": "shared_expert"}'
 
 log "phase 4: jobs"
-while [ ! -e "$JOBS/02_shared_expert.done" ]; do
+while [ ! -e "$JOBS/03_shared_expert.done" ]; do
     kill -0 "$(cat server.pid)" 2>/dev/null || fail "model server exited, see results/server.log"
     sleep 20
 done

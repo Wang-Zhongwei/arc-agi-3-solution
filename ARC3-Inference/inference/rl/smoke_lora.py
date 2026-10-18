@@ -186,7 +186,18 @@ def chunked_cross_entropy(lm_head, hidden, targets, chunk: int = 2048):
     return total / targets.numel()
 
 
-def step(model, sample, device, offload: bool = False) -> dict[str, Any]:
+def host_memory_gb() -> dict[str, float]:
+    """Resident and peak resident host memory of this process (Linux), in GiB."""
+    out = {}
+    with contextlib.suppress(OSError):
+        for line in open("/proc/self/status"):
+            if line.startswith(("VmRSS:", "VmHWM:")):
+                key, value = line.split(":")
+                out["rss" if key == "VmRSS" else "rss_peak"] = round(int(value.split()[0]) / 2**20, 1)
+    return out
+
+
+def step(model, sample, device, offload: bool = False, profile: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU."""
     # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
@@ -201,24 +212,39 @@ def step(model, sample, device, offload: bool = False) -> dict[str, Any]:
         torch.cuda.reset_peak_memory_stats(i)
     _sync()
     t0 = time.perf_counter()
-    saved = (torch.autograd.graph.save_on_cpu(pin_memory=torch.cuda.is_available()) if offload
-             else contextlib.nullcontext())
-    with saved:
-        hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
-        loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
-    _sync()
-    t1 = time.perf_counter()
-    loss.backward()
-    _sync()
-    t2 = time.perf_counter()
+    # pageable, not pinned: the pinned host allocator rounds every block up to a power of two and
+    # keeps it cached, so 32K then 64K steps held ~144 GB besides the 102.5 GB PLE table and the
+    # cgroup OOM-killed the process
+    saved = torch.autograd.graph.save_on_cpu(pin_memory=False) if offload else contextlib.nullcontext()
+    activities = [torch.profiler.ProfilerActivity.CPU] + (
+        [torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else [])
+    profiler = (torch.profiler.profile(activities=activities, profile_memory=True) if profile
+                else contextlib.nullcontext())
+    with profiler:
+        with saved:
+            hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
+            loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
+        _sync()
+        t1 = time.perf_counter()
+        loss.backward()
+        _sync()
+        t2 = time.perf_counter()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
     model.zero_grad(set_to_none=True)
-    return dict(tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()), offload=offload,
+    extra = {}
+    if profile:
+        sort = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+        averages = profiler.key_averages()
+        extra["profile"] = averages.table(sort_by=sort, row_limit=30, max_name_column_width=70)
+        if torch.cuda.is_available():
+            extra["profile_memory"] = averages.table(sort_by="self_cuda_memory_usage", row_limit=25,
+                                                     max_name_column_width=70)
+    return dict(extra, tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()), offload=offload,
                 images=int(sample["image_grid_thw"].shape[0]) if "image_grid_thw" in sample else 0,
                 loss=round(float(loss), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
                 tokens_per_s=round(sample["input_ids"].shape[1] / (t2 - t0), 1),
-                lora_params_with_grad=len(grads), lora_grad_norm=norm, peak_gb=peak_gb())
+                lora_params_with_grad=len(grads), lora_grad_norm=norm, peak_gb=peak_gb(), host_gb=host_memory_gb())
 
 
 def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int, dict[str, torch.Tensor]]:
@@ -234,7 +260,8 @@ def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int,
     return samples
 
 
-def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None) -> dict[str, list]:
+def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
+              profile: bool = False) -> dict[str, list]:
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised."""
     steps: dict[str, list] = {}
     for spec in specs:
@@ -244,7 +271,7 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
         results = []
         for _ in range(repeats):
             try:
-                results.append(step(model, samples[length], device, offload=offload))
+                results.append(step(model, samples[length], device, offload=offload, profile=profile))
                 print(spec, results[-1], flush=True)
             except torch.cuda.OutOfMemoryError as exc:
                 where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
@@ -280,7 +307,7 @@ def serve(model, device, args, processor, tools, game) -> None:
     """Keep the loaded model and run job files dropped in args.serve until a STOP file appears.
 
     A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
-    "adapter": "default" | "shared_expert"}. qsa.py and this module are reloaded before
+    "adapter": "default" | "shared_expert", "profile": false}. qsa.py and this module are reloaded before
     each job, so code fixes need no 5-minute model reload. Results go to NAME.result.json."""
     import importlib
 
@@ -309,7 +336,8 @@ def serve(model, device, args, processor, tools, game) -> None:
             print("job", job_path.stem, job, result["lora"], flush=True)
             out = jobs / f"{job_path.stem}.result.json"
             save = lambda steps: out.write_text(json.dumps(dict(result, steps=steps), indent=1))
-            result["steps"] = module.run_specs(model, device, samples, specs, job.get("repeats", args.repeats), save)
+            result["steps"] = module.run_specs(model, device, samples, specs, job.get("repeats", args.repeats), save,
+                                               profile=job.get("profile", False))
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)

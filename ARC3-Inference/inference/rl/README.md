@@ -40,7 +40,8 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 - Rebuild checked on the 10 runs with request logs (17,979 requests): on runs without non-main features, 98.3–100% of windows exact among non-`uncertain` requests; message content ≥ 99.7% exact ([summary](../../../docs/RL/data/context_rebuild_validation.json)).
 - Samples: 32K/64K/100K targets give 33,811 / 64,893 / 99,072 tokens with 15 / 32 / 55 images.
 - Smoke test on 1×H200, first attempt: the model loads (68.5 GiB, PLE on CPU) and LoRA attaches; the first 32K step OOMs inside transformers' QSA reference.
-- Since then: chunked QSA, activation offload and chunked cross-entropy, all checked against the reference on a tiny model on CPU. Next: rerun the smoke test.
+- Since then: chunked QSA, activation offload and chunked cross-entropy, all checked against the reference on a tiny model on CPU.
+- First full step on 1×H200, 32K sample (33,811 tokens, 15 images, 5,664 trained): loss 0.4665, all 456 LoRA tensors get gradients; forward 19.7 s + backward 149.8 s ≈ 200 tokens/s steady state; peak 123.4 GiB, or 98.4 GiB with checkpoints offloaded (+1.3 s). 64K/100K and a profile are next.
 
 ## Existing training paths for this model
 
