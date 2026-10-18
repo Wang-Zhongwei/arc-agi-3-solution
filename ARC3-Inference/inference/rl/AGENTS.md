@@ -41,6 +41,8 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 
 - Hyper-connections widen the residual to 4 × 2,560, so each layer's checkpointed input is N × 10,240: ~31.5 GB over 48 layers at 32K, ~98 GB at 100K, next to 68.5 GiB of weights. Offload them to host memory (`step(offload=True)`, the `o` suffix in `smoke_lora --lengths`); the backward recompute runs outside `save_on_cpu`, so only the checkpoints move.
 - Offload to pageable memory (`save_on_cpu(pin_memory=False)`). PyTorch's pinned host allocator rounds each block up to a power of two and keeps it cached: after a 32K and a 64K step it held ~144 GB next to the 102.5 GB PLE table, and the pod's 251 GB cgroup OOM-killed the server. At 100K every layer's 2 GB checkpoint would take a 4 GB pinned block.
+- AutoRound's MoE (`moe_experts_interface.linear_loop_experts_forward`) gathers all N × top-10 token rows at once (4.7 GiB at 100K) and loops over the 512 unfused experts: memory grows ~0.9 MB per token and the forward is CPU-bound. Chunk the MoE block over tokens before training 100K samples on one H200.
+- Sample `nvidia-smi --query-gpu=utilization.gpu,utilization.memory,power.draw -l 1` during steps to see the bottleneck; a whole-model `torch.profiler` run with `profile_memory` grew host memory by 55 GiB and kept a billed GPU idle for 20 minutes.
 - Never build [K, vocab] logits at once (10K trained positions × 248,320 = 10 GB in fp32): `chunked_cross_entropy` checkpoints the lm_head + loss per 2,048 positions. Both changes are exact (loss and gradients equal to 1e-9 on the tiny model).
 
 ## Pods (RunPod)
@@ -52,4 +54,5 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - `free` inside a pod shows the host. The pod's RAM is RunPod's `gpu.memory` (251 GB on 1×H200; the PLE table takes ~102 GB of it).
 - Direct SSH (needed for scp) shows up in the REST `publicIp` and `portMappings` about a minute after creation. The 181 GB checkpoint download speed depends on the data center: 52 s on US-NC-1, 665 s on US-CO-1 (both `hf_transfer`). Pin `dataCenterIds` to a fast one, or keep the checkpoint on a network volume.
 - A failed run does not stop the pod. Delete pods you created as soon as they sit idle.
-- Before uploading code, run its path on a tiny random `qwen4_exp` on CPU: every pod retry costs a 5-minute reload.
+- Before uploading code, run its path on a tiny random `qwen4_exp` on CPU: every pod retry costs a 5-minute reload. Then run `smoke_lora --serve`, which keeps the model loaded and hot-reloads code per job.
+- Choose the cheapest GPU that fits: a single GPU or LoRA data parallel needs no SXM/NVLink (H200 NVL, community cloud are cheaper).

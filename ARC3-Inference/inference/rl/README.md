@@ -41,7 +41,20 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 - Samples: 32K/64K/100K targets give 33,811 / 64,893 / 99,072 tokens with 15 / 32 / 55 images.
 - Smoke test on 1×H200, first attempt: the model loads (68.5 GiB, PLE on CPU) and LoRA attaches; the first 32K step OOMs inside transformers' QSA reference.
 - Since then: chunked QSA, activation offload and chunked cross-entropy, all checked against the reference on a tiny model on CPU.
-- First full step on 1×H200, 32K sample (33,811 tokens, 15 images, 5,664 trained): loss 0.4665, all 456 LoRA tensors get gradients; forward 19.7 s + backward 149.8 s ≈ 200 tokens/s steady state; peak 123.4 GiB, or 98.4 GiB with checkpoints offloaded (+1.3 s). 64K/100K and a profile are next.
+- Smoke test on 1×H200 SXM (2026-10-18, two pods, ~2.3 h, ~$12; logs and results in `runs/runpod/jonathanwang2022/rft-lora-smoke/`):
+
+  | Sample (o = checkpoints offloaded to host) | Tokens | Images | Trained | Forward | Backward | Tokens/s | Peak GPU |
+  |---|---|---|---|---|---|---|---|
+  | 32K | 33,811 | 15 | 5,664 | 19.7 s | 149.8 s | 200 | 123.4 GiB |
+  | 32K o | 33,811 | 15 | 5,664 | 21.0 s | 150.8 s | 197 | 98.4 GiB |
+  | 64K o | 64,893 | 32 | 8,141 | 63.8 s | 261.9 s | 199 | 127.6 GiB |
+  | 100K o | 99,072 | 55 | 9,942 | OOM in the MoE forward | | | > 139.8 GiB |
+  | 32K o, + shared expert LoRA (33.5M params) | 33,811 | 15 | 5,664 | 38.2 s | 156.5 s | 174 | 99.3 GiB |
+
+  Loss on the model's own tokens is 0.47 (32K) and 0.28 (64K); with fresh LoRA it is the base model's loss. Peak memory grows ~0.9 MB per token above the 68.5 GiB of weights, mostly the AutoRound MoE dispatch (all token × top-10 rows at once: 4.7 GiB at 100K).
+- GPU sampling during the steps: backward keeps kernels running 80–90% of the time but at ~350 W of 700 W and ~50% memory-bandwidth use; forward is CPU-bound (15–40% busy). Many small per-expert kernels, not a memory-bandwidth limit.
+- Data: 79 local runs, 1,903 games, 153 distinct levels cleared. Dropping levels cleared ≥ 90% of the time and keeping the 2 fewest-action clears per level gives 160 trajectories, 21.6M tokens to process (4.5M trained): ~30 h on one H200 at 200 tokens/s.
+- Next, moderate fixes only: chunk the MoE over tokens (fits 100K) and replace the per-expert loop with a grouped GEMM (speed); then a short LoRA A/B (with vs without shared expert) on held-out loss.
 
 ## Existing training paths for this model
 

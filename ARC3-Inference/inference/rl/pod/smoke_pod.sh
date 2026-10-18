@@ -67,15 +67,18 @@ submit() {  # name, job json; skipped when already queued, running or done
     if [ -e "$JOBS/$name.job" ] || [ -e "$JOBS/$name.running" ] || [ -e "$JOBS/$name.done" ]; then return 0; fi
     echo "$2" > "$JOBS/$name.tmp" && mv "$JOBS/$name.tmp" "$JOBS/$name.job"
 }
-submit 01_profile '{"lengths": "16384", "repeats": 1, "profile": true}'
-submit 02_base "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
+submit 01_base "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
 submit 03_shared_expert '{"lengths": "32768o", "repeats": 1, "adapter": "shared_expert"}'
 
-log "phase 4: jobs"
+log "phase 4: jobs (GPU utilization and power sampled every second into results/gpu.csv)"
+nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,memory.used --format=csv,noheader \
+    -l 1 > results/gpu.csv 2>/dev/null &
+sampler=$!
 while [ ! -e "$JOBS/03_shared_expert.done" ]; do
-    kill -0 "$(cat server.pid)" 2>/dev/null || fail "model server exited, see results/server.log"
+    kill -0 "$(cat server.pid)" 2>/dev/null || { kill $sampler; fail "model server exited, see results/server.log"; }
     sleep 20
 done
+kill $sampler
 cp "$JOBS"/*.result.json results/
 if [ "$KEEP_SERVER" != 1 ]; then
     touch "$JOBS/STOP"

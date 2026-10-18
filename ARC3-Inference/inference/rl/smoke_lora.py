@@ -290,6 +290,81 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
     return steps
 
 
+def profile_layers(model, device, sample, layers=(0, 1, 3), iters: int = 2) -> dict[str, Any]:
+    """Time single decoder layers on the inputs they get in a real forward.
+
+    Captures each layer's inputs during one no-grad forward of `sample`, then per layer:
+    a no-grad forward (the first pass under checkpointing) and a forward + backward with
+    gradients (the recompute and backward), timed with CUDA events, plus one torch-profiler
+    pass over the latter (a single layer has few enough events to profile)."""
+    import inspect
+
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    decoder = [m for m in base.modules() if type(m).__name__ == "Qwen4ExpTextDecoderLayer"]
+    signature = inspect.signature(type(decoder[0]).forward)
+    captured: dict[int, dict[str, Any]] = {}
+
+    def hook(index):
+        def capture(module, args, kwargs):
+            bound = signature.bind(module, *args, **kwargs).arguments
+            bound.pop("self", None)
+            captured[index] = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in bound.items()}
+        return capture
+
+    handles = [decoder[i].register_forward_pre_hook(hook(i), with_kwargs=True) for i in layers]
+    inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
+    model.eval()
+    with torch.no_grad():
+        base.model(**inputs, use_cache=False)
+    for h in handles:
+        h.remove()
+    model.train()
+
+    def timed(fn):
+        if torch.cuda.is_available():
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / 1000
+        t0 = time.perf_counter()
+        fn()
+        return time.perf_counter() - t0
+
+    out: dict[str, Any] = {}
+    for i in layers:
+        layer, kwargs = decoder[i], dict(captured[i])
+        hidden = kwargs.pop("hidden_states")
+        # call forward directly: GradientCheckpointingLayer.__call__ would checkpoint it
+        forward = lambda h: type(layer).forward(layer, h, **kwargs)
+
+        def no_grad_forward():
+            with torch.no_grad():
+                forward(hidden)
+
+        def grad_forward_backward():
+            h = hidden.clone().requires_grad_(True)
+            y = forward(h)
+            y.backward(torch.ones_like(y))
+            model.zero_grad(set_to_none=True)
+
+        no_grad_forward(), grad_forward_backward()  # warm-up: JIT and autotune
+        row = dict(kind=getattr(layer, "layer_type", "?"), ple=getattr(layer, "ple", None) is not None,
+                   forward_s=round(min(timed(no_grad_forward) for _ in range(iters)), 3),
+                   forward_backward_s=round(min(timed(grad_forward_backward) for _ in range(iters)), 3))
+        activities = [torch.profiler.ProfilerActivity.CPU] + (
+            [torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else [])
+        with torch.profiler.profile(activities=activities) as prof:
+            grad_forward_backward()
+            _sync()
+        sort = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+        row["top_ops"] = prof.key_averages().table(sort_by=sort, row_limit=15, max_name_column_width=60)
+        out[str(i)] = row
+        print("layer", i, {k: v for k, v in row.items() if k != "top_ops"}, flush=True)
+    return out
+
+
 def use_adapter(model, name: str, rank: int) -> dict[str, int]:
     """Switch to LoRA adapter `name` ("default" = attention + GDN, "shared_expert" adds the shared expert MLP)."""
     from peft import LoraConfig
@@ -330,6 +405,17 @@ def serve(model, device, args, processor, tools, game) -> None:
             module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
             qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk))
             result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
+            if "layer_profile" in job:
+                spec = job["layer_profile"]
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                sample = next(iter(samples.values()))
+                result["tokens"] = int(sample["input_ids"].shape[1])
+                result["layers"] = module.profile_layers(model, device, sample, spec.get("layers", [0, 1, 3]),
+                                                         spec.get("iters", 2))
+                (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
+                running.rename(job_path.with_suffix(".done"))
+                print("job", job_path.stem, "done", flush=True)
+                continue
             specs = [x.strip() for x in job["lengths"].split(",") if x.strip()]
             samples = module.build_samples(processor, tools, game, specs, job.get("loss_replies", args.loss_replies))
             result["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
