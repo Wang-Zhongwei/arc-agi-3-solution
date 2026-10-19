@@ -172,3 +172,36 @@ def test_selection_at_the_real_budget():
         scores = torch.relu(torch.einsum("nhd,bd->nhb", q, block_keys)).sum(1) / math.sqrt(q.shape[-1])
     assert equal_up_to_ties(reference, ours, scores)
     assert int(reference[-1].sum()) == 2048 + (n % 4)
+
+
+def test_fp32_kv_gradients_are_closer_to_float64():
+    """With many queries selecting the same keys, BF16 sums of their gradient contributions drift;
+    gathering from FP32 copies keeps the sums in FP32 and lands closer to a float64 reference."""
+    g = torch.Generator().manual_seed(0)
+    n, c, hkv, h, d, s, chunks = 64, 256, 2, 8, 32, 48, 16  # each key is picked by ~3,000 queries
+    q = torch.randn(c * chunks, h, d, generator=g)
+    k = torch.randn(n, hkv, d, generator=g)
+    v = torch.randn(n, hkv, d, generator=g)
+    idx = torch.stack([torch.randperm(n, generator=g)[:s] for _ in range(c * chunks)])
+    idx[:, -5:] = -1  # padding slots
+    upstream = torch.randn(c * chunks, h, d, generator=g)
+
+    def grads(dtype, source_dtype):
+        qq = q.to(dtype)
+        kk = k.to(dtype).to(source_dtype).requires_grad_(True)
+        vv = v.to(dtype).to(source_dtype).requires_grad_(True)
+        total = 0
+        for i in range(chunks):  # the gradients of k and v add up over chunks, as in qsa_forward
+            rows = slice(i * c, (i + 1) * c)
+            out = qsa._attend_chunk(qq[rows], kk, vv, idx[rows], d ** -0.5)
+            total = total + (out.to(upstream.dtype) * upstream[rows]).sum()
+        total.backward()
+        return kk.grad.double(), vv.grad.double()
+
+    reference = grads(torch.float64, torch.float64)
+    bf16 = grads(torch.bfloat16, torch.bfloat16)
+    fp32 = grads(torch.bfloat16, torch.float32)
+    error = lambda pair: max(float((a - b).norm() / b.norm()) for a, b in zip(pair, reference))
+    # what is left in the FP32 path is the BF16 rounding of each contribution (0.44% here vs 0.69%)
+    assert error(fp32) < 0.8 * error(bf16)
+

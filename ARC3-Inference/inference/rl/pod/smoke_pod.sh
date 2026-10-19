@@ -6,7 +6,8 @@
 # Every phase is skipped when already done, so a relaunch resumes. The model is
 # loaded once by a job server (smoke_lora --serve); more jobs can be dropped into
 # $WORK/jobs as NAME.job while it runs (KEEP_SERVER=1 keeps it up after the
-# default jobs). Results land in $WORK/results/; $WORK/DONE or $WORK/FAILED marks the end.
+# default jobs). JOBS_FILE replaces the default jobs: one "NAME JSON" per line, run in
+# order. Results land in $WORK/results/; $WORK/DONE or $WORK/FAILED marks the end.
 set -uo pipefail
 
 WORK=${WORK:-/workspace/smoke}
@@ -16,6 +17,7 @@ TRANSCRIPT=${TRANSCRIPT:-$WORK/game.txt}
 LENGTHS=${LENGTHS:-32768o,65536o}  # o = offload checkpoints to host memory
 BACKEND=${BACKEND:-auto}                         # AutoRound kernel backend
 KEEP_SERVER=${KEEP_SERVER:-0}
+JOBS_FILE=${JOBS_FILE:-}                         # "NAME JSON" per line; default: the two smoke jobs below
 VENV=${VENV:-/workspace/venv}
 JOBS=$WORK/jobs
 cd "$WORK"
@@ -37,6 +39,14 @@ if ! python -c "import transformers, peft, auto_round, fla, tilelang; assert tra
     python -m pip install -q -U pip
     python -m pip install -q "transformers==5.20.1" peft accelerate auto-round kernels flash-linear-attention \
         tilelang hf_transfer pillow numpy torchvision || fail "pip install"
+fi
+if [ -d tests ] && [ ! -e results/pytest.log ]; then  # the CUDA-only tests before the 5-minute load
+    # only those: with fla installed, transformers sends the CPU tiny-model tests' GDN layers to
+    # fla's Triton kernels, which reject CPU tensors. The CPU tests run locally and in gpu_tests.sh
+    python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
+    PYTHONPATH=. python -m pytest -q -rs tests/test_host_offload.py -k cuda > results/pytest.log 2>&1 \
+        || fail "unit tests, see results/pytest.log"
+    log "unit tests: $(tail -1 results/pytest.log)"
 fi
 python - <<'PY' | tee results/env.txt
 import torch, transformers, peft
@@ -69,15 +79,22 @@ submit() {  # name, job json; skipped when already queued, running or done
     if [ -e "$JOBS/$name.job" ] || [ -e "$JOBS/$name.running" ] || [ -e "$JOBS/$name.done" ]; then return 0; fi
     echo "$2" > "$JOBS/$name.tmp" && mv "$JOBS/$name.tmp" "$JOBS/$name.job"
 }
-# the longest real request first (cd82, ~110K tokens): fail fast if it does not fit
-submit 01_longest '{"lengths": "130000o", "repeats": 1, "transcript": "game_long.txt"}'
-submit 02_speed "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
+if [ -n "$JOBS_FILE" ]; then
+    while read -r name job; do
+        [ -n "$name" ] && [ "${name#\#}" = "$name" ] && submit "$name" "$job" && last=$name
+    done < "$JOBS_FILE"
+else
+    # the longest real request first (cd82, ~110K tokens): fail fast if it does not fit
+    submit 01_longest '{"lengths": "130000o", "repeats": 1, "transcript": "game_long.txt"}'
+    submit 02_speed "{\"lengths\": \"$LENGTHS\", \"repeats\": 1}"
+    last=02_speed
+fi
 
 log "phase 4: jobs (GPU utilization and power sampled every second into results/gpu.csv)"
 nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,memory.used --format=csv,noheader \
     -l 1 > results/gpu.csv 2>/dev/null &
 sampler=$!
-while [ ! -e "$JOBS/02_speed.done" ]; do
+while [ ! -e "$JOBS/$last.done" ]; do
     kill -0 "$(cat server.pid)" 2>/dev/null || { kill $sampler; fail "model server exited, see results/server.log"; }
     sleep 20
 done

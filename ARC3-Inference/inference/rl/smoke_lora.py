@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
-from inference.rl import layer_patches, ple_mmap
+from inference.rl import host_offload, layer_patches, ple_mmap
 from inference.rl.context_rebuild import estimate_tokens, rebuild
 from inference.rl.qsa import patch_qsa_attention
 
@@ -224,17 +224,36 @@ class HostMemoryError(RuntimeError):
     pass
 
 
-def step(model, sample, device, offload: bool = False, profile: bool = False) -> dict[str, Any]:
+def step(model, sample, device, offload: bool = False, profile: bool = False,
+         reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
+         async_copies: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
-    checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU."""
+    checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
+    in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
+    With reused buffers, the step's last `gpu_keep_gb` stay on the GPU (once a step of the same
+    recompute mode has measured the total), and `async_copies` pins the buffers and copies on a
+    side stream, prefetching in backward."""
     # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
     # training mode: without this every activation is kept (OOM on the GPU, or on the host
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
     model.train()
+    tokens = int(sample["input_ids"].shape[1])
+    layout = layer_patches.current_recompute(model)  # what each layer saves depends on the recompute mode
+    arena = None
+    if offload and reuse_buffers:
+        arena = getattr(model, "_rft_host_arena", None)  # on the model: survives the job server's reloads
+        if arena is None or (async_copies and not arena.pin):  # pinned segments are allocated pinned
+            model._rft_host_arena = None
+            arena = model._rft_host_arena = host_offload.HostArena(pin=async_copies)
     if offload:
-        # every layer's checkpointed input (tokens x 4 x 2560 bf16) goes to host memory
-        need = sample["input_ids"].shape[1] * 4 * 2560 * 2 * 48 / 2**30 * 1.15 + 8
+        # each layer's checkpointed input (tokens x 4 x 2560 bf16), plus the mixer's input and output
+        # with recompute "parts"; measured once a step of this layout has run
+        per_token = (arena.bytes_per_token.get(layout) if arena is not None else None) \
+            or 4 * 2560 * 2 * 48 * (1.5 if layout == "parts" else 1.0)
+        need = tokens * per_token / 2**30 * 1.15 + 8 - (gpu_keep_gb if arena is not None else 0)
         available = host_memory_available_gb()
+        if available is not None and arena is not None:
+            available += arena.capacity_gb  # already counted as used, and free again for this step
         if available is not None and need > available:
             raise HostMemoryError(f"offload needs ~{need:.0f} GiB of host memory, {available:.0f} GiB available")
     labels = sample["labels"][0].to(device)
@@ -247,8 +266,15 @@ def step(model, sample, device, offload: bool = False, profile: bool = False) ->
     t0 = time.perf_counter()
     # pageable, not pinned: the pinned host allocator rounds every block up to a power of two and
     # keeps it cached, so 32K then 64K steps held ~144 GB besides the 102.5 GB PLE table and the
-    # cgroup OOM-killed the process
-    saved = torch.autograd.graph.save_on_cpu(pin_memory=False) if offload else contextlib.nullcontext()
+    # cgroup OOM-killed the process. Fresh pageable memory is slow to fill (first-touch page
+    # faults), hence the reused arena.
+    if arena is not None:
+        saved = host_offload.offload_to_host(arena, keep_bytes=gpu_keep_gb * 2**30, async_copies=async_copies,
+                                             layout=layout, tokens=tokens)
+    elif offload:
+        saved = torch.autograd.graph.save_on_cpu(pin_memory=False)
+    else:
+        saved = contextlib.nullcontext()
     activities = [torch.profiler.ProfilerActivity.CPU] + (
         [torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else [])
     profiler = (torch.profiler.profile(activities=activities, profile_memory=True) if profile
@@ -264,6 +290,11 @@ def step(model, sample, device, offload: bool = False, profile: bool = False) ->
         t2 = time.perf_counter()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
+    if keep_grads:  # for compare_grads: ~0.1 GB of host memory per kept step at r = 16
+        if getattr(model, "_rft_grads", None) is None:
+            model._rft_grads = {}
+        model._rft_grads[keep_grads] = {name: p.grad.detach().float().cpu() for name, p in model.named_parameters()
+                                        if p.requires_grad and p.grad is not None}
     model.zero_grad(set_to_none=True)
     extra = {}
     if profile:
@@ -275,9 +306,13 @@ def step(model, sample, device, offload: bool = False, profile: bool = False) ->
                                                      max_name_column_width=70)
     return dict(extra, tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()), offload=offload,
                 images=int(sample["image_grid_thw"].shape[0]) if "image_grid_thw" in sample else 0,
-                loss=round(float(loss), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
+                loss=round(float(loss.detach()), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
                 tokens_per_s=round(sample["input_ids"].shape[1] / (t2 - t0), 1),
-                lora_params_with_grad=len(grads), lora_grad_norm=norm, peak_gb=peak_gb(), host_gb=host_memory_gb())
+                lora_params_with_grad=len(grads), lora_grad_norm=norm, kept_grads=keep_grads,
+                peak_gb=peak_gb(), host_gb=host_memory_gb(),
+                recompute=layout, host_buffers_gb=round(arena.capacity_gb, 1) if arena is not None else None,
+                host_pinned_gb=round(arena.pinned_gb, 1) if arena is not None else None,
+                offload_stats={k: round(v, 3) for k, v in arena.stats.items()} if arena is not None else None)
 
 
 def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int, dict[str, torch.Tensor]]:
@@ -300,22 +335,43 @@ def current_token_chunk(model) -> int | None:
     return None
 
 
+GPU_MARGIN_GB = 8  # left free when gpu_keep_gb is "auto": fragmentation and the peak's variation
+
+
+def auto_keep_gb(result: dict[str, Any]) -> float:
+    """Checkpoint memory a repeat of this step can keep on the GPU: what its peak left free."""
+    total = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0.0
+    peak = max((result.get("peak_gb") or {}).values(), default=0.0) - (result.get("gpu_keep_gb") or 0.0)
+    return round(max(total - GPU_MARGIN_GB - peak, 0.0), 1)
+
+
 def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
-              profile: bool = False) -> dict[str, list]:
-    """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised."""
+              profile: bool = False, reuse_buffers: bool = True, keep_grads: str | None = None,
+              gpu_keep_gb: float | str = 0.0, async_copies: bool = False) -> dict[str, list]:
+    """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised.
+    `keep_grads` keeps each step's LoRA gradients as "<keep_grads>/<spec>/<repeat>" for compare_grads.
+    `gpu_keep_gb="auto"`: the first repeat offloads everything, later ones keep what its peak left free."""
     steps: dict[str, list] = {}
     for spec in specs:
         length, offload = int(spec.rstrip("o")), spec.endswith("o")
         if length not in samples:
             continue
         results = []
-        for _ in range(repeats):
+        keep = 0.0 if gpu_keep_gb == "auto" else float(gpu_keep_gb)
+        for repeat in range(repeats):
             start_chunk = current_token_chunk(model)
+            start_recompute = layer_patches.current_recompute(model)
             retries = 2
             while True:
                 try:
-                    result = step(model, samples[length], device, offload=offload, profile=profile)
+                    result = step(model, samples[length], device, offload=offload, profile=profile,
+                                  reuse_buffers=reuse_buffers,
+                                  keep_grads=f"{keep_grads}/{spec}/{repeat}" if keep_grads else None,
+                                  gpu_keep_gb=keep, async_copies=async_copies)
                     result["token_chunk"] = current_token_chunk(model)
+                    result["gpu_keep_gb"] = keep
+                    if gpu_keep_gb == "auto" and offload:
+                        keep = auto_keep_gb(result)
                     results.append(result)
                     print(spec, results[-1], flush=True)
                     break
@@ -323,11 +379,19 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                     where = [f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
                              for f in traceback.extract_tb(exc.__traceback__)[-6:]]
                     results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb(),
-                                        token_chunk=current_token_chunk(model)))
+                                        token_chunk=current_token_chunk(model),
+                                        recompute=layer_patches.current_recompute(model),
+                                        memory=torch.cuda.memory_summary(abbreviated=True)[-4000:]))
                     print(spec, "OOM", where, str(exc)[:160], flush=True)
                     model.zero_grad(set_to_none=True)
                     torch.cuda.empty_cache()
                     chunk = current_token_chunk(model)
+                    if layer_patches.current_recompute(model) == "parts":
+                        # parts OOMed at 123K on a 4.69 GiB (N x 10,240 FP32) allocation that smaller
+                        # token chunks do not shrink; layer checkpoints fit that request (129 GiB)
+                        layer_patches.configure(model, recompute="layer")
+                        print(spec, "retrying with recompute layer", flush=True)
+                        continue
                     if retries and chunk and chunk > 1024:  # smaller token chunks need less memory
                         retries -= 1
                         layer_patches.configure(model, token_chunk=chunk // 2)
@@ -344,6 +408,8 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                     break
             if start_chunk:
                 layer_patches.configure(model, token_chunk=start_chunk)
+            if layer_patches.current_recompute(model) != start_recompute:
+                layer_patches.configure(model, recompute=start_recompute)
             if results and "error" in results[-1]:
                 break
         steps[spec] = results
@@ -351,6 +417,90 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
     return steps
+
+
+def compare_grads(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> dict[str, Any]:
+    """Agreement of two kept LoRA gradient sets, `b` taken as the reference: cosine similarity and
+    relative difference over all parameters, per mixer kind, and the worst parameters. Parameters
+    whose gradient is zero in both (lora_A while lora_B is still zero) are left out."""
+    names = [n for n in sorted(a.keys() & b.keys()) if a[n].norm() > 0 or b[n].norm() > 0]
+
+    def agreement(subset):
+        x = torch.cat([a[n].flatten() for n in subset]).double()
+        y = torch.cat([b[n].flatten() for n in subset]).double()
+        return dict(params=len(subset), norm=round(float(x.norm()), 5), reference_norm=round(float(y.norm()), 5),
+                    cosine=round(float(x @ y / (x.norm() * y.norm()).clamp_min(1e-30)), 6),
+                    rel_diff=round(float((x - y).norm() / y.norm().clamp_min(1e-30)), 5))
+
+    per_param = []
+    for n in names:
+        x, y = a[n].flatten().double(), b[n].flatten().double()
+        per_param.append((float((x - y).norm() / y.norm().clamp_min(1e-30)),
+                          float(x @ y / (x.norm() * y.norm()).clamp_min(1e-30)), n))
+    per_param.sort(reverse=True)
+    kinds = {kind: [n for n in names if kind in n] for kind in ("self_attn", "linear_attn")}
+    rel = sorted(r for r, _, _ in per_param)
+    return dict(all=agreement(names), **{kind: agreement(subset) for kind, subset in kinds.items() if subset},
+                median_param_rel_diff=round(rel[len(rel) // 2], 5) if rel else None,
+                min_param_cosine=round(min(c for _, c, _ in per_param), 6) if per_param else None,
+                worst=[dict(param=n, rel_diff=round(r, 5), cosine=round(c, 6)) for r, c, n in per_param[:5]])
+
+
+@torch.no_grad()
+def qsa_overlap(model, device, sample, windows=(4, 16, 64, 256), per_window: int = 256,
+                recent: int = 4096) -> dict[str, Any]:
+    """How much the token selections of neighbouring queries overlap, per QSA layer.
+
+    For `per_window` random windows of w consecutive queries (all far enough in that the selection
+    is sparse), the union of their selected tokens relative to one query's selection: 1 means
+    they all attend to the same tokens, w that they share none. Also the share of selected
+    tokens among the `recent` tokens before each query. Decides how a QSA kernel should tile
+    queries: a small union lets a tile of queries load each key once."""
+    from inference.rl import qsa as qsa_module
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    attentions = [(name, mod) for name, mod in base.named_modules() if isinstance(mod, m.Qwen4ExpTextAttention)]
+    out: dict[str, Any] = {}
+    generator = torch.Generator().manual_seed(0)
+
+    def hook(name):
+        def measure(module, args, kwargs):
+            hidden, position_embeddings = args[0], args[1]
+            n = hidden.shape[1]
+            cos, sin = (x[:, -n:, :] for x in position_embeddings)
+            selected = qsa_module.select_tokens(module.indexer, hidden, cos, sin, 256)  # [N, S], -1 = none
+            width = selected.shape[1]
+            first = min(4 * width, n - 1)  # earlier queries see few blocks and take nearly all of them
+            row = dict(selection=width)
+            positions = torch.arange(n, device=selected.device)[:, None]
+            valid = selected >= 0
+            near = (selected > positions - recent) & valid
+            row["recent_share"] = round(float(near[first:].sum() / valid[first:].sum().clamp_min(1)), 4)
+            for w in windows:
+                if n - w <= first:
+                    continue
+                starts = torch.randint(first, n - w, (per_window,), generator=generator).tolist()
+                ratios = []
+                for start in starts:
+                    window = selected[start:start + w]
+                    union = torch.unique(window[window >= 0]).numel()
+                    ratios.append(union / max(int((window >= 0).sum(dim=1).float().mean()), 1))
+                ratios = torch.tensor(ratios)
+                row[f"union_{w}"] = dict(mean=round(float(ratios.mean()), 2), median=round(float(ratios.median()), 2),
+                                         p90=round(float(ratios.quantile(0.9)), 2))
+            out[name] = row
+        return measure
+
+    handles = [mod.register_forward_pre_hook(hook(name), with_kwargs=True) for name, mod in attentions]
+    try:
+        model.eval()
+        base.model(**{k: v.to(device) for k, v in sample.items() if k != "labels"}, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
+        model.train()
+    return out
 
 
 def profile_layers(model, device, sample, layers=(0, 1, 3), iters: int = 2) -> dict[str, Any]:
@@ -446,8 +596,11 @@ def serve(model, device, args, processor, tools, game) -> None:
 
     A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
     "adapter": "default" | "shared_expert", "profile": false, "transcript": "other_game.txt",
-    "token_chunk": 8192, "expert_tile": 128}. qsa.py and this module are reloaded before
-    each job, so code fixes need no 5-minute model reload. Results go to NAME.result.json."""
+    "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
+    "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false},
+    or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
+    host_offload.py and this module are reloaded before each job, so code fixes need no 5-minute
+    model reload. Results go to NAME.result.json."""
     import importlib
 
     jobs = args.serve
@@ -468,11 +621,13 @@ def serve(model, device, args, processor, tools, game) -> None:
             result["job"] = job
             qsa_module = importlib.reload(importlib.import_module("inference.rl.qsa"))
             patches = importlib.reload(importlib.import_module("inference.rl.layer_patches"))
+            importlib.reload(importlib.import_module("inference.rl.host_offload"))
             module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
-            qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk))
+            qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk), job.get("kv_grad_fp32", False))
             if not args.no_layer_patches:
                 result["layer_patches"] = patches.patch_for_training(
-                    model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile))
+                    model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile),
+                    job.get("recompute", args.recompute))
             if job.get("transcript"):
                 if job["transcript"] not in games:
                     games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))
@@ -480,6 +635,27 @@ def serve(model, device, args, processor, tools, game) -> None:
             else:
                 game = default_game
             result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
+            if "compare_grads" in job:  # [[label, reference_label], ...] of steps kept with keep_grads
+                kept = getattr(model, "_rft_grads", None) or {}
+                result["kept"] = sorted(kept)
+                result["comparisons"] = [dict(a=a, b=b, **module.compare_grads(kept[a], kept[b]))
+                                         if a in kept and b in kept else dict(a=a, b=b, error="not kept")
+                                         for a, b in job["compare_grads"]]
+                (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
+                running.rename(job_path.with_suffix(".done"))
+                print("job", job_path.stem, "done", flush=True)
+                continue
+            if "qsa_overlap" in job:  # {"length": 65536, "windows": [4, 16, 64, 256], "per_window": 256}
+                spec = job["qsa_overlap"]
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                sample = next(iter(samples.values()))
+                result["tokens"] = int(sample["input_ids"].shape[1])
+                result["layers"] = module.qsa_overlap(model, device, sample, tuple(spec.get("windows", (4, 16, 64, 256))),
+                                                      spec.get("per_window", 256))
+                (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
+                running.rename(job_path.with_suffix(".done"))
+                print("job", job_path.stem, "done", flush=True)
+                continue
             if "layer_profile" in job:
                 spec = job["layer_profile"]
                 samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
@@ -498,7 +674,11 @@ def serve(model, device, args, processor, tools, game) -> None:
             out = jobs / f"{job_path.stem}.result.json"
             save = lambda steps: out.write_text(json.dumps(dict(result, steps=steps), indent=1))
             result["steps"] = module.run_specs(model, device, samples, specs, job.get("repeats", args.repeats), save,
-                                               profile=job.get("profile", False))
+                                               profile=job.get("profile", False),
+                                               reuse_buffers=job.get("reuse_host_buffers", True),
+                                               keep_grads=job.get("keep_grads"),
+                                               gpu_keep_gb=job.get("gpu_keep_gb", 0.0),
+                                               async_copies=job.get("async_copies", False))
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)
@@ -528,6 +708,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="keep transformers' decoder layers and AutoRound's experts loop")
     parser.add_argument("--token-chunk", type=int, default=8192, help="tokens per chunk in patched decoder layers")
     parser.add_argument("--expert-tile", type=int, default=128, help="experts dequantized per grouped GEMM")
+    parser.add_argument("--recompute", default="layer", choices=layer_patches.RECOMPUTE_MODES,
+                        help="layer: transformers' layer checkpoints (token chunks run 3x); parts: mixer and "
+                             "token chunks checkpointed separately (2x)")
     parser.add_argument("--use-kernels", action="store_true", help="load hub kernels (causal-conv1d) via use_kernels")
     parser.add_argument("--ple-in-ram", action="store_true",
                         help="load the 102.5 GB PLE table into host RAM instead of memory-mapping the checkpoint")
@@ -611,7 +794,8 @@ def main(argv: list[str] | None = None) -> int:
     print("lora", report["lora"], flush=True)
     device = model.get_input_embeddings().weight.device
     if not args.no_layer_patches:
-        report["layer_patches"] = layer_patches.patch_for_training(model, args.token_chunk, args.expert_tile)
+        report["layer_patches"] = layer_patches.patch_for_training(model, args.token_chunk, args.expert_tile,
+                                                                   args.recompute)
         report["experts_check"] = layer_patches.check_experts(model)
         print("layer patches", report["layer_patches"], "experts check", report["experts_check"], flush=True)
         if report["experts_check"]["max_rel_error"] > 0.05:  # grouped experts disagree: keep AutoRound's

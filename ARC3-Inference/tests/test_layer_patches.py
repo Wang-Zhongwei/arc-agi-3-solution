@@ -89,3 +89,44 @@ def test_dequant_int4_reverses_the_packing():
     expected = scales.repeat_interleave(group, 0) * (q - zeros.repeat_interleave(group, 0))
     got = layer_patches.dequant_int4(qweight, scales, qzeros, group, dtype=torch.float32)
     torch.testing.assert_close(got, expected.float())
+
+
+def test_parts_recompute_matches_and_runs_the_experts_twice():
+    """With gradient checkpointing, "layer" recomputes the token chunks inside an already recomputed
+    layer (three forwards); "parts" checkpoints the mixer instead and gets the same gradients."""
+    model = tiny()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()
+    ids = torch.randint(0, 1000, (1, 50))
+    calls = []
+    for module in model.modules():
+        if isinstance(module, m.Qwen4ExpTextExperts):
+            module.register_forward_hook(lambda *_: calls.append(1))
+
+    def run(recompute):
+        layer_patches.patch_for_training(model, token_chunk=16, expert_tile=3, recompute=recompute)
+        assert layer_patches.current_recompute(model) == recompute
+        model.zero_grad(set_to_none=True)
+        calls.clear()
+        logits = model(input_ids=ids, use_cache=False).logits
+        logits.float().pow(2).mean().backward()
+        return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}, len(calls)
+
+    try:
+        reference, ref_grads, layer_calls = run("layer")
+        ours, grads, parts_calls = run("parts")
+        run("layer")  # switching back restores transformers' layer checkpoint
+        assert any(getattr(x, "gradient_checkpointing", False) for x in model.modules()
+                   if isinstance(x, m.Qwen4ExpTextDecoderLayer))
+    finally:
+        layer_patches.unpatch()
+    chunks_per_layer = 4  # 50 tokens in chunks of 16
+    layers = TEXT["num_hidden_layers"]
+    # "layer": forward, the layer's recompute (which stops early, before the last chunk: nothing after
+    # it is saved) and each chunk's own recompute. "parts": forward and each chunk's recompute
+    assert layer_calls == (3 * chunks_per_layer - 1) * layers and parts_calls == 2 * chunks_per_layer * layers
+    torch.testing.assert_close(ours, reference, rtol=0, atol=0)
+    assert grads.keys() == ref_grads.keys()
+    for name in grads:
+        torch.testing.assert_close(grads[name], ref_grads[name], rtol=0, atol=0, msg=name)
+

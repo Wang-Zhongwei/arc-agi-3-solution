@@ -88,3 +88,54 @@ GPU 采样：反向 80–90% 时间在跑 kernel，但只有约 350 W（满载 7
 1. offload 复用主机 buffer：64K 每步约省 35 s，也不再依赖主机的缺页速度。
 2. QSA 的 K/V 梯度改为 FP32 累加，并重复同一步，看梯度的波动有多大。
 3. 然后是训练循环、数据集（留出部分游戏做评估）、merge 后和 vLLM 的对齐。
+
+## 10-19
+
+### 本地：吞吐计划和前三步的代码
+
+- 写了 [Throughput.md](Throughput.md)：目标 10×（64K 137 s → ~14 s），分 0–6 步，每步一个问题，每步都有测试。
+- 第 0 步：`kv_grad_fp32` 让 QSA 的 K/V 梯度在 FP32 里累加（块内和块间）；`keep_grads` / `compare_grads` 保存并比较 LoRA 梯度。测试里每个 key 被约 3,000 个 query 选中时，FP32 累加的误差 0.44%，BF16 是 0.69%；剩下的是每一项本身的 BF16 舍入。
+- 第 1 步：[host_offload.py](host_offload.py) 的 arena 保留 16 GiB 的段并在每步复用；同一个张量只拷一次；最后 `gpu_keep_gb` 留在 GPU；`async_copies` 用锁页的段在单独的 stream 上拷贝，反向时预取。写去重时踩了一个坑：pack 之后原张量会被释放，新张量可能落在同一地址、同一形状、同一版本号上，按地址去重会拿错数据，改成按基张量对象（弱引用）去重。
+- 第 2 步：`recompute="parts"` 关掉层级 checkpoint，mixer 单独 checkpoint。小模型上 logits 和梯度逐位一致。数调用次数时发现：层级重算会在最后一块之前提前停下（PyTorch 非重入 checkpoint 的 early stop），所以 layer 模式每层跑 3c − 1 遍（64K 是 23 遍），parts 是 2c 遍（16 遍）。
+- 本地 16 个测试通过，1 个 CUDA 测试待在 pod 上跑。都还没上 GPU。
+- 决定第一轮不做 shared expert LoRA：旧代码上 32K 慢 12%，还要单独 A/B；RFT 收益小再回头看。训练参数先取偏保守的默认值。
+
+### 本地：吞吐计划和今天的代码
+
+- 写了 [Throughput.md](Throughput.md)：10× 的分步计划。
+- 第 0 步：QSA 的 K/V 梯度可选 FP32 累加（`kv_grad_fp32`）；保存 LoRA 梯度并逐模块比较（`keep_grads`、`compare_grads`）。
+- 第 1 步：host_offload 加了三样东西。同一个张量只 offload 一次（按存活的 base 张量识别，第一版按地址识别，释放后的内存被新张量复用，梯度出错）；显存够时最后的 checkpoint 留在 GPU（`gpu_keep_gb`，`"auto"` 按上一次的峰值算）；锁页的 16 GiB 段 + 单独 stream 的异步拷贝，反向时预取。
+- 第 2 步：`recompute: "parts"`，mixer 和逐 token 部分各自 checkpoint，逐 token 部分每块算 2 遍（原来每层 3 × 块数 − 1 遍：层级重算会在最后一块之前提前停止）。
+- 第 3 步准备：`qsa_overlap` job。
+
+### 轻量 GPU（17a68q43k5mv0y，社区 RTX 3090，约 15 分钟，约 $0.06）
+
+- 只跑单元测试和拷贝测速，不加载模型（[pod/gpu_tests.sh](pod/gpu_tests.sh)）。
+- 发现：CPU 上的小模型测试在 x86 上梯度不逐位一致。原因是 host buffer 一律连续存放，而 `.cpu()` 保留 stride，反向 kernel 走了不同路径。改成稠密张量保留原 stride 后 18 个测试全部通过。
+- 拷贝速度：新分配的 pageable 1.4 GiB/s，复用的 pageable 13.8 GiB/s，锁页 23.5 GiB/s；锁页拷贝放在单独 stream 上和矩阵乘完全重叠。
+
+### 第四台 pod（93so3gmik3uttk，secure 1×H200，US-NC-1，约 49 分钟，约 $4.3）
+
+社区云没有 ≥ 240 GB 内存的 H200，用了 secure。同一个 64K 样本（64,893 token，训练 8,141）：
+
+| 配置 | 前向 | 反向 | Token/s | 显存峰值 | 说明 |
+|---|---|---|---|---|---|
+| 原来的 `save_on_cpu` | 59.0 s | 78.6 s | 472 | 99.3 GiB | 和第三台的 474 一致 |
+| 复用 pageable buffer | 33.6 / 44.0 s | 79.9 / 80.7 s | 571 / 520 | 100.7 GiB | 第二次前向反而慢，原因未查 |
+| 加 FP32 K/V 梯度 | 33.1 / 36.3 s | 93.7 / 91.9 s | 512 / 506 | 100.7 GiB | 反向慢 12–14 s |
+| parts + 同步拷贝 | 29.5 s | 90.7 s | 540 | 96.2 GiB | 每层 ~30 次同步 unpack，反向变慢 |
+| **parts + 异步 + 留 GPU** | **16.8 s** | **66.0 s** | **784** | 121.1 GiB | 留 35.6 GiB 在 GPU；第一次锁页 112 GiB 时 522 |
+| 同上，32K | 11.5 s | 30.7 s | **800** | 126.5 GiB | 几乎全部留在 GPU；第三台 32K 是 251 |
+
+- 前向 16.8 s 基本就是 GPU 计算时间，拷贝不再挡路。现在反向占约 80%，主要是 QSA。
+- ft09（122,943 token）parts 模式三次都 OOM：反向要一块 4.69 GiB = N × 10,240 × 4 B（整条序列、hyper-connection 宽度的 FP32 张量），减小 token 块没用。原因未查；先在 OOM 时退回 layer 模式（123K 在 layer 模式下放得下）。
+- 留在 GPU 的张量被保存两次时重复计数，下一步留得比预算少（应留 47 GiB，实际 24 GiB）。已修，热更新后生效。
+- **梯度不可复现**：同一步重复两次，LoRA 梯度的余弦只有 0.87–0.90，相对差 45–52%；FP32 K/V 累加也一样；loss 在 0.2745–0.2789 之间变。原因是 MoE 用 BF16 的 `index_add`（原子加）合并 10 个专家的输出，每次加法顺序不同，前向就不同，近似并列的路由和 QSA 选择在 48 层里被放大。改成先 gather 回原顺序、再在 FP32 里对 10 个专家求和之后：两次 loss 都是 0.2750，梯度余弦 0.99989，相对差 1.5%（剩下的来自反向的原子加）。这两步只有 424–433 token/s，但当时锁页 arena 已涨到 192 GiB（ft09 那次），主机内存紧张，速度要下次单独量。
+- QSA 选择重叠（64K，12 个 QSA 层）：相邻 4 / 16 / 64 / 256 个 query 的并集是单个 query 选择的 1.9–2.2 / 3.4–4.3 / 5.7–7.3 / 8.9–11.1 倍；33–47% 的选择落在最近 4,096 个 token 里。
+- 装了 fla 的 pod 上 CPU 小模型测试会失败（fla 的 Triton kernel 拒绝 CPU 张量），`smoke_pod.sh` 改为只跑 CUDA 测试。
+
+下一步：
+
+1. 下次 H200：单独量确定性合并的速度（arena 不超过 112 GiB）；查 parts 在 123K 的 4.69 GiB 分配。
+2. 第 3 步 QSA kernel：16 个 query 一块取并集，或按 query 读、靠 L2 复用；在 H100 上开发。
+

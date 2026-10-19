@@ -11,6 +11,11 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   and the PLE short convolution is per token (hyper-connections, router, experts,
   shared expert, injections). It runs in chunks of tokens, each under its own
   checkpoint, so that part's memory no longer grows with the sequence length.
+- recompute "parts": transformers checkpoints every decoder layer, and the token chunks
+  inside it are checkpointed again, so their forward runs three times per step. With
+  "parts" the layer-level checkpoint is off and the mixer gets its own: every part is
+  recomputed once. The layer then keeps the mixer's input and output for backward
+  besides the layer input (N x 2,560 each next to N x 10,240).
 
 Scope: batch 1, no cache (training). Anything else runs transformers' forward.
 """
@@ -21,7 +26,8 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 EXPERTS_IMPLEMENTATION = "rft_grouped"
-_DEFAULTS = dict(token_chunk=8192, expert_tile=128)
+_DEFAULTS = dict(token_chunk=8192, expert_tile=128, recompute="layer")
+RECOMPUTE_MODES = ("layer", "parts")
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +114,12 @@ def grouped_experts_forward(self, hidden_states, top_k_index, top_k_weights):
             outputs.append(_grouped_mm(gated, down, offsets))
         first_row = last_row
     out = torch.cat(outputs) if outputs else rows[:0]
-    out = out * top_k_weights.reshape(-1)[order].unsqueeze(-1).to(out.dtype)
-    result = torch.zeros(n, hidden_states.shape[-1], dtype=out.dtype, device=out.device).index_add(0, tokens, out)
-    return result.to(hidden_states.dtype)
+    # combine each token's k expert outputs in FP32 and in a fixed order: undo the sort with a gather,
+    # then sum over k. A BF16 index_add here adds in a different order every run (CUDA atomics), so the
+    # forward differed between identical steps and near-tied routing flipped further down
+    out = out.float() * top_k_weights.reshape(-1)[order].unsqueeze(-1).float()
+    out = out[torch.argsort(order)].view(n, k, -1).sum(dim=1)
+    return out.to(hidden_states.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +159,17 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
         return mixed, weights
 
     mixed, inject = _chunked(before_mixer, hidden_states, size=size)
-    if self.layer_type == "linear_attention":
-        mixed = self.linear_attn(mixed, cache_params=None, attention_mask=conv_mask, **kwargs)
+
+    def mixer(h):
+        if self.layer_type == "linear_attention":
+            return self.linear_attn(h, cache_params=None, attention_mask=conv_mask, **kwargs)
+        return self.self_attn(h, position_embeddings, attention_mask=attention_mask, past_key_values=None,
+                              **kwargs)[0]
+
+    if getattr(self, "_rft_recompute", "layer") == "parts" and torch.is_grad_enabled():
+        mixed = checkpoint(mixer, mixed, use_reentrant=False)
     else:
-        mixed, _ = self.self_attn(mixed, position_embeddings, attention_mask=attention_mask, past_key_values=None,
-                                  **kwargs)
+        mixed = mixer(mixed)
 
     def after_mixer(h, mixer_out, weights):
         h = h + (mixer_out.unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
@@ -169,21 +184,39 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
 # Install
 # ---------------------------------------------------------------------------
 
-def configure(model, token_chunk: int | None = None, expert_tile: int | None = None) -> None:
-    """Set the chunk sizes on every patched module (lower them after an OOM)."""
+def configure(model, token_chunk: int | None = None, expert_tile: int | None = None,
+              recompute: str | None = None) -> None:
+    """Set the chunk sizes (lower them after an OOM) and the recompute mode on every patched module."""
+    if recompute is not None and recompute not in RECOMPUTE_MODES:
+        raise ValueError(f"recompute must be one of {RECOMPUTE_MODES}, got {recompute!r}")
     for module in model.modules():
         name = type(module).__name__
-        if name == "Qwen4ExpTextDecoderLayer" and token_chunk:
-            module._rft_token_chunk = token_chunk
+        if name == "Qwen4ExpTextDecoderLayer":
+            if token_chunk:
+                module._rft_token_chunk = token_chunk
+            if recompute:
+                if not hasattr(module, "_rft_layer_checkpointing"):  # what gradient_checkpointing_enable set
+                    module._rft_layer_checkpointing = getattr(module, "gradient_checkpointing", False)
+                module._rft_recompute = recompute if module._rft_layer_checkpointing else "layer"
+                module.gradient_checkpointing = module._rft_layer_checkpointing and recompute == "layer"
         elif name == "Qwen4ExpTextExperts" and expert_tile:
             module._rft_expert_tile = expert_tile
 
 
+def current_recompute(model) -> str:
+    """The recompute mode of the patched decoder layers ("layer" when not set)."""
+    for module in model.modules():
+        if type(module).__name__ == "Qwen4ExpTextDecoderLayer":
+            return getattr(module, "_rft_recompute", "layer")
+    return "layer"
+
+
 def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
-                       expert_tile: int = _DEFAULTS["expert_tile"]) -> dict:
+                       expert_tile: int = _DEFAULTS["expert_tile"], recompute: str = _DEFAULTS["recompute"]) -> dict:
     """Route qwen4_exp experts through grouped GEMMs and chunk decoder layers over tokens.
 
-    Safe to call again (e.g. after reloading this module)."""
+    Call it after gradient_checkpointing_enable(): `recompute="parts"` replaces the layer-level
+    checkpoint it sets. Safe to call again (e.g. after reloading this module)."""
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
@@ -202,9 +235,9 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     if not hasattr(layer, "_hf_forward"):
         layer._hf_forward = layer.forward
     layer.forward = chunked_decoder_forward
-    configure(model, token_chunk, expert_tile)
+    configure(model, token_chunk, expert_tile, recompute)
     return dict(experts_implementation=EXPERTS_IMPLEMENTATION, configs=len(configs), token_chunk=token_chunk,
-                expert_tile=expert_tile)
+                expert_tile=expert_tile, recompute=current_recompute(model))
 
 
 def unpatch(model=None) -> None:

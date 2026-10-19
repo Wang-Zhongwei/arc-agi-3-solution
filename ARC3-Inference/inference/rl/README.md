@@ -12,7 +12,7 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | Context | The real 50–100K window, rebuilt from transcripts at training time | Truncating would teach conclusions without the evidence for them, and break harness parity. |
 | Packing | Requests between two trims share their prefix (`preserve_thinking`), so a segment is one sequence | reset-baseline v01: 209M input tokens as one sample per request, 14.4M packed by segment. |
 | Loss | Only on assistant tokens of the selected (game, level); drop `uncertain` requests | Everything else is context. |
-| LoRA targets | `self_attn.{q,k,v,o}_proj` and `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}`: 228 modules, 26.1M parameters at r=16. Optional: shared expert MLP. Frozen: routed experts, QSA indexer, PLE, vision | All BF16 in the deployed checkpoint, so merging costs nothing. The layers [ms-swift's recipe](https://swift.readthedocs.io/en/v4.5/BestPractices/Qwen3_8-Flash-Next-Best-Practice.html) targets too (`linear_qkv linear_proj in_proj out_proj`). |
+| LoRA targets | `self_attn.{q,k,v,o}_proj` and `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}`: 228 modules, 26.1M parameters at r=16. Frozen: routed experts, shared expert, QSA indexer, PLE, vision | All BF16 in the deployed checkpoint, so merging costs nothing. Shared-expert LoRA is out of the first round (2026-10-19): it slowed a 32K step by 12% (forward 21.0 → 38.2 s) and would need its own A/B; revisit if RFT gains little. The layers [ms-swift's recipe](https://swift.readthedocs.io/en/v4.5/BestPractices/Qwen3_8-Flash-Next-Best-Practice.html) targets too (`linear_qkv linear_proj in_proj out_proj`). |
 | Base | Intel W4A16 AutoRound checkpoint, the one we deploy | Routed experts identical to serving; 68.5 GiB on the GPU. |
 | Hardware | 1×H200 (141 GB); layer checkpoints offloaded to host RAM | Weights take 68.5 GiB on the GPU; a 123K-token request peaks at 129 GiB (fits to ~133K). Its checkpoints take ~113 GiB of host RAM. |
 | Merge | W′ = W + (α/r)BA on the BF16 attention/GDN tensors, swapped into a copy of the W4A16 checkpoint, config unchanged | Same kernels, so no serving slowdown. Check MTP draft acceptance after merging. Lord's mixed checkpoint keeps attention in FP8, where requantizing may round small updates away. |
@@ -34,6 +34,7 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | [qsa.py](qsa.py) | Chunked QSA for training, replacing transformers' reference ([test](../../tests/test_qsa.py)) |
 | [layer_patches.py](layer_patches.py) | Grouped INT4 experts and token-chunked decoder layers ([test](../../tests/test_layer_patches.py)) |
 | [ple_mmap.py](ple_mmap.py) | Serve the PLE n-gram table from the checkpoint files ([test](../../tests/test_ple_mmap.py)) |
+| [host_offload.py](host_offload.py) | Offload saved activations into host buffers reused across steps ([test](../../tests/test_host_offload.py)) |
 | [pod/smoke_pod.sh](pod/smoke_pod.sh) | The smoke test as one pod job |
 | [data/python_tool.json](data/python_tool.json) | The harness's tool schema |
 
@@ -44,14 +45,30 @@ What a LoRA step on the W4A16 checkpoint needs beyond stock transformers + PEFT.
 | Patch | Where | What it does | Evidence |
 |---|---|---|---|
 | Chunked QSA | [qsa.py](qsa.py) | Queries in chunks of 256. Each query's ~2,051 selected keys and values are gathered with `index_select`, the query heads that share a KV head are laid out as SDPA query positions, and each chunk is checkpointed. | transformers' reference OOMs at 32K. Matches it on a tiny model (selections up to ties, outputs, logits, gradients). One QSA layer at 64K: 0.57 s forward, 3.61 s forward + backward. |
-| Grouped INT4 experts | [layer_patches.py](layer_patches.py) | Tokens sorted by expert; per tile of 128 experts, one AutoRound `dequant248` call to BF16 and two `torch._grouped_mm` calls. Replaces AutoRound's loop over 512 unfused experts. | Startup self-check against AutoRound's INT4 path: 0.3% max error. 64K backward 262 → 134 s. |
+| Grouped INT4 experts | [layer_patches.py](layer_patches.py) | Tokens sorted by expert; per tile of 128 experts, one AutoRound `dequant248` call to BF16 and two `torch._grouped_mm` calls. Replaces AutoRound's loop over 512 unfused experts. Each token's k outputs are summed in FP32 in a fixed order (deterministic). | Startup self-check against AutoRound's INT4 path: 0.3% max error. 64K backward 262 → 134 s. |
 | Token-chunked decoder layers | [layer_patches.py](layer_patches.py) | Hyper-connections, router, experts and shared expert run in 8,192-token checkpointed chunks; the PLE block is checkpointed whole. | Exact against transformers on a tiny model. 100K OOMed before; 123K now peaks at 129 GiB. |
 | Memory-mapped PLE table | [ple_mmap.py](ple_mmap.py) | The 102.5 GB n-gram table is read from the checkpoint files instead of being loaded into RAM. | Bit-identical on a tiny model. The process holds 2.9 GB after loading (was ~105 GB); a lookup pass costs 0.46 s at 64K. |
 | Checkpointing on | [smoke_lora.py](smoke_lora.py) `step` | `model.train()` before every step. | transformers checkpoints layers only in training mode; in eval mode every activation was kept. |
-| Activation offload | `step(offload=True)` | Each layer's checkpointed input (N × 4 × 2,560) goes to pageable host memory (`save_on_cpu(pin_memory=False)`). | Needed above ~45K tokens; ~113 GiB of host RAM at 123K. Pinned memory got the container OOM-killed. |
+| Activation offload | `step(offload=True)`, [host_offload.py](host_offload.py) | Each layer's checkpointed input (N × 4 × 2,560) goes to pageable host memory, into 16 GiB segments kept on the model and reused by every later step (`reuse_host_buffers: false` in a job falls back to `save_on_cpu(pin_memory=False)`). | Needed above ~45K tokens; ~113 GiB of host RAM at 123K. Pinned memory got the container OOM-killed. Fresh pageable memory filled at 1.7 GiB/s on one host, a reused buffer at 16.5 GiB/s. Gradients exact on a tiny model; not yet timed on a GPU. |
 | Chunked cross-entropy | `chunked_cross_entropy` | lm_head + loss on the trained positions only, 2,048 at a time, each checkpointed. | Never builds [K, 248,320] logits; exact. |
 | Guards | `run_specs`, `host_memory_available_gb` | On OOM: free memory, halve the token chunk and retry (twice), else skip. Skip offload steps the container's memory (cgroup v1 or v2) can't hold. | Not triggered so far. |
 | Environment | [pod/smoke_pod.sh](pod/smoke_pod.sh) | `tilelang` + `CUDA_HOME` for fla's GDN backward on Hopper, `expandable_segments`, an explicit GPU device map, no `use_kernels`. | See [AGENTS.md](AGENTS.md). |
+
+## Latest results (smoke test 4, 2026-10-19)
+
+Secure 1×H200 in US-NC-1, 49 min, ~$4.30; logs and results in `runs/runpod/jonathanwang2022/rft-lora-smoke/93so3gmik3uttk/`. Same 64K request as smoke test 3 (64,893 tokens, 8,141 trained).
+
+| Configuration | Forward | Backward | Tokens/s | Peak GPU |
+|---|---|---|---|---|
+| `save_on_cpu` (smoke test 3's path) | 59.0 s | 78.6 s | 472 | 99.3 GiB |
+| Reused pageable buffers | 33.6 s | 79.9 s | 571 | 100.7 GiB |
+| `recompute: "parts"`, synchronous copies | 29.5 s | 90.7 s | 540 | 96.2 GiB |
+| **parts, pinned async copies, 35.6 GiB kept on the GPU** | **16.8 s** | **66.0 s** | **784** | 121.1 GiB |
+| Same, 32K request (almost everything kept on the GPU) | 11.5 s | 30.7 s | 800 | 126.5 GiB |
+
+- The forward is now GPU compute only; backward is ~80% of the step, mostly QSA.
+- Two runs of the same step had LoRA gradients with cosine 0.87 until the MoE combine was made deterministic (0.99989 after). See [AGENTS.md](AGENTS.md#determinism).
+- parts OOMs at 123K; such requests fall back to layer recompute. Plan and next steps: [Throughput.md](Throughput.md).
 
 ## Latest results (smoke test 3, 2026-10-18)
 
@@ -72,9 +89,11 @@ Secure 1×H200 in US-NC-1, 43 min, ~$3.80; logs and results in `runs/runpod/jona
 
 ## Open issues and next steps
 
-1. Reuse host buffers for the offload: saves ~35 s per 64K step and stops depending on the host's page-fault speed.
+The plan for a 10× faster training step, step by step, is in [Throughput.md](Throughput.md).
+
+1. Reuse host buffers for the offload: done in [host_offload.py](host_offload.py), exact on a tiny model and on MPS. Should save ~35 s per 64K step and stop depending on the host's page-fault speed; time it on the next pod (64K with `reuse_host_buffers` true and false).
 2. QSA key/value gradients accumulate in BF16 in both gathers (1.7% error against FP32 on one real-size chunk; 0.33% with FP32 accumulation), and the same 64K step gave LoRA gradient norms 0.248 and 0.293 with the two gathers. Accumulate in FP32 and measure the spread on a repeated step.
-3. Then the training loop (optimizer, LR, epochs), the dataset build (selection thresholds, harness-config filter, held-out games), a short LoRA A/B with vs without the shared expert on held-out loss, and the merge check against vLLM (QSA parity, MTP draft acceptance).
+3. Then the training loop (optimizer, LR, epochs), the dataset build (selection thresholds, harness-config filter, held-out games), and the merge check against vLLM (QSA parity, MTP draft acceptance).
 
 ## Existing training paths for this model
 

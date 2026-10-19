@@ -13,6 +13,9 @@ same selection and attention in query chunks:
 - attention: each query attends to its own ~budget gathered keys/values; each
   chunk is checkpointed so the gathered keys/values are not kept for backward.
 
+The key/value gradients are scattered back with an atomic index_add per chunk and
+summed over chunks, in BF16 unless `kv_grad_fp32` gathers from FP32 copies.
+
 Scope: batch 1, no cache, causal mask only (training on packed single
 sequences). Anything else falls back to the original forward.
 """
@@ -99,9 +102,10 @@ def _attend_chunk(q, k, v, idx, scaling):
     safe = idx.clamp(min=0)
     # index_select backpropagates through an atomic index_add; advanced indexing (k[safe]) goes through a
     # sort-based index_put, which took 66% of a QSA layer's forward + backward at 64K tokens
+    # k, v may be FP32 copies (kv_grad_fp32): the gathered rows are cast to q's dtype for SDPA
     flat = safe.reshape(-1)
-    keys = k.index_select(0, flat).view(c, -1, hkv, d).transpose(1, 2)  # [C, Hkv, S, D]
-    values = v.index_select(0, flat).view(c, -1, hkv, d).transpose(1, 2)
+    keys = k.index_select(0, flat).to(q.dtype).view(c, -1, hkv, d).transpose(1, 2)  # [C, Hkv, S, D]
+    values = v.index_select(0, flat).to(q.dtype).view(c, -1, hkv, d).transpose(1, 2)
     mask = (idx >= 0)[:, None, None, :]
     out = F.scaled_dot_product_attention(q.reshape(c, hkv, h // hkv, d), keys, values, attn_mask=mask,
                                          scale=scaling)
@@ -125,6 +129,10 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     value = self.v_proj(hidden_states[0]).view(hidden_shape)
     query = _rope(query, cos[0], sin[0])
     key = _rope(key, cos[0], sin[0])
+    if getattr(self, "_qsa_kv_grad_fp32", False) and torch.is_grad_enabled():
+        # gather from FP32 copies: every query's contribution to a key's gradient then adds up in
+        # FP32, within a chunk's index_add and across chunks (BF16 sums were 1.7% off on one chunk)
+        key, value = key.float(), value.float()
 
     pieces = []
     for start in range(0, n, chunk):
@@ -138,7 +146,7 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     return self.o_proj(output)[None], None
 
 
-def patch_qsa_attention(chunk_size: int = 256) -> None:
+def patch_qsa_attention(chunk_size: int = 256, kv_grad_fp32: bool = False) -> None:
     """Route qwen4_exp full-attention layers through qsa_forward. Safe to call again after
     reloading this module: transformers' forward is kept on the class, not here."""
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
@@ -148,6 +156,7 @@ def patch_qsa_attention(chunk_size: int = 256) -> None:
         cls._hf_forward = cls.forward
     cls.forward = qsa_forward
     cls._qsa_chunk_size = chunk_size
+    cls._qsa_kv_grad_fp32 = kv_grad_fp32
 
 
 def unpatch_qsa_attention() -> None:
