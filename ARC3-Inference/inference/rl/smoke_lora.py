@@ -453,6 +453,120 @@ def compare_grads(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> dic
                 worst=[dict(param=n, rel_diff=round(r, 5), cosine=round(c, 6)) for r, c, n in per_param[:5]])
 
 
+def check_layers(model, device, sample, layers, variants: dict[str, Any], qsa_module, patches) -> dict[str, Any]:
+    """Real-size check of single decoder layers against the standard answer, on real inputs.
+
+    End-to-end gradients cannot tell a correct rewrite from a wrong one here: top-10-of-512 routing and
+    the next layers' top-k selections turn rounding-level differences into other experts and blocks, and
+    any two implementations (even BF16 atomics in a different order) agree to only ~0.8-0.87 cosine
+    after 48 layers. One layer on one input keeps those flips to a few tokens, and they are counted.
+
+    Captures the inputs of `layers` in one no-grad forward of `sample`, then runs each layer under every
+    configuration in `variants` (name -> dict(reference=bool, qsa_fused, compile_hc, ...); "reference"
+    is transformers' layer, QSA attention and AutoRound's experts with select_blocks' selection) with
+    the same input and upstream gradient, and compares output, input gradient and the layer's LoRA
+    gradients with the reference, plus the number of tokens routed to other experts."""
+    import inspect
+
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    decoder = [x for x in base.modules() if isinstance(x, m.Qwen4ExpTextDecoderLayer)]
+    signature = inspect.signature(m.Qwen4ExpTextDecoderLayer.forward)
+    captured: dict[int, dict[str, Any]] = {}
+
+    def capture(index):
+        def hook(module, args, kwargs):
+            bound = signature.bind(module, *args, **kwargs).arguments
+            bound.pop("self", None)
+            captured[index] = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in bound.items()}
+        return hook
+
+    handles = [decoder[i].register_forward_pre_hook(capture(i), with_kwargs=True) for i in layers]
+    model.eval()
+    with torch.no_grad():
+        base.model(**{k: v.to(device) for k, v in sample.items() if k != "labels"}, use_cache=False)
+    for h in handles:
+        h.remove()
+    model.train()
+
+    routes: list[torch.Tensor] = []
+    phase = {"forward": False}
+    router_forward = m.Qwen4ExpTextTopKRouter.forward
+
+    def recording_router(self, hidden_states):
+        out = router_forward(self, hidden_states)
+        if phase["forward"]:
+            routes.append(out[2].detach().sort(dim=-1).values)
+        return out
+
+    def configure(spec):
+        qsa_module.unpatch_reference_indexer()
+        if spec.get("reference"):
+            qsa_module.unpatch_qsa_attention()
+            qsa_module.patch_reference_indexer()
+            patches.unpatch(model)
+        else:
+            qsa_module.patch_qsa_attention(256, False, fused=spec.get("qsa_fused", True))
+            patches.patch_for_training(model, spec.get("token_chunk", 8192), 128, "parts",
+                                       compile_hc=spec.get("compile_hc", False),
+                                       compile_moe=spec.get("compile_moe", False),
+                                       cache_experts=spec.get("cache_experts", True),
+                                       fast_conv=spec.get("fast_conv", False))
+
+    def rel(a, b):
+        return round(float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)), 6)
+
+    def cos(a, b):
+        a, b = a.double().flatten(), b.double().flatten()
+        return round(float(a @ b / (a.norm() * b.norm()).clamp_min(1e-30)), 6)
+
+    m.Qwen4ExpTextTopKRouter.forward = recording_router
+    out: dict[str, Any] = {}
+    try:
+        for i in layers:
+            layer, kwargs = decoder[i], dict(captured[i])
+            hidden = kwargs.pop("hidden_states")
+            lora = {n: p for n, p in layer.named_parameters() if "lora_" in n and p.requires_grad}
+            g = torch.Generator(device=hidden.device).manual_seed(i)
+            results = {}
+            for name, spec in variants.items():
+                configure(spec)
+                h = hidden.clone().requires_grad_(True)
+                layer.zero_grad(set_to_none=True)
+                routes.clear()
+                phase["forward"] = True
+                y = type(layer).forward(layer, h, **kwargs)  # not __call__: no layer checkpoint
+                phase["forward"] = False
+                upstream = torch.randn(y.shape, generator=g.manual_seed(i), device=y.device, dtype=torch.float32)
+                (y.float() * upstream).sum().backward()
+                results[name] = dict(out=y.detach().float(), dh=h.grad.float(),
+                                     lora={n: p.grad.detach().float().clone() for n, p in lora.items()
+                                           if p.grad is not None},
+                                     routes=torch.cat(routes) if routes else None)
+                del y, h
+            row: dict[str, Any] = dict(kind=layer.layer_type, tokens=int(hidden.shape[1]))
+            ref = results["reference"]
+            for name, r in results.items():
+                if name == "reference":
+                    continue
+                names = sorted(r["lora"].keys() & ref["lora"].keys())
+                a = torch.cat([r["lora"][n].flatten() for n in names]) if names else torch.zeros(1)
+                b = torch.cat([ref["lora"][n].flatten() for n in names]) if names else torch.zeros(1)
+                flips = None
+                if r["routes"] is not None and ref["routes"] is not None and r["routes"].shape == ref["routes"].shape:
+                    flips = int((r["routes"] != ref["routes"]).any(-1).sum())
+                row[name] = dict(out_rel=rel(r["out"], ref["out"]), dh_rel=rel(r["dh"], ref["dh"]),
+                                 dh_cos=cos(r["dh"], ref["dh"]), lora_rel=rel(a, b), lora_cos=cos(a, b),
+                                 lora_params=len(names), routing_flips=flips)
+            out[str(i)] = row
+            print("layer check", i, json.dumps(row), flush=True)
+    finally:
+        m.Qwen4ExpTextTopKRouter.forward = router_forward
+        qsa_module.unpatch_reference_indexer()
+    return out
+
+
 @torch.no_grad()
 def qsa_overlap(model, device, sample, windows=(4, 16, 64, 256), per_window: int = 256,
                 recent: int = 4096) -> dict[str, Any]:
@@ -606,7 +720,8 @@ def serve(model, device, args, processor, tools, game) -> None:
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
     "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
     "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
-    "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer)},
+    "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer),
+    "reference_qsa" / "reference_layers": one half of it, "reference_selection": transformers' own tie-breaking},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
     host_offload.py and this module are reloaded before each job, so code fixes need no 5-minute
     model reload. Results go to NAME.result.json."""
@@ -632,14 +747,24 @@ def serve(model, device, args, processor, tools, game) -> None:
             patches = importlib.reload(importlib.import_module("inference.rl.layer_patches"))
             importlib.reload(importlib.import_module("inference.rl.host_offload"))
             module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
-            if job.get("reference"):  # the standard answer: transformers' QSA, layers and AutoRound's experts
+            # the standard answer: transformers' QSA ("reference_qsa"), transformers' layers with AutoRound's
+            # experts ("reference_layers"), or both ("reference"); the selection is always select_blocks', since
+            # transformers' per-query topk breaks the ties at score 0 its own way ("reference_selection": true
+            # keeps it)
+            reference_qsa = job.get("reference") or job.get("reference_qsa")
+            reference_layers = job.get("reference") or job.get("reference_layers")
+            qsa_module.unpatch_reference_indexer()
+            if reference_qsa:
                 qsa_module.unpatch_qsa_attention()
-                patches.unpatch(model)
-                result["layer_patches"] = "reference"
+                if not job.get("reference_selection"):
+                    qsa_module.patch_reference_indexer()
             else:
                 qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk), job.get("kv_grad_fp32", False),
                                                fused=job.get("qsa_fused", not args.no_qsa_kernel))
-            if not args.no_layer_patches and not job.get("reference"):
+            if reference_layers:
+                patches.unpatch(model)
+                result["layer_patches"] = "reference"
+            if not args.no_layer_patches and not reference_layers:
                 result["layer_patches"] = patches.patch_for_training(
                     model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile),
                     job.get("recompute", args.recompute), compile_hc=job.get("compile_hc", args.compile_hc),
@@ -672,6 +797,16 @@ def serve(model, device, args, processor, tools, game) -> None:
                 (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
                 running.rename(job_path.with_suffix(".done"))
                 print("job", job_path.stem, "done", flush=True)
+                continue
+            if "layer_check" in job:
+                spec = job["layer_check"]
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                sample = next(iter(samples.values()))
+                result["tokens"] = int(sample["input_ids"].shape[1])
+                result["layers"] = module.check_layers(model, device, sample, spec.get("layers", [0, 1, 3]),
+                                                       spec["variants"], qsa_module, patches)
+                (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
+                running.rename(job_path.with_suffix(".done"))
                 continue
             if "layer_profile" in job:
                 spec = job["layer_profile"]
