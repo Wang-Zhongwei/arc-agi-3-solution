@@ -139,3 +139,73 @@ GPU 采样：反向 80–90% 时间在跑 kernel，但只有约 350 W（满载 7
 1. 下次 H200：单独量确定性合并的速度（arena 不超过 112 GiB）；查 parts 在 123K 的 4.69 GiB 分配。
 2. 第 3 步 QSA kernel：16 个 query 一块取并集，或按 query 读、靠 L2 复用；在 H100 上开发。
 
+
+### 下午：目标改为当天 10×，第 3–6 步（kernel pod ux3e2aop5mnv1t，secure A100 SXM 80GB，约 52 分钟，约 $1.55）
+
+你的要求：先把速度做上去，123K 的 OOM 先不管；显存可以多用一点，实在不够开 B200；每步先在便宜的卡上测；每次优化都要和标准答案对照。H200/H100 都没货，48 GB 的卡也没货，用了 A100。
+
+做法：写了单层基准 [bench_layer.py](bench_layer.py)（真实尺寸、随机权重的 GDN 层和 QSA 层，INT4 专家 + LoRA，量 checkpoint 下的前向和重算 + 反向），按 36 GDN + 12 QSA 估算整步。旧路径算出 227 s，H200 实测 83 s，比例约 2.7。
+
+| 轮次 | 改动 | GDN 层 | QSA 层 | 整步（A100） |
+|---|---|---|---|---|
+| r1 | 旧路径 | 2.11 s | 12.62 s | 227 s |
+| r1 | QSA 融合 kernel（Triton，每个 query 一个程序，dK/dV FP32 原子加） | 2.12 s | 3.78 s | 122 s |
+| r2 | 专家缓存（一层 BF16 专家约 5 GB）+ `split` 切块 | 1.65 s | 3.31 s | 99 s |
+| r2 | + 编译 hyper-connection 和 MoE 合并 | 1.43 s | 3.11 s | 89 s |
+| r3 | + 512 个专家一次 grouped GEMM、gather 反向不用 `index_put`、dK/dV 按 16 个 query 的并集 | 1.40 s | 3.56 s* | 93 s* |
+| r3b | 同上，QSA 用合成的真实统计选择 | — | 2.32 s | 78 s |
+| r4 | + 通道在后的 GDN 短卷积、A100 的 grouped GEMM 只算 dX | 1.03 s | 2.27 s | 64 s |
+| r5 | 编译改为全动态形状 | 1.17 s | 2.40 s | 71 s |
+| r6 | 编译改为块长补到 2 的幂的静态图 | **1.03 s** | **2.27 s** | **64 s** |
+
+\* 随机权重让相邻 query 的选择几乎独立（16 个 query 并集 9.98 倍，真实约 3.5 倍），并集 kernel 白做 3 倍的活。之后基准用合成选择：每 16 个 query 共享的噪声 + 每个 query 的噪声 + 最近窗口加分，再取 top-k；最近 4,096 个 token 占 44%，16 个并集 3.46 倍，和 10-19 上午实测一致。
+
+正确性（每项都对照了标准答案）：
+
+- QSA kernel：输出、LSE、dQ/dK/dV 对照 FP32 稠密参照，误差不超过旧分块路径（`test_qsa_kernel.py`，两种 dK/dV 都测）；整模型（小模型带图、开 gradient checkpointing）的 logits 和注意力梯度对照 transformers 的 QSA，FP32（`test_qsa_fused_model.py`），并确认重算复用了选择（indexer 每层每步只跑一次）。
+- 并集表：CPU 上对照暴力循环（`test_qsa_union.py`）。
+- 专家缓存、单次 grouped GEMM、合并、两个 gather 的反向、`split`：小模型上对 transformers 逐位一致；只算 dX 的 grouped GEMM 对逐组 matmul 逐位一致。
+- 编译和短卷积：对照 FP32，误差不超过 BF16 eager 的 1.5 倍（`test_compile_hc.py`）。
+
+踩到的坑：
+
+- 并集 dK/dV kernel 越界：query 正好结束一个块时，它的尾块是下一个块，最后一个 tile 的尾块在 N 之后。kernel 只判断了块号 ≥ 0，读到 K/V 之外的垃圾，`0 × NaN` 让 dK 的越界写变成 NaN，正好落在紧挨着分配的 dV 开头。只有 dV 出错，且只在部分顺序下出现（新进程里是 device-side assert）。改为 `tok < N` 并把屏蔽位置的 dS 显式置 0。
+- 编译版的路由梯度误差是 eager 的 6 倍。不是编译错了：小模型 top-3 of 8，有个 token 第 3、4 名专家只差 1.2e-5，编译版的舍入让它换了专家（200 个 token 里 1 个），MoE 输出就差 5%。对照测试改为每个 token 用全部专家（路由连续）后通过。先后排除了"前向和重算路由不同"（没有）和"函数本身不准"（单独测比 eager 还准）。
+- A100 上 `torch._grouped_mm` 不可用，transformers 的后备是逐专家循环，反向还给冻结的专家算权重梯度。基准里 GEMM 因此偏慢；加了只算 dX 的后备。
+- `ssh ... 'cd DIR && tar ... && nohup ... &'` 又让 ssh 卡住（AGENTS.md 里记过）：要用 `;`，不要 `&&`。
+
+整模型对照（T9）在第二台 A100（ih0v0tcp42cfey，260 GB 磁盘）上跑：8K 样本，原版模型（`"reference": true`：transformers 的 QSA 和层、AutoRound 的专家循环）、旧路径、新路径各两遍，比较 loss 和 LoRA 梯度。
+
+### 整模型对照（8K，r4ii27zn88nx8j，secure RTX PRO 6000 96GB；A100 80GB 放不下真实样本）
+
+A100 上 8K（这局游戏最短的请求也有 7.4K）三条路径全部 OOM：68.5 GiB 模型 + ~10 GiB 固定开销。换 96 GB 的 RTX PRO 6000（sm120）。这台主机连不上 PyPI（pypi.org 和镜像都超时），在 Mac 上用 [pod/fetch_wheels.py](pod/fetch_wheels.py) 下好 wheel 传过去离线装。7 个 CUDA 对照测试在 sm120 上也都通过。
+
+同一个 8K 请求，各跑两遍：
+
+| 对照 | 梯度余弦 | 相对差 | loss |
+|---|---|---|---|
+| 同一路径两遍（三条路径都是） | 0.9999 | 1.4–1.6% | 完全一致 |
+| 旧路径 vs 原版模型 | 0.833 | 58% | 0.5079 vs 0.5176 |
+| 新路径 vs 原版模型 | 0.665 | 99% | 0.5172 vs 0.5176 |
+| 新路径 vs 旧路径 | 0.660 | 98% | |
+
+第一个怀疑是 QSA 选择的并列：relu 之后很多块分数正好是 0，正分不足 512 个时剩下的名额在并列里挑，transformers 逐 query 的 topk、我们 256 和 2,048 一块的 topk 挑的都不一样。改成确定的并列规则（稳定排序，并列选最近的块），参照模型也用同一个选择，重跑：
+
+| 对照（同一个选择） | 梯度余弦 | loss |
+|---|---|---|
+| 旧路径 vs 原版 | 0.833 | 0.5096 vs 0.5126 |
+| 新路径 vs 原版 | 0.786 | 0.5172 |
+| 只换 QSA 注意力（旧路径 vs transformers 注意力） | 0.819 | 0.5096 vs 0.5113 |
+| 只换层和专家（fused QSA + transformers 层 vs 原版） | 0.851 | 0.5190 |
+
+结论：任何两种实现之间只有 0.79–0.85 的余弦，连只换注意力实现（小模型上逐 1e-5 一致）也是 0.82。上午只是 BF16 原子加顺序不同也是 0.87。top-10/512 的路由和后面各层的 top-k 选择把舍入级的差异变成换了专家、换了块，48 层放大。所以整模型梯度对比在这个模型上分不出“正确但舍入不同”和“有 bug”。改为在真实模型上逐层对照：用真实输入，单层里的翻转只影响少数 token，而且数出来。
+
+### 晚上：逐层对照、grouped GEMM、fast_lora（同一台 RTX PRO 6000，约 77 分钟，约 $3.2）
+
+- 真实输入逐层对照（8K，层 0 GDN、1 GDN+PLE、3 QSA；对 transformers 层 + AutoRound 专家 + transformers QSA 注意力，同一个选择）：上午的路径 LoRA 梯度余弦 0.99974 / 0.99976 / 0.99962，新路径 0.99970 / 0.99975 / 0.99964，输入梯度都约 0.9999；路由翻转 11–17% 的 token（BF16 logits 并列）。`keep_mixer` 和新路径逐位相同。
+- 整步（第二步）：16K 上午路径 572 → 新路径 1,101 tok/s；`keep_mixer` 1,064（offload 激活的开销大于省下的重算，撤回）。
+- profile（16K）：GDN 层一半时间是专家 GEMM 的逐专家循环（6,163 次 matmul）。写了 Triton grouped GEMM：16K 1,314、32K 1,475 tok/s（上午的路径 569）；AutoRound 自检误差 0.75% → 0.53%；逐层对照不变。
+- `fast_lora`：PEFT 的 FP32 adapter 更新编译成一个函数；和 PEFT 逐位一致（CPU），逐层对照不变；同一次运行 32K 1,421 → 1,470 tok/s。
+- 时间线（32K）：层内前向 7.3 s、反向 15.5 s，层外合计 0.46 s；GDN 层占 66%，QSA 层 32%。
+- 服务循环不热重载：新加的 job 参数要重启服务才生效（第一次量 fast_lora 时没生效，是这个原因）。
+- 冰岛的 H200（smpzdlhal2bt5q）网络太差（HF 12 MB/s、PyPI 223 KB/s），开了约 25 分钟没跑任何 job 就删了，约 $2.2。

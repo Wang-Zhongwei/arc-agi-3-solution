@@ -31,7 +31,9 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | [context_rebuild.py](context_rebuild.py) | Rebuild every request's messages from a transcript |
 | [validate_rebuild.py](validate_rebuild.py) | Compare rebuilds with `*_requests.jsonl` |
 | [smoke_lora.py](smoke_lora.py) | Load W4A16 + LoRA, time forward/backward on real packed samples |
-| [qsa.py](qsa.py) | Chunked QSA for training, replacing transformers' reference ([test](../../tests/test_qsa.py)) |
+| [qsa.py](qsa.py) | QSA for training, replacing transformers' reference ([test](../../tests/test_qsa.py)) |
+| [qsa_kernel.py](qsa_kernel.py) | Fused sparse-attention forward and backward in Triton ([kernel test](../../tests/test_qsa_kernel.py), [model test](../../tests/test_qsa_fused_model.py)) |
+| [bench_layer.py](bench_layer.py) | Time one real-size GDN and QSA layer without the checkpoint ([pod/kernel_pod.sh](pod/kernel_pod.sh)) |
 | [layer_patches.py](layer_patches.py) | Grouped INT4 experts and token-chunked decoder layers ([test](../../tests/test_layer_patches.py)) |
 | [ple_mmap.py](ple_mmap.py) | Serve the PLE n-gram table from the checkpoint files ([test](../../tests/test_ple_mmap.py)) |
 | [host_offload.py](host_offload.py) | Offload saved activations into host buffers reused across steps ([test](../../tests/test_host_offload.py)) |
@@ -44,9 +46,15 @@ What a LoRA step on the W4A16 checkpoint needs beyond stock transformers + PEFT.
 
 | Patch | Where | What it does | Evidence |
 |---|---|---|---|
-| Chunked QSA | [qsa.py](qsa.py) | Queries in chunks of 256. Each query's ~2,051 selected keys and values are gathered with `index_select`, the query heads that share a KV head are laid out as SDPA query positions, and each chunk is checkpointed. | transformers' reference OOMs at 32K. Matches it on a tiny model (selections up to ties, outputs, logits, gradients). One QSA layer at 64K: 0.57 s forward, 3.61 s forward + backward. |
-| Grouped INT4 experts | [layer_patches.py](layer_patches.py) | Tokens sorted by expert; per tile of 128 experts, one AutoRound `dequant248` call to BF16 and two `torch._grouped_mm` calls. Replaces AutoRound's loop over 512 unfused experts. Each token's k outputs are summed in FP32 in a fixed order (deterministic). | Startup self-check against AutoRound's INT4 path: 0.3% max error. 64K backward 262 → 134 s. |
-| Token-chunked decoder layers | [layer_patches.py](layer_patches.py) | Hyper-connections, router, experts and shared expert run in 8,192-token checkpointed chunks; the PLE block is checkpointed whole. | Exact against transformers on a tiny model. 100K OOMed before; 123K now peaks at 129 GiB. |
+| Fused QSA kernel (default on CUDA) | [qsa_kernel.py](qsa_kernel.py) | Selection as block ids; forward and dQ one Triton program per query and KV head (online softmax, LSE); dK/dV per tile of 16 neighbouring queries over the union of their blocks, FP32 atomics. A checkpoint's recompute reuses the forward's selection. | Matches FP32 dense attention at the checkpoint's head layout and transformers' QSA through a tiny model. One QSA layer at 64K on an A100: 12.6 → 2.3 s. |
+| Chunked QSA (CPU, `fused=False`) | [qsa.py](qsa.py) | Queries in chunks of 256. Each query's ~2,051 selected keys and values are gathered with `index_select`, the query heads that share a KV head are laid out as SDPA query positions, and each chunk is checkpointed. | transformers' reference OOMs at 32K. Matches it on a tiny model (selections up to ties, outputs, logits, gradients). One QSA layer at 64K: 0.57 s forward, 3.61 s forward + backward. |
+| Grouped INT4 experts | [layer_patches.py](layer_patches.py) | Tokens sorted by expert; one layer's experts dequantized to BF16 once per pass (tiles of 128, `dequant248`) and cached (~5 GB), then one `torch._grouped_mm` per projection over all 512 experts with offsets on the GPU (no host sync). Replaces AutoRound's loop over 512 unfused experts. Each token's k outputs are summed in FP32 in a fixed order (deterministic); the sort and unsort gathers have gather backwards (no `index_put`). | Startup self-check against AutoRound's INT4 path: 0.3% max error. 64K backward 262 → 134 s. |
+| Token-chunked decoder layers | [layer_patches.py](layer_patches.py) | Hyper-connections, router, experts and shared expert run in 8,192-token checkpointed chunks (`split`, so backward concatenates once); the PLE block is checkpointed whole. | Exact against transformers on a tiny model. 100K OOMed before; 123K now peaks at 129 GiB. |
+| Triton grouped GEMM | [grouped_gemm.py](grouped_gemm.py) | On GPUs without `torch._grouped_mm` (A100, SM120): all 512 experts in one launch per projection, dX with the same kernel (frozen experts). Hopper keeps torch's. | Per-expert FP32 matmuls ([test](../../tests/test_grouped_gemm.py)); AutoRound self-check 0.53%. RTX PRO 6000 32K: 1,081 → 1,475 tok/s. |
+| Fused LoRA update (`fast_lora`) | [layer_patches.py](layer_patches.py) | peft's FP32-adapter update as one compiled function (no FP32 intermediates the size of the output). | Bit-identical to peft on CPU; +3.4% at 32K. |
+| PLE lookup once per step | [layer_patches.py](layer_patches.py) | The host-side n-gram gather is reused by the PLE checkpoint's recompute. | Bit-identical; one lookup instead of two. |
+| Compiled hyper-connections and MoE combine (`compile_hc`, `compile_moe`) | [layer_patches.py](layer_patches.py) | The gated residuals and injections as pure functions under `torch.compile`, shared by all layers; chunks padded to power-of-two buckets so every chunk's recompute runs the same static graph as its forward. | As accurate as BF16 eager against FP32 ([test](../../tests/test_compile_hc.py)). GDN layer at 64K on an A100: 1.65 → 1.43 s. |
+| Channels-last GDN convolution (`fast_conv`) | [layer_patches.py](layer_patches.py) | Four shifted multiply-adds in the projection's layout, compiled, instead of `F.conv1d` on a transposed copy. | Matches the `F.conv1d` fallback on CPU. |
 | Memory-mapped PLE table | [ple_mmap.py](ple_mmap.py) | The 102.5 GB n-gram table is read from the checkpoint files instead of being loaded into RAM. | Bit-identical on a tiny model. The process holds 2.9 GB after loading (was ~105 GB); a lookup pass costs 0.46 s at 64K. |
 | Checkpointing on | [smoke_lora.py](smoke_lora.py) `step` | `model.train()` before every step. | transformers checkpoints layers only in training mode; in eval mode every activation was kept. |
 | Activation offload | `step(offload=True)`, [host_offload.py](host_offload.py) | Each layer's checkpointed input (N × 4 × 2,560) goes to pageable host memory, into 16 GiB segments kept on the model and reused by every later step (`reuse_host_buffers: false` in a job falls back to `save_on_cpu(pin_memory=False)`). | Needed above ~45K tokens; ~113 GiB of host RAM at 123K. Pinned memory got the container OOM-killed. Fresh pageable memory filled at 1.7 GiB/s on one host, a reused buffer at 16.5 GiB/s. Gradients exact on a tiny model; not yet timed on a GPU. |
@@ -54,7 +62,18 @@ What a LoRA step on the W4A16 checkpoint needs beyond stock transformers + PEFT.
 | Guards | `run_specs`, `host_memory_available_gb` | On OOM: free memory, halve the token chunk and retry (twice), else skip. Skip offload steps the container's memory (cgroup v1 or v2) can't hold. | Not triggered so far. |
 | Environment | [pod/smoke_pod.sh](pod/smoke_pod.sh) | `tilelang` + `CUDA_HOME` for fla's GDN backward on Hopper, `expandable_segments`, an explicit GPU device map, no `use_kernels`. | See [AGENTS.md](AGENTS.md). |
 
-## Latest results (smoke test 4, 2026-10-19)
+## Latest results (RTX PRO 6000 96GB, 2026-10-19 evening)
+
+Real model, second step, all of `qsa_fused`, `compile_hc`, `compile_moe`, `fast_conv`, `cache_experts`, `fast_lora`:
+
+| Sample | Morning path | Now | Speed-up |
+|---|---|---|---|
+| 16K (14,173 tokens) | 572 tok/s | 1,314 tok/s | 2.3× |
+| 32K (33,811 tokens) | 569 tok/s | 1,470 tok/s | 2.6× |
+
+Checked layer by layer against transformers' layers, QSA attention and AutoRound's experts on real inputs (`layer_check` job): LoRA gradient cosine 0.9996–0.9997, input gradient 0.9999, as close as the morning's path. Whole-model gradient comparisons cannot validate this model (see [AGENTS.md](AGENTS.md#kernels-compile-and-benchmarks-10-19)). Not yet timed on an H200.
+
+## Results (smoke test 4, 2026-10-19)
 
 Secure 1×H200 in US-NC-1, 49 min, ~$4.30; logs and results in `runs/runpod/jonathanwang2022/rft-lora-smoke/93so3gmik3uttk/`. Same 64K request as smoke test 3 (64,893 tokens, 8,141 trained).
 

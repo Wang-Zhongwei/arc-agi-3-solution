@@ -14,6 +14,40 @@
 |---|---|---|---|
 | 10-18 | 137 s | 474 | 起点 |
 | 10-19 | 83 s | 784 | 第 1 步（复用、锁页、异步拷贝、留 GPU）+ 第 2 步（parts） |
+| 10-19 下午 | 约 24 s（估算） | 约 2,700（估算） | 第 3–5 步的大部分，单层基准估算，见下节；还没在 H200 上端到端量过 |
+
+### 真实模型整步（RTX PRO 6000 96GB，sm120，第二步）
+
+H200 当天不是没货就是网络太差（冰岛 EUR-IS-4：HF 12 MB/s、PyPI 223 KB/s），按你的意思用便宜的卡证明。这张卡没有 `torch._grouped_mm`，旧路径的专家是逐个 matmul。
+
+| 路径 | 16K（14,173 token） | 32K（33,811 token） |
+|---|---|---|
+| 上午的路径（分块 QSA，每块反量化） | 572 tok/s | 569 tok/s |
+| QSA kernel + 专家缓存 + 编译 + 短卷积 | 1,101 | 1,081（带 keep_mixer） |
+| + Triton grouped GEMM | **1,314** | **1,475**（2.6×） |
+
+- 正确性：真实输入的逐层对照（8K，层 0/1/3，对 transformers 层 + AutoRound 专家 + transformers QSA 注意力，同一个选择）：LoRA 梯度余弦 0.9996–0.9997、输入梯度 0.9999，和上午的路径一样；整模型梯度对比分不出对错（见 Logs.md）。
+- `keep_mixer`（QSA mixer 不重算）逐位正确，但 16K 反而慢 0.4 s（激活要 offload），没有提交。
+
+### 单层基准（A100，64K，[bench_layer.py](bench_layer.py)）
+
+不加载模型：用真实尺寸、随机权重的一个 GDN 层和一个 QSA 层（专家是打包的 INT4，按 AutoRound 的方式反量化，带 LoRA），量一步里每层做的事（checkpoint 下的前向，再加重算和反向）。整步按 36 个 GDN 层 + 12 个 QSA 层估算。随机权重让相邻 query 的选择几乎互不相关（16 个 query 的并集约 10 倍，真实模型约 3.5 倍），所以 QSA 层改用和真实统计一致的合成选择（最近 4,096 个 token 占 44%，16 个 query 并集 3.46 倍），indexer 照常运行以计入它的时间。
+
+旧路径算出的 227 s 对应 H200 实测的 83 s，比例约 2.7。A100 上 MoE 的 grouped GEMM 是逐专家的循环（`torch._grouped_mm` 要 SM90），H200 上这部分更快，所以下表的比例在 H200 上只会更好。
+
+| 改动 | GDN 层 | QSA 层 | 整步（A100 估算） |
+|---|---|---|---|
+| 旧路径（分块 gather + SDPA + `index_add`） | 2.11 s | 12.62 s | 227 s |
+| 第 3 步：QSA 融合 kernel（每个 query 一个程序，dK/dV 用 FP32 原子加） | 2.12 s | 3.78 s | 122 s |
+| 第 5 步：每层专家只反量化一次（缓存一层的 BF16 专家，约 5 GB），`split` 切块 | 1.65 s | 3.31 s | 99 s |
+| 第 4 步：hyper-connection 和 MoE 合并用 `torch.compile` | 1.43 s | 3.11 s | 89 s |
+| 512 个专家一次 grouped GEMM（不同步主机），gather 的反向不用 `index_put` | 1.40 s | — | — |
+| 第 3 步：dK/dV 按 16 个相邻 query 的并集算（合成选择下） | — | 2.32 s | 78 s |
+| 第 6 步：GDN 短卷积按通道在后计算（不转置），A100 的 grouped GEMM 只算 dX | **1.03 s** | **2.27 s** | **64 s** |
+
+- 编译用静态形状：块长补到 2 的幂（512–8,192），每块的重算和前向走同一份图。全动态的图慢约 12%（GDN 层 1.17 s）。
+- QSA kernel 现在 0.86 s（前向两遍各 0.085 s、dQ 0.09 s、dK/dV 0.6 s）。dK/dV 逐 query 原子加是 1.26 s。
+- 剩下的大头：A100 上的 GEMM（GDN 层 0.44 s，H200 上应低得多）、QSA kernel、GPU 空等（GDN 层 1.03 s 里 GPU 只忙 0.81 s）。
 
 ## 时间都花在哪（64K，137 s）
 
@@ -108,7 +142,7 @@
 
 ## 开发方式
 
-- kernel 在便宜的 Hopper 卡（H100）上开发和单测，不加载 181 GB 的模型；TileLang 和 TileKernels 都要求 SM90 以上，本地 Mac 跑不了。
+- kernel 用 Triton 写，在便宜的卡上开发和单测（10-19 用的 A100），不加载 181 GB 的模型；本地 Mac 跑不了 Triton。速度用 [bench_layer.py](bench_layer.py) 的单层基准，脚本是 [pod/kernel_pod.sh](pod/kernel_pod.sh)（先跑 CUDA 对照测试，再跑基准）。
 - 端到端计时在 H200 上用 `smoke_lora --serve` 热更新跑 job；每台 pod 一个脚本，结果存到 `runs/runpod/jonathanwang2022/rft-lora-smoke/<pod-id>/`，记录写进 [Logs.md](Logs.md)。
 
 ## 今天（10-19）的目标
@@ -119,3 +153,11 @@
 - [x] T4 第 3 步准备：`qsa_overlap` job，统计相邻 4/16/64/256 个 query 的选择并集和最近 4,096 个 token 的占比。
 - [x] T5 H200 pod（93so3gmik3uttk，约 49 分钟，约 $4.3）：64K 到 784 token/s（1.66×），32K 800 token/s。梯度差异的原因：MoE 合并用 BF16 原子加，前向不可复现，同一步两次梯度余弦只有 0.87；改成 FP32 固定顺序合并后 0.99989。parts 模式在 123K OOM，先退回 layer 模式。详见 [Logs.md](Logs.md)。
 - [x] T6 结果写进 Logs.md、README 和 AGENTS.md。
+
+下午（目标改为当天 10×）：
+
+- [x] T7 第 3 步：QSA 融合 kernel（[qsa_kernel.py](qsa_kernel.py)，Triton）。前向每个 query 一个程序；反向 dQ 同样按 query，dK/dV 按 16 个相邻 query 的选择并集算。对照 FP32 稠密参照（输出、LSE、dQ/dK/dV）和整模型对照 transformers 的 QSA（[test_qsa_kernel.py](../../tests/test_qsa_kernel.py)、[test_qsa_fused_model.py](../../tests/test_qsa_fused_model.py)）。checkpoint 重算复用前向的选择，不再跑第二遍 indexer。
+- [x] T8 第 4–6 步：专家缓存、单次 grouped GEMM、编译的 hyper-connection 和 MoE 合并、通道在后的短卷积；单层基准 227 → 64 s（A100）。每项都有对照测试（小模型对 transformers 逐位一致，或对 FP32 误差不超过 BF16 eager 的 1.5 倍）。
+- [x] T9 正确性：整模型梯度对比在这个模型上分不出对错（任何两种实现都只有 0.79–0.87 余弦），改为真实输入的逐层对照（`layer_check`）：新路径和上午的路径一样接近原版（LoRA 梯度余弦 0.9996+）。
+- [x] T11 晚上：PLE 查表每步一次、确定的 QSA 并列规则、Triton grouped GEMM（非 Hopper）、融合的 LoRA 更新；RTX PRO 6000 上 32K 1,470 tok/s（上午的路径 569）。`keep_mixer` 量过更慢，没提交。
+- [ ] T10 H200 上 64K 端到端计时（当天的 H200 不是没货就是网络太差）。
