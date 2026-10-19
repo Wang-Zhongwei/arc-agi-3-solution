@@ -221,3 +221,22 @@ def test_selection_does_not_depend_on_the_chunk_size():
     small = qsa.select_blocks(indexer, hidden, cos, sin, chunk_size=64)
     large = qsa.select_blocks(indexer, hidden, cos, sin, chunk_size=2048)
     assert torch.equal(small.sort(-1).values, large.sort(-1).values)
+
+
+def test_top_blocks_breaks_ties_toward_recent_blocks():
+    scores = torch.tensor([[0.0, 2.0, 0.0, 1.0, 0.0, float("-inf")],
+                           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    assert qsa.top_blocks(scores, 3).tolist() == [[1, 3, 4], [5, 4, 3]]
+
+
+def test_reference_indexer_with_our_selection_matches_transformers(setup):
+    """Without ties (8 index heads), the reference indexer built from select_blocks returns transformers' mask."""
+    _, _, _, c = setup
+    with torch.no_grad():
+        reference = c["module"].indexer(c["hidden"], c["pos"], c["mask"], None)
+        qsa.patch_reference_indexer()
+        try:
+            ours = c["module"].indexer(c["hidden"], c["pos"], c["mask"], None)
+        finally:
+            qsa.unpatch_reference_indexer()
+    assert torch.equal(ours, reference)

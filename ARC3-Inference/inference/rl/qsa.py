@@ -59,6 +59,19 @@ def indexer_queries_and_keys(indexer, hidden_states, cos, sin):
     return q, _rope(pooled[:, None, :], cos[0, starts], sin[0, starts])[:, 0].float()
 
 
+def top_blocks(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Indices of the k highest scores per row, ties going to the later block.
+
+    After the relu many blocks score exactly 0, so whenever fewer than k blocks score above 0 the
+    rest of the selection is a pick among ties, and topk's pick depends on the kernel and the batch
+    shape: transformers' per-query loop, our 256- and 2,048-query chunks all chose different blocks,
+    and attention over different keys gave the same 8K step LoRA gradients with cosine 0.66-0.83.
+    A stable descending sort over the blocks in reverse order is deterministic and prefers the
+    most recent blocks among ties."""
+    order = torch.sort(scores.flip(-1), dim=-1, descending=True, stable=True).indices[..., :k]
+    return scores.shape[-1] - 1 - order
+
+
 @torch.no_grad()
 def select_blocks(indexer, hidden_states, cos, sin, chunk_size: int) -> torch.Tensor:
     """Block ids [N, K + 1] (int32, -1 = none) each query attends to, K = min(topk, complete blocks).
@@ -80,7 +93,7 @@ def select_blocks(indexer, hidden_states, cos, sin, chunk_size: int) -> torch.Te
         if k:
             scores = torch.relu(torch.einsum("chd,bd->chb", q[start:stop], block_keys)).sum(dim=1) / math.sqrt(d)
             scores.masked_fill_(torch.arange(blocks, device=q.device)[None, :] >= complete[:, None], float("-inf"))
-            chosen = scores.topk(k, dim=-1).indices  # [C, k], the visible blocks first
+            chosen = top_blocks(scores, k)  # [C, k], the visible blocks first
             valid = torch.arange(k, device=q.device)[None, :] < complete[:, None].clamp(max=k)
             out[start:stop, :k] = torch.where(valid, chosen, -1).to(torch.int32)
         out[start:stop, k] = complete.to(torch.int32)  # the incomplete tail block is always visible
@@ -176,7 +189,7 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
         output = qsa_kernel.qsa_attention(query, key, value, blocks, self.scaling, self.indexer.compress_ratio)
         return self.o_proj(output.reshape(n, -1) * torch.sigmoid(gate))[None], None
 
-    selected = select_tokens(self.indexer, hidden_states, cos, sin, chunk)
+    selected = select_tokens(self.indexer, hidden_states, cos, sin, SELECTION_CHUNK)  # the fused path's selection
     if getattr(self, "_qsa_kv_grad_fp32", False) and torch.is_grad_enabled():
         # gather from FP32 copies: every query's contribution to a key's gradient then adds up in
         # FP32, within a chunk's index_add and across chunks (BF16 sums were 1.7% off on one chunk)
@@ -213,5 +226,41 @@ def unpatch_qsa_attention() -> None:
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
     cls = m.Qwen4ExpTextAttention
+    if hasattr(cls, "_hf_forward"):
+        cls.forward = cls._hf_forward
+
+
+def reference_indexer_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values):
+    """transformers' indexer output (an [B, 1, N, N] selection mask) built from select_blocks.
+
+    For end-to-end comparisons against the unpatched model: its per-query topk breaks the many ties
+    at score 0 its own way, so the reference attends to other blocks than any implementation of ours.
+    Everything downstream of the selection then runs transformers' code on the same selection."""
+    if past_key_values is not None or hidden_states.shape[0] != 1:
+        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+    n = hidden_states.shape[1]
+    cos, sin = (x[:, -n:, :] for x in position_embeddings)
+    tokens = select_tokens(self, hidden_states, cos, sin, SELECTION_CHUNK)
+    kv_length = attention_mask.shape[-1]
+    mask = torch.zeros((1, n, kv_length + 1), device=hidden_states.device, dtype=torch.bool)
+    mask = mask.scatter(-1, torch.where(tokens >= 0, tokens, kv_length)[None], True)[..., :kv_length].unsqueeze(1)
+    if attention_mask.is_floating_point():
+        mask = torch.where(mask, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
+    return mask
+
+
+def patch_reference_indexer() -> None:
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    cls = m.Qwen4ExpTextQSAIndexer
+    if not hasattr(cls, "_hf_forward"):
+        cls._hf_forward = cls.forward
+    cls.forward = reference_indexer_forward
+
+
+def unpatch_reference_indexer() -> None:
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    cls = m.Qwen4ExpTextQSAIndexer
     if hasattr(cls, "_hf_forward"):
         cls.forward = cls._hf_forward
