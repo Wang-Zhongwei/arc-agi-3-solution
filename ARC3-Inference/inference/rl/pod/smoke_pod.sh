@@ -35,10 +35,14 @@ log "phase 1: python packages"
 # the image's system Python is externally managed (PEP 668): a venv that still sees its torch
 [ -x "$VENV/bin/python" ] || python3 -m venv --system-site-packages "$VENV" || fail "venv"
 export PATH="$VENV/bin:$PATH"
-if ! python -c "import transformers, peft, auto_round, fla, tilelang; assert transformers.__version__ == '5.20.1'" 2>/dev/null; then
+hopper=$(python -c "import torch; print(int(torch.cuda.get_device_capability()[0] == 9))" 2>/dev/null || echo 0)
+need="import transformers, peft, auto_round, fla$([ "$hopper" = 1 ] && echo ", tilelang"); assert transformers.__version__ == '5.20.1'"
+if ! python -c "$need" 2>/dev/null; then
     python -m pip install -q -U pip
-    python -m pip install -q "transformers==5.20.1" peft accelerate auto-round kernels flash-linear-attention \
-        tilelang hf_transfer pillow numpy torchvision || fail "pip install"
+    # tilelang only for fla's GDN backward on Hopper (fla #640); WHEELS: a directory of wheels for hosts without PyPI
+    python -m pip install -q ${WHEELS:+--no-index --find-links "$WHEELS"} "transformers==5.20.1" peft accelerate \
+        auto-round flash-linear-attention hf_transfer pillow numpy torchvision $([ "$hopper" = 1 ] && echo tilelang) \
+        || fail "pip install"
 fi
 if [ -d tests ] && [ ! -e results/pytest.log ]; then  # the CUDA-only tests before the 5-minute load
     # only those: with fla installed, transformers sends the CPU tiny-model tests' GDN layers to

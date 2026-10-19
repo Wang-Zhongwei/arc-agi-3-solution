@@ -351,6 +351,13 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised.
     `keep_grads` keeps each step's LoRA gradients as "<keep_grads>/<spec>/<repeat>" for compare_grads.
     `gpu_keep_gb="auto"`: the first repeat offloads everything, later ones keep what its peak left free."""
+    import gc
+
+    # hand the caching allocator's free blocks back to the driver: Triton kernels (fla's GDN backward autotune)
+    # allocate outside it and ran out of memory on an A100 with 10 GB cached but unused
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     steps: dict[str, list] = {}
     for spec in specs:
         length, offload = int(spec.rstrip("o")), spec.endswith("o")
@@ -597,7 +604,9 @@ def serve(model, device, args, processor, tools, game) -> None:
     A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
     "adapter": "default" | "shared_expert", "profile": false, "transcript": "other_game.txt",
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
-    "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false},
+    "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
+    "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
+    "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer)},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
     host_offload.py and this module are reloaded before each job, so code fixes need no 5-minute
     model reload. Results go to NAME.result.json."""
@@ -623,11 +632,19 @@ def serve(model, device, args, processor, tools, game) -> None:
             patches = importlib.reload(importlib.import_module("inference.rl.layer_patches"))
             importlib.reload(importlib.import_module("inference.rl.host_offload"))
             module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
-            qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk), job.get("kv_grad_fp32", False))
-            if not args.no_layer_patches:
+            if job.get("reference"):  # the standard answer: transformers' QSA, layers and AutoRound's experts
+                qsa_module.unpatch_qsa_attention()
+                patches.unpatch(model)
+                result["layer_patches"] = "reference"
+            else:
+                qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk), job.get("kv_grad_fp32", False),
+                                               fused=job.get("qsa_fused", not args.no_qsa_kernel))
+            if not args.no_layer_patches and not job.get("reference"):
                 result["layer_patches"] = patches.patch_for_training(
                     model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile),
-                    job.get("recompute", args.recompute))
+                    job.get("recompute", args.recompute), compile_hc=job.get("compile_hc", args.compile_hc),
+                    compile_moe=job.get("compile_moe", args.compile_moe),
+                    cache_experts=job.get("cache_experts", True), fast_conv=job.get("fast_conv", args.fast_conv))
             if job.get("transcript"):
                 if job["transcript"] not in games:
                     games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))
@@ -703,6 +720,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-checkpointing", action="store_true")
     parser.add_argument("--reference-qsa", action="store_true", help="keep transformers' QSA (dense mask, slow)")
     parser.add_argument("--qsa-chunk", type=int, default=256, help="queries per chunk in our QSA")
+    parser.add_argument("--no-qsa-kernel", action="store_true", help="chunked PyTorch QSA instead of qsa_kernel")
+    parser.add_argument("--compile-hc", action="store_true", help="torch.compile the hyper-connections")
+    parser.add_argument("--compile-moe", action="store_true", help="torch.compile the MoE combine")
+    parser.add_argument("--fast-conv", action="store_true", help="channels-last GDN short convolution (compiled)")
     parser.add_argument("--serve", type=Path, help="after loading, run job files from this directory (see serve)")
     parser.add_argument("--no-layer-patches", action="store_true",
                         help="keep transformers' decoder layers and AutoRound's experts loop")
@@ -742,7 +763,7 @@ def main(argv: list[str] | None = None) -> int:
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
     if not args.reference_qsa:
-        patch_qsa_attention(args.qsa_chunk)
+        patch_qsa_attention(args.qsa_chunk, fused=not args.no_qsa_kernel)
     if not args.ple_in_ram:
         ple_mmap.install()  # before the device map and the load: transformers then skips the table's shards
     t0 = time.perf_counter()
@@ -794,8 +815,9 @@ def main(argv: list[str] | None = None) -> int:
     print("lora", report["lora"], flush=True)
     device = model.get_input_embeddings().weight.device
     if not args.no_layer_patches:
-        report["layer_patches"] = layer_patches.patch_for_training(model, args.token_chunk, args.expert_tile,
-                                                                   args.recompute)
+        report["layer_patches"] = layer_patches.patch_for_training(
+            model, args.token_chunk, args.expert_tile, args.recompute, compile_hc=args.compile_hc,
+            compile_moe=args.compile_moe, fast_conv=args.fast_conv)
         report["experts_check"] = layer_patches.check_experts(model)
         print("layer patches", report["layer_patches"], "experts check", report["experts_check"], flush=True)
         if report["experts_check"]["max_rel_error"] > 0.05:  # grouped experts disagree: keep AutoRound's
