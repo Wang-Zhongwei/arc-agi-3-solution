@@ -6,11 +6,18 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   grouped GEMMs (`torch._grouped_mm`, one call per projection per tile of experts)
   instead of a Python loop over 512 experts. AutoRound's own grouped path rejects its
   packed INT4 layers, so tiles of experts are dequantized to BF16 on the fly (the
-  weights serving uses) and freed after use.
+  weights serving uses). The last layer's dequantized tiles are cached: its token chunks and
+  the backward's recompute of them reuse one dequantization per pass instead of one per
+  chunk (~5 GB of BF16 experts held at a time; exact).
 - token chunks: everything in a decoder layer except the sequence mixer (GDN or QSA)
   and the PLE short convolution is per token (hyper-connections, router, experts,
   shared expert, injections). It runs in chunks of tokens, each under its own
   checkpoint, so that part's memory no longer grows with the sequence length.
+- compiled hyper-connections: the gated residuals around the mixer and the MLP (an FP32
+  grouped RMSNorm over N x 10,240, a low-rank mix, sigmoids, a 4-way weighted mean and the
+  injection back into the 4 streams) are dozens of small elementwise kernels in eager mode.
+  `compile_hc` runs them as two pure functions under torch.compile, shared by all layers
+  (weights are arguments), so each becomes a few fused kernels around the small GEMMs.
 - recompute "parts": transformers checkpoints every decoder layer, and the token chunks
   inside it are checkpointed again, so their forward runs three times per step. With
   "parts" the layer-level checkpoint is off and the mixer gets its own: every part is
@@ -22,11 +29,14 @@ Scope: batch 1, no cache (training). Anything else runs transformers' forward.
 
 from __future__ import annotations
 
+import weakref
+
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 EXPERTS_IMPLEMENTATION = "rft_grouped"
-_DEFAULTS = dict(token_chunk=8192, expert_tile=128, recompute="layer")
+_DEFAULTS = dict(token_chunk=8192, expert_tile=128, recompute="layer", compile_hc=False, cache_experts=True)
 RECOMPUTE_MODES = ("layer", "parts")
 
 
@@ -91,36 +101,281 @@ def expert_weights(experts, start: int, stop: int):
     return torch.cat([gate, up], dim=-1), down
 
 
+class _GatherRows(torch.autograd.Function):
+    """x[index] where every row of x appears exactly `k` times in index ([n * k] rows from [n, d]).
+
+    Autograd's backward for x[index] is a sort-based index_put with atomic accumulation; with
+    `inverse` (the token-order position of each gathered row: index[inverse] = arange(n * k) // k) it
+    is a gather and a fixed-order FP32 sum over the k copies instead."""
+
+    @staticmethod
+    def forward(ctx, x, index, inverse, k):
+        ctx.save_for_backward(inverse)
+        ctx.k = k
+        return x[index]
+
+    @staticmethod
+    def backward(ctx, grad):
+        (inverse,) = ctx.saved_tensors
+        rows = grad[inverse].float().view(-1, ctx.k, grad.shape[-1])
+        return rows.sum(dim=1).to(grad.dtype), None, None, None
+
+
+def gather_rows(x, index, inverse, k: int):
+    return _GatherRows.apply(x, index, inverse, k) if torch.is_grad_enabled() and x.requires_grad else x[index]
+
+
+class _PermuteRows(torch.autograd.Function):
+    """x[perm] for a permutation: the backward is the gather by the inverse permutation (no atomics)."""
+
+    @staticmethod
+    def forward(ctx, x, perm, inverse):
+        ctx.save_for_backward(perm)
+        return x[inverse]
+
+    @staticmethod
+    def backward(ctx, grad):
+        (perm,) = ctx.saved_tensors
+        return grad[perm], None, None
+
+
+class _LoopGroupedMM(torch.autograd.Function):
+    """Grouped GEMM as a loop of per-group matmuls (GPUs without torch._grouped_mm, e.g. A100).
+
+    transformers' fallback also computes every expert's weight gradient in backward; the experts
+    here are frozen (dequantized copies), so only the input gradient is computed."""
+
+    @staticmethod
+    def forward(ctx, x, weight, offsets):
+        ctx.save_for_backward(weight, offsets)
+        out = x.new_empty(x.shape[0], weight.shape[2])
+        start = 0
+        for i, end in enumerate(offsets.tolist()):
+            if end > start:
+                torch.mm(x[start:end], weight[i], out=out[start:end])
+            start = end
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        weight, offsets = ctx.saved_tensors
+        dx = grad.new_zeros(grad.shape[0], weight.shape[1])
+        start = 0
+        for i, end in enumerate(offsets.tolist()):
+            if end > start:
+                torch.mm(grad[start:end], weight[i].t(), out=dx[start:end])
+            start = end
+        return dx, None, None
+
+
+def grouped_mm(x, weight, offsets):
+    """x [rows sorted by group, in] @ weight [groups, in, out]; torch's grouped GEMM where it runs."""
+    from transformers.integrations.moe import _can_use_grouped_mm, _grouped_mm
+
+    if weight.requires_grad or _can_use_grouped_mm(x, weight, offsets):
+        return _grouped_mm(x, weight, offsets)
+    return _LoopGroupedMM.apply(x.to(weight.dtype), weight, offsets)
+
+
+# the BF16 expert tiles of the experts module used last: {"owner": weakref, (start, stop): (gate_up, down)}
+_EXPERT_CACHE: dict = {}
+
+
+def clear_expert_cache() -> None:
+    _EXPERT_CACHE.clear()
+
+
+def cached_expert_weights(experts, start: int, stop: int):
+    """expert_weights, kept for the experts module used last (one layer's BF16 experts at a time).
+
+    A decoder layer calls its experts once per token chunk, and backward recomputes the chunks of one
+    layer after another, so each pass over a layer dequantizes its experts once instead of per chunk."""
+    if not getattr(experts, "_rft_cache_experts", _DEFAULTS["cache_experts"]):
+        return expert_weights(experts, start, stop)
+    owner = _EXPERT_CACHE.get("owner")
+    if owner is None or owner() is not experts:
+        _EXPERT_CACHE.clear()
+        _EXPERT_CACHE["owner"] = weakref.ref(experts)
+    if (start, stop) not in _EXPERT_CACHE:
+        _EXPERT_CACHE[(start, stop)] = _assemble(experts, start, stop)
+    return _EXPERT_CACHE[(start, stop)]
+
+
+def _assemble(experts, start: int, stop: int):
+    """expert_weights for many experts, dequantized one tile at a time into preallocated tensors, so the
+    transient memory is one tile's (all 512 at once needed ~7 GB of temporaries next to the 5 GB result)."""
+    tile = getattr(experts, "_rft_expert_tile", _DEFAULTS["expert_tile"])
+    trainable = any(p.requires_grad for p in experts.parameters())  # BF16 parameters: views, keep autograd
+    if stop - start <= tile or trainable:
+        return expert_weights(experts, start, stop)
+    gate_up = down = None
+    for first in range(start, stop, tile):
+        last = min(stop, first + tile)
+        g, d = expert_weights(experts, first, last)
+        if gate_up is None:
+            gate_up = g.new_empty((stop - start, *g.shape[1:]))
+            down = d.new_empty((stop - start, *d.shape[1:]))
+        gate_up[first - start:last - start] = g
+        down[first - start:last - start] = d
+        del g, d
+    return gate_up, down
+
+
+def moe_combine(rows, weights):
+    """Each token's k expert outputs ([1, n, k, d] in token order) times their routing weights ([1, n, k]),
+    summed in FP32 in a fixed order. A BF16 index_add here adds in a different order every run (CUDA
+    atomics), so the forward differed between identical steps and near-tied routing flipped further down."""
+    return (rows.float() * weights.unsqueeze(-1).float()).sum(dim=2)
+
+
 def grouped_experts_forward(self, hidden_states, top_k_index, top_k_weights):
     """Routed experts as grouped GEMMs over tiles of experts; same result as the per-expert loop."""
-    from transformers.integrations.moe import _grouped_mm
+    _grouped_mm = grouped_mm
 
     tile = getattr(self, "_rft_expert_tile", _DEFAULTS["expert_tile"])
     n, k = top_k_index.shape
     flat_ids = top_k_index.reshape(-1)
     order = torch.argsort(flat_ids, stable=True)
-    tokens = order // k
+    inverse = torch.argsort(order)
+    rows = gather_rows(hidden_states, order // k, inverse, k)
+    compiled = getattr(self, "_rft_compile_moe", False) and rows.is_cuda
+
+    def combine(out):  # undo the sort (a gather both ways), then weight and sum
+        rows = _PermuteRows.apply(out, order, inverse).view(1, n, k, -1)
+        if compiled:
+            return static_call("moe_combine", n, (rows, top_k_weights[None]))[0].to(hidden_states.dtype)
+        return moe_combine(rows, top_k_weights[None])[0].to(hidden_states.dtype)
+
+    if getattr(self, "_rft_cache_experts", _DEFAULTS["cache_experts"]):
+        # all experts are cached anyway: one grouped GEMM per projection, offsets computed on the GPU
+        # (no host sync, no concatenation of per-tile outputs)
+        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=flat_ids.device)
+        counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32))
+        offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+        gate_up, down = cached_expert_weights(self, 0, self.num_experts)
+        return combine(_grouped_mm(self._apply_gate(_grouped_mm(rows, gate_up, offsets)), down, offsets))
     counts = torch.bincount(flat_ids, minlength=self.num_experts)
     bounds = torch.cumsum(counts, 0).tolist()  # one host sync per call
-    rows = hidden_states[tokens]
     outputs, first_row = [], 0
     for start in range(0, self.num_experts, tile):
         stop = min(self.num_experts, start + tile)
         last_row = bounds[stop - 1]
         if last_row > first_row:
-            gate_up, down = expert_weights(self, start, stop)
+            gate_up, down = cached_expert_weights(self, start, stop)
             offsets = torch.cumsum(counts[start:stop], 0).to(torch.int32)
             gated = self._apply_gate(_grouped_mm(rows[first_row:last_row], gate_up, offsets))
             outputs.append(_grouped_mm(gated, down, offsets))
         first_row = last_row
-    out = torch.cat(outputs) if outputs else rows[:0]
-    # combine each token's k expert outputs in FP32 and in a fixed order: undo the sort with a gather,
-    # then sum over k. A BF16 index_add here adds in a different order every run (CUDA atomics), so the
-    # forward differed between identical steps and near-tied routing flipped further down
-    out = out.float() * top_k_weights.reshape(-1)[order].unsqueeze(-1).float()
-    out = out[torch.argsort(order)].view(n, k, -1).sum(dim=1)
-    return out.to(hidden_states.dtype)
+    return combine(torch.cat(outputs) if outputs else rows[:0])
 
+
+# ---------------------------------------------------------------------------
+# Hyper-connections as pure functions (compiled once for all layers)
+# ---------------------------------------------------------------------------
+
+def _gated_residual(x, norm_weight, down, up, inject, eps: float, hc: int):
+    """Qwen4ExpTextGatedResidual.forward without the module: (mixed input [.., hidden], injection weights [.., hc])."""
+    xf = x.float().unflatten(-1, (hc, -1))
+    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    normed = (normed.flatten(-2) * (1.0 + norm_weight.float())).to(x.dtype)
+    mix = F.silu(F.linear(normed, down) / hc)
+    mix = torch.sigmoid(F.linear(mix, up))
+    mixed = (mix.unflatten(-1, (hc, -1)) * normed.unflatten(-1, (hc, -1))).mean(dim=-2)
+    weights = 2 * torch.sigmoid(F.linear(normed, inject) / hc)
+    return mixed, weights
+
+
+def _hc_args(module):
+    return (module.hc_norm.weight, module.input_mix_weight_down.weight, module.input_mix_weight_up.weight,
+            module.block_inject_weight.weight)
+
+
+def hc_before_mixer(x, norm_weight, down, up, inject, eps: float, hc: int):
+    return _gated_residual(x, norm_weight, down, up, inject, eps, hc)
+
+
+def hc_after_mixer(x, mixer_out, mixer_weights, norm_weight, down, up, inject, eps: float, hc: int):
+    """Inject the mixer output into the streams, then the MLP's gated residual: (streams, mlp input, weights)."""
+    x = x + (mixer_out.unsqueeze(-2) * mixer_weights.unsqueeze(-1)).flatten(-2)
+    mlp_in, weights = _gated_residual(x, norm_weight, down, up, inject, eps, hc)
+    return x, mlp_in, weights
+
+
+def hc_inject(x, out, weights):
+    return x + (out.unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
+
+
+_COMPILED: dict = {}
+
+
+def _hc_fn(name: str, compiled: bool, dynamic: bool = False):
+    fn = globals()[name]
+    if not compiled:
+        return fn
+    if (name, dynamic) not in _COMPILED:
+        _COMPILED[name, dynamic] = torch.compile(fn, dynamic=dynamic)
+    return _COMPILED[name, dynamic]
+
+
+def _bucket(n: int) -> int:
+    """Token count a compiled per-token function runs at: the next power of two, at least 512."""
+    return max(512, 1 << (n - 1).bit_length())
+
+
+def _pad_tokens(t, dim: int, size: int):
+    extra = size - t.shape[dim]
+    return t if extra == 0 else F.pad(t, [0, 0] * (t.dim() - dim - 1) + [0, extra])
+
+
+def static_call(name: str, n: int, tokens: tuple, weights: tuple = (), **constants):
+    """A compiled per-token function on `tokens` ([1, n, ...]) zero-padded to _bucket(n), outputs cut back.
+
+    Static graphs, one per bucket (at most 5 for 8,192-token chunks), keep each chunk's checkpoint
+    recompute on the same kernels as its forward. Automatic dynamic shapes would switch the 8,192
+    chunks from a static graph in forward to a dynamic one in recompute once a shorter last chunk
+    recompiled, and fully dynamic graphs were ~12% slower (GDN layer 1.03 -> 1.17 s on an A100).
+    Padding is exact: every function here works token by token."""
+    size = _bucket(n)
+    out = _hc_fn(name, True)(*(_pad_tokens(t, 1, size) for t in tokens), *weights, **constants)
+    return tuple(o[:, :n] for o in out) if isinstance(out, tuple) else out[:, :n]
+
+
+
+# ---------------------------------------------------------------------------
+# GDN short convolution, channels last
+# ---------------------------------------------------------------------------
+
+def short_conv(x, weight, bias, silu: bool):
+    """Depthwise causal convolution over [B, T, C] (channels last) with FP32 accumulation, then SiLU.
+
+    transformers' fallback (no causal_conv1d package) runs F.conv1d on a [B, C, T] view of the
+    projection, so the input and the output are each copied to another layout (forward, recompute
+    and backward). Four shifted multiply-adds in the projection's own layout need no copy and
+    compile to one kernel. Same result up to BF16 rounding of the sum."""
+    k, t = weight.shape[-1], x.shape[1]
+    padded = F.pad(x, (0, 0, k - 1, 0))
+    w = weight.reshape(weight.shape[0], k).float()
+    out = padded[:, 0:t].float() * w[:, 0]
+    for i in range(1, k):
+        out = out + padded[:, i:i + t].float() * w[:, i]
+    if bias is not None:
+        out = out + bias.float()
+    out = out.to(x.dtype)
+    return F.silu(out) if silu else out
+
+
+_FAST_CONV = {"on": False}
+
+
+def _causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwargs):
+    """Drop-in for modeling_qwen4_exp.causal_conv1d_fn ([B, C, T] in and out) on CUDA when enabled."""
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    if not (_FAST_CONV["on"] and hidden_states.is_cuda and activation in (None, "silu")):
+        return m._rft_hf_causal_conv1d_fn(hidden_states, weight, bias=bias, activation=activation, **kwargs)
+    # the whole sequence (not chunked): one dynamic graph for every length
+    out = _hc_fn("short_conv", True, dynamic=True)(hidden_states.transpose(1, 2), weight, bias, activation == "silu")
+    return out.transpose(1, 2)
 
 # ---------------------------------------------------------------------------
 # Token-chunked decoder layer
@@ -132,9 +387,10 @@ def _chunked(fn, *tensors, size: int):
     if n <= size:
         pieces = [checkpoint(fn, *tensors, use_reentrant=False) if torch.is_grad_enabled() else fn(*tensors)]
     else:
+        # split, not slicing: each slice's backward would build a zero tensor of the whole sequence and the
+        # chunks' gradients would be added up one by one; split's backward concatenates them once
         pieces = []
-        for start in range(0, n, size):
-            part = [t[:, start:start + size] for t in tensors]
+        for part in zip(*(t.split(size, dim=1) for t in tensors)):
             pieces.append(checkpoint(fn, *part, use_reentrant=False) if torch.is_grad_enabled() else fn(*part))
     if isinstance(pieces[0], tuple):
         return tuple(torch.cat(p, dim=1) for p in zip(*pieces))
@@ -154,8 +410,14 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
             else ple(hidden_states, ple_input_ids)
         hidden_states = hidden_states + extra
 
+    compiled = getattr(self, "_rft_compile_hc", False) and hidden_states.is_cuda
+    attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
+    hc_kw = dict(eps=attn_hc.hc_norm.eps, hc=attn_hc.hc_count)
+
     def before_mixer(h):
-        mixed, _, weights = self.attn_hyper_connection(h)
+        if compiled:
+            return static_call("hc_before_mixer", h.shape[1], (h,), _hc_args(attn_hc), **hc_kw)
+        mixed, _, weights = attn_hc(h)
         return mixed, weights
 
     mixed, inject = _chunked(before_mixer, hidden_states, size=size)
@@ -172,8 +434,13 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
         mixed = mixer(mixed)
 
     def after_mixer(h, mixer_out, weights):
+        if compiled:
+            n = h.shape[1]
+            h, mlp_in, mlp_weights = static_call("hc_after_mixer", n, (h, mixer_out, weights), _hc_args(mlp_hc),
+                                                 **hc_kw)
+            return static_call("hc_inject", n, (h, self.mlp(mlp_in), mlp_weights))
         h = h + (mixer_out.unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
-        mlp_in, hyper, mlp_weights = self.mlp_hyper_connection(h)
+        mlp_in, hyper, mlp_weights = mlp_hc(h)
         mlp_out = self.mlp(mlp_in)
         return hyper + (mlp_out.unsqueeze(-2) * mlp_weights.unsqueeze(-1)).flatten(-2)
 
@@ -185,8 +452,10 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
 # ---------------------------------------------------------------------------
 
 def configure(model, token_chunk: int | None = None, expert_tile: int | None = None,
-              recompute: str | None = None) -> None:
-    """Set the chunk sizes (lower them after an OOM) and the recompute mode on every patched module."""
+              recompute: str | None = None, compile_hc: bool | None = None, compile_moe: bool | None = None,
+              cache_experts: bool | None = None) -> None:
+    """Set the chunk sizes (lower them after an OOM), the recompute mode and compiled hyper-connections
+    on every patched module."""
     if recompute is not None and recompute not in RECOMPUTE_MODES:
         raise ValueError(f"recompute must be one of {RECOMPUTE_MODES}, got {recompute!r}")
     for module in model.modules():
@@ -194,13 +463,20 @@ def configure(model, token_chunk: int | None = None, expert_tile: int | None = N
         if name == "Qwen4ExpTextDecoderLayer":
             if token_chunk:
                 module._rft_token_chunk = token_chunk
+            if compile_hc is not None:
+                module._rft_compile_hc = compile_hc
             if recompute:
                 if not hasattr(module, "_rft_layer_checkpointing"):  # what gradient_checkpointing_enable set
                     module._rft_layer_checkpointing = getattr(module, "gradient_checkpointing", False)
                 module._rft_recompute = recompute if module._rft_layer_checkpointing else "layer"
                 module.gradient_checkpointing = module._rft_layer_checkpointing and recompute == "layer"
-        elif name == "Qwen4ExpTextExperts" and expert_tile:
-            module._rft_expert_tile = expert_tile
+        elif name == "Qwen4ExpTextExperts":
+            if expert_tile:
+                module._rft_expert_tile = expert_tile
+            if compile_moe is not None:
+                module._rft_compile_moe = compile_moe
+            if cache_experts is not None:
+                module._rft_cache_experts = cache_experts
 
 
 def current_recompute(model) -> str:
@@ -212,7 +488,9 @@ def current_recompute(model) -> str:
 
 
 def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
-                       expert_tile: int = _DEFAULTS["expert_tile"], recompute: str = _DEFAULTS["recompute"]) -> dict:
+                       expert_tile: int = _DEFAULTS["expert_tile"], recompute: str = _DEFAULTS["recompute"],
+                       compile_hc: bool = _DEFAULTS["compile_hc"], compile_moe: bool = False,
+                       cache_experts: bool = _DEFAULTS["cache_experts"], fast_conv: bool = False) -> dict:
     """Route qwen4_exp experts through grouped GEMMs and chunk decoder layers over tokens.
 
     Call it after gradient_checkpointing_enable(): `recompute="parts"` replaces the layer-level
@@ -235,17 +513,33 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     if not hasattr(layer, "_hf_forward"):
         layer._hf_forward = layer.forward
     layer.forward = chunked_decoder_forward
-    configure(model, token_chunk, expert_tile, recompute)
+    if not hasattr(m, "_rft_hf_causal_conv1d_fn"):
+        m._rft_hf_causal_conv1d_fn = m.causal_conv1d_fn
+    m.causal_conv1d_fn = _causal_conv1d_fn
+    _FAST_CONV["on"] = fast_conv
+    configure(model, token_chunk, expert_tile, recompute, compile_hc, compile_moe, cache_experts)
     return dict(experts_implementation=EXPERTS_IMPLEMENTATION, configs=len(configs), token_chunk=token_chunk,
-                expert_tile=expert_tile, recompute=current_recompute(model))
+                expert_tile=expert_tile, recompute=current_recompute(model), compile_hc=compile_hc,
+                compile_moe=compile_moe, cache_experts=cache_experts, fast_conv=fast_conv)
 
 
 def unpatch(model=None) -> None:
+    """Back to transformers' decoder layers, short convolution and (with `model`) the experts' previous
+    implementation, with layer-level checkpointing: the reference the patches are checked against."""
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    if model is not None:
+        configure(model, recompute="layer")
+        for module in model.modules():
+            if isinstance(module, m.Qwen4ExpTextExperts) and hasattr(module, "_rft_previous_implementation"):
+                module.config._experts_implementation = module._rft_previous_implementation
+        clear_expert_cache()
 
     layer = m.Qwen4ExpTextDecoderLayer
     if hasattr(layer, "_hf_forward"):
         layer.forward = layer._hf_forward
+    if hasattr(m, "_rft_hf_causal_conv1d_fn"):
+        m.causal_conv1d_fn = m._rft_hf_causal_conv1d_fn
 
 
 @torch.no_grad()

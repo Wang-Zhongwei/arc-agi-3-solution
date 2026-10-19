@@ -25,10 +25,14 @@ def tiny():
     return AutoModelForImageTextToText.from_config(config, dtype=torch.float32)
 
 
-def test_grouped_experts_match_the_loop():
+@pytest.mark.parametrize("cache", [True, False])
+def test_grouped_experts_match_the_loop(cache):
+    """Cached: all experts in one grouped GEMM; not cached: tiles of experts, one partial."""
     model = tiny()
     experts = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextExperts))
     experts._rft_expert_tile = 3  # several tiles, one partial
+    experts._rft_cache_experts = cache
+    layer_patches.clear_expert_cache()
     x = torch.randn(40, experts.hidden_dim)
     index = torch.stack([torch.randperm(8)[:3] for _ in range(40)])
     weights = torch.softmax(torch.randn(40, 3), -1)
@@ -130,3 +134,73 @@ def test_parts_recompute_matches_and_runs_the_experts_twice():
     for name in grads:
         torch.testing.assert_close(grads[name], ref_grads[name], rtol=0, atol=0, msg=name)
 
+
+
+def test_hyper_connection_functions_match_the_modules():
+    """The pure functions compile_hc compiles compute exactly what Qwen4ExpTextGatedResidual does."""
+    model = tiny().to(torch.bfloat16)
+    layer = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextDecoderLayer))
+    attn_hc, mlp_hc = layer.attn_hyper_connection, layer.mlp_hyper_connection
+    kw = dict(eps=attn_hc.hc_norm.eps, hc=attn_hc.hc_count)
+    with torch.no_grad():
+        for p in (*attn_hc.parameters(), *mlp_hc.parameters()):
+            p.normal_(0, 0.1)  # norm weights start at 0: make them count
+    x = torch.randn(2, 7, attn_hc.hc_count * attn_hc.hidden_size, dtype=torch.bfloat16)
+    mixer_out = torch.randn(2, 7, attn_hc.hidden_size, dtype=torch.bfloat16)
+    with torch.no_grad():
+        mixed, _, weights = attn_hc(x)
+        ours = layer_patches.hc_before_mixer(x, *layer_patches._hc_args(attn_hc), **kw)
+        assert torch.equal(ours[0], mixed) and torch.equal(ours[1], weights)
+        h = x + (mixer_out.unsqueeze(-2) * weights.unsqueeze(-1)).flatten(-2)
+        mlp_in, _, mlp_weights = mlp_hc(h)
+        h2, ours_in, ours_weights = layer_patches.hc_after_mixer(x, mixer_out, weights,
+                                                                 *layer_patches._hc_args(mlp_hc), **kw)
+        assert torch.equal(h2, h) and torch.equal(ours_in, mlp_in) and torch.equal(ours_weights, mlp_weights)
+
+
+def test_short_conv_matches_conv1d():
+    """The channels-last GDN short convolution computes transformers' F.conv1d fallback."""
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as mm
+
+    reference_fn = getattr(mm, "_rft_hf_causal_conv1d_fn", mm.causal_conv1d_fn)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 37, 24, generator=g)  # [B, T, C], as the projection produces it
+    weight = torch.randn(24, 4, generator=g)
+    reference = reference_fn(x.transpose(1, 2), weight, None, activation="silu").transpose(1, 2)
+    ours = layer_patches.short_conv(x, weight, None, silu=True)
+    torch.testing.assert_close(ours, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_loop_grouped_mm_matches_per_group_matmuls():
+    """The dX-only grouped GEMM (GPUs without torch._grouped_mm, frozen experts) equals per-group matmuls,
+    forward and input gradient, including an empty group."""
+    g = torch.Generator().manual_seed(0)
+    offsets = torch.tensor([3, 3, 8, 10], dtype=torch.int32)  # group 1 is empty
+    x = torch.randn(10, 6, generator=g)
+    w = torch.randn(4, 6, 7, generator=g)  # frozen: no gradient wanted
+    upstream = torch.randn(10, 7, generator=g)
+    starts = [0, *offsets[:-1].tolist()]
+
+    xr = x.clone().requires_grad_(True)
+    reference = torch.cat([xr[s:e] @ w[i] for i, (s, e) in enumerate(zip(starts, offsets.tolist()))])
+    (reference * upstream).sum().backward()
+    xo = x.clone().requires_grad_(True)
+    ours = layer_patches._LoopGroupedMM.apply(xo, w, offsets)
+    (ours * upstream).sum().backward()
+    assert torch.equal(ours, reference)
+    assert torch.equal(xo.grad, xr.grad)
+
+
+def test_unpatch_restores_transformers():
+    """unpatch(model) (the job server's reference mode) runs exactly transformers' layers and experts again."""
+    model = tiny().eval()
+    ids = torch.randint(0, 1000, (1, 40), generator=torch.Generator().manual_seed(3))
+    with torch.no_grad():
+        before = model(input_ids=ids, use_cache=False).logits
+    layer_patches.patch_for_training(model, token_chunk=16)
+    layer_patches.unpatch(model)
+    experts = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextExperts))
+    assert experts.config._experts_implementation != layer_patches.EXPERTS_IMPLEMENTATION
+    with torch.no_grad():
+        after = model(input_ids=ids, use_cache=False).logits
+    assert torch.equal(before, after)
