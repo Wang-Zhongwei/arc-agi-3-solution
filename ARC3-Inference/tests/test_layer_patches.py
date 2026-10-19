@@ -204,3 +204,39 @@ def test_unpatch_restores_transformers():
     with torch.no_grad():
         after = model(input_ids=ids, use_cache=False).logits
     assert torch.equal(before, after)
+
+
+def test_ngram_lookup_runs_once_per_step():
+    """With gradient checkpointing the PLE block is recomputed in backward; its n-gram lookup (a host-side
+    gather of the memory-mapped table) is reused instead of repeated, with identical logits and gradients."""
+    ids = torch.randint(0, 1000, (1, 50), generator=torch.Generator().manual_seed(5))
+
+    def run(patched):
+        model = tiny().train()
+        for module in model.modules():  # frozen, as in LoRA training
+            if isinstance(module, m.Qwen4ExpTextNGramEmbedding):
+                module.ngram_embedding.weight.requires_grad_(False)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        layer_patches.patch_for_training(model, token_chunk=16, recompute="parts")
+        if not patched:  # transformers' lookup every time, through _hf_forward so it is counted
+            m.Qwen4ExpTextNGramEmbedding.forward = lambda self, *a, **k: type(self)._hf_forward(self, *a, **k)
+        calls = []
+        hf = m.Qwen4ExpTextNGramEmbedding._hf_forward
+        m.Qwen4ExpTextNGramEmbedding._hf_forward = lambda *a, **k: calls.append(1) or hf(*a, **k)
+        try:
+            logits = model(input_ids=ids, use_cache=False).logits
+            logits.float().pow(2).mean().backward()
+        finally:
+            m.Qwen4ExpTextNGramEmbedding._hf_forward = hf
+            layer_patches.unpatch(model)
+        grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+        return logits.detach(), grads, len(calls)
+
+    ref_logits, ref_grads, ref_calls = run(patched=False)
+    logits, grads, calls = run(patched=True)
+    ple_layers = sum(1 for x in tiny().modules() if isinstance(x, m.Qwen4ExpTextNGramEmbedding))
+    assert ref_calls == 2 * ple_layers and calls == ple_layers
+    assert torch.equal(logits, ref_logits)
+    assert grads.keys() == ref_grads.keys()
+    for name in grads:
+        assert torch.equal(grads[name], ref_grads[name]), name

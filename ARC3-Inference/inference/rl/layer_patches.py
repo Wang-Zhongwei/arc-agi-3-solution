@@ -9,6 +9,8 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   weights serving uses). The last layer's dequantized tiles are cached: its token chunks and
   the backward's recompute of them reuse one dequantization per pass instead of one per
   chunk (~5 GB of BF16 experts held at a time; exact).
+- PLE n-gram lookup: the host-side table gather runs once per step; the PLE checkpoint's
+  recompute reuses the forward's result (exact).
 - token chunks: everything in a decoder layer except the sequence mixer (GDN or QSA)
   and the PLE short convolution is per token (hyper-connections, router, experts,
   shared expert, injections). It runs in chunks of tokens, each under its own
@@ -377,6 +379,27 @@ def _causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwarg
     out = _hc_fn("short_conv", True, dynamic=True)(hidden_states.transpose(1, 2), weight, bias, activation == "silu")
     return out.transpose(1, 2)
 
+
+# ---------------------------------------------------------------------------
+# PLE n-gram lookup, once per step
+# ---------------------------------------------------------------------------
+
+def ngram_embedding_forward(self, input_ids, past_key_values):
+    """transformers' n-gram lookup, reused by the checkpoint recompute.
+
+    The lookup depends only on the token ids, and its table is frozen and memory-mapped on the host
+    (ple_mmap): a 64K pass gathers rows on the CPU for ~0.46 s, and the PLE checkpoint ran it again in
+    backward. The forward keeps its output (N x 2,560, 335 MB at 64K) until the recompute takes it."""
+    if past_key_values is not None or not torch.is_grad_enabled() or self.ngram_embedding.weight.requires_grad:
+        return type(self)._hf_forward(self, input_ids, past_key_values)  # a trainable table saves its indices
+    cached = getattr(self, "_rft_ngram_cache", None)
+    self._rft_ngram_cache = None
+    if cached is not None and cached[0]() is input_ids:
+        return cached[1]
+    out = type(self)._hf_forward(self, input_ids, past_key_values)
+    self._rft_ngram_cache = (weakref.ref(input_ids), out)
+    return out
+
 # ---------------------------------------------------------------------------
 # Token-chunked decoder layer
 # ---------------------------------------------------------------------------
@@ -513,6 +536,10 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     if not hasattr(layer, "_hf_forward"):
         layer._hf_forward = layer.forward
     layer.forward = chunked_decoder_forward
+    ngram = m.Qwen4ExpTextNGramEmbedding
+    if not hasattr(ngram, "_hf_forward"):
+        ngram._hf_forward = ngram.forward
+    ngram.forward = ngram_embedding_forward
     if not hasattr(m, "_rft_hf_causal_conv1d_fn"):
         m._rft_hf_causal_conv1d_fn = m.causal_conv1d_fn
     m.causal_conv1d_fn = _causal_conv1d_fn
@@ -540,6 +567,8 @@ def unpatch(model=None) -> None:
         layer.forward = layer._hf_forward
     if hasattr(m, "_rft_hf_causal_conv1d_fn"):
         m.causal_conv1d_fn = m._rft_hf_causal_conv1d_fn
+    if hasattr(m.Qwen4ExpTextNGramEmbedding, "_hf_forward"):
+        m.Qwen4ExpTextNGramEmbedding.forward = m.Qwen4ExpTextNGramEmbedding._hf_forward
 
 
 @torch.no_grad()
