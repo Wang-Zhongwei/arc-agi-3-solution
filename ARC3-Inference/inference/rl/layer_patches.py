@@ -9,6 +9,8 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   weights serving uses). The last layer's dequantized tiles are cached: its token chunks and
   the backward's recompute of them reuse one dequantization per pass instead of one per
   chunk (~5 GB of BF16 experts held at a time; exact).
+- fast_lora: peft's LoRA update (FP32 adapter on a BF16 base output) as one compiled function
+  instead of FP32 intermediates the size of the output.
 - PLE n-gram lookup: the host-side table gather runs once per step; the PLE checkpoint's
   recompute reuses the forward's result (exact).
 - token chunks: everything in a decoder layer except the sequence mixer (GDN or QSA)
@@ -385,6 +387,47 @@ def _causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwarg
 
 
 # ---------------------------------------------------------------------------
+# LoRA branch, fused
+# ---------------------------------------------------------------------------
+
+def lora_add(result, x, a, b, scaling: float):
+    """PEFT's vanilla LoRA update, op for op: the adapter runs in its own dtype (FP32 by default), the BF16
+    base output is promoted for the sum and the sum is rounded back once."""
+    return (result + F.linear(F.linear(x.to(a.dtype), a), b) * scaling).to(result.dtype)
+
+
+_FAST_LORA = {"on": False}
+
+
+def lora_linear_forward(self, x, *args, **kwargs):
+    """peft's lora.Linear forward with the update as one compiled function on CUDA (`fast_lora`).
+
+    PEFT materializes the adapter output and the promoted sum in FP32 ([N, 10,240] for in_proj_qkv)
+    and casts the result back: three full passes over the output per LoRA module per pass. Compiled,
+    the casts, scaling and sum fuse around the two small GEMMs. Anything but a single vanilla adapter
+    without dropout or bias (merged, disabled, variants, mixed batches) keeps PEFT's forward."""
+    names = [n for n in self.active_adapters if n in self.lora_A.keys()]
+    if (not _FAST_LORA["on"] or args or kwargs or self.disable_adapters or self.merged or len(names) != 1
+            or names[0] in self.lora_variant or not isinstance(self.lora_dropout[names[0]], torch.nn.Identity)
+            or self.lora_A[names[0]].bias is not None or self.lora_B[names[0]].bias is not None
+            or not getattr(self, "cast_input_dtype_enabled", True)):
+        return type(self)._rft_peft_forward(self, x, *args, **kwargs)
+    name = names[0]
+    fn = _hc_fn("lora_add", x.is_cuda, dynamic=True)  # token counts vary per sample: one dynamic graph
+    return fn(self.base_layer(x), x, self.lora_A[name].weight, self.lora_B[name].weight, float(self.scaling[name]))
+
+
+def patch_lora(on: bool) -> None:
+    """Route peft's lora.Linear through lora_linear_forward (a no-op unless `on`)."""
+    from peft.tuners.lora.layer import Linear
+
+    if not hasattr(Linear, "_rft_peft_forward"):
+        Linear._rft_peft_forward = Linear.forward
+    Linear.forward = lora_linear_forward
+    _FAST_LORA["on"] = on
+
+
+# ---------------------------------------------------------------------------
 # PLE n-gram lookup, once per step
 # ---------------------------------------------------------------------------
 
@@ -517,7 +560,8 @@ def current_recompute(model) -> str:
 def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
                        expert_tile: int = _DEFAULTS["expert_tile"], recompute: str = _DEFAULTS["recompute"],
                        compile_hc: bool = _DEFAULTS["compile_hc"], compile_moe: bool = False,
-                       cache_experts: bool = _DEFAULTS["cache_experts"], fast_conv: bool = False) -> dict:
+                       cache_experts: bool = _DEFAULTS["cache_experts"], fast_conv: bool = False,
+                       fast_lora: bool = False) -> dict:
     """Route qwen4_exp experts through grouped GEMMs and chunk decoder layers over tokens.
 
     Call it after gradient_checkpointing_enable(): `recompute="parts"` replaces the layer-level
@@ -548,10 +592,14 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
         m._rft_hf_causal_conv1d_fn = m.causal_conv1d_fn
     m.causal_conv1d_fn = _causal_conv1d_fn
     _FAST_CONV["on"] = fast_conv
+    try:
+        patch_lora(fast_lora)
+    except ImportError:  # no peft
+        pass
     configure(model, token_chunk, expert_tile, recompute, compile_hc, compile_moe, cache_experts)
     return dict(experts_implementation=EXPERTS_IMPLEMENTATION, configs=len(configs), token_chunk=token_chunk,
                 expert_tile=expert_tile, recompute=current_recompute(model), compile_hc=compile_hc,
-                compile_moe=compile_moe, cache_experts=cache_experts, fast_conv=fast_conv)
+                compile_moe=compile_moe, cache_experts=cache_experts, fast_conv=fast_conv, fast_lora=fast_lora)
 
 
 def unpatch(model=None) -> None:
@@ -573,6 +621,7 @@ def unpatch(model=None) -> None:
         m.causal_conv1d_fn = m._rft_hf_causal_conv1d_fn
     if hasattr(m.Qwen4ExpTextNGramEmbedding, "_hf_forward"):
         m.Qwen4ExpTextNGramEmbedding.forward = m.Qwen4ExpTextNGramEmbedding._hf_forward
+    _FAST_LORA["on"] = False  # peft's own LoRA forward
 
 
 @torch.no_grad()

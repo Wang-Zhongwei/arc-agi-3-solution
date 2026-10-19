@@ -240,3 +240,41 @@ def test_ngram_lookup_runs_once_per_step():
     assert grads.keys() == ref_grads.keys()
     for name in grads:
         assert torch.equal(grads[name], ref_grads[name]), name
+
+
+def test_fast_lora_matches_peft(monkeypatch):
+    """fast_lora's update (eager on CPU; compiled on CUDA) is peft's op for op: identical logits and gradients
+    (LoRA, base and input), with an FP32 adapter on a BF16 model as in training."""
+    peft = pytest.importorskip("peft")
+    calls = []
+    lora_add = layer_patches.lora_add
+    monkeypatch.setattr(layer_patches, "lora_add", lambda *a, **k: calls.append(1) or lora_add(*a, **k))
+    from inference.rl.smoke_lora import ATTENTION_GDN
+
+    def run(fast):
+        model = tiny().to(torch.bfloat16).train()
+        peft.inject_adapter_in_model(peft.LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+                                                     target_modules=ATTENTION_GDN), model)
+        torch.manual_seed(1)
+        for name, p in model.named_parameters():
+            p.requires_grad_("lora_" in name)
+            if "lora_" in name:
+                p.data = (torch.randn_like(p, dtype=torch.float32) * 0.05)  # FP32 adapters, B non-zero
+        layer_patches.patch_for_training(model, token_chunk=16, fast_lora=fast)
+        ids = torch.randint(0, 1000, (1, 40), generator=torch.Generator().manual_seed(7))
+        try:
+            logits = model(input_ids=ids, use_cache=False).logits
+            logits.float().pow(2).mean().backward()
+        finally:
+            layer_patches.unpatch(model)
+        return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+    reference, ref_grads = run(False)
+    assert not calls
+    ours, grads = run(True)
+    modules = 3 * 5 + 1 * 4  # 3 GDN layers x 5 LoRA projections + 1 QSA layer x 4 (no checkpointing: one call each)
+    assert len(calls) == modules  # every LoRA module took the fused path
+    assert torch.equal(ours, reference)
+    assert grads.keys() == ref_grads.keys() and len(grads) > 10
+    for name in grads:
+        assert torch.equal(grads[name], ref_grads[name]), name

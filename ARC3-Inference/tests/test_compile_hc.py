@@ -71,3 +71,34 @@ def test_compiled_layer_is_as_accurate_as_eager():
     for name in reference:
         assert rel(compiled[name], reference[name]) <= 1.5 * rel(eager[name], reference[name]) + 1e-3, \
             (name, rel(compiled[name], reference[name]), rel(eager[name], reference[name]))
+
+
+def test_compiled_lora_matches_peft():
+    """fast_lora compiled on CUDA against peft's forward: same math, rounding may differ by fused ops."""
+    peft = pytest.importorskip("peft")
+    from inference.rl.smoke_lora import ATTENTION_GDN
+
+    def run(fast):
+        model = tiny().to("cuda", torch.bfloat16).train()
+        peft.inject_adapter_in_model(peft.LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, bias="none",
+                                                     target_modules=ATTENTION_GDN), model)
+        torch.manual_seed(1)
+        for name, p in model.named_parameters():
+            p.requires_grad_("lora_" in name)
+            if "lora_" in name:
+                p.data = torch.randn_like(p, dtype=torch.float32) * 0.05
+        layer_patches.patch_for_training(model, token_chunk=64, fast_lora=fast)
+        ids = torch.randint(0, 1000, (1, 150), generator=torch.Generator().manual_seed(7)).cuda()
+        try:
+            logits = model(input_ids=ids, use_cache=False).logits
+            logits.float().pow(2).mean().backward()
+        finally:
+            layer_patches.unpatch(model)
+        return logits.detach().float(), {n: p.grad.float() for n, p in model.named_parameters() if p.grad is not None}
+
+    reference, ref_grads = run(False)
+    ours, grads = run(True)
+    assert rel(ours, reference) < 1e-3
+    assert grads.keys() == ref_grads.keys()
+    for name in grads:
+        assert rel(grads[name], ref_grads[name]) < 1e-2, (name, rel(grads[name], ref_grads[name]))

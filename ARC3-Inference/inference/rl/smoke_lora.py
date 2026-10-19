@@ -512,7 +512,8 @@ def check_layers(model, device, sample, layers, variants: dict[str, Any], qsa_mo
                                        compile_hc=spec.get("compile_hc", False),
                                        compile_moe=spec.get("compile_moe", False),
                                        cache_experts=spec.get("cache_experts", True),
-                                       fast_conv=spec.get("fast_conv", False))
+                                       fast_conv=spec.get("fast_conv", False),
+                                       fast_lora=spec.get("fast_lora", False))
 
     def rel(a, b):
         return round(float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)), 6)
@@ -694,6 +695,18 @@ def profile_layers(model, device, sample, layers=(0, 1, 3), iters: int = 2) -> d
             _sync()
         sort = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
         row["top_ops"] = prof.key_averages().table(sort_by=sort, row_limit=15, max_name_column_width=60)
+        if torch.cuda.is_available():  # GPU time by kernel category and the top kernels, as bench_layer reports them
+            from inference.rl.bench_layer import categorize
+
+            kernels = [e for e in prof.key_averages()
+                       if e.self_device_time_total > 0 and str(getattr(e, "device_type", "")).endswith("CUDA")]
+            cats: dict[str, float] = {}
+            for e in kernels:
+                cats[categorize(e.key)] = cats.get(categorize(e.key), 0.0) + e.self_device_time_total / 1e6
+            row["gpu_busy_s"] = round(sum(cats.values()), 4)
+            row["categories_s"] = {k: round(v, 4) for k, v in sorted(cats.items(), key=lambda kv: -kv[1])}
+            row["top_kernels"] = [dict(name=e.key[:110], s=round(e.self_device_time_total / 1e6, 4), calls=e.count)
+                                  for e in sorted(kernels, key=lambda e: -e.self_device_time_total)[:30]]
         out[str(i)] = row
         print("layer", i, {k: v for k, v in row.items() if k != "top_ops"}, flush=True)
     return out
@@ -720,6 +733,7 @@ def serve(model, device, args, processor, tools, game) -> None:
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
     "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
     "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
+    "fast_lora": false,
     "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer),
     "reference_qsa" / "reference_layers": one half of it, "reference_selection": transformers' own tie-breaking},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
@@ -769,7 +783,8 @@ def serve(model, device, args, processor, tools, game) -> None:
                     model, job.get("token_chunk", args.token_chunk), job.get("expert_tile", args.expert_tile),
                     job.get("recompute", args.recompute), compile_hc=job.get("compile_hc", args.compile_hc),
                     compile_moe=job.get("compile_moe", args.compile_moe),
-                    cache_experts=job.get("cache_experts", True), fast_conv=job.get("fast_conv", args.fast_conv))
+                    cache_experts=job.get("cache_experts", True), fast_conv=job.get("fast_conv", args.fast_conv),
+                    fast_lora=job.get("fast_lora", False))
             if job.get("transcript"):
                 if job["transcript"] not in games:
                     games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))
