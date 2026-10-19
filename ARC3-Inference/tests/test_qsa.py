@@ -205,3 +205,19 @@ def test_fp32_kv_gradients_are_closer_to_float64():
     # what is left in the FP32 path is the BF16 rounding of each contribution (0.44% here vs 0.69%)
     assert error(fp32) < 0.8 * error(bf16)
 
+
+
+def test_selection_does_not_depend_on_the_chunk_size():
+    """select_blocks chunks queries only to bound memory: any chunk size gives the same blocks."""
+    torch.manual_seed(4)
+    config = Qwen4ExpConfig(text_config=dict(TEXT, hidden_size=64, indexer_head_dim=128, indexer_n_heads=4,
+                                             indexer_budget=64)).text_config
+    indexer = m.Qwen4ExpTextQSAIndexer(config, layer_idx=3).eval()
+    n, rotary = 700, 64
+    hidden = torch.randn(1, n, config.hidden_size)
+    angles = torch.arange(n)[:, None] * (1e4 ** (-torch.arange(rotary // 2) / (rotary // 2)))[None, :]
+    cos = torch.cat([angles.cos()] * 2, -1)[None]
+    sin = torch.cat([angles.sin()] * 2, -1)[None]
+    small = qsa.select_blocks(indexer, hidden, cos, sin, chunk_size=64)
+    large = qsa.select_blocks(indexer, hidden, cos, sin, chunk_size=2048)
+    assert torch.equal(small.sort(-1).values, large.sort(-1).values)
