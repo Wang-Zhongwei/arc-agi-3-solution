@@ -224,9 +224,73 @@ class HostMemoryError(RuntimeError):
     pass
 
 
+class LayerTimeline:
+    """CUDA events at each decoder layer's forward and backward, for one step (`timeline` in step).
+
+    Forward: a layer's pre- and post-hook. Backward: the gradient reaching the layer's output (its
+    backward starts) and leaving through its input (done). Whatever the layers do not account for
+    (embeddings, vision, lm_head and loss, offload waits, Python between layers) is the rest."""
+
+    def __init__(self, model):
+        base = model.get_base_model() if hasattr(model, "get_base_model") else model
+        self.layers = [x for x in base.modules() if type(x).__name__ == "Qwen4ExpTextDecoderLayer"]
+        self.events: dict[tuple[str, int, str], torch.cuda.Event] = {}
+        self.forward_phase = True
+        self.handles = []
+        for i, layer in enumerate(self.layers):
+            self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
+            self.handles.append(layer.register_forward_hook(self._post(i)))
+
+    def _event(self, key):
+        if key not in self.events:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            self.events[key] = e
+
+    def _pre(self, i):
+        def hook(module, args):
+            if self.forward_phase:
+                self._event(("fwd", i, "start"))
+                h = args[0] if args else None
+                if torch.is_tensor(h) and h.requires_grad:
+                    h.register_hook(lambda g: self._event(("bwd", i, "end")))
+        return hook
+
+    def _post(self, i):
+        def hook(module, args, out):
+            if self.forward_phase:
+                self._event(("fwd", i, "end"))
+                y = out[0] if isinstance(out, tuple) else out
+                if torch.is_tensor(y) and y.requires_grad:
+                    y.register_hook(lambda g: self._event(("bwd", i, "start")))
+        return hook
+
+    def close(self) -> dict[str, Any]:
+        for h in self.handles:
+            h.remove()
+        torch.cuda.synchronize()
+
+        def span(kind, i):
+            a, b = self.events.get((kind, i, "start")), self.events.get((kind, i, "end"))
+            return a.elapsed_time(b) / 1000 if a is not None and b is not None else None
+
+        fwd = [span("fwd", i) for i in range(len(self.layers))]
+        bwd = [span("bwd", i) for i in range(len(self.layers))]
+        kinds = [getattr(x, "layer_type", "?") for x in self.layers]
+        by_kind: dict[str, dict[str, float]] = {}
+        for k, f, b in zip(kinds, fwd, bwd):
+            row = by_kind.setdefault(k, dict(layers=0, forward_s=0.0, backward_s=0.0))
+            row["layers"] += 1
+            row["forward_s"] += f or 0.0
+            row["backward_s"] += b or 0.0
+        return dict(forward_layers_s=round(sum(f or 0 for f in fwd), 3), backward_layers_s=round(sum(b or 0 for b in bwd), 3),
+                    by_kind={k: {x: round(v, 3) for x, v in r.items()} for k, r in by_kind.items()},
+                    forward_s=[round(f, 4) if f else None for f in fwd], backward_s=[round(b, 4) if b else None for b in bwd])
+
+
 def step(model, sample, device, offload: bool = False, profile: bool = False,
          reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
-         async_copies: bool = False) -> dict[str, Any]:
+         async_copies: bool = False, timeline: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
     in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
@@ -279,12 +343,15 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
         [torch.profiler.ProfilerActivity.CUDA] if torch.cuda.is_available() else [])
     profiler = (torch.profiler.profile(activities=activities, profile_memory=True) if profile
                 else contextlib.nullcontext())
+    layer_timeline = LayerTimeline(model) if timeline and torch.cuda.is_available() else None
     with profiler:
         with saved:
             hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
             loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
         _sync()
         t1 = time.perf_counter()
+        if layer_timeline is not None:
+            layer_timeline.forward_phase = False
         loss.backward()
         _sync()
         t2 = time.perf_counter()
@@ -297,6 +364,10 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                                         if p.requires_grad and p.grad is not None}
     model.zero_grad(set_to_none=True)
     extra = {}
+    if layer_timeline is not None:
+        extra["timeline"] = layer_timeline.close()
+        extra["timeline"]["forward_other_s"] = round(t1 - t0 - extra["timeline"]["forward_layers_s"], 3)
+        extra["timeline"]["backward_other_s"] = round(t2 - t1 - extra["timeline"]["backward_layers_s"], 3)
     if profile:
         sort = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
         averages = profiler.key_averages()
@@ -347,7 +418,7 @@ def auto_keep_gb(result: dict[str, Any]) -> float:
 
 def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
               profile: bool = False, reuse_buffers: bool = True, keep_grads: str | None = None,
-              gpu_keep_gb: float | str = 0.0, async_copies: bool = False) -> dict[str, list]:
+              gpu_keep_gb: float | str = 0.0, async_copies: bool = False, timeline: bool = False) -> dict[str, list]:
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised.
     `keep_grads` keeps each step's LoRA gradients as "<keep_grads>/<spec>/<repeat>" for compare_grads.
     `gpu_keep_gb="auto"`: the first repeat offloads everything, later ones keep what its peak left free."""
@@ -374,7 +445,7 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                     result = step(model, samples[length], device, offload=offload, profile=profile,
                                   reuse_buffers=reuse_buffers,
                                   keep_grads=f"{keep_grads}/{spec}/{repeat}" if keep_grads else None,
-                                  gpu_keep_gb=keep, async_copies=async_copies)
+                                  gpu_keep_gb=keep, async_copies=async_copies, timeline=timeline)
                     result["token_chunk"] = current_token_chunk(model)
                     result["gpu_keep_gb"] = keep
                     if gpu_keep_gb == "auto" and offload:
@@ -733,7 +804,7 @@ def serve(model, device, args, processor, tools, game) -> None:
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
     "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
     "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
-    "fast_lora": false,
+    "fast_lora": false, "timeline": false (per-layer forward/backward CUDA times),
     "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer),
     "reference_qsa" / "reference_layers": one half of it, "reference_selection": transformers' own tie-breaking},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
@@ -845,7 +916,8 @@ def serve(model, device, args, processor, tools, game) -> None:
                                                reuse_buffers=job.get("reuse_host_buffers", True),
                                                keep_grads=job.get("keep_grads"),
                                                gpu_keep_gb=job.get("gpu_keep_gb", 0.0),
-                                               async_copies=job.get("async_copies", False))
+                                               async_copies=job.get("async_copies", False),
+                                               timeline=job.get("timeline", False))
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)
