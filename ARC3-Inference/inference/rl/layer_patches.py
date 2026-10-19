@@ -176,6 +176,10 @@ def grouped_mm(x, weight, offsets):
 
     if weight.requires_grad or _can_use_grouped_mm(x, weight, offsets):
         return _grouped_mm(x, weight, offsets)
+    from inference.rl import grouped_gemm
+
+    if grouped_gemm.available(x, weight):  # one Triton launch for all groups (A100, SM120)
+        return grouped_gemm.GroupedMM.apply(x.to(weight.dtype), weight, offsets)
     return _LoopGroupedMM.apply(x.to(weight.dtype), weight, offsets)
 
 

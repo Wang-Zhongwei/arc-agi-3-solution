@@ -33,7 +33,7 @@ python -c "import torch, triton; print('torch', torch.__version__, 'triton', tri
     | tee results/env.txt || fail "no GPU"
 
 log "phase 2: CUDA tests (kernels, compiled layer)"
-PYTHONPATH=. python -m pytest -q -rs tests/test_qsa_kernel.py tests/test_compile_hc.py tests/test_qsa_fused_model.py > results/pytest_kernel.log 2>&1
+PYTHONPATH=. python -m pytest -q -rs tests/test_qsa_kernel.py tests/test_compile_hc.py tests/test_qsa_fused_model.py tests/test_grouped_gemm.py > results/pytest_kernel.log 2>&1
 status=$?
 log "pytest exit $status: $(tail -1 results/pytest_kernel.log)"
 [ $status -eq 0 ] || grep -E "^(FAILED|E  )" results/pytest_kernel.log | head -20  # benchmarks still run
