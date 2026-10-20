@@ -133,14 +133,19 @@ STEP_DIFF = re.compile(r"^Diff image \(step (\d+) -> (\d+)\)")
 HISTORY_DIFF = re.compile(r"^(?:Diff image|Fatal step diff image) \(history\[(\d+)\]\.frame -> history\[(\d+)\]\.frame\)")
 HISTORY_FRAME = re.compile(r"^history\[(\d+)\]\.frame")
 ANIMATION_FRAME = re.compile(r"^last_animation_frames\[(\d+)\]:")
-BOARD_AFTER = re.compile(r"^(?:Level \d+\. )?Board after step (\d+)")
+BOARD_AFTER = re.compile(r"^(?:Level \d+\. )?(?:Board after step|Starting board, step) (\d+)")
 SOLVED = re.compile(r"^Board as level \d+ was solved \(shown during step (\d+)")
 CURRENT = ("Current grid image", "Current board", "This is the CURRENT board")
 
 
-def resolve(label: str, before: int, frames: Frames, scales: Scales, completed: Sequence[int]) -> Image.Image | None:
+GAME_OVER = ("Death frame image", "Fatal step diff image", "Current grid image (the board AFTER the automatic reset")
+
+
+def resolve(label: str, before: int, frames: Frames, scales: Scales, completed: Sequence[int],
+            game_over: bool = False) -> Image.Image | None:
     """The image a label names, for a message built when `before` actions had run.
-    `completed` lists the level-completing action numbers in order."""
+    `completed` lists the level-completing action numbers in order. In a `game_over` message the last
+    action was the automatic RESET, and the animation frames shown are the fatal action's."""
     label = label.strip()
     if label.startswith(CURRENT) or label.endswith("this is the CURRENT board to act on."):
         return draw(frames.after(before), scales.board)
@@ -152,7 +157,7 @@ def resolve(label: str, before: int, frames: Frames, scales: Scales, completed: 
         grid = frames.level_end(done[-1]) if done else None
         return draw(grid, scales.board) if grid is not None else None
     if (m := ANIMATION_FRAME.match(label)):
-        chain = frames.chain(before)
+        chain = frames.chain(before - 1 if game_over else before)
         index = int(m[1]) + 1
         return draw(chain[index], scales.animation) if chain and index < len(chain) - 1 else None
     if label.startswith("Death frame image"):
@@ -162,8 +167,6 @@ def resolve(label: str, before: int, frames: Frames, scales: Scales, completed: 
     if (m := HISTORY_FRAME.match(label)):
         scale = scales.board if "DEATH board" in label else scales.intermediate
         return draw(frames.after(int(m[1])), scale)
-    if label.startswith("Starting board, step 0"):
-        return draw(frames.after(0), scales.board)
     if (m := BOARD_AFTER.match(label)):
         return draw(frames.after(int(m[1])), scales.board)
     if (m := SOLVED.match(label)):
@@ -178,14 +181,21 @@ def label_before(text: str) -> str:
     return lines[-1] if lines else ""
 
 
-def message_images(message: dict[str, Any], before: int, frames: Frames, scales: Scales,
-                   completed: Sequence[int]) -> list[Image.Image | None]:
-    """One image (or None) per image part of a rebuilt user message, in order."""
+def message_labels(message: dict[str, Any]) -> list[str]:
+    """The label of each image part of a rebuilt user message, in order."""
     out, previous = [], ""
     for part in message.get("content") or []:
         if part.get("type") == "image_url":
-            out.append(resolve(label_before(previous), before, frames, scales, completed))
+            out.append(label_before(previous))
             previous = ""
         else:
             previous = part.get("text") or ""
     return out
+
+
+def message_images(message: dict[str, Any], before: int, frames: Frames, scales: Scales,
+                   completed: Sequence[int]) -> list[Image.Image | None]:
+    """One image (or None) per image part of a rebuilt user message, in order."""
+    labels = message_labels(message)
+    game_over = any(label.startswith(GAME_OVER) or "this is the DEATH board" in label for label in labels)
+    return [resolve(label, before, frames, scales, completed, game_over) for label in labels]
