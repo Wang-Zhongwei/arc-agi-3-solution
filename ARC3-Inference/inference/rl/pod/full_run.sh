@@ -20,10 +20,15 @@ MIN_HF_MBPS=${MIN_HF_MBPS:-40}
 cd "$WORK"
 mkdir -p results
 rm -f FULL_DONE ABORTED
+# an ssh session lacks the container's RUNPOD_* variables (pod id and a pod-scoped API key for runpodctl)
+for var in RUNPOD_POD_ID RUNPOD_API_KEY; do
+    [ -n "${!var:-}" ] || export "$(tr '\0' '\n' < /proc/1/environ | grep "^$var=")" 2>/dev/null || true
+done
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 self_delete() {
     log "deleting this pod ($1)"
     if command -v runpodctl > /dev/null && [ -n "${RUNPOD_POD_ID:-}" ]; then
+        runpodctl config --apiKey "${RUNPOD_API_KEY:-}" > /dev/null 2>&1  # it reads a config file, not the env
         runpodctl remove pod "$RUNPOD_POD_ID" || log "runpodctl failed"
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
