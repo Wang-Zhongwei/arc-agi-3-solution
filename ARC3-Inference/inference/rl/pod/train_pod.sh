@@ -120,6 +120,10 @@ echo "$flags" > results/train_flags.txt
 log "phase 3: wait for the checkpoint, then train"
 wait $download || abort "checkpoint download failed"
 log "checkpoint: $(du -sh "$MODEL_DIR" | cut -f1)"
+# GPU utilization and power every second, to line up with each sample's wall_start/wall_end in train_log.jsonl
+nvidia-smi --query-gpu=timestamp,utilization.gpu,power.draw,memory.used --format=csv,noheader -l 1 \
+    > results/gpu.csv 2>/dev/null &
+sampler=$!
 for attempt in 1 2 3; do
     resume=$([ "$attempt" -gt 1 ] && echo --resume)
     PYTHONPATH=. python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out train --max-hours "$TRAIN_HOURS" \
@@ -129,6 +133,7 @@ for attempt in 1 2 3; do
     [ -e train/TRAIN_DONE ] && break
     grep -q '"event": "time_limit"' train/train_log.jsonl 2>/dev/null && break
 done
+kill $sampler 2>/dev/null
 cp train/train_log.jsonl results/ 2>/dev/null
 [ -e train/TRAIN_DONE ] && log "TRAIN_DONE" || log "training did not finish; the last saved adapter is in train/"
 date -u > FULL_DONE

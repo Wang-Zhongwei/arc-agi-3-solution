@@ -66,9 +66,11 @@ def test_accumulated_samples_weight_every_trained_token_once(model, monkeypatch)
 
     monkeypatch.setattr(smoke_lora, "step", failing_once)
     model.zero_grad(set_to_none=True)
-    results = [train_rft.run_sample(model, "cpu", s, c / total, margin=24.0) for s, c in zip(samples, counts)]
+    results = [train_rft.run_sample(model, "cpu", s, c / total) for s, c in zip(samples, counts)]
     got = lora_grads(model)
-    assert results[0]["retries"] == 1 and results[1]["retries"] == 0 and len(calls) == 3
+    # the retry runs with recompute "layer": the same gradient, other tensors saved
+    assert results[0]["retries"] == 1 and results[0]["recompute_mode"] == "layer" and len(calls) == 3
+    assert results[1]["retries"] == 0 and results[1]["recompute_mode"] == "parts"
     assert got.keys() == expected.keys() and len(got) > 20
     # FP32 rounding differs between scaling the loss before backward and the gradients after: up to ~1e-4
     # relative in parameters whose gradient norm is ~1e-6 (16 hash seeds); a wrong weight or a lost sample is O(1)
@@ -84,3 +86,21 @@ def test_lr_schedule_warms_up_then_decays_to_the_floor():
     assert lrs[0] == pytest.approx(0.2) and lrs[4] == pytest.approx(1.0)
     assert max(lrs) == pytest.approx(1.0) and lrs[-1] == pytest.approx(0.1, abs=1e-3)
     assert all(a >= b for a, b in zip(lrs[4:], lrs[5:]))
+
+
+def test_arena_cap_leaves_the_ple_table_its_page_cache():
+    # H200 pod: 251 GB limit, 95.5 GiB PLE table, 14 GiB process -> 251 - 95.5 - 14 - 12 - 10
+    assert train_rft.arena_cap_gb(95.5, 14.0, 251.0) == 119.5
+    assert train_rft.arena_cap_gb(95.5, 14.0, None) == 0.0 and train_rft.arena_cap_gb(95.5, 14.0, 100.0) == 0.0
+
+
+def test_samples_whose_checkpoints_do_not_fit_the_arena_recompute_by_layer():
+    labels = torch.full((1, 100), -100)
+    labels[0, 61:70] = 1  # first trained token at 61: positions 60.. are after the prefix
+    sample = {"input_ids": torch.zeros(1, 100, dtype=torch.long), "labels": labels}
+    assert train_rft.suffix_tokens(sample, True) == 40 and train_rft.suffix_tokens(sample, False) == 100
+    cap = 100 * 2**30
+    assert train_rft.choose_recompute(40_000, cap, {}, True) == "parts"  # 40K x 2.4 MB = 96 GB
+    assert train_rft.choose_recompute(50_000, cap, {}, True) == "layer"  # 120 GB
+    assert train_rft.choose_recompute(50_000, cap, {"parts+prefix": 2.0e6}, True) == "parts"  # measured: 100 GB
+    assert train_rft.choose_recompute(10**6, None, {}, True) == "parts"  # no cap: never "layer"

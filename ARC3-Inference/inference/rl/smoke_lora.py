@@ -222,6 +222,37 @@ def host_memory_available_gb() -> float | None:
     return None
 
 
+def cgroup_memory_gb() -> dict[str, float]:
+    """The container's memory limit, anonymous memory and page cache (file), in GiB (Linux cgroup v2 or v1)."""
+    for limit_file, stat_file, anon_key, file_key in (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.stat", "anon", "file"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_rss",
+             "total_cache")):
+        try:
+            limit = open(limit_file).read().strip()
+            stat = dict(line.split() for line in open(stat_file))
+        except (OSError, ValueError):
+            continue
+        out = dict(anon_gb=round(int(stat.get(anon_key, 0)) / 2**30, 1), file_gb=round(int(stat.get(file_key, 0)) / 2**30, 1))
+        if limit != "max" and int(limit) < 2**60:
+            out["limit_gb"] = round(int(limit) / 2**30, 1)
+        return out
+    return {}
+
+
+def _thread_major_faults() -> int:
+    """Major page faults of the calling thread (pages read from disk, e.g. an evicted PLE table)."""
+    import resource
+    return resource.getrusage(getattr(resource, "RUSAGE_THREAD", resource.RUSAGE_SELF)).ru_majflt
+
+
+def _compiled_graphs() -> int:
+    try:
+        return int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class HostMemoryError(RuntimeError):
     pass
 
@@ -310,28 +341,33 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
     model.train()
     tokens = int(sample["input_ids"].shape[1])
-    # what each layer saves depends on the recompute mode, and with prefix stop-grad the prefix saves nothing
+    labels = sample["labels"][0].to(device)
+    targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
+    # prefix stop-grad: positions before the one predicting the first trained token run without gradient
+    prefix = int(targets.min()) - 1 if prefix_stop_grad and targets.numel() else 0
+    # what each layer saves depends on the recompute mode, and with prefix stop-grad the prefix saves nothing:
+    # saved bytes are learnt per token after the prefix
     layout = layer_patches.current_recompute(model) + ("+prefix" if prefix_stop_grad else "")
+    saved_tokens = tokens - prefix
     arena = None
     if offload and reuse_buffers:
         arena = getattr(model, "_rft_host_arena", None)  # on the model: survives the job server's reloads
         if arena is None or (async_copies and not arena.pin):  # pinned segments are allocated pinned
             model._rft_host_arena = None
             arena = model._rft_host_arena = host_offload.HostArena(pin=async_copies)
-    if offload:
+    if offload and not (arena is not None and arena.max_bytes is not None):  # a capped arena never grows
         # each layer's checkpointed input (tokens x 4 x 2560 bf16), plus the mixer's input and output
         # with recompute "parts"; measured once a step of this layout has run
         per_token = (arena.bytes_per_token.get(layout) if arena is not None else None) \
             or 4 * 2560 * 2 * 48 * (1.5 if layout == "parts" else 1.0)
-        need = tokens * per_token / 2**30 * 1.15 + 8 - (gpu_keep_gb if arena is not None else 0)
+        need = saved_tokens * per_token / 2**30 * 1.15 + 8 - (gpu_keep_gb if arena is not None else 0)
         available = host_memory_available_gb()
         if available is not None and arena is not None:
             available += arena.capacity_gb  # already counted as used, and free again for this step
         if available is not None and need > available:
             raise HostMemoryError(f"offload needs ~{need:.0f} GiB of host memory, {available:.0f} GiB available")
-    labels = sample["labels"][0].to(device)
-    targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1  # positions whose token is trained
-    inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
+    inputs = {k: v.to(device) for k, v in sample.items() if k != "labels" and not k.startswith("_")}
+    layer_patches.provide_ngram(model, sample.get("_ngram"))  # PLE rows gathered ahead (train_rft's prefetch)
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     for i in range(torch.cuda.device_count()):
         torch.cuda.reset_peak_memory_stats(i)
@@ -341,6 +377,8 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
         torch.cuda.memory._record_memory_history(max_entries=200_000)
     _sync()
     memory["start_gb"] = gb()
+    wall_start = time.time()
+    counters = [(_thread_major_faults(), ple_mmap.lookup_seconds(), _compiled_graphs())]
     t0 = time.perf_counter()
     # pageable, not pinned: the pinned host allocator rounds every block up to a power of two and
     # keeps it cached, so 32K then 64K steps held ~144 GB besides the 102.5 GB PLE table and the
@@ -348,7 +386,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     # faults), hence the reused arena.
     if arena is not None:
         saved = host_offload.offload_to_host(arena, keep_bytes=gpu_keep_gb * 2**30, async_copies=async_copies,
-                                             layout=layout, tokens=tokens)
+                                             layout=layout, tokens=saved_tokens)
     elif offload:
         saved = torch.autograd.graph.save_on_cpu(pin_memory=False)
     else:
@@ -358,8 +396,6 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     profiler = (torch.profiler.profile(activities=activities, profile_memory=True) if profile
                 else contextlib.nullcontext())
     layer_timeline = LayerTimeline(model) if timeline and torch.cuda.is_available() else None
-    # prefix stop-grad: positions before the one predicting the first trained token run without gradient
-    prefix = int(targets.min()) - 1 if prefix_stop_grad and targets.numel() else 0
     layer_patches.set_prefix(prefix)
     failed = True
     try:
@@ -369,6 +405,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
             _sync()
             t1 = time.perf_counter()
+            counters.append((_thread_major_faults(), ple_mmap.lookup_seconds(), _compiled_graphs()))
             memory["after_forward_gb"] = gb()
             if memory_snapshot and torch.cuda.is_available():
                 torch.cuda.memory._dump_snapshot(f"{memory_snapshot}_fwd.pickle")
@@ -377,6 +414,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
             (loss * loss_scale).backward()
             _sync()
             t2 = time.perf_counter()
+            counters.append((_thread_major_faults(), ple_mmap.lookup_seconds(), _compiled_graphs()))
             memory["after_backward_gb"] = gb()
         failed = False
     except torch.cuda.OutOfMemoryError:
@@ -385,6 +423,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
         raise
     finally:
         layer_patches.set_prefix(0)
+        layer_patches.provide_ngram(model, None)
         if memory_snapshot and torch.cuda.is_available():
             torch.cuda.memory._record_memory_history(enabled=None)
         if failed and layer_timeline is not None:  # its hooks would stay on the layers for every later step
@@ -422,7 +461,14 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 peak_gb=peak_gb(), memory_gb=memory, host_gb=host_memory_gb(),
                 recompute=layout, host_buffers_gb=round(arena.capacity_gb, 1) if arena is not None else None,
                 host_pinned_gb=round(arena.pinned_gb, 1) if arena is not None else None,
-                offload_stats={k: round(v, 3) for k, v in arena.stats.items()} if arena is not None else None)
+                offload_stats={k: round(v, 3) for k, v in arena.stats.items()} if arena is not None else None,
+                arena_used_gb=round(arena.used / 2**30, 1) if arena is not None else None,
+                # where a slow step went: pages read from disk by this thread, PLE rows gathered inline (0 when
+                # they came from the prefetch), graphs compiled, and the container's memory at the end
+                major_faults=[b[0] - a[0] for a, b in zip(counters, counters[1:])],
+                ple_lookup_s=round(counters[-1][1] - counters[0][1], 2),
+                graphs_compiled=counters[-1][2] - counters[0][2],
+                cgroup=cgroup_memory_gb(), wall_start=round(wall_start, 1), wall_end=round(time.time(), 1))
 
 
 def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int, dict[str, torch.Tensor]]:

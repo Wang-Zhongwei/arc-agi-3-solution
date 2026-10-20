@@ -8,9 +8,16 @@ hyper-connections and MoE, fast LoRA and GDN, parts recompute, async offload), t
   counts once (a sample's mean loss is weighted by its share of the batch's tokens).
 - Prefix stop-grad: the context before a sample's first trained token runs forward only.
 - AdamW, linear warm-up then cosine decay to `min_lr_ratio`, gradient clipping.
-- Memory: checkpoints kept on the GPU only within `gpu_margin_gb` of the predicted peak;
-  an out-of-memory sample is retried with nothing kept, then with layer recompute, then
-  skipped (its partial gradients are taken back out first).
+- Host memory: the checkpoints go to a pinned host arena of a fixed size, reserved at start
+  (`arena_cap_gb`): the container's limit minus the PLE table (it must stay in the page cache:
+  an arena that grew to ~157 GiB evicted it in the first run and the GPU idled on disk reads),
+  the process, the prefetched batches and a margin. A sample uses recompute "parts" when its
+  checkpoints fit the arena, else "layer" (~2.4x smaller); nothing is kept on the GPU on purpose
+  (a kept view holds its whole base tensor: 19 GB kept ran out of memory at a 95 GB peak). An
+  out-of-memory sample is retried with "layer", then skipped (its partial gradients are taken
+  back out first).
+- Prefetch: the next batch is tokenized and its PLE rows gathered on a thread while the GPU
+  runs the current one.
 - Saves: the adapter after every epoch (`adapter_epoch<N>`) and `latest` (adapter,
   optimizer, position) every `save_every` steps; `--resume` continues from `latest`.
 - Validation: mean loss on val.jsonl (forward only) before training and after each epoch.
@@ -35,10 +42,15 @@ from typing import Any
 import torch
 from PIL import Image
 
-from inference.rl import layer_patches, ple_mmap, smoke_lora
+from inference.rl import host_offload, layer_patches, ple_mmap, smoke_lora
 from inference.rl.qsa import patch_qsa_attention
 
-PEAK_BASE_GB, PEAK_PER_1K_GB = 69.0, 0.35  # H200, prefix stop-grad, nothing kept: 92 GB at 64.9K, 112 GB at 122.9K
+# Saved bytes per token after the prefix, until a step of the layout has measured them: parts ~2.3 MB (the first
+# run's arena, 144 GiB for a 68.5K-token suffix, rounded up), layer ~1.2 MB (48 layers x 4 x 2,560 BF16 inputs =
+# 0.98 MB, plus a margin)
+DEFAULT_BYTES_PER_TOKEN = {"parts": 2.4e6, "layer": 1.2e6}
+PREFETCH_RESERVE_GB = 12  # two tokenized batches of 4 (images ~0.5-1 GB, PLE rows up to 0.65 GB per sample)
+HOST_MARGIN_GB = 10  # other page cache (images, libraries), CUDA host allocations, allocator slack
 
 
 def load_samples(path: Path) -> list[dict[str, Any]]:
@@ -79,9 +91,30 @@ class Prefetch:
         return value
 
 
-def keep_gb(tokens: int, margin: float) -> float:
-    total = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0.0
-    return round(max(0.0, total - margin - (PEAK_BASE_GB + PEAK_PER_1K_GB * tokens / 1000)), 1)
+def arena_cap_gb(ple_gb: float, process_gb: float, limit_gb: float | None) -> float:
+    """Host arena size: what the container can give without pushing the PLE table out of the page cache."""
+    if limit_gb is None:
+        return 0.0
+    return round(max(0.0, limit_gb - ple_gb - process_gb - PREFETCH_RESERVE_GB - HOST_MARGIN_GB), 1)
+
+
+def suffix_tokens(sample, prefix_stop_grad: bool) -> int:
+    """Tokens whose checkpoints are saved: from the position predicting the first trained token (prefix stop-grad)."""
+    tokens = int(sample["input_ids"].shape[1])
+    if not prefix_stop_grad:
+        return tokens
+    trained = torch.nonzero(sample["labels"][0][1:] != -100)
+    return tokens - (int(trained.min()) if trained.numel() else tokens)
+
+
+def choose_recompute(saved_tokens: int, arena_bytes: float | None, bytes_per_token: dict[str, float],
+                     prefix_stop_grad: bool) -> str:
+    """"parts" when the sample's checkpoints fit the arena, else "layer" (an uncapped arena: always "parts")."""
+    if arena_bytes is None:
+        return "parts"
+    key = "parts+prefix" if prefix_stop_grad else "parts"
+    per_token = bytes_per_token.get(key) or DEFAULT_BYTES_PER_TOKEN["parts"]
+    return "parts" if saved_tokens * per_token <= arena_bytes else "layer"
 
 
 def lr_at(step: int, total: int, warmup: int, min_ratio: float) -> float:
@@ -91,26 +124,31 @@ def lr_at(step: int, total: int, warmup: int, min_ratio: float) -> float:
     return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def run_sample(model, device, sample, scale: float, margin: float, prefix_stop_grad: bool = True) -> dict[str, Any]:
-    """Forward + backward of one sample, adding scale x its gradient; OOM fallbacks as in the docstring."""
+def run_sample(model, device, sample, scale: float, prefix_stop_grad: bool = True) -> dict[str, Any]:
+    """Forward + backward of one sample, adding scale x its gradient; recompute mode and OOM fallback as in the
+    docstring."""
     params = [p for p in model.parameters() if p.requires_grad]
     saved = [None if p.grad is None else p.grad.detach().clone() for p in params]
     tokens = int(sample["input_ids"].shape[1])
-    attempts = [("parts", keep_gb(tokens, margin)), ("parts", 0.0), ("layer", 0.0)]
+    arena = getattr(model, "_rft_host_arena", None)
+    saved_tokens = suffix_tokens(sample, prefix_stop_grad)
+    mode = choose_recompute(saved_tokens, arena.max_bytes if arena is not None else None,
+                            arena.bytes_per_token if arena is not None else {}, prefix_stop_grad)
+    attempts = [mode] + (["layer"] if mode != "layer" else [])
     start_mode = layer_patches.current_recompute(model)
     errors = []
-    for mode, keep in attempts:
+    for mode in attempts:
         if layer_patches.current_recompute(model) != mode:
             layer_patches.configure(model, recompute=mode)
         oom = False
         try:
             cuda = torch.cuda.is_available()  # CPU: the tests
-            result = smoke_lora.step(model, sample, device, offload=cuda, async_copies=cuda, gpu_keep_gb=keep,
+            result = smoke_lora.step(model, sample, device, offload=cuda, async_copies=cuda, gpu_keep_gb=0.0,
                                      prefix_stop_grad=prefix_stop_grad, accumulate=True, loss_scale=scale)
-            result.update(recompute_mode=mode, gpu_keep_gb=keep, retries=len(errors))
+            result.update(recompute_mode=mode, retries=len(errors), saved_tokens=saved_tokens)
             break
         except torch.cuda.OutOfMemoryError as exc:
-            errors.append(f"{mode}/{keep}: {str(exc)[:120]}")
+            errors.append(f"{mode}: {str(exc)[:120]}")
             oom = True
         except smoke_lora.HostMemoryError as exc:
             errors.append(f"host: {exc}")
@@ -128,27 +166,36 @@ def run_sample(model, device, sample, scale: float, margin: float, prefix_stop_g
     if result is None:
         for p, g in zip(params, saved):
             p.grad = g
-        return dict(error="; ".join(errors) or "failed", tokens=tokens)
+        return dict(error="; ".join(errors) or "failed", tokens=tokens, saved_tokens=saved_tokens)
     if errors:
         result["errors"] = errors
     return result
 
 
 @torch.no_grad()
-def evaluate(model, device, samples: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
+def evaluate(model, device, samples: list[dict[str, Any]], prepare) -> dict[str, Any]:
+    """Mean loss over the trained tokens of `samples`, tokenized one at a time by `prepare` (kept tokenized for the
+    whole run, 16 samples held ~10-16 GB of image tensors in host memory)."""
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     total = count = 0.0
+    skipped = 0
     model.train()  # the patched layers' token chunks; dropout is 0
-    for sample in samples:
+    for raw in samples:
+        sample = prepare(raw)
+        if sample is None:
+            skipped += 1
+            continue
         labels = sample["labels"][0].to(device)
         targets = torch.nonzero(labels[1:] != -100).squeeze(1) + 1
-        inputs = {k: v.to(device) for k, v in sample.items() if k != "labels"}
+        inputs = {k: v.to(device) for k, v in sample.items() if k != "labels" and not k.startswith("_")}
+        layer_patches.provide_ngram(model, sample.get("_ngram"))
         hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
         loss = smoke_lora.chunked_cross_entropy(base.lm_head, hidden, labels[targets])
         total += float(loss) * targets.numel()
         count += targets.numel()
-        del hidden, loss
-    return dict(loss=round(total / max(count, 1), 5), tokens=int(count), samples=len(samples))
+        del hidden, loss, sample, inputs
+    layer_patches.provide_ngram(model, None)
+    return dict(loss=round(total / max(count, 1), 5), tokens=int(count), samples=len(samples) - skipped)
 
 
 def load_model(args):
@@ -161,7 +208,7 @@ def load_model(args):
     model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16,
                                                         device_map=smoke_lora.gpu_device_map(args.model),
                                                         attn_implementation="sdpa")
-    ple_mmap.attach(model, args.model)
+    ple = ple_mmap.attach(model, args.model)
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
@@ -179,7 +226,7 @@ def load_model(args):
     check = layer_patches.check_experts(model)
     if check["max_rel_error"] > 0.05:
         raise RuntimeError(f"grouped experts disagree with AutoRound's: {check}")
-    return model, processor, device, dict(patches=patches, experts_check=check)
+    return model, processor, device, dict(patches=patches, experts_check=check, ple=ple)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=131072, help="longer samples are skipped")
-    parser.add_argument("--gpu-margin-gb", type=float, default=24.0)
+    parser.add_argument("--arena-gb", type=float, help="host arena size (default: from the container's limit)")
     parser.add_argument("--token-chunk", type=int, default=8192)
     parser.add_argument("--save-every", type=int, default=5, help="optimizer steps between `latest` saves")
     parser.add_argument("--max-hours", type=float, default=0.0, help="stop and save after this long (0: no limit)")
@@ -230,6 +277,14 @@ def main(argv: list[str] | None = None) -> int:
         val = val[::len(val) // args.val_samples][:args.val_samples]
     model, processor, device, info = load_model(args)
     log(event="loaded", train=len(train), val=len(val), args={k: str(v) for k, v in vars(args).items()}, **info)
+    if torch.cuda.is_available():
+        memory, process_gb = smoke_lora.cgroup_memory_gb(), smoke_lora.host_memory_gb().get("rss", 15.0)
+        cap = args.arena_gb if args.arena_gb is not None else arena_cap_gb(info["ple"]["mapped_gb"], process_gb,
+                                                                             memory.get("limit_gb"))
+        arena = model._rft_host_arena = host_offload.HostArena(pin=True, max_gb=cap)
+        log(event="arena", cap_gb=cap, limit_gb=memory.get("limit_gb"), ple_gb=info["ple"]["mapped_gb"],
+            process_gb=process_gb, prefetch_reserve_gb=PREFETCH_RESERVE_GB, margin_gb=HOST_MARGIN_GB,
+            reserve_s=round(arena.reserve(), 1), cgroup=smoke_lora.cgroup_memory_gb())
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.999), weight_decay=0.0)
@@ -256,25 +311,36 @@ def main(argv: list[str] | None = None) -> int:
             (target / "state.json").write_text(json.dumps(state))
         log(event="saved", name=name, step=state["step"])
 
+    def prepare(sample):
+        """Tokens, images and PLE rows of one sample (on the prefetch thread), with what it cost."""
+        start, faults = time.perf_counter(), smoke_lora._thread_major_faults()
+        item = tokenize_sample(processor, sample, args.data)
+        tokenized = time.perf_counter()
+        if item["input_ids"].shape[1] <= args.max_tokens:
+            item["_ngram"] = layer_patches.precompute_ngram(model, item["input_ids"])
+        item["_prefetch"] = dict(tokenize_s=round(tokenized - start, 2), ple_s=round(time.perf_counter() - tokenized, 2),
+                                 major_faults=smoke_lora._thread_major_faults() - faults)
+        return item
+
     def tokenize_batch(indices):
         out = []
         for i in indices:
             try:
-                out.append((i, tokenize_sample(processor, train[i], args.data)))
+                out.append((i, prepare(train[i])))
             except Exception as exc:  # noqa: BLE001 - a bad sample is skipped, not fatal
                 out.append((i, f"{type(exc).__name__}: {str(exc)[:300]}"))
         return out
 
-    val_tokens = []
-    for sample in val:
+    def prepare_val(sample):
         try:
-            tokenized = tokenize_sample(processor, sample, args.data)
-            if tokenized["input_ids"].shape[1] <= args.max_tokens:
-                val_tokens.append(tokenized)
+            item = prepare(sample)
         except Exception as exc:  # noqa: BLE001
             log(event="val_skip", id=sample["id"], error=str(exc)[:300])
-    if val_tokens and state["step"] == 0:
-        log(event="val", epoch=0, **evaluate(model, device, val_tokens))
+            return None
+        return item if item["input_ids"].shape[1] <= args.max_tokens else None
+
+    if val and state["step"] == 0:
+        log(event="val", epoch=0, **evaluate(model, device, val, prepare_val))
 
     batches = [(e, b, orders[e][b * args.batch:(b + 1) * args.batch]) for e in range(args.epochs)
                for b in range(steps_per_epoch)]
@@ -300,9 +366,13 @@ def main(argv: list[str] | None = None) -> int:
         t0, losses, done_tokens = time.time(), [], 0
         for i, item in ready:
             n = int((item["labels"] != -100).sum())
-            result = run_sample(model, device, item, n / trained, args.gpu_margin_gb, args.prefix_stop_grad)
-            row = {k: result.get(k) for k in ("tokens", "loss_tokens", "prefix_tokens", "loss", "forward_s", "backward_s",
-                                              "tokens_per_s", "peak_gb", "recompute_mode", "gpu_keep_gb", "error", "errors")}
+            result = run_sample(model, device, item, n / trained, args.prefix_stop_grad)
+            row = {k: result.get(k) for k in ("tokens", "loss_tokens", "prefix_tokens", "saved_tokens", "loss",
+                                              "forward_s", "backward_s", "tokens_per_s", "peak_gb", "recompute_mode",
+                                              "error", "errors", "arena_used_gb", "major_faults", "ple_lookup_s",
+                                              "graphs_compiled", "cgroup", "wall_start", "wall_end")}
+            stats = result.get("offload_stats") or {}
+            row.update(overflow_gb=stats.get("overflow_gb"), d2h_gb=stats.get("d2h_gb"), prefetch=item.get("_prefetch"))
             log(event="sample", step=state["step"], epoch=epoch, id=train[i]["id"], **row)
             if "error" not in result:
                 losses.append((result["loss"], n))
@@ -327,8 +397,8 @@ def main(argv: list[str] | None = None) -> int:
         epoch_end = state["step"] % steps_per_epoch == 0
         if epoch_end:
             save(f"adapter_epoch{epoch + 1}", with_state=False)
-            if val_tokens:
-                log(event="val", epoch=epoch + 1, **evaluate(model, device, val_tokens))
+            if val:
+                log(event="val", epoch=epoch + 1, **evaluate(model, device, val, prepare_val))
         if state["step"] % args.save_every == 0 or epoch_end:
             save("latest", with_state=True)
         if args.max_hours and time.time() - started > args.max_hours * 3600:
