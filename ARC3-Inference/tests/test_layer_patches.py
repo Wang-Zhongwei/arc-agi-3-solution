@@ -301,3 +301,4 @@ def test_gdn_pure_functions_match_the_module():
         ours = layer_patches.gated_rms_norm(x, gate, gdn.norm.weight, gdn.norm.variance_epsilon,
                                             gdn.norm.activation == "sigmoid")
         assert torch.equal(ours, gdn.norm(x, gate))
+

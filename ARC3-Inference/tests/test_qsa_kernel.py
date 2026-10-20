@@ -81,3 +81,30 @@ def test_lse_matches_reference():
     reference = torch.logsumexp(scores.masked_fill(~mask[:, None, :n], float("-inf")), dim=-1) / torch.log(
         torch.tensor(2.0))
     torch.testing.assert_close(lse, reference, rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.parametrize("union", [True, False])
+def test_kernel_suffix_over_constant_prefix_keys(union, monkeypatch):
+    """Prefix stop-grad: suffix queries (q_offset) over all keys, keys before key_start get no gradient."""
+    monkeypatch.setattr(qsa_kernel, "UNION_DKV", union)
+    g = torch.Generator().manual_seed(11)
+    n, p, topk, h, hkv, d = 1031, 600, 32, 24, 2, 256
+    scale = d ** -0.5
+    q = torch.randn(n, h, d, generator=g).cuda().bfloat16()
+    k = torch.randn(n, hkv, d, generator=g).cuda().bfloat16()
+    v = torch.randn(n, hkv, d, generator=g).cuda().bfloat16()
+    upstream = torch.randn(n - p, h, d, generator=g).cuda()
+    blocks = random_blocks(n, topk, g).cuda()
+    tokens = qsa.blocks_to_tokens(blocks, RATIO, topk * RATIO + RATIO - 1)
+
+    qr, kr, vr = (t.float().requires_grad_(True) for t in (q[p:], k, v))
+    ref = dense_reference(torch.cat([q[:p].float(), qr]), kr, vr, tokens, scale)[p:]
+    (ref * upstream).sum().backward()
+
+    qs, ks, vs = (t.clone().requires_grad_(True) for t in (q[p:], k, v))
+    ours = qsa_kernel.qsa_attention(qs, ks, vs, blocks[p:], scale, RATIO, q_offset=p, key_start=p)
+    (ours.float() * upstream).sum().backward()
+    assert rel(ours.float(), ref.detach()) < 1e-2
+    assert rel(qs.grad.float(), qr.grad) < 1e-2
+    assert rel(ks.grad[p:].float(), kr.grad[p:]) < 1e-2 and rel(vs.grad[p:].float(), vr.grad[p:]) < 1e-2
+    assert ks.grad[:p].abs().max() == 0 and vs.grad[:p].abs().max() == 0  # constants under stop-grad

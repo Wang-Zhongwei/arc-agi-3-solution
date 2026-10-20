@@ -200,7 +200,10 @@ def cached_expert_weights(experts, start: int, stop: int):
 
     A decoder layer calls its experts once per token chunk, and backward recomputes the chunks of one
     layer after another, so each pass over a layer dequantizes its experts once instead of per chunk."""
-    if not getattr(experts, "_rft_cache_experts", _DEFAULTS["cache_experts"]):
+    if not getattr(experts, "_rft_cache_experts", _DEFAULTS["cache_experts"]) \
+            or any(p.requires_grad for p in experts.parameters()):
+        # trainable BF16 experts: views of the parameters, taken in the current grad mode (a view cached under
+        # no_grad, as prefix stop-grad's prefix runs, would carry no gradient into a recompute's graph)
         return expert_weights(experts, start, stop)
     owner = _EXPERT_CACHE.get("owner")
     if owner is None or owner() is not experts:
@@ -452,6 +455,60 @@ def gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, **k
     return self.out_proj(out.reshape(1, n, -1))
 
 
+def gdn_mixer(self, hidden_states, state=None, return_state: bool = False):
+    """The GDN mixer of one sequence [1, n, hidden], optionally continuing a prefix's `state` (the last K - 1 rows
+    of the convolution's input and the recurrent state) and returning this sequence's state: prefix stop-grad
+    runs the prefix without gradient and the suffix from its state, as a cache would. fast_gdn's kernels on
+    CUDA with fla, transformers' functions otherwise (GDN layers without attention masks, batch 1)."""
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError:
+        chunk_gated_delta_rule = None
+    fast = (_FAST_GDN["on"] and chunk_gated_delta_rule is not None and hidden_states.is_cuda
+            and self.norm.activation in ("sigmoid", "silu") and self.activation == "silu")
+    n = hidden_states.shape[1]
+    mixed_qkv = self.in_proj_qkv(hidden_states)
+    z = self.in_proj_z(hidden_states)
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+    conv_in = mixed_qkv if state is None else torch.cat([state["conv"], mixed_qkv], dim=1)
+    skip = conv_in.shape[1] - n  # rows of the prefix's convolution input in front
+    if fast:
+        q, k, v = _hc_fn("conv_split", True, dynamic=True)(conv_in, self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                                                           self.key_dim, self.num_k_heads, self.num_v_heads,
+                                                           self.head_k_dim, self.head_v_dim)
+        q, k, v = q[:, skip:], k[:, skip:], v[:, skip:]
+    else:
+        conv = m.causal_conv1d_fn(conv_in.transpose(1, 2), self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                                  activation=self.activation).transpose(1, 2)[:, skip:]
+        q, k, v = torch.split(conv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(1, n, -1, self.head_k_dim)
+        k = k.reshape(1, n, -1, self.head_k_dim)
+        v = v.reshape(1, n, -1, self.head_v_dim)
+    beta = b.sigmoid()
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    initial = None if state is None else state["recurrent"]
+    if fast:
+        core, final = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=initial,
+                                             output_final_state=return_state, use_qk_l2norm_in_kernel=True)
+        out = _hc_fn("gated_rms_norm", True, dynamic=True)(core.reshape(-1, self.head_v_dim),
+                                                           z.reshape(-1, self.head_v_dim), self.norm.weight,
+                                                           self.norm.variance_epsilon, self.norm.activation == "sigmoid")
+    else:
+        if self.num_v_heads // self.num_k_heads > 1:
+            q = q.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            k = k.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        core, final = m.torch_chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=initial,
+                                                     output_final_state=return_state, use_qk_l2norm_in_kernel=True)
+        out = self.norm(core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+    out = self.out_proj(out.reshape(1, n, -1))
+    if not return_state:
+        return out
+    return out, dict(conv=conv_in[:, -(self.conv_kernel_size - 1):].detach(), recurrent=final.detach())
+
+
 # ---------------------------------------------------------------------------
 # LoRA branch, fused
 # ---------------------------------------------------------------------------
@@ -514,6 +571,52 @@ def ngram_embedding_forward(self, input_ids, past_key_values):
     return out
 
 # ---------------------------------------------------------------------------
+# Prefix stop-grad
+# ---------------------------------------------------------------------------
+
+_PREFIX = {"p": 0}
+
+
+def set_prefix(p: int) -> None:
+    """Positions before `p` run without gradient in the next forward/backward (0 = off): the LoRA learns only
+    from the computation at and after p, as if the prefix were a cache (truncated backpropagation). p is the
+    position whose output predicts the first trained token."""
+    _PREFIX["p"] = int(p)
+
+
+def split_decoder_forward(self, hidden_states, p: int, position_embeddings, attention_mask, conv_mask,
+                          ple_input_ids, kwargs):
+    """chunked_decoder_forward with positions before p computed without gradient (prefix stop-grad).
+
+    Per-token parts and the mixer run on the prefix under no_grad (no checkpoints, nothing saved); the suffix
+    runs as usual, its GDN continuing the prefix's convolution and recurrent state and its QSA attending to the
+    prefix's keys and values as constants. PLE has no trainable weights: it runs on the whole sequence, and
+    its gradient reaches only suffix positions since the prefix's hidden states carry none."""
+    size = getattr(self, "_rft_token_chunk", _DEFAULTS["token_chunk"])
+    parts = getattr(self, "_rft_recompute", "layer") == "parts"
+    if self.ple is not None:
+        ple = lambda h, ids: self.ple(h, ids, None, conv_mask=conv_mask)
+        hidden_states = hidden_states + checkpoint(ple, hidden_states, ple_input_ids, use_reentrant=False)
+    before_mixer, after_mixer = _per_token_functions(self, hidden_states.is_cuda)
+    h_p, h_s = hidden_states[:, :p], hidden_states[:, p:]
+    with torch.no_grad():
+        mixed_p, inject_p = _chunked(before_mixer, h_p, size=size)
+    mixed_s, inject_s = _chunked(before_mixer, h_s, size=size)
+    if self.layer_type == "linear_attention":
+        with torch.no_grad():
+            out_p, state = gdn_mixer(self.linear_attn, mixed_p, return_state=True)
+        mixer = lambda m: gdn_mixer(self.linear_attn, m, state=state)
+        out_s = checkpoint(mixer, mixed_s, use_reentrant=False) if parts else mixer(mixed_s)
+    else:
+        from inference.rl import qsa
+
+        out_p, out_s = qsa.qsa_split(self.self_attn, mixed_p, mixed_s, position_embeddings, checkpointed=parts)
+    with torch.no_grad():
+        y_p = _chunked(after_mixer, h_p, out_p, inject_p, size=size)
+    return torch.cat([y_p, _chunked(after_mixer, h_s, out_s, inject_s, size=size)], dim=1)
+
+
+# ---------------------------------------------------------------------------
 # Token-chunked decoder layer
 # ---------------------------------------------------------------------------
 
@@ -533,20 +636,10 @@ def _chunked(fn, *tensors, size: int):
     return torch.cat(pieces, dim=1)
 
 
-def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_mask=None, conv_mask=None,
-                            past_key_values=None, ple_input_ids=None, **kwargs):
-    if past_key_values is not None or hidden_states.shape[0] != 1:
-        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask=attention_mask,
-                                      conv_mask=conv_mask, past_key_values=past_key_values,
-                                      ple_input_ids=ple_input_ids, **kwargs)
-    size = getattr(self, "_rft_token_chunk", _DEFAULTS["token_chunk"])
-    if self.ple is not None:  # its short convolution spans tokens: one checkpoint, not chunks
-        ple = lambda h, ids: self.ple(h, ids, None, conv_mask=conv_mask)
-        extra = checkpoint(ple, hidden_states, ple_input_ids, use_reentrant=False) if torch.is_grad_enabled() \
-            else ple(hidden_states, ple_input_ids)
-        hidden_states = hidden_states + extra
-
-    compiled = getattr(self, "_rft_compile_hc", False) and hidden_states.is_cuda
+def _per_token_functions(self, cuda: bool):
+    """The decoder layer's per-token work before the mixer (attention hyper-connection: mixer input, injection
+    weights) and after it (inject, MLP hyper-connection, MoE, inject), compiled with compile_hc on CUDA."""
+    compiled = getattr(self, "_rft_compile_hc", False) and cuda
     attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
     hc_kw = dict(eps=attn_hc.hc_norm.eps, hc=attn_hc.hc_count)
 
@@ -555,19 +648,6 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
             return static_call("hc_before_mixer", h.shape[1], (h,), _hc_args(attn_hc), **hc_kw)
         mixed, _, weights = attn_hc(h)
         return mixed, weights
-
-    mixed, inject = _chunked(before_mixer, hidden_states, size=size)
-
-    def mixer(h):
-        if self.layer_type == "linear_attention":
-            return self.linear_attn(h, cache_params=None, attention_mask=conv_mask, **kwargs)
-        return self.self_attn(h, position_embeddings, attention_mask=attention_mask, past_key_values=None,
-                              **kwargs)[0]
-
-    if getattr(self, "_rft_recompute", "layer") == "parts" and torch.is_grad_enabled():
-        mixed = checkpoint(mixer, mixed, use_reentrant=False)
-    else:
-        mixed = mixer(mixed)
 
     def after_mixer(h, mixer_out, weights):
         if compiled:
@@ -580,6 +660,39 @@ def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_
         mlp_out = self.mlp(mlp_in)
         return hyper + (mlp_out.unsqueeze(-2) * mlp_weights.unsqueeze(-1)).flatten(-2)
 
+    return before_mixer, after_mixer
+
+
+def chunked_decoder_forward(self, hidden_states, position_embeddings, attention_mask=None, conv_mask=None,
+                            past_key_values=None, ple_input_ids=None, **kwargs):
+    if past_key_values is not None or hidden_states.shape[0] != 1:
+        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask=attention_mask,
+                                      conv_mask=conv_mask, past_key_values=past_key_values,
+                                      ple_input_ids=ple_input_ids, **kwargs)
+    p = _PREFIX["p"]
+    if torch.is_grad_enabled() and 0 < p < hidden_states.shape[1]:
+        return split_decoder_forward(self, hidden_states, p, position_embeddings, attention_mask, conv_mask,
+                                     ple_input_ids, kwargs)
+    size = getattr(self, "_rft_token_chunk", _DEFAULTS["token_chunk"])
+    if self.ple is not None:  # its short convolution spans tokens: one checkpoint, not chunks
+        ple = lambda h, ids: self.ple(h, ids, None, conv_mask=conv_mask)
+        extra = checkpoint(ple, hidden_states, ple_input_ids, use_reentrant=False) if torch.is_grad_enabled() \
+            else ple(hidden_states, ple_input_ids)
+        hidden_states = hidden_states + extra
+
+    before_mixer, after_mixer = _per_token_functions(self, hidden_states.is_cuda)
+    mixed, inject = _chunked(before_mixer, hidden_states, size=size)
+
+    def mixer(h):
+        if self.layer_type == "linear_attention":
+            return self.linear_attn(h, cache_params=None, attention_mask=conv_mask, **kwargs)
+        return self.self_attn(h, position_embeddings, attention_mask=attention_mask, past_key_values=None,
+                              **kwargs)[0]
+
+    if getattr(self, "_rft_recompute", "layer") == "parts" and torch.is_grad_enabled():
+        mixed = checkpoint(mixer, mixed, use_reentrant=False)
+    else:
+        mixed = mixer(mixed)
     return _chunked(after_mixer, hidden_states, mixed, inject, size=size)
 
 
@@ -693,6 +806,7 @@ def unpatch(model=None) -> None:
         m.causal_conv1d_fn = m._rft_hf_causal_conv1d_fn
     if hasattr(m.Qwen4ExpTextNGramEmbedding, "_hf_forward"):
         m.Qwen4ExpTextNGramEmbedding.forward = m.Qwen4ExpTextNGramEmbedding._hf_forward
+
     _FAST_LORA["on"] = False  # peft's own LoRA forward
     _FAST_GDN["on"] = False
 

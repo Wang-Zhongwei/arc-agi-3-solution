@@ -165,16 +165,16 @@ def select_blocks(indexer, hidden_states, cos, sin, chunk_size: int) -> torch.Te
     return out
 
 
-def blocks_to_tokens(blocks: torch.Tensor, ratio: int, width: int) -> torch.Tensor:
+def blocks_to_tokens(blocks: torch.Tensor, ratio: int, width: int, offset: int = 0) -> torch.Tensor:
     """Token indices [N, width] (-1 = padding) of select_blocks' selection: the chosen blocks' tokens,
-    then the tail block's tokens up to the query."""
+    then the tail block's tokens up to the query (row i is the query at position i + offset)."""
     n, k = blocks.shape[0], blocks.shape[1] - 1
     offsets = torch.arange(ratio, device=blocks.device)
     chosen = blocks[:, :k].long()
     tokens = (chosen[..., None] * ratio + offsets).view(n, k * ratio)
     tokens = torch.where(chosen.repeat_interleave(ratio, dim=1) >= 0, tokens, -1)
     tail = blocks[:, k:].long() * ratio + offsets[: ratio - 1]
-    tail = torch.where(tail <= torch.arange(n, device=blocks.device)[:, None], tail, -1)
+    tail = torch.where(tail <= torch.arange(offset, offset + n, device=blocks.device)[:, None], tail, -1)
     out = torch.full((n, width), -1, dtype=torch.long, device=blocks.device)
     out[:, : k * ratio] = tokens
     out[:, k * ratio: k * ratio + ratio - 1] = tail
@@ -230,15 +230,10 @@ def _attend_chunk(q, k, v, idx, scaling):
 SELECTION_CHUNK = 2048
 
 
-def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
-    if past_key_values is not None or hidden_states.shape[0] != 1:
-        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values,
-                                      **kwargs)
-    chunk = getattr(self, "_qsa_chunk_size", 256)
+def qsa_project(self, hidden_states, cos, sin, fused: bool):
+    """q (normed, rotated) [n, H, D], output gate [n, H * D], k (normed, rotated) and v [n, Hkv, D] of one
+    sequence's hidden states [1, n, hidden]; cos/sin [1, n, rotary] for the same positions."""
     n = hidden_states.shape[1]
-    cos, sin = (x[:, -n:, :] for x in position_embeddings)
-    fused = getattr(self, "_qsa_fused", True) and qsa_kernel.available(hidden_states)
-
     hidden_shape = (n, -1, self.head_dim)
     query, gate = torch.chunk(self.q_proj(hidden_states[0]).view(n, -1, self.head_dim * 2), 2, dim=-1)
     gate = gate.reshape(n, -1)
@@ -250,19 +245,24 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     else:
         query = _rope(self.q_norm(query.view(hidden_shape)), cos[0], sin[0])
         key = _rope(self.k_norm(key), cos[0], sin[0])
-    if fused:
-        # the selection's query chunks only bound the [chunk, blocks] score matrix (2,048 x 16K FP32 = 128 MB at
-        # 64K); top-k is per query, so the size changes nothing but the number of launches
-        blocks = _selection(self, hidden_states, position_embeddings, cos, sin, SELECTION_CHUNK)
-        output = qsa_kernel.qsa_attention(query, key, value, blocks, self.scaling, self.indexer.compress_ratio)
-        return self.o_proj(_compiled(gate_output)(output.reshape(n, -1), gate))[None], None
+    return query, gate, key, value
 
-    selected = select_tokens(self.indexer, hidden_states, cos, sin, SELECTION_CHUNK)  # the fused path's selection
+
+def qsa_attend(self, query, gate, key, value, blocks, fused: bool, q_offset: int = 0, key_start: int = 0):
+    """Attention of the queries over their selected blocks of key/value, output gate and o_proj ([1, n, hidden]).
+    Query i sits at key position i + q_offset; keys before key_start are constants (prefix stop-grad)."""
+    n = query.shape[0]
+    if fused:
+        output = qsa_kernel.qsa_attention(query, key, value, blocks, self.scaling, self.indexer.compress_ratio,
+                                          q_offset=q_offset, key_start=key_start)
+        return self.o_proj(_compiled(gate_output)(output.reshape(n, -1), gate))[None]
+    ratio = self.indexer.compress_ratio
+    selected = blocks_to_tokens(blocks, ratio, self.indexer.token_budget + ratio - 1, offset=q_offset)
     if getattr(self, "_qsa_kv_grad_fp32", False) and torch.is_grad_enabled():
         # gather from FP32 copies: every query's contribution to a key's gradient then adds up in
         # FP32, within a chunk's index_add and across chunks (BF16 sums were 1.7% off on one chunk)
         key, value = key.float(), value.float()
-
+    chunk = getattr(self, "_qsa_chunk_size", 256)
     pieces = []
     for start in range(0, n, chunk):
         stop = min(start + chunk, n)
@@ -271,8 +271,47 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
             pieces.append(checkpoint(_attend_chunk, *args, use_reentrant=False))
         else:
             pieces.append(_attend_chunk(*args))
-    output = torch.cat(pieces).reshape(n, -1) * torch.sigmoid(gate)
-    return self.o_proj(output)[None], None
+    return self.o_proj(torch.cat(pieces).reshape(n, -1) * torch.sigmoid(gate))[None]
+
+
+def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+    if past_key_values is not None or hidden_states.shape[0] != 1:
+        return type(self)._hf_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values,
+                                      **kwargs)
+    n = hidden_states.shape[1]
+    cos, sin = (x[:, -n:, :] for x in position_embeddings)
+    fused = getattr(self, "_qsa_fused", True) and qsa_kernel.available(hidden_states)
+    query, gate, key, value = qsa_project(self, hidden_states, cos, sin, fused)
+    if fused:
+        # the selection's query chunks only bound the [chunk, blocks] score matrix (2,048 x 16K FP32 = 128 MB at
+        # 64K); top-k is per query, so the size changes nothing but the number of launches
+        blocks = _selection(self, hidden_states, position_embeddings, cos, sin, SELECTION_CHUNK)
+    else:
+        blocks = select_blocks(self.indexer, hidden_states, cos, sin, SELECTION_CHUNK)  # the fused path's selection
+    return qsa_attend(self, query, gate, key, value, blocks, fused), None
+
+
+def qsa_split(self, mixed_prefix, mixed_suffix, position_embeddings, checkpointed: bool):
+    """Prefix stop-grad for one QSA layer: (prefix output without gradient, suffix output).
+
+    The selection runs on the whole sequence (no gradient anyway); the prefix's keys and values are computed
+    without gradient and enter the suffix's attention as constants, so no gradient reaches the prefix
+    through them, as if the suffix were run on a cache of the prefix."""
+    p, n = mixed_prefix.shape[1], mixed_prefix.shape[1] + mixed_suffix.shape[1]
+    cos, sin = (x[:, -n:, :] for x in position_embeddings)
+    fused = getattr(self, "_qsa_fused", True) and qsa_kernel.available(mixed_suffix)
+    with torch.no_grad():
+        blocks = select_blocks(self.indexer, torch.cat([mixed_prefix, mixed_suffix], dim=1), cos, sin, SELECTION_CHUNK)
+        q_p, gate_p, k_p, v_p = qsa_project(self, mixed_prefix, cos[:, :p], sin[:, :p], fused)
+        out_p = qsa_attend(self, q_p, gate_p, k_p, v_p, blocks[:p], fused)
+
+    def suffix(h):
+        q, gate, k, v = qsa_project(self, h, cos[:, p:], sin[:, p:], fused)
+        return qsa_attend(self, q, gate, torch.cat([k_p, k]), torch.cat([v_p, v]), blocks[p:], fused,
+                          q_offset=p, key_start=p)
+
+    out_s = checkpoint(suffix, mixed_suffix, use_reentrant=False) if checkpointed else suffix(mixed_suffix)
+    return out_p, out_s
 
 
 def patch_qsa_attention(chunk_size: int = 256, kv_grad_fp32: bool = False, fused: bool = True,

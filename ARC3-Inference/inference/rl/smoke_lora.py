@@ -290,7 +290,7 @@ class LayerTimeline:
 
 def step(model, sample, device, offload: bool = False, profile: bool = False,
          reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
-         async_copies: bool = False, timeline: bool = False) -> dict[str, Any]:
+         async_copies: bool = False, timeline: bool = False, prefix_stop_grad: bool = False) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
     in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
@@ -302,7 +302,8 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
     model.train()
     tokens = int(sample["input_ids"].shape[1])
-    layout = layer_patches.current_recompute(model)  # what each layer saves depends on the recompute mode
+    # what each layer saves depends on the recompute mode, and with prefix stop-grad the prefix saves nothing
+    layout = layer_patches.current_recompute(model) + ("+prefix" if prefix_stop_grad else "")
     arena = None
     if offload and reuse_buffers:
         arena = getattr(model, "_rft_host_arena", None)  # on the model: survives the job server's reloads
@@ -344,17 +345,23 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     profiler = (torch.profiler.profile(activities=activities, profile_memory=True) if profile
                 else contextlib.nullcontext())
     layer_timeline = LayerTimeline(model) if timeline and torch.cuda.is_available() else None
-    with profiler:
-        with saved:
-            hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
-            loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
-        _sync()
-        t1 = time.perf_counter()
-        if layer_timeline is not None:
-            layer_timeline.forward_phase = False
-        loss.backward()
-        _sync()
-        t2 = time.perf_counter()
+    # prefix stop-grad: positions before the one predicting the first trained token run without gradient
+    prefix = int(targets.min()) - 1 if prefix_stop_grad and targets.numel() else 0
+    layer_patches.set_prefix(prefix)
+    try:
+        with profiler:
+            with saved:
+                hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
+                loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
+            _sync()
+            t1 = time.perf_counter()
+            if layer_timeline is not None:
+                layer_timeline.forward_phase = False
+            loss.backward()
+            _sync()
+            t2 = time.perf_counter()
+    finally:
+        layer_patches.set_prefix(0)
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
     if keep_grads:  # for compare_grads: ~0.1 GB of host memory per kept step at r = 16
@@ -379,7 +386,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 images=int(sample["image_grid_thw"].shape[0]) if "image_grid_thw" in sample else 0,
                 loss=round(float(loss.detach()), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
                 tokens_per_s=round(sample["input_ids"].shape[1] / (t2 - t0), 1),
-                lora_params_with_grad=len(grads), lora_grad_norm=norm, kept_grads=keep_grads,
+                lora_params_with_grad=len(grads), lora_grad_norm=norm, kept_grads=keep_grads, prefix_tokens=prefix,
                 peak_gb=peak_gb(), host_gb=host_memory_gb(),
                 recompute=layout, host_buffers_gb=round(arena.capacity_gb, 1) if arena is not None else None,
                 host_pinned_gb=round(arena.pinned_gb, 1) if arena is not None else None,
@@ -418,7 +425,8 @@ def auto_keep_gb(result: dict[str, Any]) -> float:
 
 def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
               profile: bool = False, reuse_buffers: bool = True, keep_grads: str | None = None,
-              gpu_keep_gb: float | str = 0.0, async_copies: bool = False, timeline: bool = False) -> dict[str, list]:
+              gpu_keep_gb: float | str = 0.0, async_copies: bool = False, timeline: bool = False,
+              prefix_stop_grad: bool = False) -> dict[str, list]:
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised.
     `keep_grads` keeps each step's LoRA gradients as "<keep_grads>/<spec>/<repeat>" for compare_grads.
     `gpu_keep_gb="auto"`: the first repeat offloads everything, later ones keep what its peak left free."""
@@ -445,7 +453,8 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                     result = step(model, samples[length], device, offload=offload, profile=profile,
                                   reuse_buffers=reuse_buffers,
                                   keep_grads=f"{keep_grads}/{spec}/{repeat}" if keep_grads else None,
-                                  gpu_keep_gb=keep, async_copies=async_copies, timeline=timeline)
+                                  gpu_keep_gb=keep, async_copies=async_copies, timeline=timeline,
+                                  prefix_stop_grad=prefix_stop_grad)
                     result["token_chunk"] = current_token_chunk(model)
                     result["gpu_keep_gb"] = keep
                     if gpu_keep_gb == "auto" and offload:
@@ -807,7 +816,7 @@ def serve(model, device, args, processor, tools, game) -> None:
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
     "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
     "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
-    "fast_lora": false, "fast_gdn": false, "compile_qsa": false, "timeline": false (per-layer forward/backward CUDA times),
+    "fast_lora": false, "fast_gdn": false, "compile_qsa": false, "prefix_stop_grad": false, "timeline": false (per-layer forward/backward CUDA times),
     "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer),
     "reference_qsa" / "reference_layers": one half of it, "reference_selection": transformers' own tie-breaking},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
@@ -922,7 +931,8 @@ def serve(model, device, args, processor, tools, game) -> None:
                                                keep_grads=job.get("keep_grads"),
                                                gpu_keep_gb=job.get("gpu_keep_gb", 0.0),
                                                async_copies=job.get("async_copies", False),
-                                               timeline=job.get("timeline", False))
+                                               timeline=job.get("timeline", False),
+                                               prefix_stop_grad=job.get("prefix_stop_grad", False))
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)

@@ -42,7 +42,7 @@ if triton is not None:
 
     @triton.autotune(configs=_configs((32, 64)), key=["G", "D", "R"])
     @triton.jit
-    def _fwd_kernel(Q, K, V, B, O, LSE, scale2, NB,
+    def _fwd_kernel(Q, K, V, B, O, LSE, scale2, NB, Q_OFF,
                     sq_n, sq_h, sk_n, sk_h, sv_n, sv_h, sb_n, so_n, so_h, sl_n,
                     G: tl.constexpr, R: tl.constexpr, D: tl.constexpr, BLOCK_H: tl.constexpr,
                     BLOCK_N: tl.constexpr):
@@ -62,7 +62,7 @@ if triton is not None:
             bj = j // R
             blk = tl.load(B + qi * sb_n + bj, mask=bj < NB, other=-1)
             tok = blk.to(tl.int64) * R + (j % R)
-            valid = (blk >= 0) & (tok <= qi)
+            valid = (blk >= 0) & (tok <= qi + Q_OFF)  # query qi sits at position qi + Q_OFF of the keys
             kt = tl.load(K + tok[:, None] * sk_n + g * sk_h + offs_d[None, :], mask=valid[:, None], other=0.0)
             s = tl.dot(q, tl.trans(kt)) * scale2
             s = tl.where(valid[None, :], s, float("-inf"))
@@ -80,7 +80,7 @@ if triton is not None:
 
     @triton.autotune(configs=_configs((16, 32, 64)), key=["G", "D", "R", "WITH_DKV"], reset_to_zero=["DK", "DV"])
     @triton.jit
-    def _bwd_kernel(Q, K, V, B, DO, LSE, DELTA, DQ, DK, DV, scale, scale2, NB,
+    def _bwd_kernel(Q, K, V, B, DO, LSE, DELTA, DQ, DK, DV, scale, scale2, NB, Q_OFF, KEY_START,
                     sq_n, sq_h, sk_n, sk_h, sv_n, sv_h, sb_n, sdo_n, sdo_h, sl_n, sdq_n, sdq_h,
                     sdk_n, sdk_h, sdv_n, sdv_h,
                     G: tl.constexpr, R: tl.constexpr, D: tl.constexpr, BLOCK_H: tl.constexpr,
@@ -102,7 +102,7 @@ if triton is not None:
             bj = j // R
             blk = tl.load(B + qi * sb_n + bj, mask=bj < NB, other=-1)
             tok = blk.to(tl.int64) * R + (j % R)
-            valid = (blk >= 0) & (tok <= qi)
+            valid = (blk >= 0) & (tok <= qi + Q_OFF)
             kt = tl.load(K + tok[:, None] * sk_n + g * sk_h + offs_d[None, :], mask=valid[:, None], other=0.0)
             vt = tl.load(V + tok[:, None] * sv_n + g * sv_h + offs_d[None, :], mask=valid[:, None], other=0.0)
             s = tl.dot(q, tl.trans(kt)) * scale2
@@ -114,9 +114,10 @@ if triton is not None:
             if WITH_DKV:
                 dk = tl.dot(tl.trans(ds.to(q.dtype)), q) * scale
                 dv = tl.dot(tl.trans(p.to(do.dtype)), do)
-                tl.atomic_add(DK + tok[:, None] * sdk_n + g * sdk_h + offs_d[None, :], dk, mask=valid[:, None],
+                kv = valid & (tok >= KEY_START)  # keys before KEY_START are constants (prefix stop-grad)
+                tl.atomic_add(DK + tok[:, None] * sdk_n + g * sdk_h + offs_d[None, :], dk, mask=kv[:, None],
                               sem="relaxed")
-                tl.atomic_add(DV + tok[:, None] * sdv_n + g * sdv_h + offs_d[None, :], dv, mask=valid[:, None],
+                tl.atomic_add(DV + tok[:, None] * sdv_n + g * sdv_h + offs_d[None, :], dv, mask=kv[:, None],
                               sem="relaxed")
         tl.store(DQ + qi * sdq_n + heads[:, None] * sdq_h + offs_d[None, :], (dq * scale).to(DQ.dtype.element_ty),
                  mask=hmask[:, None])
@@ -125,7 +126,7 @@ if triton is not None:
                               for n in (16, 32) for w in (4, 8)],
                      key=["G", "D", "R", "QT"], reset_to_zero=["DK", "DV"])
     @triton.jit
-    def _dkv_union_kernel(Q, K, V, UB, UM, DO, LSE, DELTA, DK, DV, scale, scale2, N, U,
+    def _dkv_union_kernel(Q, K, V, UB, UM, DO, LSE, DELTA, DK, DV, scale, scale2, N, U, NK, Q_OFF, KEY_START,
                           sq_n, sq_h, sk_n, sk_h, sv_n, sv_h, su_t, sdo_n, sdo_h, sl_n,
                           sdk_n, sdk_h, sdv_n, sdv_h,
                           G: tl.constexpr, R: tl.constexpr, D: tl.constexpr, QT: tl.constexpr,
@@ -153,14 +154,14 @@ if triton is not None:
             tok = blk.to(tl.int64) * R + (j % R)
             # the tail block of a query ending a block is the next one, past the last query for the final tile:
             # never read or write keys at or after N
-            tvalid = (blk >= 0) & (tok < N)
+            tvalid = (blk >= 0) & (tok < NK) & (tok >= KEY_START)  # N queries, NK keys, constants before KEY_START
             if tl.max(tvalid.to(tl.int32), 0) > 0:
                 kt = tl.load(K + tok[:, None] * sk_n + g * sk_h + offs_d[None, :], mask=tvalid[:, None], other=0.0)
                 vt = tl.load(V + tok[:, None] * sv_n + g * sv_h + offs_d[None, :], mask=tvalid[:, None], other=0.0)
                 dk = tl.zeros([BLOCK_N, D], tl.float32)
                 dv = tl.zeros([BLOCK_N, D], tl.float32)
                 selected = ((bits[None, :] >> rq[:, None]) & 1) == 1
-                allowed = selected & tvalid[None, :] & (tok[None, :] <= query[:, None]) & qmask[:, None]
+                allowed = selected & tvalid[None, :] & (tok[None, :] <= query[:, None] + Q_OFF) & qmask[:, None]
                 for c in range(0, G // HC):
                     heads = g * G + c * HC + rh
                     q = tl.load(Q + query[:, None] * sq_n + heads[:, None] * sq_h + offs_d[None, :],
@@ -185,13 +186,14 @@ def _block_h(g: int) -> int:
     return max(16, triton.next_power_of_2(g))
 
 
-def qsa_forward(q, k, v, blocks, scale: float, ratio: int):
-    """q [N, H, D], k/v [N, Hkv, D], blocks [N, NB] int32 -> (out [N, H, D], lse [N, H] base 2)."""
+def qsa_forward(q, k, v, blocks, scale: float, ratio: int, q_offset: int = 0):
+    """q [N, H, D], k/v [NK, Hkv, D], blocks [N, NB] int32 -> (out [N, H, D], lse [N, H] base 2).
+    Query i sits at key position i + q_offset (a suffix attending to cached prefix keys)."""
     n, h, d = q.shape
     hkv = k.shape[1]
     out = torch.empty_like(q)
     lse = torch.empty(n, h, device=q.device, dtype=torch.float32)
-    _fwd_kernel[(n, hkv)](q, k, v, blocks, out, lse, scale * LOG2E, blocks.shape[1],
+    _fwd_kernel[(n, hkv)](q, k, v, blocks, out, lse, scale * LOG2E, blocks.shape[1], q_offset,
                           q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
                           blocks.stride(0), out.stride(0), out.stride(1), lse.stride(0),
                           G=h // hkv, R=ratio, D=d, BLOCK_H=_block_h(h // hkv))
@@ -227,7 +229,9 @@ def union_tiles(blocks: torch.Tensor, qt: int):
 UNION_QUERIES = 16  # queries per dK/dV tile: 16 neighbours select ~3.5x one query's tokens (10-19 overlap job)
 
 
-def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, union: bool = True):
+def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, union: bool = True,
+                 q_offset: int = 0, key_start: int = 0):
+    """dQ, dK, dV; dK and dV stay zero for keys before `key_start` (constants under prefix stop-grad)."""
     n, h, d = q.shape
     hkv = k.shape[1]
     g = h // hkv
@@ -237,6 +241,7 @@ def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, unio
     dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
     dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
     _bwd_kernel[(n, hkv)](q, k, v, blocks, dout, lse, delta, dq, dk, dv, scale, scale * LOG2E, blocks.shape[1],
+                          q_offset, key_start,
                           q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
                           blocks.stride(0), dout.stride(0), dout.stride(1), lse.stride(0), dq.stride(0), dq.stride(1),
                           dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1),
@@ -246,7 +251,8 @@ def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, unio
         heads_per_chunk = 4 if g % 4 == 0 else (2 if g % 2 == 0 else 1)
         ub, um = union_tiles(blocks, qt)
         _dkv_union_kernel[(ub.shape[0], hkv)](
-            q, k, v, ub, um, dout, lse, delta, dk, dv, scale, scale * LOG2E, n, ub.shape[1],
+            q, k, v, ub, um, dout, lse, delta, dk, dv, scale, scale * LOG2E, n, ub.shape[1], k.shape[0], q_offset,
+            key_start,
             q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), ub.stride(0),
             dout.stride(0), dout.stride(1), lse.stride(0), dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1),
             G=g, R=ratio, D=d, QT=qt, HC=heads_per_chunk)
@@ -258,20 +264,22 @@ UNION_DKV = True  # dK/dV per tile of neighbouring queries (False: per query, on
 
 class QSAAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, blocks, scale, ratio):
+    def forward(ctx, q, k, v, blocks, scale, ratio, q_offset, key_start):
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-        out, lse = qsa_forward(q, k, v, blocks, scale, ratio)
+        out, lse = qsa_forward(q, k, v, blocks, scale, ratio, q_offset)
         ctx.save_for_backward(q, k, v, blocks, out, lse)
-        ctx.scale, ctx.ratio = scale, ratio
+        ctx.scale, ctx.ratio, ctx.q_offset, ctx.key_start = scale, ratio, q_offset, key_start
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q, k, v, blocks, out, lse = ctx.saved_tensors
-        dq, dk, dv = qsa_backward(q, k, v, blocks, out, lse, dout, ctx.scale, ctx.ratio, union=UNION_DKV)
-        return dq, dk, dv, None, None, None
+        dq, dk, dv = qsa_backward(q, k, v, blocks, out, lse, dout, ctx.scale, ctx.ratio, union=UNION_DKV,
+                                  q_offset=ctx.q_offset, key_start=ctx.key_start)
+        return dq, dk, dv, None, None, None, None, None
 
 
-def qsa_attention(q, k, v, blocks, scale: float, ratio: int):
-    """Sparse attention of each query over its selected blocks; differentiable in q, k and v."""
-    return QSAAttention.apply(q, k, v, blocks.to(torch.int32).contiguous(), scale, ratio)
+def qsa_attention(q, k, v, blocks, scale: float, ratio: int, q_offset: int = 0, key_start: int = 0):
+    """Sparse attention of each query over its selected blocks; differentiable in q, k and v. Query i sits at
+    key position i + q_offset; keys before key_start get no gradient (prefix stop-grad: pass them detached)."""
+    return QSAAttention.apply(q, k, v, blocks.to(torch.int32).contiguous(), scale, ratio, q_offset, key_start)
