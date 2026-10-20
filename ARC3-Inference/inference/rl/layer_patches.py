@@ -13,6 +13,8 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   grouped value attention instead of repeat_interleave copies); the gated RMSNorm is compiled.
 - fast_lora: peft's LoRA update (FP32 adapter on a BF16 base output) as one compiled function
   instead of FP32 intermediates the size of the output.
+- PLE layer: its per-token part in checkpointed token chunks, only the short convolution on the
+  whole sequence (no full-sequence FP32 temporaries; exact).
 - PLE n-gram lookup: the host-side table gather runs once per step; the PLE checkpoint's
   recompute reuses the forward's result (exact).
 - token chunks: everything in a decoder layer except the sequence mixer (GDN or QSA)
@@ -35,6 +37,7 @@ Scope: batch 1, no cache (training). Anything else runs transformers' forward.
 
 from __future__ import annotations
 
+import math
 import weakref
 
 import torch
@@ -570,6 +573,30 @@ def ngram_embedding_forward(self, input_ids, past_key_values):
     self._rft_ngram_cache = (weakref.ref(input_ids), out)
     return out
 
+def ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
+    """transformers' PLE layer with its per-token part in checkpointed token chunks (training, batch 1).
+
+    Only the short convolution spans tokens. Run whole, the PLE block's norms built several full-sequence
+    FP32 [N, 10,240] temporaries in backward (4.69 GiB each at 123K tokens: the size of the allocation that
+    ran recompute "parts" out of memory). Chunked, those exist one chunk at a time; same operations per token."""
+    if past_key_values is not None or conv_mask is not None or hidden_states.shape[0] != 1:
+        return type(self)._hf_forward(self, hidden_states, input_ids, past_key_values, conv_mask=conv_mask)
+    hc, hidden = self.hc_count, self.hidden_size
+    embeddings = self.ple_embedding(input_ids, None)
+
+    def per_token(h, emb):
+        key_normed = self.norm_key(self.key_proj(emb)).unflatten(-1, (hc, hidden))
+        value = self.value_proj(emb)
+        query_normed = self.norm_query(h).unflatten(-1, (hc, hidden))
+        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True) / math.sqrt(hidden)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated = torch.sigmoid(gate) * value.unsqueeze(-2)
+        return gated.flatten(-2), self.norm_conv(gated.flatten(-2))
+
+    gated, normed = _chunked(per_token, hidden_states, embeddings, size=getattr(self, "_rft_token_chunk", 8192))
+    return gated + self._short_conv(normed, None)
+
+
 # ---------------------------------------------------------------------------
 # Prefix stop-grad
 # ---------------------------------------------------------------------------
@@ -709,6 +736,8 @@ def configure(model, token_chunk: int | None = None, expert_tile: int | None = N
         raise ValueError(f"recompute must be one of {RECOMPUTE_MODES}, got {recompute!r}")
     for module in model.modules():
         name = type(module).__name__
+        if name == "Qwen4ExpTextPLELayer" and token_chunk:
+            module._rft_token_chunk = token_chunk
         if name == "Qwen4ExpTextDecoderLayer":
             if token_chunk:
                 module._rft_token_chunk = token_chunk
@@ -763,6 +792,10 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     if not hasattr(layer, "_hf_forward"):
         layer._hf_forward = layer.forward
     layer.forward = chunked_decoder_forward
+    ple_layer = m.Qwen4ExpTextPLELayer
+    if not hasattr(ple_layer, "_hf_forward"):
+        ple_layer._hf_forward = ple_layer.forward
+    ple_layer.forward = ple_forward
     ngram = m.Qwen4ExpTextNGramEmbedding
     if not hasattr(ngram, "_hf_forward"):
         ngram._hf_forward = ngram.forward
@@ -806,7 +839,8 @@ def unpatch(model=None) -> None:
         m.causal_conv1d_fn = m._rft_hf_causal_conv1d_fn
     if hasattr(m.Qwen4ExpTextNGramEmbedding, "_hf_forward"):
         m.Qwen4ExpTextNGramEmbedding.forward = m.Qwen4ExpTextNGramEmbedding._hf_forward
-
+    if hasattr(m.Qwen4ExpTextPLELayer, "_hf_forward"):
+        m.Qwen4ExpTextPLELayer.forward = m.Qwen4ExpTextPLELayer._hf_forward
     _FAST_LORA["on"] = False  # peft's own LoRA forward
     _FAST_GDN["on"] = False
 

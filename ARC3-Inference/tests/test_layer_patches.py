@@ -302,3 +302,35 @@ def test_gdn_pure_functions_match_the_module():
                                             gdn.norm.activation == "sigmoid")
         assert torch.equal(ours, gdn.norm(x, gate))
 
+
+def test_chunked_ple_matches_the_module():
+    """The PLE layer with its per-token part in token chunks: same output and gradients as transformers'."""
+    model = tiny()
+    ple = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextPLELayer))
+    g = torch.Generator().manual_seed(2)
+    n = 45
+    width = ple.hc_count * ple.hidden_size
+    ids = torch.randint(0, 1000, (1, n), generator=g)
+    x = torch.randn(1, n, width, generator=g)
+    upstream = torch.randn(1, n, width, generator=g)
+
+    def run(chunked):
+        h = x.clone().requires_grad_(True)
+        ple.zero_grad(set_to_none=True)
+        if chunked:
+            ple._rft_token_chunk = 16  # 3 chunks, the last partial
+            out = layer_patches.ple_forward(ple, h, ids, None)
+        else:  # transformers' forward, whether or not patch_for_training replaced it
+            hf = getattr(m.Qwen4ExpTextPLELayer, "_hf_forward", m.Qwen4ExpTextPLELayer.forward)
+            out = hf(ple, h, ids, None)
+        (out * upstream).sum().backward()
+        return out.detach(), h.grad, {k: p.grad.clone() for k, p in ple.named_parameters() if p.grad is not None}
+
+    ref = run(False)
+    ours = run(True)
+    assert torch.equal(ours[0], ref[0])
+    print("dh max rel", float((ours[1] - ref[1]).abs().max() / ref[1].abs().max()))
+    torch.testing.assert_close(ours[1], ref[1], rtol=1e-5, atol=1e-6)  # per-chunk reductions: float reassociation
+    assert ours[2].keys() == ref[2].keys()
+    for name in ref[2]:
+        torch.testing.assert_close(ours[2][name], ref[2][name], rtol=1e-6, atol=1e-7, msg=name)
