@@ -55,6 +55,8 @@ class Request:
     stream_end: int  # stream index one past the last message sent
     level: int | None = None
     uncertain: bool = False  # in a trimmed turn, close enough to the budget that the trim may have come earlier
+    turn: int = 0  # ordinal of the analyzer invocation (transcript header) that sent it
+    action: int = 0  # the header's action number: actions executed before the turn + 1
 
 
 @dataclass
@@ -154,7 +156,7 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
     game: Game | None = None
     trace: dict[str, Any] | None = None
     history: list[int] = []  # stream indices currently retained
-    for step, _action, body in split_steps(transcript):
+    for turn_index, (step, action, body) in enumerate(split_steps(transcript)):
         turn: list[int] = []
         sections = split_sections(body)
         kept = budget = None
@@ -176,7 +178,7 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
                 continue
             stream = game.stream
             if label == "COMPRESSED TRACE":
-                trace = user_message(text)
+                trace = user_message(text, _action=action)
             elif label == "ANALYZER STATUS" and text.startswith("vc_sampling: replaced reply") and step_requests:
                 # the reply and its tool results were swapped for another
                 # sampled candidate, logged next without a meta section
@@ -190,7 +192,8 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
                 pending_calls = []
             elif label == "USER PROMPT":
                 extra = {"_control": "followup"} if turn else {}
-                stream.append(user_message(text, **extra))
+                # _action: the header's action number, for drawing the message's images (rft_images)
+                stream.append(user_message(text, _action=action, **extra))
                 turn.append(len(stream) - 1)
             elif label == "MODEL RESPONSE META":
                 finish, calls = parse_meta(text)
@@ -202,7 +205,7 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
                 pending_calls = list(calls or [])
                 step_requests.append(Request(step, len(step_requests) + 1, head + sent, reply, finish,
                                              history[0] if history else (turn[0] if turn else len(stream) - 1),
-                                             len(stream) - 1))
+                                             len(stream) - 1, turn=turn_index, action=action))
             elif label == "THINKING" and step_requests:
                 step_requests[-1].reply["reasoning"] = text
             elif label == "ASSISTANT" and step_requests:
