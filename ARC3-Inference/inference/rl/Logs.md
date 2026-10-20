@@ -209,3 +209,16 @@ A100 上 8K（这局游戏最短的请求也有 7.4K）三条路径全部 OOM：
 - 时间线（32K）：层内前向 7.3 s、反向 15.5 s，层外合计 0.46 s；GDN 层占 66%，QSA 层 32%。
 - 服务循环不热重载：新加的 job 参数要重启服务才生效（第一次量 fast_lora 时没生效，是这个原因）。
 - 冰岛的 H200（smpzdlhal2bt5q）网络太差（HF 12 MB/s、PyPI 223 KB/s），开了约 25 分钟没跑任何 job 就删了，约 $2.2。
+
+## 10-20 凌晨：完整流程演练（RTX PRO 6000，dshsgfhx2rzdn3，约 43 分钟，约 $1.8）
+
+目的：B200/H200 上要一次跑完、中途不做决定，所以先在便宜的卡上把 [full_run.sh](pod/full_run.sh) 整个走一遍。B200、H200 SXM、H200 NVL 当时全部没货。
+
+- 开头的 CUDA 测试里 `test_prefix_stop_grad_cuda` 失败（最差 0.063），make_jobs 自动关掉了前缀不回传梯度的 job。排查：只开 `compile_hc` 时 `dt_bias`/`A_log` 梯度差 19%。但编译的 hyper-connection 函数和 eager 在 FP32 下差 3e-7；换成每个 token 走全部专家后降到 1.1%；未改动的模型输入乘 (1 + 1e-7 噪声) 也会让这两个梯度变 1.5–2%；改用 transformers 的 torch GDN（不用 fla）后只有 0.03%，而且 `compile_hc` 一点不变。结论：19% 是 top-3/8 路由翻转，剩下的是 fla GDN kernel 的 TF32 点积，这两个参数的梯度是对所有 token 求和、互相抵消的量，被放大。测试改用全专家路由后通过。
+- 32K：旧路径 67.1 s，新路径 20.6 s（3.25×）。旧路径第一步 LoRA 梯度范数 341（之后 0.379，loss 一样）：layer_check 只在每个变体之前清梯度，最后一个变体的梯度留在层上，`step` 在算范数之后才清。改成 `step` 开头先清。
+- 补跑的前缀不回传梯度 job 在 32K OOM，之后 16K 的普通 job 也 OOM。两个问题：
+  - OOM 的重试写在 except 里，异常的 traceback 还拿着失败那一步的帧、激活和计算图（第二次尝试一开始就占了 92 GiB）。改成出了 except 再 `gc.collect()` 后重试，之后的 job 不再受影响。
+  - 前缀多占的显存：加了 `memory_snapshot`（CUDA 分配记录，前向结束和 OOM 时导出）和 [mem_report.py](mem_report.py)。16K 前向结束时多出 36 块 `lora_add` 分配的张量（3.6 GiB），32K OOM 时 12.1 GiB。原因：前缀的 GDN 短卷积状态取的是 `conv_in[:, -3:]` 的视图，留住了整段前缀的 `in_proj_qkv` 输出（p × 10,240 BF16 每层），后半段的 checkpoint 一直拿着它到反向。改成 `.clone()`。
+- 修好后 32K：新路径 23.7 s，加前缀不回传梯度 15.8 s（1.50×，前缀 49.5%），峰值 85.0 vs 85.7 GB；同一路径两遍梯度余弦 0.99993/0.99994；前缀不回传梯度和完整梯度余弦 0.78（截断本身）。
+- 冷启动的第一步（从没跑过的 8K 形状）和第二步 loss 一样（0.5114），所以 autotune 不改结果；不同服务进程之间同一个样本的 loss 差约 0.3%（0.4662 vs 0.4678），是舍入经路由放大。
+- pod 自删：演练时 pod 上的 full_run.sh 还是改环境变量之前上传的旧版，回退成“只停进程”；上传当前版本后在这台 pod 上实测：`pod "dshsgfhx2rzdn3" removed`，REST get-pod 404。本地 watcher 改成拉取结果成功后才删 pod（失败最多重试 5 次）。
