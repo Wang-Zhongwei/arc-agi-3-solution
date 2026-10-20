@@ -240,3 +240,31 @@ def test_reference_indexer_with_our_selection_matches_transformers(setup):
         finally:
             qsa.unpatch_reference_indexer()
     assert torch.equal(ours, reference)
+
+
+def test_top_blocks_keys_match_the_stable_sort():
+    """The int64-key topk picks exactly the stable sort's blocks, in the same order, with many ties (zeros,
+    repeated values, -inf for invisible blocks, -0.0)."""
+    g = torch.Generator().manual_seed(9)
+    scores = torch.relu(torch.randn(64, 700, generator=g)).round(decimals=1)  # ~half exact zeros, many repeats
+    scores[:, 650:] = float("-inf")
+    scores[0, :5] = -0.0
+    scores[1] = -scores[1].abs()  # negative scores too
+    for k in (1, 37, 512, 700):
+        assert torch.equal(qsa.top_blocks(scores, k), qsa.top_blocks_sorted(scores, k)), k
+
+
+def test_qsa_pure_functions_match_the_modules(setup):
+    """compile_qsa's pieces compute transformers' q_norm/k_norm + rotary embedding and our indexer scores."""
+    _, _, _, c = setup
+    attn = c["module"]
+    n = c["hidden"].shape[1]
+    cos, sin = (x[:, -n:, :] for x in c["pos"])
+    g = torch.Generator().manual_seed(3)
+    q = torch.randn(n, attn.config.num_attention_heads, attn.head_dim, generator=g)
+    k = torch.randn(n, attn.config.num_key_value_heads, attn.head_dim, generator=g)
+    with torch.no_grad():
+        attn.q_norm.weight.normal_(0, 0.1)
+        oq, ok = qsa.qk_prepare(q, k, attn.q_norm.weight, attn.k_norm.weight, attn.q_norm.eps, cos[0], sin[0])
+        assert torch.equal(oq, qsa._rope(attn.q_norm(q), cos[0], sin[0]))
+        assert torch.equal(ok, qsa._rope(attn.k_norm(k), cos[0], sin[0]))

@@ -59,6 +59,59 @@ def indexer_queries_and_keys(indexer, hidden_states, cos, sin):
     return q, _rope(pooled[:, None, :], cos[0, starts], sin[0, starts])[:, 0].float()
 
 
+_COMPILE = {"on": False}
+
+
+def _compiled(fn):
+    """fn under torch.compile (one dynamic graph: whole samples of any length) when compile_qsa is on."""
+    if not _COMPILE["on"]:
+        return fn
+    from inference.rl.layer_patches import _COMPILED
+
+    key = ("qsa", fn.__name__)
+    if key not in _COMPILED:
+        _COMPILED[key] = torch.compile(fn, dynamic=True)
+    return _COMPILED[key]
+
+
+def block_scores(q, block_keys, complete, scale: float):
+    """Indexer scores of a chunk of queries ([C, blocks], -inf past each query's complete blocks)."""
+    scores = torch.relu(torch.einsum("chd,bd->chb", q, block_keys)).sum(dim=1) / scale
+    hidden = torch.arange(block_keys.shape[0], device=q.device)[None, :] >= complete[:, None]
+    return scores.masked_fill(hidden, float("-inf"))
+
+
+def block_score_keys(q, block_keys, complete, scale: float):
+    """block_scores as top_blocks' int64 keys, in one function (compiled: scores, mask and keys in one pass)."""
+    return score_keys(block_scores(q, block_keys, complete, scale))
+
+
+def _rms(x, weight, eps: float):
+    """Qwen4ExpTextRMSNorm.forward without the module (no groups)."""
+    out = x.float()
+    out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + eps)
+    return (out * (1.0 + weight.float())).type_as(x)
+
+
+def _rotate(x, cos, sin):
+    """apply_rotary_pos_emb for one tensor [L, heads, d] with cos/sin [L, rotary_dim], op for op."""
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    r = cos.shape[-1]
+    x_rope, x_pass = x[..., :r], x[..., r:]
+    half = r // 2
+    rotated = torch.cat((-x_rope[..., half:], x_rope[..., :half]), dim=-1)
+    return torch.cat([x_rope * cos + rotated * sin, x_pass], dim=-1)
+
+
+def qk_prepare(query, key, q_weight, k_weight, eps: float, cos, sin):
+    """QSA's q_norm and k_norm, then the partial rotary embedding of both."""
+    return _rotate(_rms(query, q_weight, eps), cos, sin), _rotate(_rms(key, k_weight, eps), cos, sin)
+
+
+def gate_output(output, gate):
+    return output * torch.sigmoid(gate)
+
+
 def top_blocks(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Indices of the k highest scores per row, ties going to the later block.
 
@@ -66,8 +119,21 @@ def top_blocks(scores: torch.Tensor, k: int) -> torch.Tensor:
     rest of the selection is a pick among ties, and topk's pick depends on the kernel and the batch
     shape: transformers' per-query loop, our 256- and 2,048-query chunks all chose different blocks,
     and attention over different keys gave the same 8K step LoRA gradients with cosine 0.66-0.83.
-    A stable descending sort over the blocks in reverse order is deterministic and prefers the
-    most recent blocks among ties."""
+    Each score becomes one int64 key, its order-preserving integer image in the high 32 bits and the
+    block index in the low 32 bits, so topk over the keys is deterministic and prefers the most
+    recent blocks among ties (a full stable sort did the same at 0.13 s per QSA layer at 64K)."""
+    return score_keys(scores).topk(k, dim=-1).indices
+
+
+def score_keys(scores: torch.Tensor) -> torch.Tensor:
+    """top_blocks' int64 keys: the score's order-preserving integer image, then the block index."""
+    bits = (scores.float() + 0.0).view(torch.int32)  # + 0.0: -0.0 becomes +0.0
+    ordered = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64)  # same order as the floats
+    return (ordered << 32) | torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int64)
+
+
+def top_blocks_sorted(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """top_blocks by a full stable sort (the reference for its test)."""
     order = torch.sort(scores.flip(-1), dim=-1, descending=True, stable=True).indices[..., :k]
     return scores.shape[-1] - 1 - order
 
@@ -91,9 +157,8 @@ def select_blocks(indexer, hidden_states, cos, sin, chunk_size: int) -> torch.Te
         positions = torch.arange(start, stop, device=q.device)
         complete = (positions + 1) // ratio  # complete blocks visible to each query
         if k:
-            scores = torch.relu(torch.einsum("chd,bd->chb", q[start:stop], block_keys)).sum(dim=1) / math.sqrt(d)
-            scores.masked_fill_(torch.arange(blocks, device=q.device)[None, :] >= complete[:, None], float("-inf"))
-            chosen = top_blocks(scores, k)  # [C, k], the visible blocks first
+            keys = _compiled(block_score_keys)(q[start:stop], block_keys, complete, math.sqrt(d))
+            chosen = keys.topk(k, dim=-1).indices  # top_blocks: [C, k], the visible blocks first, ties to recent
             valid = torch.arange(k, device=q.device)[None, :] < complete[:, None].clamp(max=k)
             out[start:stop, :k] = torch.where(valid, chosen, -1).to(torch.int32)
         out[start:stop, k] = complete.to(torch.int32)  # the incomplete tail block is always visible
@@ -177,17 +242,20 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     hidden_shape = (n, -1, self.head_dim)
     query, gate = torch.chunk(self.q_proj(hidden_states[0]).view(n, -1, self.head_dim * 2), 2, dim=-1)
     gate = gate.reshape(n, -1)
-    query = self.q_norm(query.view(hidden_shape))
-    key = self.k_norm(self.k_proj(hidden_states[0]).view(hidden_shape))
+    key = self.k_proj(hidden_states[0]).view(hidden_shape)
     value = self.v_proj(hidden_states[0]).view(hidden_shape)
-    query = _rope(query, cos[0], sin[0])
-    key = _rope(key, cos[0], sin[0])
+    if _COMPILE["on"] and fused:  # norms and rotary embedding as one compiled function
+        query, key = _compiled(qk_prepare)(query.view(hidden_shape), key, self.q_norm.weight, self.k_norm.weight,
+                                           self.q_norm.eps, cos[0], sin[0])
+    else:
+        query = _rope(self.q_norm(query.view(hidden_shape)), cos[0], sin[0])
+        key = _rope(self.k_norm(key), cos[0], sin[0])
     if fused:
         # the selection's query chunks only bound the [chunk, blocks] score matrix (2,048 x 16K FP32 = 128 MB at
         # 64K); top-k is per query, so the size changes nothing but the number of launches
         blocks = _selection(self, hidden_states, position_embeddings, cos, sin, SELECTION_CHUNK)
         output = qsa_kernel.qsa_attention(query, key, value, blocks, self.scaling, self.indexer.compress_ratio)
-        return self.o_proj(output.reshape(n, -1) * torch.sigmoid(gate))[None], None
+        return self.o_proj(_compiled(gate_output)(output.reshape(n, -1), gate))[None], None
 
     selected = select_tokens(self.indexer, hidden_states, cos, sin, SELECTION_CHUNK)  # the fused path's selection
     if getattr(self, "_qsa_kv_grad_fp32", False) and torch.is_grad_enabled():
@@ -207,7 +275,8 @@ def qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_k
     return self.o_proj(output)[None], None
 
 
-def patch_qsa_attention(chunk_size: int = 256, kv_grad_fp32: bool = False, fused: bool = True) -> None:
+def patch_qsa_attention(chunk_size: int = 256, kv_grad_fp32: bool = False, fused: bool = True,
+                        compile: bool = False) -> None:
     """Route qwen4_exp full-attention layers through qsa_forward. Safe to call again after
     reloading this module: transformers' forward is kept on the class, not here.
     `fused` uses the Triton kernel (qsa_kernel) on CUDA; otherwise the chunked PyTorch path."""
@@ -220,6 +289,7 @@ def patch_qsa_attention(chunk_size: int = 256, kv_grad_fp32: bool = False, fused
     cls._qsa_chunk_size = chunk_size
     cls._qsa_kv_grad_fp32 = kv_grad_fp32
     cls._qsa_fused = fused
+    _COMPILE["on"] = compile and torch.cuda.is_available()
 
 
 def unpatch_qsa_attention() -> None:

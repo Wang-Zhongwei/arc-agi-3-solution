@@ -46,20 +46,23 @@ def test_fused_model_matches_reference(monkeypatch):
     select_blocks = qsa.select_blocks
     monkeypatch.setattr(qsa, "select_blocks", lambda *a, **k: calls.append(1) or select_blocks(*a, **k))
     results = {}
-    for fused in (False, True):
-        qsa.patch_qsa_attention(chunk_size=64, fused=fused)
+    for name, fused, compiled in (("chunked", False, False), ("fused", True, False), ("compiled", True, True)):
+        qsa.patch_qsa_attention(chunk_size=64, fused=fused, compile=compiled)
         try:
             calls.clear()
-            results[fused] = run(bf16, bf16_inputs)
-            results[fused, "calls"] = len(calls)
+            results[name] = run(bf16, bf16_inputs)
+            results[name, "calls"] = len(calls)
         finally:
+            qsa.patch_qsa_attention(chunk_size=64, compile=False)
             qsa.unpatch_qsa_attention()
     qsa_layers = sum(1 for t in config.text_config.layer_types if t != "linear_attention")
-    assert results[True, "calls"] == qsa_layers  # forward computes the selection, the recompute reuses it
+    assert results["fused", "calls"] == qsa_layers  # forward computes the selection, the recompute reuses it
 
-    chunked, fused = results[False], results[True]
-    assert rel(fused[0], reference[0]) <= 1.5 * rel(chunked[0], reference[0]) + 1e-3
-    assert fused[1].keys() == reference[1].keys() and fused[1]
-    for name in reference[1]:
-        ours, theirs = rel(fused[1][name], reference[1][name]), rel(chunked[1][name], reference[1][name])
-        assert ours <= 1.5 * theirs + 1e-3, (name, ours, theirs)
+    chunked = results["chunked"]
+    for variant in ("fused", "compiled"):  # compiled: compile_qsa (norms + rotary, gate, indexer scores)
+        ours = results[variant]
+        assert rel(ours[0], reference[0]) <= 1.5 * rel(chunked[0], reference[0]) + 1e-3, variant
+        assert ours[1].keys() == reference[1].keys() and ours[1]
+        for name in reference[1]:
+            a, b = rel(ours[1][name], reference[1][name]), rel(chunked[1][name], reference[1][name])
+            assert a <= 1.5 * b + 1e-3, (variant, name, a, b)
