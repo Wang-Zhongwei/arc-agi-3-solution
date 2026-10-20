@@ -332,11 +332,18 @@ def hc_inject(x, out, weights):
 _COMPILED: dict = {}
 
 
+# Compiled variants are finite but more than dynamo's default 8 per function: token buckets x grad modes (prefix
+# stop-grad, checkpoint recompute, no-grad validation) for the per-token functions, LoRA module shapes x grad modes
+# for lora_add. Past the limit dynamo runs the function eagerly: the 10-20 training run fell to ~600-1,000 tok/s.
+RECOMPILE_LIMIT = 64
+
+
 def _hc_fn(name: str, compiled: bool, dynamic: bool = False):
     fn = globals()[name]
     if not compiled:
         return fn
     if (name, dynamic) not in _COMPILED:
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, RECOMPILE_LIMIT)
         _COMPILED[name, dynamic] = torch.compile(fn, dynamic=dynamic)
     return _COMPILED[name, dynamic]
 
@@ -344,6 +351,13 @@ def _hc_fn(name: str, compiled: bool, dynamic: bool = False):
 def _bucket(n: int) -> int:
     """Token count a compiled per-token function runs at: the next power of two, at least 512."""
     return max(512, 1 << (n - 1).bit_length())
+
+
+def _own_batch_stride(t):
+    """A [1, n, ...] chunk of a longer sequence keeps the whole sequence's batch stride, and a compiled graph
+    guards on it: one recompile per sample length. Dropping and re-adding the size-1 dim (views) gives the
+    chunk its own stride."""
+    return t.squeeze(0).unsqueeze(0) if t.dim() > 1 and t.shape[0] == 1 else t
 
 
 def _pad_tokens(t, dim: int, size: int):
@@ -360,7 +374,7 @@ def static_call(name: str, n: int, tokens: tuple, weights: tuple = (), **constan
     recompiled, and fully dynamic graphs were ~12% slower (GDN layer 1.03 -> 1.17 s on an A100).
     Padding is exact: every function here works token by token."""
     size = _bucket(n)
-    out = _hc_fn(name, True)(*(_pad_tokens(t, 1, size) for t in tokens), *weights, **constants)
+    out = _hc_fn(name, True)(*(_pad_tokens(_own_batch_stride(t), 1, size) for t in tokens), *weights, **constants)
     return tuple(o[:, :n] for o in out) if isinstance(out, tuple) else out[:, :n]
 
 
