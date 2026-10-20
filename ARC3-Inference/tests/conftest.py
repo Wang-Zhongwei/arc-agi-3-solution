@@ -21,3 +21,19 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if f"{Path(str(item.fspath)).name}::{item.name}" in _DIVERGENT:
             item.add_marker(pytest.mark.skip(reason=_REASON))
+
+
+def _bf16_grouped_mm_only():
+    """transformers sends FP32 experts to torch._grouped_mm on Hopper (torch 2.8: BF16 only), so the tests'
+    FP32 reference models failed there with 'Expected mat_a to be BFloat16'. Its fallback loop for them."""
+    try:
+        import torch
+        from transformers.integrations import moe
+    except ImportError:
+        return
+    can_use = moe._can_use_grouped_mm
+    moe._can_use_grouped_mm = lambda input, weight, offs: (weight.device.type != "cuda" or weight.dtype == torch.bfloat16) \
+        and can_use(input, weight, offs)
+
+
+_bf16_grouped_mm_only()

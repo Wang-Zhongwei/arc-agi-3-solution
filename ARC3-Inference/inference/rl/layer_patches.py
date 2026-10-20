@@ -181,6 +181,14 @@ def grouped_mm(x, weight, offsets):
     """x [rows sorted by group, in] @ weight [groups, in, out]; torch's grouped GEMM where it runs."""
     from transformers.integrations.moe import _can_use_grouped_mm, _grouped_mm
 
+    if x.is_cuda and weight.dtype != torch.bfloat16:
+        # torch._grouped_mm (Hopper) takes BF16 only; FP32 runs are the tests' references: a plain loop, with
+        # weight gradients
+        x, out, start = x.to(weight.dtype), [], 0
+        for g, end in enumerate(offsets.tolist()):
+            out.append(x[start:end] @ weight[g])
+            start = end
+        return torch.cat(out)
     if weight.requires_grad or _can_use_grouped_mm(x, weight, offsets):
         return _grouped_mm(x, weight, offsets)
     from inference.rl import grouped_gemm
