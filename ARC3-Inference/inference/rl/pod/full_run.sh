@@ -14,6 +14,7 @@ VENV=${VENV:-/workspace/venv}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 REHEARSAL=${REHEARSAL:-0}
+PLE_FP8=${PLE_FP8:-0}  # 1: also fetch nvidia's FP8 PLE table and run make_jobs.py --ple-fp8 (BF16 vs FP8 PLE gradients)
 MAX_MINUTES=${MAX_MINUTES:-90}
 GRACE_MINUTES=${GRACE_MINUTES:-20}
 MIN_HF_MBPS=${MIN_HF_MBPS:-40}
@@ -86,7 +87,11 @@ if torch.cuda.get_device_capability()[0] == 10:
 PY
 
 log "phase 1b: checkpoint download in the background"
-HF_HUB_ENABLE_HF_TRANSFER=1 nohup hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" > results/download.log 2>&1 < /dev/null &
+if [ "$PLE_FP8" = 1 ]; then  # 53.7 GB: nvidia's PLE (FP8, one scale) and MTP, after the main checkpoint
+    HF_HUB_ENABLE_HF_TRANSFER=1 nohup sh -c "hf download '$MODEL_REPO' --local-dir '$MODEL_DIR' --exclude '*.bak' && hf download nvidia/Qwen3.8-Flash-Next-NVFP4 model-fp8-mtp-ple.safetensors --local-dir /workspace/nvfp8" > results/download.log 2>&1 < /dev/null &
+else
+    HF_HUB_ENABLE_HF_TRANSFER=1 nohup hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" > results/download.log 2>&1 < /dev/null &
+fi
 download=$!
 
 log "phase 2: CUDA tests"
@@ -107,12 +112,13 @@ runtest prefix_cuda_fast "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_
 echo 0 > results/pytest_prefix_cpu.exit  # CPU tiny-model tests cannot run next to fla; passed locally
 
 log "phase 3: jobs from the test outcomes"
-python inference/rl/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) | tee -a results/env.txt
+python inference/rl/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) $([ "$PLE_FP8" = 1 ] && echo --ple-fp8) | tee -a results/env.txt
 
 log "phase 4: wait for the checkpoint, then the model server's jobs"
 wait $download || abort "checkpoint download failed"
 log "checkpoint: $(du -sh "$MODEL_DIR" | cut -f1)"
-JOBS_FILE="$WORK/jobs.txt" MODEL_DIR="$MODEL_DIR" bash inference/rl/pod/smoke_pod.sh > results/smoke_pod.log 2>&1
+SERVER_ARGS=$([ "$PLE_FP8" = 1 ] && echo "--ple-fp8-path /workspace/nvfp8") \
+    JOBS_FILE="$WORK/jobs.txt" MODEL_DIR="$MODEL_DIR" bash inference/rl/pod/smoke_pod.sh > results/smoke_pod.log 2>&1
 log "jobs finished: $(tail -1 results/smoke_pod.log)"
 cp jobs/*.result.json results/ 2>/dev/null
 date -u > FULL_DONE

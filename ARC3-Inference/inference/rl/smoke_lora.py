@@ -918,6 +918,7 @@ def serve(model, device, args, processor, tools, game) -> None:
             else:
                 game = default_game
             result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
+            ple_mmap.set_fp8(job.get("ple_fp8"))  # "row": PLE rows through per-row FP8 (a measurement)
             if "compare_grads" in job:  # [[label, reference_label], ...] of steps kept with keep_grads
                 kept = getattr(model, "_rft_grads", None) or {}
                 result["kept"] = sorted(kept)
@@ -978,6 +979,7 @@ def serve(model, device, args, processor, tools, game) -> None:
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)
+        result["ple_fp8_rel_err"] = ple_mmap._FP8["last_rel_err"]
         (jobs / f"{job_path.stem}.result.json").write_text(json.dumps(result, indent=1))
         running.rename(job_path.with_suffix(".done"))
         print("job", job_path.stem, "done", flush=True)
@@ -1012,6 +1014,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="layer: transformers' layer checkpoints (token chunks run 3x); parts: mixer and "
                              "token chunks checkpointed separately (2x)")
     parser.add_argument("--use-kernels", action="store_true", help="load hub kernels (causal-conv1d) via use_kernels")
+    parser.add_argument("--ple-fp8-path", type=Path,
+                        help="a directory with nvidia's model-fp8-mtp-ple.safetensors: jobs can read the FP8 PLE table "
+                             "(\"ple_fp8\": \"nvidia\")")
     parser.add_argument("--ple-in-ram", action="store_true",
                         help="load the 102.5 GB PLE table into host RAM instead of memory-mapping the checkpoint")
     parser.add_argument("--out", type=Path, default=Path("smoke_lora.json"))
@@ -1067,7 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
         print("use_kernels failed, loading without:", report["use_kernels_error"], flush=True)
         model = AutoModelForImageTextToText.from_pretrained(args.model, **kwargs)
     if not args.ple_in_ram:
-        report["ple_mmap"] = ple_mmap.attach(model, args.model)
+        report["ple_mmap"] = ple_mmap.attach(model, args.model, fp8_path=args.ple_fp8_path)
     report["load"] = dict(seconds=round(time.perf_counter() - t0, 1), memory_gb=memory_gb(), host_gb=host_memory_gb())
     kinds = {}
     for name, module in model.named_modules():

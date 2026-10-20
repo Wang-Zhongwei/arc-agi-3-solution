@@ -74,7 +74,7 @@ log "phase 3: model server (loads once, ~5 min)"
 rm -f "$JOBS/STOP"
 if ! { [ -s server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null; }; then
     nohup python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
-        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json \
+        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json ${SERVER_ARGS:-} \
         > results/server.log 2>&1 < /dev/null &
     echo $! > server.pid
 fi

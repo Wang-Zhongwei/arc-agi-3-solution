@@ -1,7 +1,10 @@
 """Write the jobs file of a full run from the CUDA tests' outcome: a feature whose test failed on this GPU is
 switched off in every job, so the run needs no decision after it starts.
 
-    python make_jobs.py RESULTS_DIR JOBS_FILE [--rehearsal]
+    python make_jobs.py RESULTS_DIR JOBS_FILE [--rehearsal] [--ple-fp8]
+
+--ple-fp8: only the PLE precision measurement (one sample, the training configuration): LoRA gradients with the
+BF16 table twice (repeat noise), nvidia's FP8 table and a per-row FP8 rounding, then their agreement.
 
 RESULTS_DIR holds pytest_<name>.exit files (0 = passed) for the test files run by full_run.sh."""
 
@@ -11,6 +14,7 @@ from pathlib import Path
 
 results, out = Path(sys.argv[1]), Path(sys.argv[2])
 rehearsal = "--rehearsal" in sys.argv
+ple_fp8 = "--ple-fp8" in sys.argv
 
 
 def passed(name: str) -> bool:
@@ -42,6 +46,19 @@ opt = dict(base, **flags)
 psg = dict(opt, prefix_stop_grad=True)
 long_len, mid_len = ("32768o", "16384o") if rehearsal else ("65536o", "32768o")
 layer_flags = {k: v for k, v in opt.items() if k not in base} | dict(token_chunk=2048)
+
+if ple_fp8:
+    one = dict(psg if psg_ok else opt, lengths=long_len, gpu_keep_gb=0)  # speed is not measured: nothing kept
+    s = long_len
+    jobs = [("01_bf16", dict(one, repeats=2, keep_grads="bf16")),
+            ("02_nvidia", dict(one, repeats=1, keep_grads="nvidia", ple_fp8="nvidia")),
+            ("03_row", dict(one, repeats=1, keep_grads="row", ple_fp8="row")),
+            ("04_cmp", {"compare_grads": [[f"bf16/{s}/1", f"bf16/{s}/0"], [f"nvidia/{s}/0", f"bf16/{s}/1"],
+                                          [f"row/{s}/0", f"bf16/{s}/1"], [f"nvidia/{s}/0", f"row/{s}/0"]]})]
+    out.write_text("".join(f"{name} {json.dumps(job)}\n" for name, job in jobs))
+    (results / "flags.json").write_text(json.dumps(dict(off=sorted(set(off)), prefix_stop_grad=psg_ok, opt=opt), indent=1))
+    print("PLE FP8 measurement | features off:", sorted(set(off)) or "none", "| prefix stop-grad:", psg_ok)
+    sys.exit(0)
 
 jobs = [
     ("01_check", {"layer_check": {"length": 8192, "layers": [0, 1, 3],
