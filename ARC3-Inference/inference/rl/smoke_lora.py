@@ -574,17 +574,20 @@ def check_layers(model, device, sample, layers, variants: dict[str, Any], qsa_mo
     def configure(spec):
         qsa_module.unpatch_reference_indexer()
         if spec.get("reference"):
+            qsa_module.patch_qsa_attention(256, compile=False)  # the reference selection is never compiled
             qsa_module.unpatch_qsa_attention()
             qsa_module.patch_reference_indexer()
             patches.unpatch(model)
         else:
-            qsa_module.patch_qsa_attention(256, False, fused=spec.get("qsa_fused", True))
+            qsa_module.patch_qsa_attention(256, False, fused=spec.get("qsa_fused", True),
+                                           compile=spec.get("compile_qsa", False))
             patches.patch_for_training(model, spec.get("token_chunk", 8192), 128, "parts",
                                        compile_hc=spec.get("compile_hc", False),
                                        compile_moe=spec.get("compile_moe", False),
                                        cache_experts=spec.get("cache_experts", True),
                                        fast_conv=spec.get("fast_conv", False),
-                                       fast_lora=spec.get("fast_lora", False))
+                                       fast_lora=spec.get("fast_lora", False),
+                                       fast_gdn=spec.get("fast_gdn", False))
 
     def rel(a, b):
         return round(float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)), 6)
@@ -804,7 +807,7 @@ def serve(model, device, args, processor, tools, game) -> None:
     "token_chunk": 8192, "expert_tile": 128, "reuse_host_buffers": true, "kv_grad_fp32": false,
     "keep_grads": "label", "recompute": "layer" | "parts", "gpu_keep_gb": 0, "async_copies": false,
     "qsa_fused": true, "compile_hc": false, "compile_moe": false, "fast_conv": false, "cache_experts": true,
-    "fast_lora": false, "timeline": false (per-layer forward/backward CUDA times),
+    "fast_lora": false, "fast_gdn": false, "compile_qsa": false, "timeline": false (per-layer forward/backward CUDA times),
     "reference": false (true: unpatched transformers QSA and layers, AutoRound experts: the standard answer),
     "reference_qsa" / "reference_layers": one half of it, "reference_selection": transformers' own tie-breaking},
     or {"compare_grads": [["label/65536o/0", "ref/65536o/0"]]}. qsa.py, layer_patches.py,
@@ -840,12 +843,14 @@ def serve(model, device, args, processor, tools, game) -> None:
             reference_layers = job.get("reference") or job.get("reference_layers")
             qsa_module.unpatch_reference_indexer()
             if reference_qsa:
+                qsa_module.patch_qsa_attention(256, compile=False)  # the reference selection is never compiled
                 qsa_module.unpatch_qsa_attention()
                 if not job.get("reference_selection"):
                     qsa_module.patch_reference_indexer()
             else:
                 qsa_module.patch_qsa_attention(job.get("qsa_chunk", args.qsa_chunk), job.get("kv_grad_fp32", False),
-                                               fused=job.get("qsa_fused", not args.no_qsa_kernel))
+                                               fused=job.get("qsa_fused", not args.no_qsa_kernel),
+                                               compile=job.get("compile_qsa", False))
             if reference_layers:
                 patches.unpatch(model)
                 result["layer_patches"] = "reference"
@@ -855,7 +860,7 @@ def serve(model, device, args, processor, tools, game) -> None:
                     job.get("recompute", args.recompute), compile_hc=job.get("compile_hc", args.compile_hc),
                     compile_moe=job.get("compile_moe", args.compile_moe),
                     cache_experts=job.get("cache_experts", True), fast_conv=job.get("fast_conv", args.fast_conv),
-                    fast_lora=job.get("fast_lora", False))
+                    fast_lora=job.get("fast_lora", False), fast_gdn=job.get("fast_gdn", False))
             if job.get("transcript"):
                 if job["transcript"] not in games:
                     games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))

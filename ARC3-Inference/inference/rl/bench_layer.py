@@ -184,9 +184,17 @@ def bench(layer, config, n, device, iters, profile, out_rows):
     row = dict(kind=kind, tokens=n, forward_s=round(fwd, 4), backward_s=round(bwd, 4), total_s=round(fwd + bwd, 4),
                peak_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2))
     if profile:
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                                    record_shapes=True) as prof:
             step()
-        events = [e for e in prof.key_averages() if e.self_device_time_total > 0]
+        # which aten ops (and input shapes) the GPU time belongs to: copies and elementwise kernels by source
+        ops = [e for e in prof.key_averages(group_by_input_shape=True)
+               if e.key.startswith("aten::") and e.self_device_time_total > 0]
+        row["top_ops"] = [dict(op=e.key, shapes=str(e.input_shapes)[:160], s=round(e.self_device_time_total / 1e6, 4),
+                               calls=e.count)
+                          for e in sorted(ops, key=lambda e: -e.self_device_time_total)[:40]]
+        events = [e for e in prof.key_averages()
+                  if e.self_device_time_total > 0 and str(getattr(e, "device_type", "")).endswith("CUDA")]
         total = sum(e.self_device_time_total for e in events)
         cats: dict[str, float] = {}
         for e in events:
@@ -198,7 +206,7 @@ def bench(layer, config, n, device, iters, profile, out_rows):
         row["top_kernels"] = [dict(name=e.key[:110], s=round(e.self_device_time_total / 1e6, 4), calls=e.count,
                                    category=categorize(e.key)) for e in top]
     out_rows.append(row)
-    print(json.dumps({k: v for k, v in row.items() if k != "top_kernels"}), flush=True)
+    print(json.dumps({k: v for k, v in row.items() if k not in ("top_kernels", "top_ops")}), flush=True)
     return row
 
 
@@ -215,6 +223,9 @@ def main():
     parser.add_argument("--compile-moe", action="store_true")
     parser.add_argument("--no-cache-experts", action="store_true")
     parser.add_argument("--fast-conv", action="store_true")
+    parser.add_argument("--fast-lora", action="store_true")
+    parser.add_argument("--fast-gdn", action="store_true")
+    parser.add_argument("--compile-qsa", action="store_true")
     parser.add_argument("--no-lora", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--selection", default="realistic", choices=["realistic", "indexer"],
@@ -232,7 +243,7 @@ def main():
     device = torch.device("cuda")
     config = Qwen4ExpConfig(text_config=REAL).text_config
     config._attn_implementation = "sdpa"
-    qsa.patch_qsa_attention(chunk_size=256, fused=args.qsa == "fused")
+    qsa.patch_qsa_attention(chunk_size=256, fused=args.qsa == "fused", compile=args.compile_qsa)
     from inference.rl import qsa_kernel
     qsa_kernel.UNION_DKV = args.union_dkv == "on"
     stats: dict = {}
@@ -269,7 +280,8 @@ def main():
         layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
         layer_patches.patch_for_training(wrap, token_chunk=args.token_chunk, recompute=args.recompute,
                                          compile_hc=args.compile_hc, compile_moe=args.compile_moe,
-                                         cache_experts=not args.no_cache_experts, fast_conv=args.fast_conv)
+                                         cache_experts=not args.no_cache_experts, fast_conv=args.fast_conv,
+                                         fast_lora=args.fast_lora, fast_gdn=args.fast_gdn)
         bench(layer, config, args.tokens, device, args.iters, args.profile, rows)
         del layer, wrap
         torch.cuda.empty_cache()
