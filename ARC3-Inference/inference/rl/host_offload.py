@@ -15,6 +15,11 @@ between steps and hands them out bump-style; `offload_to_host` packs into them a
 Segments are pinned only as whole 16 GiB blocks allocated once. Pinning every saved tensor
 separately got the container OOM-killed: the pinned allocator rounds each block up to a power
 of two and caches it (see AGENTS.md).
+
+`max_gb` caps the arena (`reserve()` allocates it all up front); what does not fit stays on the
+device. Uncapped, the first training run's arena grew to ~157 GiB on a 126K-token sample and never
+shrank, which pushed the memory-mapped PLE table (102.5 GB) out of a 251 GB pod's page cache: every
+step then re-read it from disk while the GPU waited.
 """
 
 from __future__ import annotations
@@ -35,9 +40,10 @@ class HostArena:
     `reset()` at the start of a step makes all segments free again, so a step must not
     run while tensors packed by the previous one are still needed."""
 
-    def __init__(self, segment_gb: float = 16, pin: bool = False):
+    def __init__(self, segment_gb: float = 16, pin: bool = False, max_gb: float | None = None):
         self.segment_bytes = int(segment_gb * 2**30)
         self.pin = pin
+        self.max_bytes = None if max_gb is None else int(max_gb * 2**30)
         self.segments: list[torch.Tensor] = []
         self.stream = None  # side stream of async copies, shared by all steps
         self.bytes_per_token: dict[str, float] = {}  # saved bytes per token, per layout of saved tensors
@@ -57,8 +63,27 @@ class HostArena:
     def pinned_gb(self) -> float:
         return sum(s.numel() for s in self.segments if s.is_pinned()) / 2**30
 
-    def take(self, nbytes: int) -> torch.Tensor:
-        """A uint8 host view of `nbytes`, from the current segment, the next one that fits, or a new one."""
+    def reserve(self) -> float:
+        """Allocate the capped arena's segments now (pinning costs ~0.7 s per GiB, once); returns seconds."""
+        start = time.perf_counter()
+        while self.max_bytes is not None and self.capacity_gb * 2**30 < self.max_bytes:
+            size = min(self.segment_bytes, self.max_bytes - int(self.capacity_gb * 2**30))
+            self.segments.append(self._new_segment(size))
+        return time.perf_counter() - start
+
+    def _new_segment(self, size: int) -> torch.Tensor:
+        segment = None
+        if self.pin and torch.cuda.is_available():
+            with contextlib.suppress(RuntimeError):  # pinning can fail (memory lock limits): fall back
+                segment = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        if segment is None:
+            segment = torch.empty(size, dtype=torch.uint8)
+            segment.zero_()  # fault the pages in now, on all CPU threads, rather than inside a GPU copy
+        return segment
+
+    def take(self, nbytes: int) -> torch.Tensor | None:
+        """A uint8 host view of `nbytes`, from the current segment, the next one that fits, or a new one;
+        None when a new one would pass `max_gb`."""
         while self.segment < len(self.segments):
             segment = self.segments[self.segment]
             if self.offset + nbytes <= segment.numel():
@@ -68,14 +93,11 @@ class HostArena:
                 return view
             self.segment, self.offset = self.segment + 1, 0
         size = max(self.segment_bytes, nbytes)
-        segment = None
-        if self.pin and torch.cuda.is_available():
-            with contextlib.suppress(RuntimeError):  # pinning can fail (memory lock limits): fall back
-                segment = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-        if segment is None:
-            segment = torch.empty(size, dtype=torch.uint8)
-            segment.zero_()  # fault the pages in now, on all CPU threads, rather than inside a GPU copy
-        self.segments.append(segment)
+        if self.max_bytes is not None:
+            size = max(min(size, self.max_bytes - int(self.capacity_gb * 2**30)), 0)
+            if size < nbytes:
+                return None
+        self.segments.append(self._new_segment(size))
         self.segment, self.offset = len(self.segments) - 1, 0
         return self.take(nbytes)
 
@@ -108,7 +130,8 @@ def offload_to_host(arena: HostArena, keep_bytes: float = 0, async_copies: bool 
     layout offloads everything). Host tensors, parameters and tensors under `min_bytes` are kept
     as they are; `include_cpu` copies host tensors too (tests)."""
     arena.reset()
-    stats = arena.stats = dict(d2h_gb=0.0, h2d_gb=0.0, d2h_sync_s=0.0, h2d_sync_s=0.0, kept_gb=0.0, deduplicated=0)
+    stats = arena.stats = dict(d2h_gb=0.0, h2d_gb=0.0, d2h_sync_s=0.0, h2d_sync_s=0.0, kept_gb=0.0, overflow_gb=0.0,
+                               deduplicated=0)
     known = arena.bytes_per_token.get(layout)
     budget = max(known * tokens - keep_bytes, 0) if known is not None and tokens and keep_bytes else float("inf")
     use_stream = async_copies and arena.pin and torch.cuda.is_available()
@@ -161,10 +184,15 @@ def offload_to_host(arena: HostArena, keep_bytes: float = 0, async_copies: bool 
             stats["kept_gb"] += nbytes / 2**30
             by_key[key] = (weakref.ref(base), None)  # counted once, like an offloaded tensor
             return tensor
+        flat = arena.take(nbytes)
+        if flat is None:  # the capped arena is full: the rest of the step stays on the device
+            stats["overflow_gb"] += nbytes / 2**30
+            by_key[key] = (weakref.ref(base), None)
+            return tensor
+        flat = flat.view(tensor.dtype)
         record = _Saved()
         record.device, record.uses, record.index, record.device_copy = tensor.device, 1, len(records), None
         strides = _dense_strides(tensor)
-        flat = arena.take(nbytes).view(tensor.dtype)
         record.host = flat.as_strided(tensor.shape, strides) if strides else flat.view(tensor.shape)
         if stream is not None and tensor.is_cuda and record.host.is_pinned():
             stream.wait_stream(torch.cuda.current_stream(tensor.device))

@@ -215,3 +215,32 @@ def test_a_kept_tensor_saved_twice_is_counted_once():
     run(keep_bytes=size * 512 / 2)
     assert arena.stats["kept_gb"] > 0 and arena.bytes_per_token["twice"] == size
 
+
+
+def test_a_capped_arena_never_grows_and_keeps_the_rest_on_the_device():
+    """max_gb: reserve() allocates the cap once; a step needing more keeps its overflow where it is, with
+    unchanged gradients, and the arena stays at the cap."""
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList(torch.nn.Linear(256, 256) for _ in range(6))
+    x = torch.randn(512, 256)
+
+    def run(arena):
+        layers.zero_grad(set_to_none=True)
+        context = offload_to_host(arena, include_cpu=True, min_bytes=0) if arena else contextlib.nullcontext()
+        with context:
+            h = x
+            for layer in layers:
+                h = checkpoint(lambda t, layer=layer: torch.tanh(layer(t)), h, use_reentrant=False)
+        h.pow(2).mean().backward()
+        return [p.grad.clone() for p in layers.parameters()]
+
+    reference = run(None)
+    arena = HostArena(segment_gb=0.25 / 1024, max_gb=1 / 1024)  # 256 KiB segments, 1 MiB cap
+    arena.reserve()
+    assert [s.numel() for s in arena.segments] == [256 * 1024] * 4
+    for _ in range(2):
+        grads = run(arena)
+        for grad, ref in zip(grads, reference):
+            torch.testing.assert_close(grad, ref, rtol=0, atol=0)
+        assert arena.stats["overflow_gb"] > 0 and arena.capacity_gb == 1 / 1024
+        assert arena.used <= MiB and arena.stats["d2h_gb"] * 2**30 + arena.stats["overflow_gb"] * 2**30 >= 6 * 512 * 256 * 4
