@@ -334,3 +334,42 @@ def test_chunked_ple_matches_the_module():
     assert ours[2].keys() == ref[2].keys()
     for name in ref[2]:
         torch.testing.assert_close(ours[2][name], ref[2][name], rtol=1e-6, atol=1e-7, msg=name)
+
+
+def test_precomputed_ngram_rows_replace_the_lookup():
+    """precompute_ngram (train_rft's prefetch thread) gives the rows the forward would gather; handed over with
+    provide_ngram, a training step does no lookup of its own and its logits and gradients are bit-identical.
+    A no-grad forward (validation) takes them too."""
+    ids = torch.randint(0, 1000, (1, 50), generator=torch.Generator().manual_seed(6))
+    model = tiny().train()
+    for module in model.modules():
+        if isinstance(module, m.Qwen4ExpTextNGramEmbedding):
+            module.ngram_embedding.weight.requires_grad_(False)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    layer_patches.patch_for_training(model, token_chunk=16, recompute="parts")
+    calls = []
+    hf = m.Qwen4ExpTextNGramEmbedding._hf_forward
+    try:
+        def run(rows):
+            model.zero_grad(set_to_none=True)
+            layer_patches.provide_ngram(model, rows)
+            logits = model(input_ids=ids, use_cache=False).logits
+            logits.float().pow(2).mean().backward()
+            return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+
+        ref_logits, ref_grads = run(None)
+        rows = layer_patches.precompute_ngram(model, ids)
+        assert len(rows) >= 1 and all(r.device.type == "cpu" for r in rows)
+        m.Qwen4ExpTextNGramEmbedding._hf_forward = lambda *a, **k: calls.append(1) or hf(*a, **k)
+        logits, grads = run(rows)
+        assert calls == []
+        assert torch.equal(logits, ref_logits) and grads.keys() == ref_grads.keys()
+        for name in grads:
+            assert torch.equal(grads[name], ref_grads[name]), name
+        with torch.no_grad():
+            layer_patches.provide_ngram(model, rows)
+            assert torch.equal(model(input_ids=ids, use_cache=False).logits, ref_logits)
+        assert calls == []
+    finally:
+        m.Qwen4ExpTextNGramEmbedding._hf_forward = hf
+        layer_patches.unpatch(model)

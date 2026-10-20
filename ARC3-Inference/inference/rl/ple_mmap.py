@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import os
 import struct
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +36,11 @@ FP8_MAX = 448.0  # largest finite float8_e4m3fn
 #   whole table), mapped by attach(fp8_path=...): half the page cache of the BF16 one.
 # last_rel_err: the looked-up rows' relative difference from the BF16 rows, when both are mapped.
 _FP8 = {"mode": None, "last_rel_err": None}
+_LOOKUP = {"seconds": 0.0}  # time the main thread spent gathering rows (prefetch threads are not counted)
+
+
+def lookup_seconds() -> float:
+    return _LOOKUP["seconds"]
 
 
 def set_fp8(mode: str | None) -> None:
@@ -79,6 +86,14 @@ class MappedTable(nn.Module):
         return out
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        start = time.perf_counter()
+        try:
+            return self._forward(ids)
+        finally:
+            if threading.current_thread() is threading.main_thread():
+                _LOOKUP["seconds"] += time.perf_counter() - start
+
+    def _forward(self, ids: torch.Tensor) -> torch.Tensor:
         mode = _FP8["mode"]
         if mode == "nvidia" and not self.fp8_shards:
             raise RuntimeError("PLE FP8 mode 'nvidia' needs attach(..., fp8_path=...)")

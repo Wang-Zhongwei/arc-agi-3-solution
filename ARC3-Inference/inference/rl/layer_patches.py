@@ -582,20 +582,60 @@ def patch_lora(on: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def ngram_embedding_forward(self, input_ids, past_key_values):
-    """transformers' n-gram lookup, reused by the checkpoint recompute.
+    """transformers' n-gram lookup, reused by the checkpoint recompute, or taken from provide_ngram.
 
     The lookup depends only on the token ids, and its table is frozen and memory-mapped on the host
     (ple_mmap): a 64K pass gathers rows on the CPU for ~0.46 s, and the PLE checkpoint ran it again in
     backward. The forward keeps its output (N x 2,560, 335 MB at 64K) until the recompute takes it."""
-    if past_key_values is not None or not torch.is_grad_enabled() or self.ngram_embedding.weight.requires_grad:
+    if past_key_values is not None or self.ngram_embedding.weight.requires_grad:
         return type(self)._hf_forward(self, input_ids, past_key_values)  # a trainable table saves its indices
-    cached = getattr(self, "_rft_ngram_cache", None)
-    self._rft_ngram_cache = None
-    if cached is not None and cached[0]() is input_ids:
-        return cached[1]
-    out = type(self)._hf_forward(self, input_ids, past_key_values)
-    self._rft_ngram_cache = (weakref.ref(input_ids), out)
+    provided = self.__dict__.pop("_rft_ngram_provided", None)
+    if provided is not None and tuple(provided.shape[:2]) == tuple(input_ids.shape):
+        out = provided.to(input_ids.device)
+    elif not torch.is_grad_enabled():
+        return type(self)._hf_forward(self, input_ids, past_key_values)
+    else:
+        cached = getattr(self, "_rft_ngram_cache", None)
+        self._rft_ngram_cache = None
+        if cached is not None and cached[0]() is input_ids:
+            return cached[1]
+        out = type(self)._hf_forward(self, input_ids, past_key_values)
+    if torch.is_grad_enabled():
+        self._rft_ngram_cache = (weakref.ref(input_ids), out)
     return out
+
+
+_CPU_TWINS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _ngram_modules(model) -> list:
+    return [m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextNGramEmbedding"]
+
+
+def precompute_ngram(model, input_ids: torch.Tensor) -> list[torch.Tensor]:
+    """Every n-gram module's output for host `input_ids` ([1, N]), on the host: what ngram_embedding_forward
+    would compute. train_rft's prefetch thread calls this, so the table lookup (and any page faults on the
+    memory-mapped table) overlaps the GPU's work on the previous batch. A CPU twin of each module holds host
+    copies of its small id buffers and shares its table."""
+    out = []
+    for module in _ngram_modules(model):
+        twin = _CPU_TWINS.get(module)
+        if twin is None:
+            twin = object.__new__(type(module))
+            twin.__dict__.update(module.__dict__)
+            twin._buffers = {k: (v.cpu() if v is not None else None) for k, v in module._buffers.items()}
+            twin._modules = dict(module._modules)
+            twin._parameters = dict(module._parameters)
+            _CPU_TWINS[module] = twin
+        with torch.no_grad():
+            out.append(getattr(type(module), "_hf_forward", type(module).forward)(twin, input_ids.cpu(), None))
+    return out
+
+
+def provide_ngram(model, rows: list[torch.Tensor] | None) -> None:
+    """Hand precompute_ngram's output to the next forward of each n-gram module (used once, then the cache)."""
+    for module, row in zip(_ngram_modules(model), rows or []):
+        module.__dict__["_rft_ngram_provided"] = row
 
 def ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
     """transformers' PLE layer with its per-token part in checkpointed token chunks (training, batch 1).
