@@ -44,6 +44,8 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | [rft_data.py](rft_data.py) | Select level clears and write training samples (messages, image files, trained replies, tool schema) |
 | [check_rft_data.py](check_rft_data.py) | Tokenize a dataset as training does: reply markers, loss spans, exact lengths |
 | [train_rft.py](train_rft.py) | The training loop ([test](../../tests/test_train_rft.py)) |
+| [train_report.py](train_report.py) | Per-sample report of a training run (where step time went, pass criteria) and the dataset's projected average throughput |
+| [wandb_log.py](wandb_log.py) | Training metrics in wandb: live (`train_rft --wandb-project`, `train_pod.sh` with `WANDB_PROJECT`) or replayed from a pulled run folder ([test](../../tests/test_wandb_log.py)) |
 | [pod/train_pod.sh](pod/train_pod.sh) | One-shot training run on a pod; [pod/watch_pod.sh](pod/watch_pod.sh) pulls the results and deletes it |
 | [pod/smoke_pod.sh](pod/smoke_pod.sh) | The smoke test as one pod job |
 | [data/python_tool.json](data/python_tool.json) | The harness's tool schema |

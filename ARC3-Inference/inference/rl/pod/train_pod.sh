@@ -7,6 +7,8 @@
 # Upload inference/, tests/ and data/ (rft_data's output) to $WORK, then:
 #   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/train_pod.sh > train_pod.log 2>&1 < /dev/null &' < /dev/null
 # TRAIN_ARGS adds train_rft arguments (a rehearsal: "--epochs 1 --limit 4 --batch 2").
+# WANDB_PROJECT (and WANDB_RUN_NAME, default rft-<pod id>) also logs to wandb; the key is read from
+# /workspace/.wandb_key (upload it with mode 600), never passed on a command line.
 set -uo pipefail
 
 WORK=${WORK:-/workspace/rft}
@@ -19,6 +21,7 @@ GRACE_MINUTES=${GRACE_MINUTES:-20}
 POD_END=${POD_END:-stop}  # what ends the pod (timers, abort): stop (GPU billing ends, the pod and its volume stay) or delete
 MIN_HF_MBPS=${MIN_HF_MBPS:-40}
 TRAIN_ARGS=${TRAIN_ARGS:-}
+WANDB_PROJECT=${WANDB_PROJECT:-}
 cd "$WORK"
 mkdir -p results train
 rm -f FULL_DONE ABORTED
@@ -69,6 +72,7 @@ export PATH="$VENV/bin:$PATH"
 hopper=$(python -c "import torch; print(int(torch.cuda.get_device_capability()[0] == 9))" 2>/dev/null || echo 0)
 pkgs="transformers==5.20.1 peft accelerate auto-round flash-linear-attention hf_transfer pytest pillow numpy torchvision"
 [ "$hopper" = 1 ] && pkgs="$pkgs tilelang"
+[ -n "$WANDB_PROJECT" ] && pkgs="$pkgs wandb"
 if [ "$pypi" = "200" ]; then
     python -m pip install -q $pkgs || abort "pip install"
 else
@@ -129,10 +133,20 @@ log "checkpoint: $(du -sh "$MODEL_DIR" | cut -f1)"
 nvidia-smi --query-gpu=timestamp,utilization.gpu,power.draw,memory.used --format=csv,noheader -l 1 \
     > results/gpu.csv 2>/dev/null &
 sampler=$!
+wandb_args=()
+if [ -n "$WANDB_PROJECT" ]; then
+    if [ -s /workspace/.wandb_key ]; then
+        export WANDB_API_KEY="$(cat /workspace/.wandb_key)"
+        wandb_args=(--wandb-project "$WANDB_PROJECT" --wandb-run-name "${WANDB_RUN_NAME:-rft-${RUNPOD_POD_ID:-pod}}")
+        log "wandb: project $WANDB_PROJECT"
+    else
+        log "wandb: no /workspace/.wandb_key, training without it"
+    fi
+fi
 for attempt in 1 2 3; do
     resume=$([ "$attempt" -gt 1 ] && echo --resume)
     PYTHONPATH=. python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out train --max-hours "$TRAIN_HOURS" \
-        $flags $resume $TRAIN_ARGS >> results/train.log 2>&1
+        $flags $resume $TRAIN_ARGS "${wandb_args[@]}" >> results/train.log 2>&1
     code=$?
     log "train_rft attempt $attempt exited $code: $(grep -v '^\s*$' results/train.log | tail -1 | cut -c1-200)"
     [ -e train/TRAIN_DONE ] && break

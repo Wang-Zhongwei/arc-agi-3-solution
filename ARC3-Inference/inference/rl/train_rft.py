@@ -21,6 +21,8 @@ hyper-connections and MoE, fast LoRA and GDN, parts recompute, async offload), t
 - Saves: the adapter after every epoch (`adapter_epoch<N>`) and `latest` (adapter,
   optimizer, position) every `save_every` steps; `--resume` continues from `latest`.
 - Validation: mean loss on val.jsonl (forward only) before training and after each epoch.
+- wandb (`--wandb-project`, key from WANDB_API_KEY): every log row also goes to wandb (wandb_log); the
+  run id is kept in OUT/wandb_id.txt so a restart from `latest` continues the same run.
 
     python -m inference.rl.train_rft --model /workspace/w4a16 --data /workspace/data --out /workspace/train
 """
@@ -260,16 +262,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-prefix-stop-grad", dest="prefix_stop_grad", action="store_false")
     parser.add_argument("--limit", type=int, default=0, help="use only this many train samples (dry runs)")
     parser.add_argument("--val-samples", type=int, default=16, help="validation samples, spread over val.jsonl")
+    parser.add_argument("--wandb-project", help="also log to this wandb project (key: WANDB_API_KEY)")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-run-name")
     args = parser.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     log_path = args.out / "train_log.jsonl"
     started = time.time()
+
+    wandb_logger = None
+    if args.wandb_project:
+        try:
+            from inference.rl import wandb_log
+            id_file = args.out / "wandb_id.txt"
+            run_id = id_file.read_text().strip() if id_file.exists() else None
+            if run_id is None:
+                import wandb
+                run_id = wandb.util.generate_id()
+                id_file.write_text(run_id)
+            run = wandb_log.start(args.wandb_project, args.wandb_run_name, run_id,
+                                  {k: str(v) for k, v in vars(args).items()}, args.wandb_entity)
+            wandb_logger = wandb_log.WandbLogger(run)
+        except Exception as exc:  # noqa: BLE001 - monitoring must never stop training
+            print(f"wandb disabled: {type(exc).__name__}: {exc}", flush=True)
 
     def log(**row):
         row = dict(t=round(time.time() - started, 1), **row)
         print(json.dumps(row), flush=True)
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
+        if wandb_logger is not None:
+            try:
+                wandb_logger.event(row)
+            except Exception as exc:  # noqa: BLE001
+                print(f"wandb log failed: {exc}", flush=True)
 
     train = load_samples(args.data / "train.jsonl")
     val = load_samples(args.data / "val.jsonl")
@@ -411,6 +437,11 @@ def main(argv: list[str] | None = None) -> int:
     if not stopped:
         save("adapter_final", with_state=False)
         (args.out / "TRAIN_DONE").write_text(json.dumps(state))
+    if wandb_logger is not None:
+        try:
+            wandb_logger.run.finish()
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 
