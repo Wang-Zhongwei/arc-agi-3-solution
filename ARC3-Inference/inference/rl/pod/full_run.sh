@@ -70,6 +70,21 @@ else
 fi
 python -c "import torch, triton, transformers, fla; print('torch', torch.__version__, 'triton', triton.__version__, transformers.__version__, torch.cuda.get_device_name(0), torch.cuda.get_device_capability())" | tee results/env.txt || abort "imports"
 
+# fla 0.5.2 with Triton 3.4 on sm100 (B200): the GDN backward kernel's pipelined configs (num_stages 2-4) fail to
+# compile ("PassManager::run failed" in TritonGPUAssignLatencies), in every path including transformers' own.
+# fla already special-cases Blackwell for the forward; give the backward num_stages 1 there.
+python - <<'PY' | tee -a results/env.txt
+import pathlib, torch
+if torch.cuda.get_device_capability()[0] == 10:
+    import fla.ops.common.chunk_delta_h as m
+    path = pathlib.Path(m.__file__)
+    old = "for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])"
+    new = "for num_stages in ([2, 3, 4] if check_shared_mem('ampere') and not IS_NVIDIA_BLACKWELL else [1])"
+    text = path.read_text()
+    print("fla sm100 patch:", "applied" if text.count(old) == 1 else "not found (fla changed?)")
+    path.write_text(text.replace(old, new))
+PY
+
 log "phase 1b: checkpoint download in the background"
 HF_HUB_ENABLE_HF_TRANSFER=1 nohup hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" > results/download.log 2>&1 < /dev/null &
 download=$!
