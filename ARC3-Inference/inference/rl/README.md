@@ -140,3 +140,19 @@ The plan for a 10× faster training step, step by step, is in [Throughput.md](Th
 - Open PRs for Megatron-LM ([#7553](https://github.com/NVIDIA/Megatron-LM/pull/7553)), [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl/pull/3434), [miles](https://github.com/radixark/miles/pull/2777) and [NeMo RL](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).
 
 None covers 100K contexts with images on a single GPU, which is why we keep our own loop.
+
+### Hyperparameters against the published recipes (checked 2026-10-20)
+
+| | [ms-swift](https://swift.readthedocs.io/en/v4.5/BestPractices/Qwen3_8-Flash-Next-Best-Practice.html) LoRA SFT | [Megatron-LM #7553](https://github.com/NVIDIA/Megatron-LM/pull/7553) (`examples/qwen3.8_flash_next/train_full_model_64gpu.sh`) | [NeMo RL](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md) GRPO (`grpo-qwen3.8-flash-next-dapo-8n8g-automodel.yaml`) | Ours ([train_rft.py](train_rft.py)) |
+|---|---|---|---|---|
+| Method | LoRA SFT | Full parameters; mock-data smoke/parity run with `--finetune` from the HF weights | Full parameters, DAPO-style GRPO | LoRA RFT |
+| LoRA rank / α | 8 / 32, `in_proj out_proj linear_proj linear_qkv` | — | — | 16 / 32, attention + GDN projections (the same layers) |
+| LR | 1e-4 (their GRPO recipe: 5e-5) | 1e-5 constant, min 1e-6, 50 iterations; commented pretraining placeholder 3e-4 cosine, 2,000 warm-up | 1e-6, PLE n-gram table x5 | 1e-4, 5% warm-up, cosine to 1e-5 |
+| Adam betas / weight decay | defaults | (0.9, 0.95) in the placeholder / 0.1 | (0.9, 0.95) / 0.1 | (0.9, 0.999) / 0 |
+| Clip | — | 1.0 | — | 1.0 |
+| Batch | 8 x ≤ 8K tokens, 1 epoch | 512 x 4,096 (2M tokens per step) | 128 x 4,096 | 4 x ~100K tokens (~82K trained per step), 2 epochs, 178 steps |
+| Trained besides the main weights | — | QSA indexer (aux loss 0.01), MTP head (loss 0.1) | PLE table | nothing: indexer, MTP, PLE frozen |
+
+- LR and α match ms-swift's LoRA recipe for this model. With α fixed, LoRA's early update size is roughly independent of the rank, so r 16 against their 8 adds capacity, not step size. Megatron's 1e-5 full fine-tune fits the usual LoRA ≈ 10x full-fine-tune LR rule; it comes from a 50-step smoke run, not a tuned recipe.
+- The difference that matters: both NVIDIA recipes use β2 0.95, we use 0.999, whose second-moment average spans ~1,000 steps against our 178. Weight decay 0 is usual for LoRA.
+- Megatron trains the MTP head and NeMo the PLE table; we freeze both, so check MTP draft acceptance after merging the adapter.
