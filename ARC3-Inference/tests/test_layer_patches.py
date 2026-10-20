@@ -373,3 +373,46 @@ def test_precomputed_ngram_rows_replace_the_lookup():
     finally:
         m.Qwen4ExpTextNGramEmbedding._hf_forward = hf
         layer_patches.unpatch(model)
+
+
+def test_final_mixer_runs_in_token_chunks():
+    """The model's final hyper-connection mixer upcast all [N, hc x hidden] streams to FP32 at once (4.98 GiB at
+    130K tokens); chunked it gives identical logits and gradients and builds no whole-sequence FP32 tensor."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ids = torch.randint(0, 1000, (1, 70), generator=torch.Generator().manual_seed(8))
+
+    def run(chunked):
+        model = tiny().to(torch.bfloat16).train()
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        layer_patches.patch_for_training(model, token_chunk=16, recompute="parts")
+        if not chunked:
+            for mixer in layer_patches._final_mixers(model):
+                mixer.__dict__.pop("forward")
+        width = model.config.text_config.hc_count * model.config.text_config.hidden_size
+        whole = []
+
+        class Spy(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                for o in out if isinstance(out, (tuple, list)) else [out]:
+                    if isinstance(o, torch.Tensor) and o.dtype == torch.float32 and tuple(o.shape[-2:]) == (70, width):
+                        whole.append(str(func))
+                return out
+        try:
+            with Spy():
+                hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+                hidden.float().pow(2).mean().backward()
+        finally:
+            layer_patches.unpatch(model)
+        return hidden.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}, whole
+
+    ref, ref_grads, ref_whole = run(chunked=False)
+    out, grads, whole = run(chunked=True)
+    assert ref_whole and not whole  # the reference builds whole-sequence FP32 streams, the chunked mixer does not
+    assert torch.equal(out, ref) and grads.keys() == ref_grads.keys()
+    for name in grads:
+        if "hyper_connection_mixer" in name:  # its own weights sum chunk by chunk in BF16 (frozen in LoRA training)
+            torch.testing.assert_close(grads[name].float(), ref_grads[name].float(), rtol=2e-2, atol=1e-5, msg=name)
+        else:
+            assert torch.equal(grads[name], ref_grads[name]), name

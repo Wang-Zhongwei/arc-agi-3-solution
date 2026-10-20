@@ -148,7 +148,9 @@ def run_sample(model, device, sample, scale: float, prefix_stop_grad: bool = Tru
             result.update(recompute_mode=mode, retries=len(errors), saved_tokens=saved_tokens)
             break
         except torch.cuda.OutOfMemoryError as exc:
-            errors.append(f"{mode}: {str(exc)[:120]}")
+            where = " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}"
+                                for f in traceback.extract_tb(exc.__traceback__)[-4:][::-1])
+            errors.append(f"{mode}: {str(exc)[:100]} at {where}")
             oom = True
         except smoke_lora.HostMemoryError as exc:
             errors.append(f"host: {exc}")

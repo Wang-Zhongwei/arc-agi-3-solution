@@ -38,6 +38,7 @@ Scope: batch 1, no cache (training). Anything else runs transformers' forward.
 from __future__ import annotations
 
 import math
+import types
 import weakref
 
 import torch
@@ -727,6 +728,24 @@ def _chunked(fn, *tensors, size: int):
     return torch.cat(pieces, dim=1)
 
 
+def mixer_forward(self, hyper_input):
+    """The model's final hyper-connection mixer (Qwen4ExpTextGatedResidual, use_combine=False) in token chunks.
+
+    It runs on every position and its grouped RMSNorm upcasts the whole [N, 4 x 2,560] stream tensor to FP32:
+    4.98 GiB per temporary at 130,561 tokens, which ran the 10-20 rehearsal's longest sample out of GPU memory.
+    Every operation in it works token by token, so chunks give the same values."""
+    forward = type(self).forward
+    if hyper_input.dim() != 3 or hyper_input.shape[0] != 1:
+        return forward(self, hyper_input)
+    size = getattr(self, "_rft_token_chunk", None) or _DEFAULTS["token_chunk"]
+    return _chunked(lambda x: forward(self, x), hyper_input, size=size)
+
+
+def _final_mixers(model) -> list:
+    return [mod.hyper_connection_mixer for mod in model.modules()
+            if type(mod).__name__ == "Qwen4ExpTextModel" and hasattr(mod, "hyper_connection_mixer")]
+
+
 def _per_token_functions(self, cuda: bool):
     """The decoder layer's per-token work before the mixer (attention hyper-connection: mixer input, injection
     weights) and after it (inject, MLP hyper-connection, MoE, inject), compiled with compile_hc on CUDA."""
@@ -802,6 +821,8 @@ def configure(model, token_chunk: int | None = None, expert_tile: int | None = N
         name = type(module).__name__
         if name == "Qwen4ExpTextPLELayer" and token_chunk:
             module._rft_token_chunk = token_chunk
+        if name == "Qwen4ExpTextModel" and token_chunk and hasattr(module, "hyper_connection_mixer"):
+            module.hyper_connection_mixer._rft_token_chunk = token_chunk
         if name == "Qwen4ExpTextDecoderLayer":
             if token_chunk:
                 module._rft_token_chunk = token_chunk
@@ -864,6 +885,8 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     if not hasattr(ngram, "_hf_forward"):
         ngram._hf_forward = ngram.forward
     ngram.forward = ngram_embedding_forward
+    for mixer in _final_mixers(model):  # this instance only: the decoder layers' gated residuals have their own path
+        mixer.forward = types.MethodType(mixer_forward, mixer)
     if not hasattr(m, "_rft_hf_causal_conv1d_fn"):
         m._rft_hf_causal_conv1d_fn = m.causal_conv1d_fn
     m.causal_conv1d_fn = _causal_conv1d_fn
@@ -895,6 +918,8 @@ def unpatch(model=None) -> None:
             if isinstance(module, m.Qwen4ExpTextExperts) and hasattr(module, "_rft_previous_implementation"):
                 module.config._experts_implementation = module._rft_previous_implementation
         clear_expert_cache()
+        for mixer in _final_mixers(model):
+            mixer.__dict__.pop("forward", None)
 
     layer = m.Qwen4ExpTextDecoderLayer
     if hasattr(layer, "_hf_forward"):
