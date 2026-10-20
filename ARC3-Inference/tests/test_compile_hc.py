@@ -62,11 +62,13 @@ def test_compiled_layer_is_as_accurate_as_eager():
     eager = run(layer, x, pos)
     layer_patches.configure(model, compile_hc=True, compile_moe=True)
     layer_patches._FAST_CONV["on"] = True
+    layer_patches._FAST_GDN["on"] = True  # fused conv + split, grouped value heads, fused gated norm (needs fla)
     try:
         compiled = run(layer, x, pos)
     finally:
         layer_patches.configure(model, compile_hc=False, compile_moe=False)
         layer_patches._FAST_CONV["on"] = False
+        layer_patches._FAST_GDN["on"] = False
     assert compiled.keys() == reference.keys()
     for name in reference:
         assert rel(compiled[name], reference[name]) <= 1.5 * rel(eager[name], reference[name]) + 1e-3, \

@@ -9,6 +9,8 @@ Two exact rewrites of transformers' forward, for long single-sequence training:
   weights serving uses). The last layer's dequantized tiles are cached: its token chunks and
   the backward's recompute of them reuse one dequantization per pass instead of one per
   chunk (~5 GB of BF16 experts held at a time; exact).
+- fast_gdn: the GDN mixer's convolution writes contiguous q, k, v; q and k keep their heads (fla's
+  grouped value attention instead of repeat_interleave copies); the gated RMSNorm is compiled.
 - fast_lora: peft's LoRA update (FP32 adapter on a BF16 base output) as one compiled function
   instead of FP32 intermediates the size of the output.
 - PLE n-gram lookup: the host-side table gather runs once per step; the PLE checkpoint's
@@ -387,6 +389,70 @@ def _causal_conv1d_fn(hidden_states, weight, bias=None, activation=None, **kwarg
 
 
 # ---------------------------------------------------------------------------
+# GDN mixer: fused convolution + split, grouped value heads, fused gated norm
+# ---------------------------------------------------------------------------
+
+def conv_split(mixed, weight, bias, key_dim: int, key_heads: int, value_heads: int, head_k: int, head_v: int):
+    """The GDN short convolution (+ SiLU) of the qkv projection, written straight into contiguous q, k, v
+    ([1, N, heads, dim]); fla otherwise copies each split view to make it contiguous."""
+    x = short_conv(mixed, weight, bias, silu=True)
+    q, k, v = torch.split(x, [key_dim, key_dim, value_heads * head_v], dim=-1)
+    n = x.shape[1]
+    return (q.reshape(1, n, key_heads, head_k).contiguous(), k.reshape(1, n, key_heads, head_k).contiguous(),
+            v.reshape(1, n, value_heads, head_v).contiguous())
+
+
+def gated_rms_norm(x, gate, weight, eps: float, sigmoid: bool):
+    """Qwen4ExpTextRMSNormGated.forward without the module, op for op."""
+    dtype = x.dtype
+    h = x.to(torch.float32)
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)
+    h = weight * h.to(dtype)
+    g = gate.to(torch.float32)
+    h = h * (torch.sigmoid(g) if sigmoid else F.silu(g))
+    return h.to(dtype)
+
+
+_FAST_GDN = {"on": False}
+
+
+def gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+    """transformers' GatedDeltaNet forward for training (`fast_gdn`), with three changes that keep its math:
+    the convolution writes contiguous q, k, v (conv_split); q and k stay at their 16 heads and fla's grouped
+    value attention maps each to its 3 value heads (transformers materializes repeat_interleave copies of
+    both, and sums their gradients back); the gated RMSNorm is one compiled function. Anything else (a cache,
+    no fla, CPU) runs transformers' forward."""
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as m
+
+    try:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError:
+        chunk_gated_delta_rule = None
+    if (not _FAST_GDN["on"] or cache_params is not None or chunk_gated_delta_rule is None
+            or not hidden_states.is_cuda or hidden_states.shape[0] != 1
+            or self.norm.activation not in ("sigmoid", "silu") or self.activation != "silu"):
+        return type(self)._hf_forward(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask,
+                                      **kwargs)
+    hidden_states = m.apply_mask_to_padding_states(hidden_states, attention_mask)
+    n = hidden_states.shape[1]
+    mixed_qkv = self.in_proj_qkv(hidden_states)
+    z = self.in_proj_z(hidden_states)
+    b = self.in_proj_b(hidden_states)
+    a = self.in_proj_a(hidden_states)
+    q, k, v = _hc_fn("conv_split", True, dynamic=True)(mixed_qkv, self.conv1d.weight.squeeze(1), self.conv1d.bias,
+                                                       self.key_dim, self.num_k_heads, self.num_v_heads,
+                                                       self.head_k_dim, self.head_v_dim)
+    beta = b.sigmoid()
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    core, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=None, output_final_state=False,
+                                     use_qk_l2norm_in_kernel=True)
+    out = _hc_fn("gated_rms_norm", True, dynamic=True)(core.reshape(-1, self.head_v_dim),
+                                                       z.reshape(-1, self.head_v_dim), self.norm.weight,
+                                                       self.norm.variance_epsilon, self.norm.activation == "sigmoid")
+    return self.out_proj(out.reshape(1, n, -1))
+
+
+# ---------------------------------------------------------------------------
 # LoRA branch, fused
 # ---------------------------------------------------------------------------
 
@@ -561,7 +627,7 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
                        expert_tile: int = _DEFAULTS["expert_tile"], recompute: str = _DEFAULTS["recompute"],
                        compile_hc: bool = _DEFAULTS["compile_hc"], compile_moe: bool = False,
                        cache_experts: bool = _DEFAULTS["cache_experts"], fast_conv: bool = False,
-                       fast_lora: bool = False) -> dict:
+                       fast_lora: bool = False, fast_gdn: bool = False) -> dict:
     """Route qwen4_exp experts through grouped GEMMs and chunk decoder layers over tokens.
 
     Call it after gradient_checkpointing_enable(): `recompute="parts"` replaces the layer-level
@@ -592,6 +658,11 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
         m._rft_hf_causal_conv1d_fn = m.causal_conv1d_fn
     m.causal_conv1d_fn = _causal_conv1d_fn
     _FAST_CONV["on"] = fast_conv
+    gdn = m.Qwen4ExpTextGatedDeltaNet
+    if not hasattr(gdn, "_hf_forward"):
+        gdn._hf_forward = gdn.forward
+    gdn.forward = gdn_forward
+    _FAST_GDN["on"] = fast_gdn
     try:
         patch_lora(fast_lora)
     except ImportError:  # no peft
@@ -599,7 +670,8 @@ def patch_for_training(model, token_chunk: int = _DEFAULTS["token_chunk"],
     configure(model, token_chunk, expert_tile, recompute, compile_hc, compile_moe, cache_experts)
     return dict(experts_implementation=EXPERTS_IMPLEMENTATION, configs=len(configs), token_chunk=token_chunk,
                 expert_tile=expert_tile, recompute=current_recompute(model), compile_hc=compile_hc,
-                compile_moe=compile_moe, cache_experts=cache_experts, fast_conv=fast_conv, fast_lora=fast_lora)
+                compile_moe=compile_moe, cache_experts=cache_experts, fast_conv=fast_conv, fast_lora=fast_lora,
+                fast_gdn=fast_gdn)
 
 
 def unpatch(model=None) -> None:
@@ -622,6 +694,7 @@ def unpatch(model=None) -> None:
     if hasattr(m.Qwen4ExpTextNGramEmbedding, "_hf_forward"):
         m.Qwen4ExpTextNGramEmbedding.forward = m.Qwen4ExpTextNGramEmbedding._hf_forward
     _FAST_LORA["on"] = False  # peft's own LoRA forward
+    _FAST_GDN["on"] = False
 
 
 @torch.no_grad()

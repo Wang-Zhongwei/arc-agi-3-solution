@@ -278,3 +278,26 @@ def test_fast_lora_matches_peft(monkeypatch):
     assert grads.keys() == ref_grads.keys() and len(grads) > 10
     for name in grads:
         assert torch.equal(grads[name], ref_grads[name]), name
+
+
+def test_gdn_pure_functions_match_the_module():
+    """fast_gdn's conv_split and gated_rms_norm compute transformers' convolution + split and RMSNormGated."""
+    model = tiny().to(torch.bfloat16)
+    gdn = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextGatedDeltaNet))
+    g = torch.Generator().manual_seed(0)
+    n = 37
+    mixed = torch.randn(1, n, gdn.conv_dim, generator=g).to(torch.bfloat16)
+    with torch.no_grad():
+        conv = layer_patches.short_conv(mixed, gdn.conv1d.weight.squeeze(1), gdn.conv1d.bias, silu=True)
+        q, k, v = layer_patches.conv_split(mixed, gdn.conv1d.weight.squeeze(1), gdn.conv1d.bias, gdn.key_dim,
+                                           gdn.num_k_heads, gdn.num_v_heads, gdn.head_k_dim, gdn.head_v_dim)
+        rq, rk, rv = torch.split(conv, [gdn.key_dim, gdn.key_dim, gdn.value_dim], dim=-1)
+        assert torch.equal(q, rq.reshape(1, n, -1, gdn.head_k_dim)) and q.is_contiguous()
+        assert torch.equal(k, rk.reshape(1, n, -1, gdn.head_k_dim)) and k.is_contiguous()
+        assert torch.equal(v, rv.reshape(1, n, -1, gdn.head_v_dim)) and v.is_contiguous()
+        gdn.norm.weight.normal_(1, 0.1)
+        x = torch.randn(n * gdn.num_v_heads, gdn.head_v_dim, generator=g).to(torch.bfloat16)
+        gate = torch.randn(n * gdn.num_v_heads, gdn.head_v_dim, generator=g).to(torch.bfloat16)
+        ours = layer_patches.gated_rms_norm(x, gate, gdn.norm.weight, gdn.norm.variance_epsilon,
+                                            gdn.norm.activation == "sigmoid")
+        assert torch.equal(ours, gdn.norm(x, gate))
