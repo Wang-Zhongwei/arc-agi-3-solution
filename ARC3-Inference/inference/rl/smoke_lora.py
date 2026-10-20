@@ -53,8 +53,9 @@ def board_image(seed: int) -> Image.Image:
     return Image.fromarray(pixels, "RGB")
 
 
-def to_chat(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[Image.Image]]:
-    """Rebuilt messages in the processor's format; image parts become PIL boards."""
+def to_chat(messages: list[dict[str, Any]], load_image=None) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+    """Rebuilt messages in the processor's format; image parts become PIL images: `load_image(part)`, or
+    synthetic boards of the deployed size when it is None."""
     chat, images = [], []
     for m in messages:
         role = m["role"]
@@ -64,7 +65,7 @@ def to_chat(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[
             parts = []
             for p in m["content"]:
                 if p["type"] == "image_url":
-                    images.append(board_image(len(images)))
+                    images.append(load_image(p) if load_image else board_image(len(images)))
                     parts.append({"type": "image"})
                 else:
                     parts.append({"type": "text", "text": p["text"]})
@@ -95,14 +96,15 @@ def pick_request(game, length: int):
     return best[1] if best else None
 
 
-def tokenize(processor, text: str, images: list[Image.Image], loss_replies: int):
-    """input_ids, labels (-100 outside the last `loss_replies` assistant replies) and vision inputs.
+def tokenize(processor, text: str, images: list[Image.Image], loss_replies: int, replies: list[int] | None = None):
+    """input_ids, labels (-100 outside the last `loss_replies` assistant replies, or outside the replies
+    whose 0-based ordinals are listed in `replies`) and vision inputs.
 
     The text is cut at reply boundaries, which fall on special tokens, and each
     piece is tokenized with its own images, so the mask needs no offset mapping."""
     starts = [m.end() for m in re.finditer(re.escape(ASSISTANT), text)]
     spans = []
-    for s in starts[-loss_replies:]:
+    for s in (starts[-loss_replies:] if replies is None else [starts[i] for i in replies]):
         e = text.find(END, s)
         spans.append((s, e + len(END)))
     pieces, cursor = [], 0
@@ -291,15 +293,18 @@ class LayerTimeline:
 def step(model, sample, device, offload: bool = False, profile: bool = False,
          reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
          async_copies: bool = False, timeline: bool = False, prefix_stop_grad: bool = False,
-         memory_snapshot: str | None = None) -> dict[str, Any]:
+         memory_snapshot: str | None = None, accumulate: bool = False, loss_scale: float = 1.0) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
     in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
     With reused buffers, the step's last `gpu_keep_gb` stay on the GPU (once a step of the same
     recompute mode has measured the total), and `async_copies` pins the buffers and copies on a
     side stream, prefetching in backward. `memory_snapshot` (a path prefix) records CUDA allocations and
-    dumps them at the end of the forward (`_fwd.pickle`) or at an out-of-memory error (`_oom.pickle`)."""
-    model.zero_grad(set_to_none=True)  # a layer_check leaves its last variant's gradients on its layers
+    dumps them at the end of the forward (`_fwd.pickle`) or at an out-of-memory error (`_oom.pickle`).
+    `accumulate` (training): gradients are added to those already there and kept, and the loss is
+    multiplied by `loss_scale` before backward (a sample's share of its batch's trained tokens)."""
+    if not accumulate:
+        model.zero_grad(set_to_none=True)  # a layer_check leaves its last variant's gradients on its layers
     # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
     # training mode: without this every activation is kept (OOM on the GPU, or on the host
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
@@ -369,7 +374,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 torch.cuda.memory._dump_snapshot(f"{memory_snapshot}_fwd.pickle")
             if layer_timeline is not None:
                 layer_timeline.forward_phase = False
-            loss.backward()
+            (loss * loss_scale).backward()
             _sync()
             t2 = time.perf_counter()
             memory["after_backward_gb"] = gb()
@@ -386,13 +391,14 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
             for handle in layer_timeline.handles:
                 handle.remove()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
-    norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
+    norm = 0.0 if accumulate or not grads else float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads)))
     if keep_grads:  # for compare_grads: ~0.1 GB of host memory per kept step at r = 16
         if getattr(model, "_rft_grads", None) is None:
             model._rft_grads = {}
         model._rft_grads[keep_grads] = {name: p.grad.detach().float().cpu() for name, p in model.named_parameters()
                                         if p.requires_grad and p.grad is not None}
-    model.zero_grad(set_to_none=True)
+    if not accumulate:
+        model.zero_grad(set_to_none=True)
     loss_value = float(loss.detach())
     del loss, hidden
     memory["end_gb"] = gb()

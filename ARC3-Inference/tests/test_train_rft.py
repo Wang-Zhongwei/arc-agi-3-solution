@@ -1,0 +1,79 @@
+"""train_rft's gradient accumulation: samples run one at a time, each adding its share of the batch's trained
+tokens times its own gradient, give Σ (n_i / N) ∇L_i (every trained token of the batch weighted once), and a
+sample whose first attempt ran out of memory after touching the gradients leaves no trace of that attempt."""
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("transformers.models.qwen4_exp")
+peft = pytest.importorskip("peft")
+
+from inference.rl import layer_patches, qsa, smoke_lora, train_rft  # noqa: E402
+from test_layer_patches import tiny  # noqa: E402
+
+
+def sample(seed: int, n: int, trained: list[tuple[int, int]]):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, 1000, (1, n), generator=g)
+    labels = torch.full_like(ids, -100)
+    for a, b in trained:
+        labels[0, a:b] = ids[0, a:b]
+    return {"input_ids": ids, "labels": labels, "mm_token_type_ids": torch.zeros_like(ids)}
+
+
+@pytest.fixture
+def model():
+    m = tiny().train()
+    m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    m = peft.get_peft_model(m, peft.LoraConfig(r=4, lora_alpha=8, target_modules=smoke_lora.ATTENTION_GDN))
+    with torch.no_grad():  # lora_B starts at zero: give it values so lora_A gets gradients too
+        for name, p in m.named_parameters():
+            if "lora_B" in name:
+                p.normal_(0, 0.02, generator=torch.Generator().manual_seed(hash(name) % 1000))
+    qsa.patch_qsa_attention(chunk_size=16, fused=False)
+    layer_patches.patch_for_training(m, token_chunk=16, recompute="parts")
+    yield m
+    layer_patches.unpatch(m)
+    qsa.unpatch_qsa_attention()
+
+
+def lora_grads(m):
+    return {n: p.grad.detach().clone() for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
+
+
+def test_accumulated_samples_weight_every_trained_token_once(model, monkeypatch):
+    samples = [sample(1, 48, [(30, 40)]), sample(2, 64, [(20, 30), (50, 64)])]
+    counts = [int((s["labels"] != -100).sum()) for s in samples]
+    total = sum(counts)
+    each = []
+    for s in samples:  # the standard answer: each sample's own mean-loss gradient, from a plain step
+        smoke_lora.step(model, s, "cpu", prefix_stop_grad=True, keep_grads="ref")
+        each.append(model._rft_grads["ref"])
+    expected = {n: sum(c / total * g[n] for c, g in zip(counts, each)) for n in each[0]}
+
+    real_step, calls = smoke_lora.step, []
+
+    def failing_once(m, s, device, **kwargs):  # the first attempt dirties the gradients, then runs out of memory
+        calls.append(kwargs["gpu_keep_gb"])
+        if len(calls) == 1:
+            for p in m.parameters():
+                if p.requires_grad:
+                    p.grad = torch.full_like(p, 7.0)
+            raise torch.cuda.OutOfMemoryError("test")
+        return real_step(m, s, device, **kwargs)
+
+    monkeypatch.setattr(smoke_lora, "step", failing_once)
+    model.zero_grad(set_to_none=True)
+    results = [train_rft.run_sample(model, "cpu", s, c / total, margin=24.0) for s, c in zip(samples, counts)]
+    got = lora_grads(model)
+    assert results[0]["retries"] == 1 and results[1]["retries"] == 0 and len(calls) == 3
+    assert got.keys() == expected.keys() and len(got) > 20
+    for name in expected:
+        torch.testing.assert_close(got[name], expected[name], rtol=1e-4, atol=1e-7, msg=name)
+
+
+def test_lr_schedule_warms_up_then_decays_to_the_floor():
+    lrs = [train_rft.lr_at(s, 100, 5, 0.1) for s in range(100)]
+    assert lrs[0] == pytest.approx(0.2) and lrs[4] == pytest.approx(1.0)
+    assert max(lrs) == pytest.approx(1.0) and lrs[-1] == pytest.approx(0.1, abs=1e-3)
+    assert all(a >= b for a, b in zip(lrs[4:], lrs[5:]))
