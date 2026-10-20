@@ -1,6 +1,6 @@
 #!/bin/bash
 # Local watcher for full_run.sh / train_pod.sh: when the pod writes FULL_DONE or ABORTED, pull its results and
-# stop it (GPU billing ends; the pod is kept, user's choice 2026-10-20). DELETE=1 deletes it instead.
+# end it: POD_END=stop (default: GPU billing ends, the pod and its volume stay) or POD_END=delete.
 #   bash inference/rl/pod/watch_pod.sh POD_ID HOST PORT DEST_DIR
 # RUNPOD_API_KEY comes from the repo's .env (never printed). Exits when the pod is stopped, gone or unreachable.
 # NO_DELETE=1 pulls the results only (to test the pod's own self-stop afterwards).
@@ -36,14 +36,14 @@ while true; do
                 if [ $pull_failures -lt 5 ]; then sleep 30; continue; fi
             fi
             code=skipped
-            if [ "${NO_DELETE:-0}" != 1 ] && [ "${DELETE:-0}" = 1 ]; then
+            if [ "${NO_DELETE:-0}" != 1 ] && [ "${POD_END:-stop}" = delete ]; then
                 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
                     -H "Authorization: Bearer $KEY" -A "Mozilla/5.0" "https://rest.runpod.io/v1/pods/$ID")
             elif [ "${NO_DELETE:-0}" != 1 ]; then
                 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
                     -H "Authorization: Bearer $KEY" -A "Mozilla/5.0" "https://rest.runpod.io/v1/pods/$ID/stop")
             fi
-            echo "pod $ID: $(echo "$state" | grep -E '^(FULL_DONE|ABORTED)$'); results in $DEST; $([ "${DELETE:-0}" = 1 ] && echo delete || echo stop) HTTP $code"
+            echo "pod $ID: $(echo "$state" | grep -E '^(FULL_DONE|ABORTED)$'); results in $DEST; ${POD_END:-stop} HTTP $code"
             exit 0
         fi
         if [ "$SYNC_MINUTES" -gt 0 ] && [ $(( $(date +%s) - last_sync )) -ge $((SYNC_MINUTES * 60)) ]; then

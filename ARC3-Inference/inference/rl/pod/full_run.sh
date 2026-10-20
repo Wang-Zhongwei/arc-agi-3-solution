@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-shot run on an expensive GPU (B200, H200): network check, packages, checkpoint, CUDA tests, a jobs file
 # generated from the tests (features whose test failed are off), the model server's jobs, then FULL_DONE.
-# Nothing waits for a person. The pod stops itself MAX_MINUTES after start, or GRACE_MINUTES after the end
+# Nothing waits for a person. The pod stops itself (POD_END=delete: deletes) MAX_MINUTES after start, or GRACE_MINUTES after the end
 # (a local watcher normally pulls the results and stops it first).
 #
 # Upload inference/, tests/, game.txt, game_ft09.txt (and wheels/ when PyPI is unreachable) to $WORK, then:
@@ -17,6 +17,7 @@ REHEARSAL=${REHEARSAL:-0}
 PLE_FP8=${PLE_FP8:-0}  # 1: also fetch nvidia's FP8 PLE table and run make_jobs.py --ple-fp8 (BF16 vs FP8 PLE gradients)
 MAX_MINUTES=${MAX_MINUTES:-90}
 GRACE_MINUTES=${GRACE_MINUTES:-20}
+POD_END=${POD_END:-stop}  # what ends the pod (timers, abort): stop (GPU billing ends, the pod and its volume stay) or delete
 MIN_HF_MBPS=${MIN_HF_MBPS:-40}
 cd "$WORK"
 mkdir -p results
@@ -27,10 +28,14 @@ for var in RUNPOD_POD_ID RUNPOD_API_KEY; do
 done
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 self_stop() {
-    log "stopping this pod ($1): GPU billing ends, the pod and its volume stay"
+    log "ending this pod ($1): $POD_END"
     if command -v runpodctl > /dev/null && [ -n "${RUNPOD_POD_ID:-}" ]; then
         runpodctl config --apiKey "${RUNPOD_API_KEY:-}" > /dev/null 2>&1  # it reads a config file, not the env
-        runpodctl stop pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        if [ "$POD_END" = delete ]; then
+            runpodctl remove pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        else
+            runpodctl stop pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        fi
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
         pkill -f "inference.rl.smoke_lora" || true
@@ -123,4 +128,4 @@ log "jobs finished: $(tail -1 results/smoke_pod.log)"
 cp jobs/*.result.json results/ 2>/dev/null
 date -u > FULL_DONE
 ( sleep $((GRACE_MINUTES * 60)); self_stop "grace period after FULL_DONE" ) &
-log "FULL_DONE (the pod stops itself in ${GRACE_MINUTES} min unless the watcher does first)"
+log "FULL_DONE (the pod ends itself ($POD_END) in ${GRACE_MINUTES} min unless the watcher does first)"

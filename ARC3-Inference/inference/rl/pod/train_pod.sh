@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-shot RFT training on an H200: network check, packages, checkpoint, the CUDA tests that decide the training
 # flags (a failed test switches off only its feature, as make_jobs.py does), train_rft (restarted from `latest`
-# if it dies), then FULL_DONE. Nothing waits for a person. The pod stops itself MAX_MINUTES after start, or
+# if it dies), then FULL_DONE. Nothing waits for a person. The pod stops itself (POD_END=delete: deletes) MAX_MINUTES after start, or
 # GRACE_MINUTES after the end; the local watcher (watch_pod.sh) normally pulls the results and stops it first.
 #
 # Upload inference/, tests/ and data/ (rft_data's output) to $WORK, then:
@@ -16,6 +16,7 @@ MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 MAX_MINUTES=${MAX_MINUTES:-480}
 TRAIN_HOURS=${TRAIN_HOURS:-7}  # train_rft saves and stops after this long
 GRACE_MINUTES=${GRACE_MINUTES:-20}
+POD_END=${POD_END:-stop}  # what ends the pod (timers, abort): stop (GPU billing ends, the pod and its volume stay) or delete
 MIN_HF_MBPS=${MIN_HF_MBPS:-40}
 TRAIN_ARGS=${TRAIN_ARGS:-}
 cd "$WORK"
@@ -27,10 +28,14 @@ for var in RUNPOD_POD_ID RUNPOD_API_KEY; do
 done
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 self_stop() {
-    log "stopping this pod ($1): GPU billing ends, the pod and its volume stay"
+    log "ending this pod ($1): $POD_END"
     if command -v runpodctl > /dev/null && [ -n "${RUNPOD_POD_ID:-}" ]; then
         runpodctl config --apiKey "${RUNPOD_API_KEY:-}" > /dev/null 2>&1  # it reads a config file, not the env
-        runpodctl stop pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        if [ "$POD_END" = delete ]; then
+            runpodctl remove pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        else
+            runpodctl stop pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        fi
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
         pkill -f "inference.rl.train_rft" || true
@@ -138,4 +143,4 @@ cp train/train_log.jsonl results/ 2>/dev/null
 [ -e train/TRAIN_DONE ] && log "TRAIN_DONE" || log "training did not finish; the last saved adapter is in train/"
 date -u > FULL_DONE
 ( sleep $((GRACE_MINUTES * 60)); self_stop "grace period after FULL_DONE" ) &
-log "FULL_DONE (the pod stops itself in ${GRACE_MINUTES} min unless the watcher does first)"
+log "FULL_DONE (the pod ends itself ($POD_END) in ${GRACE_MINUTES} min unless the watcher does first)"
