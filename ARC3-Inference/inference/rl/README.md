@@ -7,9 +7,9 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | Topic | Decision | Reason |
 |---|---|---|
 | Stack | transformers + PEFT + our own training loop | Fewest moving parts; full control of long packed samples, images and loss masks. verl only for GRPO. |
-| Selection | Drop (game, level)s with no difficulty; keep the top k per level by fewest actions, then fewest tokens | Score rewards few actions; a cap per level stops easy levels dominating. |
+| Selection (2026-10-20) | Levels cleared in < 80% of attempts (an attempt = the level got ≥ 1 analyzer turn); per level, the clears within the best 35% by actions whose generated tokens (thinking, reply, tool code) are at most the level's median clear. Thresholds over all runs' clears; samples only from runs that rebuild faithfully | Score rewards few actions, and time goes with tokens: within a level, actions and generated tokens correlate (median Spearman 0.65), but 21% of the fewest-action quarter still out-think the median clear. 80% to start conservative. [rft_data.py](rft_data.py) |
 | Sample | One model request: x = the context the model saw, y = its reply (thinking + tool calls) | An analyzer turn has 1.47 requests on average. |
-| Context | The real 50–100K window, rebuilt from transcripts at training time | Truncating would teach conclusions without the evidence for them, and break harness parity. |
+| Context | The real 50–120K window, rebuilt from transcripts, with each run's own settings: image scales, tool description, window | Truncating would teach conclusions without the evidence for them, and break harness parity. Images are drawn again from the run's frames ([rft_images.py](rft_images.py)). |
 | Packing | Requests between two trims share their prefix (`preserve_thinking`), so a segment is one sequence | reset-baseline v01: 209M input tokens as one sample per request, 14.4M packed by segment. |
 | Loss | Only on assistant tokens of the selected (game, level); drop `uncertain` requests | Everything else is context. |
 | LoRA targets | `self_attn.{q,k,v,o}_proj` and `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}`: 228 modules, 26.1M parameters at r=16. Frozen: routed experts, shared expert, QSA indexer, PLE, vision | All BF16 in the deployed checkpoint, so merging costs nothing. Shared-expert LoRA is out of the first round (2026-10-19): it slowed a 32K step by 12% (forward 21.0 → 38.2 s) and would need its own A/B; revisit if RFT gains little. The layers [ms-swift's recipe](https://swift.readthedocs.io/en/v4.5/BestPractices/Qwen3_8-Flash-Next-Best-Practice.html) targets too (`linear_qkv linear_proj in_proj out_proj`). |
@@ -37,6 +37,11 @@ Step 1 of the [RL plan](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob
 | [layer_patches.py](layer_patches.py) | Grouped INT4 experts and token-chunked decoder layers ([test](../../tests/test_layer_patches.py)) |
 | [ple_mmap.py](ple_mmap.py) | Serve the PLE n-gram table from the checkpoint files ([test](../../tests/test_ple_mmap.py)) |
 | [host_offload.py](host_offload.py) | Offload saved activations into host buffers reused across steps ([test](../../tests/test_host_offload.py)) |
+| [rft_images.py](rft_images.py) | Draw a rebuilt request's images again from the run's events and frames ([validation](validate_images.py): 12,778 logged images identical) |
+| [rft_data.py](rft_data.py) | Select level clears and write training samples (messages, image files, trained replies, tool schema) |
+| [check_rft_data.py](check_rft_data.py) | Tokenize a dataset as training does: reply markers, loss spans, exact lengths |
+| [train_rft.py](train_rft.py) | The training loop ([test](../../tests/test_train_rft.py)) |
+| [pod/train_pod.sh](pod/train_pod.sh) | One-shot training run on a pod; [pod/watch_pod.sh](pod/watch_pod.sh) pulls the results and deletes it |
 | [pod/smoke_pod.sh](pod/smoke_pod.sh) | The smoke test as one pod job |
 | [data/python_tool.json](data/python_tool.json) | The harness's tool schema |
 
@@ -61,6 +66,20 @@ What a LoRA step on the W4A16 checkpoint needs beyond stock transformers + PEFT.
 | Chunked cross-entropy | `chunked_cross_entropy` | lm_head + loss on the trained positions only, 2,048 at a time, each checkpointed. | Never builds [K, 248,320] logits; exact. |
 | Guards | `run_specs`, `host_memory_available_gb` | On OOM: free memory, halve the token chunk and retry (twice), else skip. Skip offload steps the container's memory (cgroup v1 or v2) can't hold. | Not triggered so far. |
 | Environment | [pod/smoke_pod.sh](pod/smoke_pod.sh) | `tilelang` + `CUDA_HOME` for fla's GDN backward on Hopper, `expandable_segments`, an explicit GPU device map, no `use_kernels`. | See [AGENTS.md](AGENTS.md). |
+
+## Dataset v1 (2026-10-20)
+
+Built by [rft_data.py](rft_data.py) with the defaults (pass rate < 80%, best 35% by actions, generated tokens ≤ the level's median); `runs/rft-data/rft_v1.tgz` (31 MB; 128 MB unpacked: JSON lines plus 9,114 deduplicated PNGs).
+
+| | Trajectories | Samples | Tokens (exact) | Trained | Prefix | Median / max length |
+|---|---|---|---|---|---|---|
+| Train | 213 (44 levels, 17 games, 47 runs) | 354 | 33.6M | 7.30M | 64% | 101K / 133K (2 over 131,072, skipped) |
+| Validation (the next-best clear of 12 levels) | 12 | 34 | 3.7M | 0.93M | 59% | 115K / 128K |
+
+- 85 runs scanned: 48 usable. Left out: no `src/` snapshot (17), another team's fork (1), no settings file (5), trimmed-history note (2), no frames (2), game priors (1), view tool (1).
+- Requests dropped: 155 whose context holds a level-complete or animation image of bp35/lf52 (saved frames overwritten), 21 over the length cap, 9 windows with only `uncertain` requests.
+- [check_rft_data.py](check_rft_data.py): every sample's reply markers and loss spans as intended; exact lengths 2.8% above the estimate (median).
+- Expected training time on one H200 from the 10-20 measurements (16.1 s per 64.9K step at an 80% prefix): ~2.9 h per epoch.
 
 ## Latest results (RTX PRO 6000 96GB, 2026-10-19 evening)
 
@@ -112,7 +131,7 @@ The plan for a 10× faster training step, step by step, is in [Throughput.md](Th
 
 1. Reuse host buffers for the offload: done in [host_offload.py](host_offload.py), exact on a tiny model and on MPS. Should save ~35 s per 64K step and stop depending on the host's page-fault speed; time it on the next pod (64K with `reuse_host_buffers` true and false).
 2. QSA key/value gradients accumulate in BF16 in both gathers (1.7% error against FP32 on one real-size chunk; 0.33% with FP32 accumulation), and the same 64K step gave LoRA gradient norms 0.248 and 0.293 with the two gathers. Accumulate in FP32 and measure the spread on a repeated step.
-3. Then the training loop (optimizer, LR, epochs), the dataset build (selection thresholds, harness-config filter, held-out games), and the merge check against vLLM (QSA parity, MTP draft acceptance).
+3. Training loop and dataset: done (10-20, above). Next: the first training run, then the merge check against vLLM (QSA parity, MTP draft acceptance) and a Kaggle A/B of the adapter.
 
 ## Existing training paths for this model
 

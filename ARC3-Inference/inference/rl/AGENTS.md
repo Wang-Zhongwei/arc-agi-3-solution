@@ -80,6 +80,17 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - fla's GDN kernels round their dots to TF32, so any change of input (even 1e-7) re-rounds them: on the tiny model the per-head `dt_bias`/`A_log` gradients (sums over all tokens that largely cancel) move by 1.5-2%. Judge exactness of a rewrite with transformers' torch GDN (`m.torch_chunk_gated_delta_rule.__wrapped__`): there `compile_hc` changes no gradient at all (10-20).
 - Top-k routing makes tiny-model gradient comparisons fragile: one token whose 3rd and 4th experts differ by 1e-5 switches experts under a different rounding and moves the MoE output by 5%. Compare compiled and eager layers with every token routed to all experts.
 
+## Training data (rft_data, 10-20)
+
+- A turn's actions run when it ends (the next prompt reports "The code executed N actions"), so every request of an analyzer invocation played the level the game was on after the header's `action` - 1 actions. The `analysis` events are logged after their invocation's actions; do not take a turn's level from them. Invocations that resume a yielded step repeat the header's step and action.
+- An attempt is a level the agent reached and gave at least one analyzer turn: ~170 "failures" with 0 turns were games a run never got to (short runs, scheduler caps).
+- Transcripts keep only `[image attached]`; the label before each marker says what was drawn. Boards come from the events (`board` after every action, the `initial` board); `intermediate_states.pkl` (`states[n]` = after action n) adds the animation frames. Its arrays were saved by reference: in bp35 and lf52 some saved boards differ from the events (overwritten later), so `rft_images` uses a game's saved frames only when every saved board matches. Checked pixel-exact against 12,778 logged images in 4 runs ([validate_images.py](validate_images.py)); level-complete, animation-frame and compressed-trace boards have no logged reference.
+- Request logs sit at the run root in some runs and under `artifacts/` in others.
+- Settings change per run and must come from the run: `MULTIMODAL_UPSCALE` (8, 10, 12, 4; 16 when unset) and the per-kind scales in `taaf_setup_env.json`; the python tool's two descriptions in the snapshot's `tool_agent.py` (5 versions; read with `ast`, the code parameter's text changed too). Images below 65,536 pixels are scaled up by the processor (`shortest_edge`).
+- Runs to leave out: no `src/` snapshot, no frames, no settings file, view tool, trimmed-history note, game priors in the prompt (priority-falloff v03), another team's fork (lordhansolo).
+- Do not pickle objects of a module run as `__main__` (`python -m ...`): only that entry point can load them. The attempts cache is JSON.
+- Exact token counts run ~6% above the builder's estimate (0.333 tokens/char); [check_rft_data.py](check_rft_data.py) tokenizes every sample the way `train_rft` does before a pod is paid for.
+
 ## Pods (RunPod)
 
 - One script per job ([pod/smoke_pod.sh](pod/smoke_pod.sh)): install, download, run, results, `DONE`/`FAILED` marker. Watch the first run of a new script step by step, and fold every surprise back into the script and this file.
