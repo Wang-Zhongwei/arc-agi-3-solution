@@ -232,3 +232,11 @@ A100 上 8K（这局游戏最短的请求也有 7.4K）三条路径全部 OOM：
 - 123K：全部优化 parts 模式 OOM，layer 模式 183.8 s（冷）；前缀不回传梯度 parts 模式放得下（111.9 GB）。
 - 梯度：同一路径两遍 0.99993；前缀不回传梯度 vs 完整 0.689（前缀 80%）。
 - watcher 在 FULL_DONE 后拉回结果并删 pod（HTTP 204，get-pod 404）；另有每 5 分钟一次的备份拉取。
+
+## 10-20 凌晨：B200（uas538q7c7lapw，secure US-NE-1，$7.99/h，04:38–05:02，约 $3.2）
+
+- CUDA 测试：fla 的 GDN 反向 kernel（`chunk_gated_delta_rule_bwd_kernel_dhu`）在 sm100 + Triton 3.4 下编译失败（`PassManager::run failed`，TritonGPUAssignLatencies），所有路径的 GDN 反向都用它。在 pod 上把它的 num_stages 改成 1（fla 已经对 Blackwell 的前向做了类似处理），测试全过，写进 full_run.sh（a301c3a）。
+- 按你的要求只留默认配置（前缀不回传梯度）的吞吐和最长样本：删掉了全部优化路径、梯度对比、32K 和 profile 的 job；旧路径当时已经在跑，让它跑完（杀掉要重新加载模型）。
+- 64K 前缀不回传梯度：17.2 s（3,772 tok/s，留 GPU 78.3 GB），H200 16.1 s（4,031）。每美元 token：B200 1.70M（secure）/ 2.27M（community），H200 2.74M / 4.04M。H200 更划算。
+- 123K：不 OOM，峰值 111.8 GB（H200 111.9 GB）。
+- 想补一个固定留 40 GB 的 64K job 做公平对比，加进去时服务已经停了，没跑成。
