@@ -2,6 +2,8 @@
 tokens times its own gradient, give Σ (n_i / N) ∇L_i (every trained token of the batch weighted once), and a
 sample whose first attempt ran out of memory after touching the gradients leaves no trace of that attempt."""
 
+import zlib
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -29,7 +31,7 @@ def model():
     with torch.no_grad():  # lora_B starts at zero: give it values so lora_A gets gradients too
         for name, p in m.named_parameters():
             if "lora_B" in name:
-                p.normal_(0, 0.02, generator=torch.Generator().manual_seed(hash(name) % 1000))
+                p.normal_(0, 0.02, generator=torch.Generator().manual_seed(zlib.crc32(name.encode())))
     qsa.patch_qsa_attention(chunk_size=16, fused=False)
     layer_patches.patch_for_training(m, token_chunk=16, recompute="parts")
     yield m
@@ -68,8 +70,13 @@ def test_accumulated_samples_weight_every_trained_token_once(model, monkeypatch)
     got = lora_grads(model)
     assert results[0]["retries"] == 1 and results[1]["retries"] == 0 and len(calls) == 3
     assert got.keys() == expected.keys() and len(got) > 20
+    # FP32 rounding differs between scaling the loss before backward and the gradients after: up to ~1e-4
+    # relative in parameters whose gradient norm is ~1e-6 (16 hash seeds); a wrong weight or a lost sample is O(1)
+    rel = lambda a, b: float((a - b).norm() / b.norm().clamp_min(1e-30))
     for name in expected:
-        torch.testing.assert_close(got[name], expected[name], rtol=1e-4, atol=1e-7, msg=name)
+        assert rel(got[name], expected[name]) < 1e-3, name
+    flat = lambda d: torch.cat([d[n].flatten() for n in sorted(d)])
+    assert rel(flat(got), flat(expected)) < 1e-4
 
 
 def test_lr_schedule_warms_up_then_decays_to_the_floor():

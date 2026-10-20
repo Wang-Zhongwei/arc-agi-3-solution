@@ -210,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-fast-gdn", dest="fast_gdn", action="store_false")
     parser.add_argument("--no-prefix-stop-grad", dest="prefix_stop_grad", action="store_false")
     parser.add_argument("--limit", type=int, default=0, help="use only this many train samples (dry runs)")
+    parser.add_argument("--val-samples", type=int, default=16, help="validation samples, spread over val.jsonl")
     args = parser.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     log_path = args.out / "train_log.jsonl"
@@ -225,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
     val = load_samples(args.data / "val.jsonl")
     if args.limit:
         train = train[:args.limit]
+    if args.val_samples and len(val) > args.val_samples:  # every k-th: all held-out trajectories, ~5 min per pass
+        val = val[::len(val) // args.val_samples][:args.val_samples]
     model, processor, device, info = load_model(args)
     log(event="loaded", train=len(train), val=len(val), args={k: str(v) for k, v in vars(args).items()}, **info)
 
