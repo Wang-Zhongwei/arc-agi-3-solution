@@ -25,11 +25,15 @@ if not passed("qsa_kernel"):
     off += ["qsa_fused", "compile_qsa"]
 if not passed("compile_layer"):
     off += ["compile_hc", "compile_moe", "fast_conv", "fast_gdn"]
+if not passed("fast_gdn"):  # fla with grouped value heads (tilelang backward on Hopper)
+    off += ["fast_gdn"]
 if not passed("compile_lora"):
     off += ["fast_lora"]
 if not passed("fused_model"):
     off += ["compile_qsa"]
 psg_ok = passed("prefix_cuda") and passed("prefix_cpu")
+if psg_ok and not passed("prefix_cuda_fast"):  # prefix stop-grad is worth more than fast_gdn
+    off += ["fast_gdn"]
 for name in set(off):
     flags[name] = False
 base = dict(recompute="parts", async_copies=True, gpu_keep_gb="auto")

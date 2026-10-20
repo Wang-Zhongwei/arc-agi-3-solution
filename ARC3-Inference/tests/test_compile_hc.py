@@ -43,7 +43,10 @@ def rel(a, b):
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
-def test_compiled_layer_is_as_accurate_as_eager():
+@pytest.mark.parametrize("fast_gdn", [False, True], ids=["plain", "fast_gdn"])
+def test_compiled_layer_is_as_accurate_as_eager(fast_gdn):
+    """[plain]: compile_hc, compile_moe, fast_conv; [fast_gdn] adds fla's kernels with grouped value heads (on
+    Hopper their backward runs on tilelang): pod/make_jobs.py switches off only the features whose case failed."""
     model = tiny().to("cuda", torch.bfloat16).train()
     layer_patches.patch_for_training(model, token_chunk=64)
     layer = next(x for x in model.modules() if isinstance(x, m.Qwen4ExpTextDecoderLayer)
@@ -62,7 +65,7 @@ def test_compiled_layer_is_as_accurate_as_eager():
     eager = run(layer, x, pos)
     layer_patches.configure(model, compile_hc=True, compile_moe=True)
     layer_patches._FAST_CONV["on"] = True
-    layer_patches._FAST_GDN["on"] = True  # fused conv + split, grouped value heads, fused gated norm (needs fla)
+    layer_patches._FAST_GDN["on"] = fast_gdn  # fused conv + split, grouped value heads, fused gated norm (fla)
     try:
         compiled = run(layer, x, pos)
     finally:

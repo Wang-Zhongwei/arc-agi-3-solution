@@ -25,7 +25,8 @@ def rel(a, b):
     return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30))
 
 
-def test_prefix_stop_grad_cuda_matches_the_cache_path():
+@pytest.mark.parametrize("fast_gdn", [False, True], ids=["torch_gdn", "fast_gdn"])
+def test_prefix_stop_grad_cuda_matches_the_cache_path(fast_gdn):
     model = tiny().cuda().train()
     for module in model.modules():
         if isinstance(module, m.Qwen4ExpTextPLELayer):
@@ -51,7 +52,7 @@ def test_prefix_stop_grad_cuda_matches_the_cache_path():
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     qsa.patch_qsa_attention(chunk_size=64, fused=True, compile=True)
     layer_patches.patch_for_training(model, token_chunk=64, recompute="parts", compile_hc=True, compile_moe=True,
-                                     fast_conv=True, fast_gdn=True)
+                                     fast_conv=True, fast_gdn=fast_gdn)
     try:
         loss_of(model(input_ids=ids, use_cache=False).logits[:, p:]).backward()
         full = grads()

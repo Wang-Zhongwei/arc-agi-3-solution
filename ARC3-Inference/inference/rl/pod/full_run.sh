@@ -82,11 +82,13 @@ runtest() {  # name, pytest args
     log "  $name: exit $(cat results/pytest_$name.exit), $(tail -1 results/pytest_$name.log)"
 }
 runtest qsa_kernel tests/test_qsa_kernel.py
-runtest compile_layer "tests/test_compile_hc.py::test_compiled_layer_is_as_accurate_as_eager"
+runtest compile_layer "tests/test_compile_hc.py::test_compiled_layer_is_as_accurate_as_eager[plain]"
+runtest fast_gdn "tests/test_compile_hc.py::test_compiled_layer_is_as_accurate_as_eager[fast_gdn]"
 runtest compile_lora "tests/test_compile_hc.py::test_compiled_lora_matches_peft"
 runtest fused_model tests/test_qsa_fused_model.py
 runtest grouped tests/test_grouped_gemm.py
-runtest prefix_cuda tests/test_prefix_stop_grad_cuda.py
+runtest prefix_cuda "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[torch_gdn]"
+runtest prefix_cuda_fast "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[fast_gdn]"
 echo 0 > results/pytest_prefix_cpu.exit  # CPU tiny-model tests cannot run next to fla; passed locally
 
 log "phase 3: jobs from the test outcomes"
