@@ -290,13 +290,16 @@ class LayerTimeline:
 
 def step(model, sample, device, offload: bool = False, profile: bool = False,
          reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
-         async_copies: bool = False, timeline: bool = False, prefix_stop_grad: bool = False) -> dict[str, Any]:
+         async_copies: bool = False, timeline: bool = False, prefix_stop_grad: bool = False,
+         memory_snapshot: str | None = None) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
     in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
     With reused buffers, the step's last `gpu_keep_gb` stay on the GPU (once a step of the same
     recompute mode has measured the total), and `async_copies` pins the buffers and copies on a
-    side stream, prefetching in backward."""
+    side stream, prefetching in backward. `memory_snapshot` (a path prefix) records CUDA allocations and
+    dumps them at the end of the forward (`_fwd.pickle`) or at an out-of-memory error (`_oom.pickle`)."""
+    model.zero_grad(set_to_none=True)  # a layer_check leaves its last variant's gradients on its layers
     # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
     # training mode: without this every activation is kept (OOM on the GPU, or on the host
     # with offload). Dropout is 0 everywhere, so this changes nothing else.
@@ -327,7 +330,12 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     for i in range(torch.cuda.device_count()):
         torch.cuda.reset_peak_memory_stats(i)
+    memory = {}
+    gb = lambda: round(torch.cuda.memory_allocated() / 2**30, 2) if torch.cuda.is_available() else 0.0
+    if memory_snapshot and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(max_entries=200_000)
     _sync()
+    memory["start_gb"] = gb()
     t0 = time.perf_counter()
     # pageable, not pinned: the pinned host allocator rounds every block up to a power of two and
     # keeps it cached, so 32K then 64K steps held ~144 GB besides the 102.5 GB PLE table and the
@@ -348,6 +356,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     # prefix stop-grad: positions before the one predicting the first trained token run without gradient
     prefix = int(targets.min()) - 1 if prefix_stop_grad and targets.numel() else 0
     layer_patches.set_prefix(prefix)
+    failed = True
     try:
         with profiler:
             with saved:
@@ -355,13 +364,27 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
             _sync()
             t1 = time.perf_counter()
+            memory["after_forward_gb"] = gb()
+            if memory_snapshot and torch.cuda.is_available():
+                torch.cuda.memory._dump_snapshot(f"{memory_snapshot}_fwd.pickle")
             if layer_timeline is not None:
                 layer_timeline.forward_phase = False
             loss.backward()
             _sync()
             t2 = time.perf_counter()
+            memory["after_backward_gb"] = gb()
+        failed = False
+    except torch.cuda.OutOfMemoryError:
+        if memory_snapshot:
+            torch.cuda.memory._dump_snapshot(f"{memory_snapshot}_oom.pickle")
+        raise
     finally:
         layer_patches.set_prefix(0)
+        if memory_snapshot and torch.cuda.is_available():
+            torch.cuda.memory._record_memory_history(enabled=None)
+        if failed and layer_timeline is not None:  # its hooks would stay on the layers for every later step
+            for handle in layer_timeline.handles:
+                handle.remove()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
     norm = float(torch.sqrt(sum((g.float() ** 2).sum().to("cpu") for g in grads))) if grads else 0.0
     if keep_grads:  # for compare_grads: ~0.1 GB of host memory per kept step at r = 16
@@ -370,6 +393,9 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
         model._rft_grads[keep_grads] = {name: p.grad.detach().float().cpu() for name, p in model.named_parameters()
                                         if p.requires_grad and p.grad is not None}
     model.zero_grad(set_to_none=True)
+    loss_value = float(loss.detach())
+    del loss, hidden
+    memory["end_gb"] = gb()
     extra = {}
     if layer_timeline is not None:
         extra["timeline"] = layer_timeline.close()
@@ -384,10 +410,10 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                                                      max_name_column_width=70)
     return dict(extra, tokens=int(sample["input_ids"].shape[1]), loss_tokens=int(targets.numel()), offload=offload,
                 images=int(sample["image_grid_thw"].shape[0]) if "image_grid_thw" in sample else 0,
-                loss=round(float(loss.detach()), 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
+                loss=round(loss_value, 4), forward_s=round(t1 - t0, 2), backward_s=round(t2 - t1, 2),
                 tokens_per_s=round(sample["input_ids"].shape[1] / (t2 - t0), 1),
                 lora_params_with_grad=len(grads), lora_grad_norm=norm, kept_grads=keep_grads, prefix_tokens=prefix,
-                peak_gb=peak_gb(), host_gb=host_memory_gb(),
+                peak_gb=peak_gb(), memory_gb=memory, host_gb=host_memory_gb(),
                 recompute=layout, host_buffers_gb=round(arena.capacity_gb, 1) if arena is not None else None,
                 host_pinned_gb=round(arena.pinned_gb, 1) if arena is not None else None,
                 offload_stats={k: round(v, 3) for k, v in arena.stats.items()} if arena is not None else None)
@@ -426,7 +452,7 @@ def auto_keep_gb(result: dict[str, Any]) -> float:
 def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: None,
               profile: bool = False, reuse_buffers: bool = True, keep_grads: str | None = None,
               gpu_keep_gb: float | str = 0.0, async_copies: bool = False, timeline: bool = False,
-              prefix_stop_grad: bool = False) -> dict[str, list]:
+              prefix_stop_grad: bool = False, memory_snapshot: str | None = None) -> dict[str, list]:
     """Run each spec ("32768" or "32768o" = with offload) `repeats` times; errors are recorded, not raised.
     `keep_grads` keeps each step's LoRA gradients as "<keep_grads>/<spec>/<repeat>" for compare_grads.
     `gpu_keep_gb="auto"`: the first repeat offloads everything, later ones keep what its peak left free."""
@@ -449,12 +475,14 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
             start_recompute = layer_patches.current_recompute(model)
             retries = 2
             while True:
+                oom = False
                 try:
                     result = step(model, samples[length], device, offload=offload, profile=profile,
                                   reuse_buffers=reuse_buffers,
                                   keep_grads=f"{keep_grads}/{spec}/{repeat}" if keep_grads else None,
                                   gpu_keep_gb=keep, async_copies=async_copies, timeline=timeline,
-                                  prefix_stop_grad=prefix_stop_grad)
+                                  prefix_stop_grad=prefix_stop_grad,
+                                  memory_snapshot=f"{memory_snapshot}_{spec}_{repeat}" if memory_snapshot else None)
                     result["token_chunk"] = current_token_chunk(model)
                     result["gpu_keep_gb"] = keep
                     if gpu_keep_gb == "auto" and offload:
@@ -468,9 +496,23 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                     results.append(dict(error="oom", detail=str(exc)[:400], where=where, peak_gb=peak_gb(),
                                         token_chunk=current_token_chunk(model),
                                         recompute=layer_patches.current_recompute(model),
-                                        memory=torch.cuda.memory_summary(abbreviated=True)[-4000:]))
+                                        memory=torch.cuda.memory_summary(abbreviated=True)[-4000:]
+                                        if torch.cuda.is_available() else None))
                     print(spec, "OOM", where, str(exc)[:160], flush=True)
+                    oom = True
+                except HostMemoryError as exc:
+                    results.append(dict(error="host_memory", detail=str(exc)))
+                    print(spec, "SKIPPED", exc, flush=True)
+                    break
+                except Exception:  # record it and keep the other numbers
+                    results.append(dict(error="exception", detail=traceback.format_exc()[-3000:]))
+                    print(spec, "ERROR", traceback.format_exc(), flush=True)
+                    break
+                if oom:
+                    # out of the except clause: its traceback held the failed step's frames, and with them its
+                    # activations and graph (the retry OOMed with the first attempt's 92 GiB still allocated)
                     model.zero_grad(set_to_none=True)
+                    gc.collect()
                     torch.cuda.empty_cache()
                     chunk = current_token_chunk(model)
                     if layer_patches.current_recompute(model) == "parts":
@@ -485,14 +527,6 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
                         print(spec, "retrying with token_chunk", chunk // 2, flush=True)
                         continue
                     break
-                except HostMemoryError as exc:
-                    results.append(dict(error="host_memory", detail=str(exc)))
-                    print(spec, "SKIPPED", exc, flush=True)
-                    break
-                except Exception:  # record it and keep the other numbers
-                    results.append(dict(error="exception", detail=traceback.format_exc()[-3000:]))
-                    print(spec, "ERROR", traceback.format_exc(), flush=True)
-                    break
             if start_chunk:
                 layer_patches.configure(model, token_chunk=start_chunk)
             if layer_patches.current_recompute(model) != start_recompute:
@@ -502,6 +536,7 @@ def run_specs(model, device, samples, specs, repeats: int, save=lambda steps: No
         steps[spec] = results
         save(steps)
         model.zero_grad(set_to_none=True)
+        gc.collect()
         torch.cuda.empty_cache()
     return steps
 
@@ -932,7 +967,8 @@ def serve(model, device, args, processor, tools, game) -> None:
                                                gpu_keep_gb=job.get("gpu_keep_gb", 0.0),
                                                async_copies=job.get("async_copies", False),
                                                timeline=job.get("timeline", False),
-                                               prefix_stop_grad=job.get("prefix_stop_grad", False))
+                                               prefix_stop_grad=job.get("prefix_stop_grad", False),
+                                               memory_snapshot=job.get("memory_snapshot"))
         except Exception:
             result["error"] = traceback.format_exc()[-3000:]
             print("job", job_path.stem, "ERROR", result["error"], flush=True)
