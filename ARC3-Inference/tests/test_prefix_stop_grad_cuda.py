@@ -1,5 +1,10 @@
 """Prefix stop-grad with the CUDA paths (fused QSA kernel with q_offset/key_start, fast_gdn's fla kernels with an
-initial state, compiled per-token functions) against transformers' cache path on the tiny model in FP32."""
+initial state, compiled per-token functions) against transformers' cache path on the tiny model in FP32.
+
+Every token routes to all experts (test_compile_hc's tiny model): with top-3 of 8 a near-tied token switched
+experts and moved one GDN layer's dt_bias/A_log gradients by 19%. What remains is fla's GDN kernel, whose TF32
+dots re-round under any change of input: a 1e-7 perturbation of the unpatched model's embeddings moves those
+per-head gradients by 1.5-2% (0.03% with transformers' torch GDN, where compile_hc changes nothing)."""
 
 import pytest
 
@@ -12,7 +17,7 @@ pytest.importorskip("fla")
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
 
 from inference.rl import layer_patches, qsa  # noqa: E402
-from test_layer_patches import tiny  # noqa: E402
+from test_compile_hc import tiny  # noqa: E402
 from test_prefix_stop_grad import assign_recurrent_states  # noqa: E402
 
 
@@ -63,5 +68,5 @@ def test_prefix_stop_grad_cuda_matches_the_cache_path():
     assert ours.keys() == ref.keys()
     worst = max(rel(ours[n], ref[n]) for n in ref)
     full_gap = sorted(rel(full[n], ref[n]) for n in ref)[-10]
-    assert worst < 3e-2, worst  # TF32 dots in the kernels
+    assert worst < 3e-2, worst  # TF32 dots in the QSA and GDN kernels
     assert full_gap > 10 * worst, (full_gap, worst)  # the stop-grad is visible above the kernels' rounding
