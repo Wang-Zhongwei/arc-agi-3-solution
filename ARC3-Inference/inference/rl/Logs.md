@@ -222,3 +222,13 @@ A100 上 8K（这局游戏最短的请求也有 7.4K）三条路径全部 OOM：
 - 修好后 32K：新路径 23.7 s，加前缀不回传梯度 15.8 s（1.50×，前缀 49.5%），峰值 85.0 vs 85.7 GB；同一路径两遍梯度余弦 0.99993/0.99994；前缀不回传梯度和完整梯度余弦 0.78（截断本身）。
 - 冷启动的第一步（从没跑过的 8K 形状）和第二步 loss 一样（0.5114），所以 autotune 不改结果；不同服务进程之间同一个样本的 loss 差约 0.3%（0.4662 vs 0.4678），是舍入经路由放大。
 - pod 自删：演练时 pod 上的 full_run.sh 还是改环境变量之前上传的旧版，回退成“只停进程”；上传当前版本后在这台 pod 上实测：`pod "dshsgfhx2rzdn3" removed`，REST get-pod 404。本地 watcher 改成拉取结果成功后才删 pod（失败最多重试 5 次）。
+
+## 10-20 凌晨：H200 一次跑完（4haw3pwub9vce4，secure US-NC-1，$5.29/h，03:56–04:32，约 $3.2）
+
+- 03:58 网络检查通过，42 s 装完包，checkpoint 下载不到 4 分钟。
+- CUDA 测试：`compile_layer`、`fast_gdn`、`fused_model`、`prefix_cuda` 先失败，都是同一个原因：测试里的 FP32 参照（小模型的 FP32 拷贝或未打补丁的 transformers 模型）在 Hopper 上被送进 `torch._grouped_mm`，它只收 BF16（`Expected mat_a to be BFloat16 matrix got Float`）。A100 和 RTX PRO 6000 不走这条路，演练没发现。`layer_patches.grouped_mm` 对非 BF16 改用逐组 matmul，测试的 conftest 把 transformers 的判断限制在 BF16。make_jobs 已经按旧结果关掉了 `compile_qsa` 和前缀不回传梯度；在模型加载的 5 分钟里重跑这些测试（全过，包括 fast_gdn 的 tilelang 反向），重新生成 job 文件，第一个 job 开始前换好。
+- 64K：上午的路径 80.0 s（811 tok/s）→ 全部优化 22.6 s（2,874）→ 加前缀不回传梯度 16.1 s（4,031，前缀 80%，layer 模式）。对 10-18 的 137 s：6.1× / 8.5×。
+- 前缀不回传梯度第二遍在 `gpu_keep_gb: "auto"` 留了 39.7 GB 后 OOM，重试成功，显存回到 74 GB 起步（except 外重试的修复生效）。
+- 123K：全部优化 parts 模式 OOM，layer 模式 183.8 s（冷）；前缀不回传梯度 parts 模式放得下（111.9 GB）。
+- 梯度：同一路径两遍 0.99993；前缀不回传梯度 vs 完整 0.689（前缀 80%）。
+- watcher 在 FULL_DONE 后拉回结果并删 pod（HTTP 204，get-pod 404）；另有每 5 分钟一次的备份拉取。
