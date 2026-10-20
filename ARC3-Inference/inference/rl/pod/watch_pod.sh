@@ -1,9 +1,9 @@
 #!/bin/bash
 # Local watcher for full_run.sh / train_pod.sh: when the pod writes FULL_DONE or ABORTED, pull its results and
-# delete it.
+# stop it (GPU billing ends; the pod is kept, user's choice 2026-10-20). DELETE=1 deletes it instead.
 #   bash inference/rl/pod/watch_pod.sh POD_ID HOST PORT DEST_DIR
-# RUNPOD_API_KEY comes from the repo's .env (never printed). Exits when the pod is gone or deleted.
-# NO_DELETE=1 pulls the results only (to test the pod's own self-delete afterwards).
+# RUNPOD_API_KEY comes from the repo's .env (never printed). Exits when the pod is stopped, gone or unreachable.
+# NO_DELETE=1 pulls the results only (to test the pod's own self-stop afterwards).
 # WORKDIR, RUNLOG and PULL (paths under WORKDIR) default to full_run.sh's; SYNC_MINUTES > 0 also pulls PULL that
 # often while the run goes on (train_pod.sh: the adapters saved so far survive a pod that dies).
 set -uo pipefail
@@ -30,15 +30,20 @@ while true; do
         misses=0
         if echo "$state" | grep -qE "^(FULL_DONE|ABORTED)$"; then
             if ! pull; then
-                # keep the pod (and its results) for another try; after 5 failures delete it anyway (billing)
+                # keep the pod running (and its results) for another try; after 5 failures stop it anyway (billing)
                 pull_failures=$((pull_failures + 1))
                 echo "pod $ID: pulling the results failed ($pull_failures)"
                 if [ $pull_failures -lt 5 ]; then sleep 30; continue; fi
             fi
             code=skipped
-            [ "${NO_DELETE:-0}" = 1 ] || code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-                -H "Authorization: Bearer $KEY" -A "Mozilla/5.0" "https://rest.runpod.io/v1/pods/$ID")
-            echo "pod $ID: $(echo "$state" | grep -E '^(FULL_DONE|ABORTED)$'); results in $DEST; delete HTTP $code"
+            if [ "${NO_DELETE:-0}" != 1 ] && [ "${DELETE:-0}" = 1 ]; then
+                code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+                    -H "Authorization: Bearer $KEY" -A "Mozilla/5.0" "https://rest.runpod.io/v1/pods/$ID")
+            elif [ "${NO_DELETE:-0}" != 1 ]; then
+                code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                    -H "Authorization: Bearer $KEY" -A "Mozilla/5.0" "https://rest.runpod.io/v1/pods/$ID/stop")
+            fi
+            echo "pod $ID: $(echo "$state" | grep -E '^(FULL_DONE|ABORTED)$'); results in $DEST; $([ "${DELETE:-0}" = 1 ] && echo delete || echo stop) HTTP $code"
             exit 0
         fi
         if [ "$SYNC_MINUTES" -gt 0 ] && [ $(( $(date +%s) - last_sync )) -ge $((SYNC_MINUTES * 60)) ]; then

@@ -1,8 +1,8 @@
 #!/bin/bash
 # One-shot run on an expensive GPU (B200, H200): network check, packages, checkpoint, CUDA tests, a jobs file
 # generated from the tests (features whose test failed are off), the model server's jobs, then FULL_DONE.
-# Nothing waits for a person. The pod deletes itself MAX_MINUTES after start, or GRACE_MINUTES after the end
-# (a local watcher normally pulls the results and deletes it first).
+# Nothing waits for a person. The pod stops itself MAX_MINUTES after start, or GRACE_MINUTES after the end
+# (a local watcher normally pulls the results and stops it first).
 #
 # Upload inference/, tests/, game.txt, game_ft09.txt (and wheels/ when PyPI is unreachable) to $WORK, then:
 #   ssh ... 'cd /workspace/smoke; nohup bash inference/rl/pod/full_run.sh > full_run.log 2>&1 < /dev/null &' < /dev/null
@@ -26,18 +26,18 @@ for var in RUNPOD_POD_ID RUNPOD_API_KEY; do
     [ -n "${!var:-}" ] || export "$(tr '\0' '\n' < /proc/1/environ | grep "^$var=")" 2>/dev/null || true
 done
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
-self_delete() {
-    log "deleting this pod ($1)"
+self_stop() {
+    log "stopping this pod ($1): GPU billing ends, the pod and its volume stay"
     if command -v runpodctl > /dev/null && [ -n "${RUNPOD_POD_ID:-}" ]; then
         runpodctl config --apiKey "${RUNPOD_API_KEY:-}" > /dev/null 2>&1  # it reads a config file, not the env
-        runpodctl remove pod "$RUNPOD_POD_ID" || log "runpodctl failed"
+        runpodctl stop pod "$RUNPOD_POD_ID" || log "runpodctl failed"
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
         pkill -f "inference.rl.smoke_lora" || true
     fi
 }
-abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_delete "abort"; exit 1; }
-( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; self_delete "time limit ${MAX_MINUTES} min" ) &
+abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_stop "abort"; exit 1; }
+( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; self_stop "time limit ${MAX_MINUTES} min" ) &
 echo $! > deadman.pid
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=/usr/local/cuda/bin:$PATH
 
@@ -122,5 +122,5 @@ SERVER_ARGS=$([ "$PLE_FP8" = 1 ] && echo "--ple-fp8-path /workspace/nvfp8") \
 log "jobs finished: $(tail -1 results/smoke_pod.log)"
 cp jobs/*.result.json results/ 2>/dev/null
 date -u > FULL_DONE
-( sleep $((GRACE_MINUTES * 60)); self_delete "grace period after FULL_DONE" ) &
-log "FULL_DONE (the pod deletes itself in ${GRACE_MINUTES} min unless the watcher does first)"
+( sleep $((GRACE_MINUTES * 60)); self_stop "grace period after FULL_DONE" ) &
+log "FULL_DONE (the pod stops itself in ${GRACE_MINUTES} min unless the watcher does first)"
