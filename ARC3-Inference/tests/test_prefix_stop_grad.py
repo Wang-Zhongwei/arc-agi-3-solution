@@ -26,6 +26,9 @@ def test_gdn_mixer_continues_its_state():
         out_p, state = layer_patches.gdn_mixer(gdn, x[:, :30], return_state=True)
         out_s = layer_patches.gdn_mixer(gdn, x[:, 30:], state=state)
     torch.testing.assert_close(torch.cat([out_p, out_s], dim=1), full, rtol=1e-5, atol=1e-6)
+    # the suffix's checkpoint holds the state until backward: it must not keep the prefix's projection alive
+    conv = state["conv"]
+    assert conv.untyped_storage().nbytes() == conv.numel() * conv.element_size()
 
 
 def assign_recurrent_states(cache):

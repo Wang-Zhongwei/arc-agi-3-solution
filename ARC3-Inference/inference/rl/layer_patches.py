@@ -509,7 +509,9 @@ def gdn_mixer(self, hidden_states, state=None, return_state: bool = False):
     out = self.out_proj(out.reshape(1, n, -1))
     if not return_state:
         return out
-    return out, dict(conv=conv_in[:, -(self.conv_kernel_size - 1):].detach(), recurrent=final.detach())
+    # a copy, not a view: the view kept the whole prefix projection alive until backward (p x 10,240 BF16 per GDN
+    # layer, 12 GiB at 32K: prefix stop-grad ran out of memory)
+    return out, dict(conv=conv_in[:, -(self.conv_kernel_size - 1):].detach().clone(), recurrent=final.detach())
 
 
 # ---------------------------------------------------------------------------
