@@ -333,4 +333,4 @@ loss 只差 0.2–0.3%，但整模型梯度方向差很多。这和之前的结�
   - 取消倒计时要先杀子 shell 再杀 sleep：顺序反了，第一台 CPU pod 被自己停掉，重开一台；
   - 被拒绝的工具调用其实在 pod 上跑了，差点同时跑两份脚本。
   - 详见 AGENTS.md。
-- 还没做：serving 端把 base 模型的 `model-ple-*` 链接进合并后的模型目录（不做的话 Kaggle 这份不能单独加载）；`merge_upload_pod.sh` 加一个默认跳过 PLE 的选项。
+- 发布脚本已改成默认不下载、不上传 PLE（4f6c0eb；`--with-ple` 保留旧的完整模式）。还没做：serving 端把 base 模型的 `model-ple-*` 链接进合并后的模型目录（不做的话 Kaggle 这份不能单独加载）。
