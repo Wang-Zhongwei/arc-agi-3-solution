@@ -5,7 +5,7 @@
 # GRACE_MINUTES after the end; the local watcher (watch_pod.sh) normally pulls the results and stops it first.
 #
 # Upload inference/, tests/ and data/ (rft_data's output) to $WORK, then:
-#   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/train_pod.sh > train_pod.log 2>&1 < /dev/null &' < /dev/null
+#   ssh ... 'cd /workspace/rft; nohup bash inference/rft/pod/train_pod.sh > train_pod.log 2>&1 < /dev/null &' < /dev/null
 # TRAIN_ARGS adds train_rft arguments (a rehearsal: "--epochs 1 --limit 4 --batch 2").
 # WANDB_PROJECT (and WANDB_RUN_NAME, default rft-<pod id>) also logs to wandb; the key is read from
 # /workspace/.wandb_key (upload it with mode 600), never passed on a command line.
@@ -41,7 +41,7 @@ self_stop() {
         fi
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
-        pkill -f "inference.rl.train_rft" || true
+        pkill -f "inference.rft.train_rft" || true
     fi
 }
 abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_stop "abort"; exit 1; }
@@ -145,7 +145,7 @@ if [ -n "$WANDB_PROJECT" ]; then
 fi
 for attempt in 1 2 3; do
     resume=$([ "$attempt" -gt 1 ] && echo --resume)
-    PYTHONPATH=. python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out train --max-hours "$TRAIN_HOURS" \
+    PYTHONPATH=. python -m inference.rft.train_rft --model "$MODEL_DIR" --data data --out train --max-hours "$TRAIN_HOURS" \
         $flags $resume $TRAIN_ARGS "${wandb_args[@]}" >> results/train.log 2>&1
     code=$?
     log "train_rft attempt $attempt exited $code: $(grep -v '^\s*$' results/train.log | tail -1 | cut -c1-200)"

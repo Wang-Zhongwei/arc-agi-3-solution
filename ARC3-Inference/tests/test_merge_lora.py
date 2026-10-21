@@ -1,4 +1,4 @@
-"""inference/rl/merge_lora.py: a merged checkpoint gives what base + adapter gives, and only adapted tensors change."""
+"""inference/rft/merge_lora.py: a merged checkpoint gives what base + adapter gives, and only adapted tensors change."""
 
 import pytest
 
@@ -9,7 +9,7 @@ pytest.importorskip("transformers.models.qwen4_exp")
 from safetensors.torch import load_file  # noqa: E402
 from transformers import AutoModelForImageTextToText  # noqa: E402
 
-from inference.rl import merge_lora, smoke_lora  # noqa: E402
+from inference.rft import merge_lora, smoke_lora  # noqa: E402
 from test_layer_patches import tiny  # noqa: E402
 
 

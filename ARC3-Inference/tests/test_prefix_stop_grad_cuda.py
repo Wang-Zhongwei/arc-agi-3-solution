@@ -16,7 +16,7 @@ pytest.importorskip("fla")
 
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
 
-from inference.rl import layer_patches, qsa  # noqa: E402
+from inference.rft import layer_patches, qsa  # noqa: E402
 from test_compile_hc import tiny  # noqa: E402
 from test_prefix_stop_grad import assign_recurrent_states  # noqa: E402
 

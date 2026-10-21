@@ -1,7 +1,7 @@
 #!/bin/bash
 # Kernel pod (no checkpoint): CUDA kernel tests, then real-size single-layer benchmarks
 # (bench_layer.py) for each variant in $BENCHES. Upload inference/ and tests/ to $WORK, then:
-#   ssh ... 'cd /workspace/rl; nohup bash inference/rl/pod/kernel_pod.sh > kernel_pod.log 2>&1 < /dev/null &' < /dev/null
+#   ssh ... 'cd /workspace/rl; nohup bash inference/rft/pod/kernel_pod.sh > kernel_pod.log 2>&1 < /dev/null &' < /dev/null
 # $WORK/DONE or $WORK/FAILED marks the end; results land in $WORK/results/.
 set -uo pipefail
 
@@ -43,7 +43,7 @@ for bench in $BENCHES; do
     name=${bench%%:*}
     args=${bench#*:}
     log "bench $name: ${args//,/ }"
-    PYTHONPATH=. python inference/rl/bench_layer.py --tokens "$TOKENS" --profile --out "results/bench_$name.json" \
+    PYTHONPATH=. python inference/rft/bench_layer.py --tokens "$TOKENS" --profile --out "results/bench_$name.json" \
         ${args//,/ } > "results/bench_$name.log" 2>&1 || log "bench $name failed: $(tail -3 results/bench_$name.log)"
     grep -v '^\s*$' "results/bench_$name.log" | grep '^{' || true
 done

@@ -2,7 +2,7 @@
 
 The first RFT model, our W4A16 checkpoint with the 2-epoch LoRA merged in, scores **8.6 points per game below** the base model on the 25 public games. The paired t-test p is 0.003 and the Wilcoxon p is 0.004. This is a regression, not a null result. It is concentrated on the games and levels we trained on.
 
-Training and data: [RL README](../../ARC3-Inference/inference/rl/README.md), [dataset rft_v1](../../ARC3-Inference/inference/rl/data/rft_v1.md), [Logs](../../ARC3-Inference/inference/rl/Logs.md).
+Training and data: [RL README](../../ARC3-Inference/inference/rft/README.md), [dataset rft_v1](../../ARC3-Inference/inference/rft/data/rft_v1.md), [Logs](../../ARC3-Inference/inference/rft/Logs.md).
 
 ## Runs
 

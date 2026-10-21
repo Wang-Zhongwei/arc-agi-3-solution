@@ -1,4 +1,4 @@
-"""inference/rl/qsa_kernel.py (Triton, CUDA only) computes the same sparse attention as a dense FP32
+"""inference/rft/qsa_kernel.py (Triton, CUDA only) computes the same sparse attention as a dense FP32
 reference with the same selection, at the checkpoint's head layout (24 query heads, 2 KV heads, D = 256).
 
 The PyTorch path it replaces (qsa._attend_chunk) runs on the same BF16 inputs as a yardstick: the kernel
@@ -11,7 +11,7 @@ if not torch.cuda.is_available():
     pytest.skip("the QSA kernel needs CUDA", allow_module_level=True)
 pytest.importorskip("triton")
 
-from inference.rl import qsa, qsa_kernel  # noqa: E402
+from inference.rft import qsa, qsa_kernel  # noqa: E402
 
 from test_qsa_kernel_common import RATIO, random_blocks  # noqa: E402
 

@@ -13,8 +13,8 @@
 # from the uploaded Hugging Face copy over its own base (whose PLE it keeps). KAGGLE=0 skips the Kaggle upload.
 # After a pod restart /root is empty: copy ~/.kaggle/{access_token,kaggle.json} to /root/.kaggle (mode 600) and the
 # HF write token to /workspace/.hf_token (mode 600; HF_REPO= skips Hugging Face), then
-#   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/merge_upload_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
-#   WORKDIR=/workspace/rft RUNLOG=publish/publish.log PULL=publish bash inference/rl/pod/watch_pod.sh POD HOST PORT DEST
+#   ssh ... 'cd /workspace/rft; nohup bash inference/rft/pod/merge_upload_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
+#   WORKDIR=/workspace/rft RUNLOG=publish/publish.log PULL=publish bash inference/rft/pod/watch_pod.sh POD HOST PORT DEST
 set -uo pipefail
 
 WORK=${WORK:-/workspace/rft}
@@ -87,14 +87,14 @@ if [ "$FRESH" = 1 ] && ! step download; then  # a fresh pod: the base without it
 fi
 
 if ! step merge; then
-    python -m inference.rl.merge_lora --checkpoint "$MODEL_DIR" --adapter "$ADAPTER" > "$OUT/merge.log" 2>&1 \
+    python -m inference.rft.merge_lora --checkpoint "$MODEL_DIR" --adapter "$ADAPTER" > "$OUT/merge.log" 2>&1 \
         || abort "merge: $(tail -1 "$OUT/merge.log")"
     grep -A12 '^{' "$OUT/merge.log" | grep -E "tensors|kept|cosine"
     done_ merge
 fi
 if [ "$VERIFY" = 1 ] && ! step verify; then
     # val loss of the merged weights (with a fresh, zero LoRA on top), with training's flags and val samples
-    python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out "$OUT/verify" --epochs 0 \
+    python -m inference.rft.train_rft --model "$MODEL_DIR" --data data --out "$OUT/verify" --epochs 0 \
         $(cat results/train_flags.txt 2>/dev/null) > "$OUT/verify.log" 2>&1 || abort "verify: $(tail -1 "$OUT/verify.log")"
     got=$(python -c "import json; print([r for r in map(json.loads, open('$OUT/verify/train_log.jsonl')) if r['event'] == 'val'][-1]['loss'])") \
         || abort "verify: no val row"
@@ -104,7 +104,7 @@ if [ "$VERIFY" = 1 ] && ! step verify; then
 fi
 if ! step layout; then
     start=$(date +%s)
-    python -m inference.rl.kaggle_layout --checkpoint "$MODEL_DIR" > "$OUT/layout.log" 2>&1 \
+    python -m inference.rft.kaggle_layout --checkpoint "$MODEL_DIR" > "$OUT/layout.log" 2>&1 \
         || abort "layout: $(tail -1 "$OUT/layout.log")"
     rm -rf /workspace/kcache
     log "$(tail -1 "$OUT/layout.log") in $(( $(date +%s) - start )) s"
@@ -146,7 +146,7 @@ if [ "$KAGGLE" = 1 ] && ! step upload; then
     log "uploading $(du -sh "$MODEL_DIR" | cut -f1), $(ls "$MODEL_DIR" | wc -l) files"
     for attempt in 1 2 3; do
         VERSION_NOTES="RFT v1 adapter merged (attempt $attempt)" \
-            bash inference/rl/pod/kaggle_model_upload.sh "$MODEL_DIR" "$OWNER" "$SLUG" "$TITLE" "$DESCRIPTION" \
+            bash inference/rft/pod/kaggle_model_upload.sh "$MODEL_DIR" "$OWNER" "$SLUG" "$TITLE" "$DESCRIPTION" \
             > "$OUT/upload_$attempt.log" 2>&1 && break
         log "upload attempt $attempt failed: $(tail -1 "$OUT/upload_$attempt.log")"
         [ $attempt = 3 ] && abort "upload failed 3 times"

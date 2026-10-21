@@ -1,7 +1,7 @@
 #!/bin/bash
 # GPU unit tests on a light pod (no checkpoint): the RL tests, including the CUDA-only async
 # offload test, then host <-> GPU copy speeds. Upload inference/ and tests/ to $WORK, then:
-#   ssh ... 'cd /workspace/rl; nohup bash inference/rl/pod/gpu_tests.sh > gpu_tests.log 2>&1 < /dev/null &' < /dev/null
+#   ssh ... 'cd /workspace/rl; nohup bash inference/rft/pod/gpu_tests.sh > gpu_tests.log 2>&1 < /dev/null &' < /dev/null
 # $WORK/DONE or $WORK/FAILED marks the end; results land in $WORK/results/.
 set -uo pipefail
 
@@ -30,7 +30,7 @@ status=$?
 log "pytest exit $status: $(tail -1 results/pytest.log)"
 
 log "phase 3: copy speeds"
-PYTHONPATH=. python inference/rl/pod/offload_speed.py > results/offload_speed.txt 2>&1 || log "copy speed script failed"
+PYTHONPATH=. python inference/rft/pod/offload_speed.py > results/offload_speed.txt 2>&1 || log "copy speed script failed"
 cat results/offload_speed.txt
 
 if [ $status -eq 0 ]; then date -u > DONE; else echo "pytest exit $status" > FAILED; fi

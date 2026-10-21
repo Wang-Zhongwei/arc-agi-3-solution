@@ -1,6 +1,6 @@
 """Live CUDA blocks of a torch.cuda.memory snapshot, grouped by the allocating code (our code, transformers, fla).
 
-    python -m inference.rl.mem_report results/mem_psg16_16384o_0_fwd.pickle [more.pickle ...]
+    python -m inference.rft.mem_report results/mem_psg16_16384o_0_fwd.pickle [more.pickle ...]
 
 The snapshots come from a smoke_lora job with "memory_snapshot": "results/mem_<label>" (dumped at the end of
 the forward and at an out-of-memory error). Blocks without a Python frame of ours are the model's weights."""
@@ -11,7 +11,7 @@ def key(frames):
     picked = []
     for f in frames:
         fn = f["filename"]
-        if any(s in fn for s in ("inference/rl/", "transformers/models/", "/fla/", "smoke_lora")):
+        if any(s in fn for s in ("inference/rft/", "transformers/models/", "/fla/", "smoke_lora")):
             picked.append(f"{fn.split('/')[-1]}:{f['line']} {f['name']}")
         if len(picked) == 3:
             break

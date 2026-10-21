@@ -11,7 +11,7 @@ Merged weights are stored in the base dtype (BF16). An update far below BF16's r
 weight) partly rounds away: the report gives, per tensor, the share of the update that survives
 (||bf16(W + dW) - W|| / ||dW||) and its direction (cosine with dW), plus ||dW|| / ||W||.
 
-    python -m inference.rl.merge_lora --checkpoint /workspace/w4a16 --adapter train/adapter_final [--dry-run]
+    python -m inference.rft.merge_lora --checkpoint /workspace/w4a16 --adapter train/adapter_final [--dry-run]
 """
 
 from __future__ import annotations

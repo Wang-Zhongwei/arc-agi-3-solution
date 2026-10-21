@@ -192,7 +192,7 @@ def grouped_mm(x, weight, offsets):
         return torch.cat(out)
     if weight.requires_grad or _can_use_grouped_mm(x, weight, offsets):
         return _grouped_mm(x, weight, offsets)
-    from inference.rl import grouped_gemm
+    from inference.rft import grouped_gemm
 
     if grouped_gemm.available(x, weight):  # one Triton launch for all groups (A100, SM120)
         return grouped_gemm.GroupedMM.apply(x.to(weight.dtype), weight, offsets)
@@ -700,7 +700,7 @@ def split_decoder_forward(self, hidden_states, p: int, position_embeddings, atte
         mixer = lambda m: gdn_mixer(self.linear_attn, m, state=state)
         out_s = checkpoint(mixer, mixed_s, use_reentrant=False) if parts else mixer(mixed_s)
     else:
-        from inference.rl import qsa
+        from inference.rft import qsa
 
         out_p, out_s = qsa.qsa_split(self.self_attn, mixed_p, mixed_s, position_embeddings, checkpointed=parts)
     with torch.no_grad():

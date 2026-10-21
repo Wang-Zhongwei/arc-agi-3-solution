@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from inference.rl import qsa_kernel  # noqa: E402
+from inference.rft import qsa_kernel  # noqa: E402
 from test_qsa_kernel_common import random_blocks  # noqa: E402
 
 

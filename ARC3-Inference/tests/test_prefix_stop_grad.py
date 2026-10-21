@@ -12,7 +12,7 @@ pytest.importorskip("transformers.models.qwen4_exp")
 
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
 
-from inference.rl import layer_patches, qsa  # noqa: E402
+from inference.rft import layer_patches, qsa  # noqa: E402
 from test_layer_patches import tiny  # noqa: E402
 
 

@@ -24,7 +24,7 @@ hyper-connections and MoE, fast LoRA and GDN, parts recompute, async offload), t
 - wandb (`--wandb-project`, key from WANDB_API_KEY): every log row also goes to wandb (wandb_log); the
   run id is kept in OUT/wandb_id.txt so a restart from `latest` continues the same run.
 
-    python -m inference.rl.train_rft --model /workspace/w4a16 --data /workspace/data --out /workspace/train
+    python -m inference.rft.train_rft --model /workspace/w4a16 --data /workspace/data --out /workspace/train
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ from typing import Any
 import torch
 from PIL import Image
 
-from inference.rl import host_offload, layer_patches, ple_mmap, smoke_lora
-from inference.rl.qsa import patch_qsa_attention
+from inference.rft import host_offload, layer_patches, ple_mmap, smoke_lora
+from inference.rft.qsa import patch_qsa_attention
 
 # Saved bytes per token after the prefix, until a step of the layout has measured them: parts ~2.3 MB (the first
 # run's arena, 144 GiB for a 68.5K-token suffix, rounded up), layer ~1.2 MB (48 layers x 4 x 2,560 BF16 inputs =
@@ -273,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     wandb_logger = None
     if args.wandb_project:
         try:
-            from inference.rl import wandb_log
+            from inference.rft import wandb_log
             id_file = args.out / "wandb_id.txt"
             run_id = id_file.read_text().strip() if id_file.exists() else None
             if run_id is None:

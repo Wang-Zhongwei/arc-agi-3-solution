@@ -4,7 +4,7 @@ Every rebuilt user message with images is matched to the logged user message wit
 text, and each image is drawn from the run's frames and compared pixel by pixel. Counts are
 reported per label kind (digits replaced by N).
 
-    python -m inference.rl.validate_images runs/kaggle/<owner>/<notebook>/vNN [...] --out summary.json
+    python -m inference.rft.validate_images runs/kaggle/<owner>/<notebook>/vNN [...] --out summary.json
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from inference.rl import rft_images
-from inference.rl.context_rebuild import rebuild
-from inference.rl.validate_rebuild import user_text
+from inference.rft import rft_images
+from inference.rft.context_rebuild import rebuild
+from inference.rft.validate_rebuild import user_text
 
 
 def kind(label: str) -> str:

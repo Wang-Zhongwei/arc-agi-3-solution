@@ -15,7 +15,7 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("compile_hc runs on CUDA only", allow_module_level=True)
 
-from inference.rl import layer_patches  # noqa: E402
+from inference.rft import layer_patches  # noqa: E402
 from test_qsa import TEXT, VISION  # noqa: E402
 from transformers import AutoModelForImageTextToText  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
@@ -81,7 +81,7 @@ def test_compiled_layer_is_as_accurate_as_eager(fast_gdn):
 def test_compiled_lora_matches_peft():
     """fast_lora compiled on CUDA against peft's forward: same math, rounding may differ by fused ops."""
     peft = pytest.importorskip("peft")
-    from inference.rl.smoke_lora import ATTENTION_GDN
+    from inference.rft.smoke_lora import ATTENTION_GDN
 
     def run(fast):
         model = tiny().to("cuda", torch.bfloat16).train()

@@ -5,13 +5,13 @@ level's replies are trained, and everything before its first request's reply is 
 stop-grad that context runs forward only (no checkpoint, recompute or backward). Token counts are
 context_rebuild's estimates; levels come from the run's events (analysis_step -> level).
 
-    PYTHONPATH=. python inference/rl/prefix_share.py runs/kaggle/ticbudja/reset-baseline/v01 [...]
+    PYTHONPATH=. python inference/rft/prefix_share.py runs/kaggle/ticbudja/reset-baseline/v01 [...]
 """
 import sys
 from pathlib import Path
 from statistics import median
 
-from inference.rl.context_rebuild import estimate_tokens, rebuild
+from inference.rft.context_rebuild import estimate_tokens, rebuild
 
 FULL, FORWARD = 3.5, 1.0  # relative cost per token: forward + recompute + backward vs forward only
 

@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers.models.qwen4_exp")
 peft = pytest.importorskip("peft")
 
-from inference.rl import layer_patches, qsa, smoke_lora, train_rft  # noqa: E402
+from inference.rft import layer_patches, qsa, smoke_lora, train_rft  # noqa: E402
 from test_layer_patches import tiny  # noqa: E402
 
 

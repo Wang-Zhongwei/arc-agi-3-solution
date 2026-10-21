@@ -12,7 +12,7 @@ With --project (check_rft_data's per-sample JSON lines), the dataset's average t
 fitted on the run's warm samples as a x prefix + b x tokens after the prefix, applied to every train sample in the
 mode the arena would pick for it.
 
-    python -m inference.rl.train_report RUN_DIR [--ple-gb 95.5] [--project check.jsonl]
+    python -m inference.rft.train_report RUN_DIR [--ple-gb 95.5] [--project check.jsonl]
 """
 
 from __future__ import annotations

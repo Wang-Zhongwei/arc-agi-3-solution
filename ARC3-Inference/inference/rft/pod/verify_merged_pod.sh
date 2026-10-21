@@ -5,8 +5,8 @@
 # training's flags and val samples) and compare with the adapter's last val loss. The base folder ends up merged;
 # Hugging Face has the base again if it is needed. Writes PASS or FAIL, then FULL_DONE, and stops the pod. Nothing waits for a person.
 #   HF token in /workspace/.hf_token (mode 600), then
-#   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/verify_merged_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
-#   WORKDIR=/workspace/rft RUNLOG=verify_merged/verify.log PULL=verify_merged bash inference/rl/pod/watch_pod.sh POD HOST PORT DEST
+#   ssh ... 'cd /workspace/rft; nohup bash inference/rft/pod/verify_merged_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
+#   WORKDIR=/workspace/rft RUNLOG=verify_merged/verify.log PULL=verify_merged bash inference/rft/pod/watch_pod.sh POD HOST PORT DEST
 set -uo pipefail
 
 WORK=${WORK:-/workspace/rft}
@@ -59,7 +59,7 @@ if [ ! -e "$OUT/download.done" ]; then
     date -u > "$OUT/download.done"
 fi
 rm -rf "$OUT/run"
-python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out "$OUT/run" --epochs 0 \
+python -m inference.rft.train_rft --model "$MODEL_DIR" --data data --out "$OUT/run" --epochs 0 \
     $(cat results/train_flags.txt 2>/dev/null) > "$OUT/train_rft.log" 2>&1 || abort "train_rft: $(tail -1 "$OUT/train_rft.log")"
 got=$(python -c "import json; print([r for r in map(json.loads, open('$OUT/run/train_log.jsonl')) if r['event'] == 'val'][-1]['loss'])") \
     || abort "no val row"

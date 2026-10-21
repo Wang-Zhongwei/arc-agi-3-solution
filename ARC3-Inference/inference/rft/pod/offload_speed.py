@@ -3,7 +3,7 @@
 Fresh pageable memory per copy (what save_on_cpu does), a reused pageable arena, and a pinned
 arena; then whether a pinned copy on a side stream overlaps with matmuls on the main stream.
 
-    PYTHONPATH=. python inference/rl/pod/offload_speed.py   # SIZE_GB=1 REPS=4
+    PYTHONPATH=. python inference/rft/pod/offload_speed.py   # SIZE_GB=1 REPS=4
 """
 
 import os
@@ -11,7 +11,7 @@ import time
 
 import torch
 
-from inference.rl.host_offload import HostArena
+from inference.rft.host_offload import HostArena
 
 size_gb = float(os.environ.get("SIZE_GB", "1"))  # one layer's checkpoint at 64K tokens is 1.24 GiB
 reps = int(os.environ.get("REPS", "4"))

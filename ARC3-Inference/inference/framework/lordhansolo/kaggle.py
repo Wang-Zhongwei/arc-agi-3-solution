@@ -90,7 +90,7 @@ DEFAULT_VLLM_DRAFT_VOCAB = ""
 # it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
 DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
 # kaggle.ple_model_source: a Kaggle model ref that supplies the model-ple-* files a partial target
-# lacks (an RFT merge publishes only the non-PLE files; inference/rl/kaggle_layout.py). Empty serves
+# lacks (an RFT merge publishes only the non-PLE files; inference/rft/kaggle_layout.py). Empty serves
 # the target as mounted. The setup script mounts it and links the target's files plus the PLE files
 # its index names into one directory.
 DEFAULT_VLLM_PLE_MODEL_SOURCE = ""
@@ -1302,7 +1302,7 @@ def assemble_target_model() -> None:
     '''Link a partial target and the PLE files it lacks into TARGET_MODEL_DIR.
 
     An RFT merge changes only BF16 attention and GDN weights, so it is published without the
-    102 GB PLE table (inference/rl/kaggle_layout.py) and its index still names the base model's 22
+    102 GB PLE table (inference/rft/kaggle_layout.py) and its index still names the base model's 22
     model-ple-* files. The directory links every file of the mounted target, then each shard its
     index names that the target lacks from the PLE checkpoint. Only model-ple-* shards may come from
     there: a missing weight shard fails here instead of loading base weights in place of merged ones.

@@ -4,7 +4,7 @@ For every sample: the chat template's reply markers match its assistant messages
 tokens are exactly the selected replies (each starts after `<think>` and ends with `<|im_end|>`),
 and the exact length against the builder's estimate and train_rft's --max-tokens.
 
-    python -m inference.rl.check_rft_data DATA_DIR --processor PROCESSOR_DIR [--max-tokens 131072]
+    python -m inference.rft.check_rft_data DATA_DIR --processor PROCESSOR_DIR [--max-tokens 131072]
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import statistics
 import sys
 from pathlib import Path
 
-from inference.rl import train_rft
+from inference.rft import train_rft
 
 
 def main(argv: list[str] | None = None) -> int:

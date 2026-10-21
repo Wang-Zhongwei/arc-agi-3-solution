@@ -1,4 +1,4 @@
-# Agent notes for `inference/rl`
+# Agent notes for `inference/rft`
 
 Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changing the rebuild, the smoke test or anything that runs on a pod. Decisions and architecture: [README](README.md).
 

@@ -19,7 +19,7 @@ later window (rolled-back turns). Images are drawn again from the run's frames w
 the run's settings (rft_images); a sample with an image that cannot be drawn is
 dropped. Each sample keeps its run's own tool description.
 
-    python -m inference.rl.rft_data runs --out data/rft_v1 [--max-pass-rate 0.8 --top 0.35]
+    python -m inference.rft.rft_data runs --out data/rft_v1 [--max-pass-rate 0.8 --top 0.35]
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from inference.rl import rft_images
-from inference.rl.context_rebuild import (TOKENS_FIXED, TOKENS_PER_CHAR, message_chars, rebuild, split_sections,
+from inference.rft import rft_images
+from inference.rft.context_rebuild import (TOKENS_FIXED, TOKENS_PER_CHAR, message_chars, rebuild, split_sections,
                                           split_steps)
 
 TRIM_NOTE = "Earlier conversation has been trimmed"

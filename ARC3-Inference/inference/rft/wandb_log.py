@@ -9,7 +9,7 @@ One mapping for both, so a replayed run looks like a live one:
 - GPU (replay only, x: gpu/elapsed_s; a live run gets wandb's own system metrics): gpu/util, gpu/power_w, gpu/memory_gb.
 The key comes from WANDB_API_KEY (or a wandb login); it is never logged.
 
-    python -m inference.rl.wandb_log RUN_DIR --project arc3-rft --name rft-train-v1-<pod> [--entity ...]
+    python -m inference.rft.wandb_log RUN_DIR --project arc3-rft --name rft-train-v1-<pod> [--entity ...]
 """
 
 from __future__ import annotations

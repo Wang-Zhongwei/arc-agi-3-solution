@@ -1,4 +1,4 @@
-"""inference/rl/ple_mmap.py serves the PLE n-gram table from the checkpoint files with identical results.
+"""inference/rft/ple_mmap.py serves the PLE n-gram table from the checkpoint files with identical results.
 
 A tiny qwen4_exp saved in the real checkpoint's shard layout is loaded twice: normally,
 and with the table memory-mapped (transformers then skips the shards without reading
@@ -13,7 +13,7 @@ pytest.importorskip("transformers.models.qwen4_exp")
 from transformers import AutoModelForImageTextToText  # noqa: E402
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig  # noqa: E402
 
-from inference.rl import ple_mmap  # noqa: E402
+from inference.rft import ple_mmap  # noqa: E402
 from test_qsa import TEXT, VISION  # noqa: E402
 
 

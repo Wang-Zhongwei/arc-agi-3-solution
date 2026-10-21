@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from inference.rl import qsa_kernel
+from inference.rft import qsa_kernel
 
 def _rope(x, cos, sin):
     """The model's own rotary embedding (it rotates only the first cos.shape[-1] dims).
@@ -66,7 +66,7 @@ def _compiled(fn):
     """fn under torch.compile (one dynamic graph: whole samples of any length) when compile_qsa is on."""
     if not _COMPILE["on"]:
         return fn
-    from inference.rl.layer_patches import _COMPILED
+    from inference.rft.layer_patches import _COMPILED
 
     key = ("qsa", fn.__name__)
     if key not in _COMPILED:

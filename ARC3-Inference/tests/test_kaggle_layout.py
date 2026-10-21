@@ -1,4 +1,4 @@
-"""inference/rl/kaggle_layout.py: a partial checkpoint (base index, no PLE) by default; --with-ple swaps in the base's checked PLE files."""
+"""inference/rft/kaggle_layout.py: a partial checkpoint (base index, no PLE) by default; --with-ple swaps in the base's checked PLE files."""
 
 import json
 import shutil
@@ -8,7 +8,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from safetensors.torch import load_file, save_file  # noqa: E402
 
-from inference.rl import kaggle_layout  # noqa: E402
+from inference.rft import kaggle_layout  # noqa: E402
 
 PLE = [f"model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding.shard_0.weight" for i in range(3)]
 

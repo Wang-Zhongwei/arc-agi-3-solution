@@ -1,7 +1,7 @@
 #!/bin/bash
 # Local watcher for full_run.sh / train_pod.sh: when the pod writes FULL_DONE or ABORTED, pull its results and
 # end it: POD_END=stop (default: GPU billing ends, the pod and its volume stay) or POD_END=delete.
-#   bash inference/rl/pod/watch_pod.sh POD_ID HOST PORT DEST_DIR
+#   bash inference/rft/pod/watch_pod.sh POD_ID HOST PORT DEST_DIR
 # RUNPOD_API_KEY comes from the repo's .env (never printed). Exits when the pod is stopped, gone or unreachable.
 # NO_DELETE=1 pulls the results only (to test the pod's own self-stop afterwards).
 # WORKDIR, RUNLOG and PULL (paths under WORKDIR) default to full_run.sh's; SYNC_MINUTES > 0 also pulls PULL that

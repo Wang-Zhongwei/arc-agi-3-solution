@@ -9,7 +9,7 @@ base's index and manifest (two small files) and moves any local PLE file out of 
 files from the base model. --with-ple instead fetches them from the base (each checked against the
 manifest) for a self-contained copy. Reruns skip what is in place.
 
-    KAGGLEHUB_CACHE=/workspace/kcache python -m inference.rl.kaggle_layout --checkpoint /workspace/w4a16
+    KAGGLEHUB_CACHE=/workspace/kcache python -m inference.rft.kaggle_layout --checkpoint /workspace/w4a16
 """
 
 from __future__ import annotations

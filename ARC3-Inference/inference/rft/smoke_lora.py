@@ -9,7 +9,7 @@ reach the LoRA weights through the quantized experts.
 Images are synthetic boards of the deployed size (640x640, 402 tokens each):
 their token count and vision cost matter here, not their content.
 
-    python -m inference.rl.smoke_lora --model /models/w4a16 --transcript game.txt \\
+    python -m inference.rft.smoke_lora --model /models/w4a16 --transcript game.txt \\
         --tools tools.json --lengths 32768,65536,100000 --out smoke.json
 """
 
@@ -33,9 +33,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
-from inference.rl import host_offload, layer_patches, ple_mmap
-from inference.rl.context_rebuild import estimate_tokens, rebuild
-from inference.rl.qsa import patch_qsa_attention
+from inference.rft import host_offload, layer_patches, ple_mmap
+from inference.rft.context_rebuild import estimate_tokens, rebuild
+from inference.rft.qsa import patch_qsa_attention
 
 ATTENTION_GDN = r".*\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj))$"
 SHARED_EXPERT = r"|.*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$"
@@ -748,7 +748,7 @@ def qsa_overlap(model, device, sample, windows=(4, 16, 64, 256), per_window: int
     they all attend to the same tokens, w that they share none. Also the share of selected
     tokens among the `recent` tokens before each query. Decides how a QSA kernel should tile
     queries: a small union lets a tile of queries load each key once."""
-    from inference.rl import qsa as qsa_module
+    from inference.rft import qsa as qsa_module
     from transformers.models.qwen4_exp import modeling_qwen4_exp as m
 
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
@@ -866,7 +866,7 @@ def profile_layers(model, device, sample, layers=(0, 1, 3), iters: int = 2) -> d
         sort = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
         row["top_ops"] = prof.key_averages().table(sort_by=sort, row_limit=15, max_name_column_width=60)
         if torch.cuda.is_available():  # GPU time by kernel category and the top kernels, as bench_layer reports them
-            from inference.rl.bench_layer import categorize
+            from inference.rft.bench_layer import categorize
 
             kernels = [e for e in prof.key_averages()
                        if e.self_device_time_total > 0 and str(getattr(e, "device_type", "")).endswith("CUDA")]
@@ -927,10 +927,10 @@ def serve(model, device, args, processor, tools, game) -> None:
         try:
             job = json.loads(running.read_text())
             result["job"] = job
-            qsa_module = importlib.reload(importlib.import_module("inference.rl.qsa"))
-            patches = importlib.reload(importlib.import_module("inference.rl.layer_patches"))
-            importlib.reload(importlib.import_module("inference.rl.host_offload"))
-            module = importlib.reload(importlib.import_module("inference.rl.smoke_lora"))
+            qsa_module = importlib.reload(importlib.import_module("inference.rft.qsa"))
+            patches = importlib.reload(importlib.import_module("inference.rft.layer_patches"))
+            importlib.reload(importlib.import_module("inference.rft.host_offload"))
+            module = importlib.reload(importlib.import_module("inference.rft.smoke_lora"))
             # the standard answer: transformers' QSA ("reference_qsa"), transformers' layers with AutoRound's
             # experts ("reference_layers"), or both ("reference"); the selection is always select_blocks', since
             # transformers' per-query topk breaks the ties at score 0 its own way ("reference_selection": true

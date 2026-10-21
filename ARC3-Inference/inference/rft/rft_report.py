@@ -1,6 +1,6 @@
 """What an rft_data dataset covers, as Markdown: per game, per level, per run, and the validation levels.
 
-    python -m inference.rl.rft_report DATA_DIR [--check CHECK_JSONL] > inference/rl/data/<name>.md
+    python -m inference.rft.rft_report DATA_DIR [--check CHECK_JSONL] > inference/rft/data/<name>.md
 
 CHECK_JSONL is check_rft_data's --out (exact tokens per sample); without it token columns are estimates.
 """

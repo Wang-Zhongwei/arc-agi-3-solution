@@ -1,4 +1,4 @@
-"""inference/rl/qsa.py computes the same QSA as transformers' reference implementation.
+"""inference/rft/qsa.py computes the same QSA as transformers' reference implementation.
 
 The reference loops over every query and builds a dense [N, N] mask, which
 runs out of memory at 32K tokens; qsa.py replaces it for training. These tests
@@ -20,7 +20,7 @@ from transformers import AutoModelForImageTextToText  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig  # noqa: E402
 
-from inference.rl import qsa  # noqa: E402
+from inference.rft import qsa  # noqa: E402
 
 TEXT = dict(
     num_hidden_layers=4, hidden_size=64, hc_lowrank=16, num_attention_heads=4, num_key_value_heads=2, head_dim=32,

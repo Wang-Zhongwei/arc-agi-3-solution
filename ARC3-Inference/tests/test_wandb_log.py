@@ -1,8 +1,8 @@
-"""inference/rl/wandb_log.py: train_rft log rows become the same wandb metrics live and in a replay."""
+"""inference/rft/wandb_log.py: train_rft log rows become the same wandb metrics live and in a replay."""
 
 import json
 
-from inference.rl import wandb_log
+from inference.rft import wandb_log
 
 
 class FakeRun:

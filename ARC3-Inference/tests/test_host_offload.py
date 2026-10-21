@@ -1,4 +1,4 @@
-"""inference/rl/host_offload.py offloads saved tensors into reused host buffers without changing results.
+"""inference/rft/host_offload.py offloads saved tensors into reused host buffers without changing results.
 
 The arena hands the same memory back after a reset and grows only when a step needs more;
 gradients of a tiny checkpointed qwen4_exp match a run without offload, and so do those of a
@@ -16,7 +16,7 @@ from torch.utils.checkpoint import checkpoint  # noqa: E402
 from transformers import AutoModelForImageTextToText  # noqa: E402
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig  # noqa: E402
 
-from inference.rl.host_offload import ALIGN, HostArena, offload_to_host  # noqa: E402
+from inference.rft.host_offload import ALIGN, HostArena, offload_to_host  # noqa: E402
 from test_qsa import TEXT, VISION  # noqa: E402
 
 MiB = 2**20

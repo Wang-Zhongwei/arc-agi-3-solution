@@ -5,7 +5,7 @@
 # (a local watcher normally pulls the results and stops it first).
 #
 # Upload inference/, tests/, game.txt, game_ft09.txt (and wheels/ when PyPI is unreachable) to $WORK, then:
-#   ssh ... 'cd /workspace/smoke; nohup bash inference/rl/pod/full_run.sh > full_run.log 2>&1 < /dev/null &' < /dev/null
+#   ssh ... 'cd /workspace/smoke; nohup bash inference/rft/pod/full_run.sh > full_run.log 2>&1 < /dev/null &' < /dev/null
 # REHEARSAL=1: shorter lengths (16K/32K, no 123K) on a cheaper 96 GB GPU.
 set -uo pipefail
 
@@ -38,7 +38,7 @@ self_stop() {
         fi
     else
         log "no runpodctl or RUNPOD_POD_ID: stopping the processes only"
-        pkill -f "inference.rl.smoke_lora" || true
+        pkill -f "inference.rft.smoke_lora" || true
     fi
 }
 abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_stop "abort"; exit 1; }
@@ -117,13 +117,13 @@ runtest prefix_cuda_fast "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_
 echo 0 > results/pytest_prefix_cpu.exit  # CPU tiny-model tests cannot run next to fla; passed locally
 
 log "phase 3: jobs from the test outcomes"
-python inference/rl/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) $([ "$PLE_FP8" = 1 ] && echo --ple-fp8) | tee -a results/env.txt
+python inference/rft/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) $([ "$PLE_FP8" = 1 ] && echo --ple-fp8) | tee -a results/env.txt
 
 log "phase 4: wait for the checkpoint, then the model server's jobs"
 wait $download || abort "checkpoint download failed"
 log "checkpoint: $(du -sh "$MODEL_DIR" | cut -f1)"
 SERVER_ARGS=$([ "$PLE_FP8" = 1 ] && echo "--ple-fp8-path /workspace/nvfp8") \
-    JOBS_FILE="$WORK/jobs.txt" MODEL_DIR="$MODEL_DIR" bash inference/rl/pod/smoke_pod.sh > results/smoke_pod.log 2>&1
+    JOBS_FILE="$WORK/jobs.txt" MODEL_DIR="$MODEL_DIR" bash inference/rft/pod/smoke_pod.sh > results/smoke_pod.log 2>&1
 log "jobs finished: $(tail -1 results/smoke_pod.log)"
 cp jobs/*.result.json results/ 2>/dev/null
 date -u > FULL_DONE

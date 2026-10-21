@@ -14,7 +14,7 @@ if not torch.cuda.is_available():
     pytest.skip("the QSA kernel needs CUDA", allow_module_level=True)
 pytest.importorskip("triton")
 
-from inference.rl import qsa  # noqa: E402
+from inference.rft import qsa  # noqa: E402
 from test_qsa import sample, tiny_model  # noqa: E402
 
 

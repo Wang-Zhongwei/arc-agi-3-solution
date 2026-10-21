@@ -7,7 +7,7 @@ per layer: the forward under checkpointing, then backward (recompute + gradients
 step is then about 36 GDN layers + 12 QSA layers (plus PLE, lm_head and copies). Fits a
 48 GB GPU at 64K; no 181 GB download, so kernels can be measured on a cheap GPU.
 
-    PYTHONPATH=. python inference/rl/bench_layer.py --tokens 65536 --out results/bench.json
+    PYTHONPATH=. python inference/rft/bench_layer.py --tokens 65536 --out results/bench.json
 """
 
 from __future__ import annotations
@@ -237,14 +237,14 @@ def main():
     from peft import LoraConfig, inject_adapter_in_model
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
 
-    from inference.rl import layer_patches, qsa
-    from inference.rl.smoke_lora import ATTENTION_GDN
+    from inference.rft import layer_patches, qsa
+    from inference.rft.smoke_lora import ATTENTION_GDN
 
     device = torch.device("cuda")
     config = Qwen4ExpConfig(text_config=REAL).text_config
     config._attn_implementation = "sdpa"
     qsa.patch_qsa_attention(chunk_size=256, fused=args.qsa == "fused", compile=args.compile_qsa)
-    from inference.rl import qsa_kernel
+    from inference.rft import qsa_kernel
     qsa_kernel.UNION_DKV = args.union_dkv == "on"
     stats: dict = {}
     if args.selection == "realistic":

@@ -1,4 +1,4 @@
-"""inference/rl/layer_patches.py rewrites qwen4_exp layers for long training sequences without changing results.
+"""inference/rft/layer_patches.py rewrites qwen4_exp layers for long training sequences without changing results.
 
 On a tiny random qwen4_exp: grouped experts match the per-expert loop, the token-chunked
 decoder layer matches transformers' layer (outputs and gradients) with chunks smaller than
@@ -14,7 +14,7 @@ from transformers import AutoModelForImageTextToText  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as m  # noqa: E402
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig  # noqa: E402
 
-from inference.rl import layer_patches  # noqa: E402
+from inference.rft import layer_patches  # noqa: E402
 from test_qsa import TEXT, VISION  # noqa: E402
 
 
@@ -249,7 +249,7 @@ def test_fast_lora_matches_peft(monkeypatch):
     calls = []
     lora_add = layer_patches.lora_add
     monkeypatch.setattr(layer_patches, "lora_add", lambda *a, **k: calls.append(1) or lora_add(*a, **k))
-    from inference.rl.smoke_lora import ATTENTION_GDN
+    from inference.rft.smoke_lora import ATTENTION_GDN
 
     def run(fast):
         model = tiny().to(torch.bfloat16).train()

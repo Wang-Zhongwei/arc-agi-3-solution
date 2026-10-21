@@ -1,4 +1,4 @@
-"""inference/rl/grouped_gemm.py (Triton, CUDA only): the grouped GEMM equals per-group matmuls, forward
+"""inference/rft/grouped_gemm.py (Triton, CUDA only): the grouped GEMM equals per-group matmuls, forward
 and input gradient (with the weight transposed), including empty and uneven groups, at the experts' shapes.
 The reference is FP32 matmul on the same BF16 inputs; the kernel may be at most 1.5x as far from it as
 cuBLAS in BF16."""
@@ -10,7 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("the grouped GEMM needs CUDA", allow_module_level=True)
 pytest.importorskip("triton")
 
-from inference.rl import grouped_gemm  # noqa: E402
+from inference.rft import grouped_gemm  # noqa: E402
 
 
 def per_group(x, w, offsets, transpose=False, dtype=None):

@@ -1,8 +1,8 @@
 #!/bin/bash
 # One-shot LoRA smoke test on a GPU pod: install, fetch the checkpoint, run, collect.
 #
-# Upload this directory (inference/rl + a transcript) to $WORK and launch once:
-#   ssh ... 'cd /workspace/smoke; nohup bash inference/rl/pod/smoke_pod.sh > smoke_pod.log 2>&1 < /dev/null &' < /dev/null
+# Upload this directory (inference/rft + a transcript) to $WORK and launch once:
+#   ssh ... 'cd /workspace/smoke; nohup bash inference/rft/pod/smoke_pod.sh > smoke_pod.log 2>&1 < /dev/null &' < /dev/null
 # Every phase is skipped when already done, so a relaunch resumes. The model is
 # loaded once by a job server (smoke_lora --serve); more jobs can be dropped into
 # $WORK/jobs as NAME.job while it runs (KEEP_SERVER=1 keeps it up after the
@@ -73,8 +73,8 @@ log "phase 3: model server (loads once, ~5 min)"
 # refuses them when the Hub's publisher-trust lookup fails; torch's short-conv fallback is fine for training
 rm -f "$JOBS/STOP"
 if ! { [ -s server.pid ] && kill -0 "$(cat server.pid)" 2>/dev/null; }; then
-    nohup python -m inference.rl.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
-        --tools inference/rl/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json ${SERVER_ARGS:-} \
+    nohup python -m inference.rft.smoke_lora --model "$MODEL_DIR" --transcript "$TRANSCRIPT" \
+        --tools inference/rft/data/python_tool.json --backend "$BACKEND" --serve "$JOBS" --out results/server.json ${SERVER_ARGS:-} \
         > results/server.log 2>&1 < /dev/null &
     echo $! > server.pid
 fi
