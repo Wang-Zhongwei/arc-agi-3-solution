@@ -312,3 +312,25 @@ loss 只差 0.2–0.3%，但整模型梯度方向差很多。这和之前的结�
 - 验证 loss：0.300 → 0.288（5 步之后，2 个验证样本）。
 - OOM 的原因：模型最后的 hyper-connection mixer 在整段序列上把 [N, 4 × 2,560] 升到 FP32（130,561 × 10,240 × 4 B = 4.98 GiB）。在 CPU 上用 dispatch 记录整段长度的 FP32 分配找到的；改成按 token 分块（613ebff），输出和 LoRA 路径的梯度逐位一致。
 - 演练结束后 watcher 把 pod 删了；你要求以后停掉而不是删除：现在 `POD_END=stop|delete`，默认 stop，pod 要带 /workspace 卷，停掉后 checkpoint 和环境都还在。
+
+## 10-20 晚上 – 10-21 凌晨：两个 epoch 正式训练（51aqerqvxsbucu，secure H200，US-NC-1，$5.29/h，约 4.95 小时，约 $26）
+
+- 704 个样本（354 × 2 epoch），0 个失败；6 个在 fla 的 chunk 内核里 OOM，换成 layer 重算后都跑完。582 个 parts、122 个 layer。平均 4,675 tok/s，墙钟 4.56 小时。
+- 验证集损失：0.310（训练前）→ 0.28773（epoch 1）→ 0.28742（epoch 2）。两个 epoch 之间只差 0.1%（16 个验证样本，只算一次），分不出好坏；训练损失 0.2849 → 0.2771。选 epoch 2（`adapter_final` 和 `adapter_epoch2` 是同一个文件，sha256 a98679ba）。
+- wandb 回放：https://forge.coreweave.com/wandb/jonathan_wang1999-epsilla/arc3-rft/runs/fxftrdw7
+- 适配器、日志、数据集（rft_v1c）都拉回到 `runs/runpod/jonathanwang2022/rft-train/51aqerqvxsbucu/`，sha256 和 pod 上一致。H200 已停（卷 250 GB 还在，里面只有可以重下的东西）。
+
+## 10-21 凌晨：合并 + 发布（CPU pod，$0.96/h，约 1 小时，约 $1）
+
+- 合并：W' = W + (α/r)·B·A 存回 BF16。228 个张量、14 个分片；BF16 保留的更新比例中位数 1.03、最小 0.977；方向余弦中位数 0.95、最小 0.80（o_proj，更新只占权重的 0.16%）。这是普通 LoRA（只加在 BF16 的注意力和 GDN 投影上），不是 QLoRA；INT4 专家没动。
+- 没在 GPU 上验证合并后的验证集损失（用户决定）。脚本 `verify_merged_pod.sh` 已写好，需要时在 H200 上从 HF 下载合并后的模型跑一遍。
+- HF：`helldriver007/qwen3.8-flash-next-w4a16-rft-v1`（私有，账号升级成 PRO 才放得下）：完整 181.2 GB（含 22 个 PLE 文件）+ `rft/` 下的适配器和优化器状态。66 秒传完——HF 的 Xet 存储会跳过它已有的数据，只有合并过的分片是新的。上传后逐个比对大小和 PLE 的 sha256，全部一致。
+- Kaggle：`jonathanwang2022/qwen3-8-flash-next-w4a16-rft-v1/Transformers/default/1`（私有，实例 768829）：只有不含 PLE 的 29 个文件（78.8 GB），PLE 用 `dfranzen/intel-qwen3.8-flash-next-w4a16-autoround` 的（逐字节相同）。用户定的规则：以后 HF 和 Kaggle 都不下载、不上传 PLE。Kaggle 的 slug 不能带点（`qwen3.8` 被拒），改成 `qwen3-8`。
+- 坑：
+  - 训练 pod 的卷有配额，硬链接按整份算；
+  - 本地拆分 PLE 放不下；
+  - CPU pod 不能挂持久卷；
+  - 取消倒计时要先杀子 shell 再杀 sleep：顺序反了，第一台 CPU pod 被自己停掉，重开一台；
+  - 被拒绝的工具调用其实在 pod 上跑了，差点同时跑两份脚本。
+  - 详见 AGENTS.md。
+- 还没做：serving 端把 base 模型的 `model-ple-*` 链接进合并后的模型目录（不做的话 Kaggle 这份不能单独加载）；`merge_upload_pod.sh` 加一个默认跳过 PLE 的选项。
