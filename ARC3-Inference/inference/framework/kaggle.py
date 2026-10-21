@@ -179,8 +179,10 @@ MAX_KAGGLE_MODEL_SOURCES = 2
 
 def pennyroyal_model_sources() -> list[str]:
     cfg = kaggle_serving_config()
-    sources = (cfg["model_source"], cfg.get("draft_model_source"), cfg.get("ple_fp8_model_source"))
-    refs = [ref for ref in sources if ref]
+    sources = (cfg["model_source"], cfg.get("draft_model_source"), cfg.get("ple_fp8_model_source"),
+               cfg.get("ple_model_source"))
+    # The PLE source may also be the draft source; mount each model once.
+    refs = list(dict.fromkeys(ref for ref in sources if ref))
     if len(refs) > MAX_KAGGLE_MODEL_SOURCES:
         raise ValueError(
             f"kaggle config mounts {len(refs)} models {refs}; keep it to {MAX_KAGGLE_MODEL_SOURCES} "
@@ -222,6 +224,7 @@ def lordhansolo_setup_command() -> str:
         model_source=cfg["model_source"],
         draft_model_source=cfg.get("draft_model_source", ""),
         ple_fp8_model_source=cfg.get("ple_fp8_model_source", ""),
+        ple_model_source=cfg.get("ple_model_source", ""),
         served_model_name=cfg.get("served_model_name", "flashnext"),
         vllm_port=int(cfg.get("port", 8001)),
         **cfg.get("vllm", {}),

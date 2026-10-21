@@ -113,7 +113,7 @@ def test_render_mounts_the_fp8_source_and_serves_the_swapped_dir(monkeypatch):
     config = lord.DuckKaggleVllmConfig(model_source=TARGET_REF, ple_fp8_model_source=PLE_FP8_REF)
     script = lord.duck_kaggle_setup_command(config)
     assert f"PLE_FP8_MODEL_SOURCE_PARTS = {tuple(PLE_FP8_REF.split('/'))!r}" in script
-    assert "MODEL_PATH = PLE_FP8_TARGET_DIR if PLE_FP8_MODEL_SOURCE_PARTS else MOUNTED_MODEL_PATH" in script
+    assert "PLE_FP8_TARGET_DIR if PLE_FP8_MODEL_SOURCE_PARTS" in script
     assert script.index("\nassemble_ple_fp8_target()\n") < script.index("\nstart_vllm_server()\n")
     assert lord.duck_kaggle_model_sources(config)[-1] == PLE_FP8_REF
     without = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(model_source=TARGET_REF))
