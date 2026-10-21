@@ -1,0 +1,250 @@
+From 8a733e4507d916e02017b535320fb5059d6878e6 Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 10:35:51 -0700
+Subject: [PATCH 7/9] Move manifest throughput aggregation to module level
+
+Pure move: the closure in main() now delegates to
+_aggregate_throughput(out_dir, results, wall_s) so it can be tested
+without running a benchmark. No behaviour change.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ tycho/harness/run_parallel.py | 214 +++++++++++++++++-----------------
+ 1 file changed, 109 insertions(+), 105 deletions(-)
+
+diff --git a/tycho/harness/run_parallel.py b/tycho/harness/run_parallel.py
+index f9a7dbd..e9f8434 100644
+--- a/tycho/harness/run_parallel.py
++++ b/tycho/harness/run_parallel.py
+@@ -507,6 +507,113 @@ def _authoritative_manifest_results(
+     return merged
+ 
+ 
++def _aggregate_throughput(out_dir: Path, indexed_results: dict, wall_s: float) -> dict:
++    """Aggregate per-call token counts from the saved game_*.json traces, so the manifest
++    carries runtime telemetry for comparing serving configurations:
++    total tokens in/out, decode tok/s (aggregate = concurrent rate, and per-stream), the
++    prefill:decode ratio (this workload is prefill-dominated), and mean tokens/latency per call.
++    Tokens live either as exact `llm_calls` entries (when LLM_LOG/viz is on) or as per-action
++    `token_delta` counters. Older records only have cumulative `token_stats`, so we delta those
++    per game instead of summing cumulative values repeatedly."""
++    tin = tout = lat = calls = cache_read = cache_write = length_stops = max_tokens_out = 0
++    # per-game peak single-prompt size (the context-overflow early-warning: a game whose peak
++    # nears --max-model-len risks a late ctx-400, as one game did at 240,315 tok). Captured from each
++    # call's per-request input size when available (llm_calls[].tokens_in is the single-call input).
++    peak_prompt_per_game: dict = {}
++
++    def _add_stats(stats: dict, *, n_calls: int = 0):
++        nonlocal tin, tout, lat, calls, cache_read, cache_write, length_stops, max_tokens_out
++        tin += int(stats.get("tokens_in") or 0)
++        tout += int(stats.get("tokens_out") or 0)
++        lat += int(stats.get("latency_ms") or 0)
++        cache_read += int(stats.get("cache_read") or 0)
++        cache_write += int(stats.get("cache_write") or 0)
++        length_stops += int(stats.get("length_stops") or 0)
++        max_tokens_out = max(max_tokens_out, int(stats.get("max_tokens_out") or 0))
++        calls += n_calls
++
++    wanted = set(indexed_results)
++    for gj in out_dir.glob("game_*.json"):
++        game = gj.stem.replace("game_", "")
++        if wanted and game not in wanted:
++            continue
++        try:
++            trace = json.loads(gj.read_text()).get("trace", [])
++        except Exception:
++            continue
++        # Peak single-call prompt occupancy includes cached buckets too. Hosted APIs
++        # `tokens_in` is only FRESH input; context pressure is fresh + cache_read + cache_write.
++        # Exact per-call llm_calls entries are preferred; newer cumulative token_stats also carry
++        # max_prompt_tokens as a fallback.
++        for step in trace:
++            r = step.get("reasoning") or {}
++            if not isinstance(r, dict):
++                continue
++            for c in (r.get("llm_calls") or []):
++                if isinstance(c, dict) and (
++                    c.get("tokens_in") or c.get("cache_read") or c.get("cache_write")
++                ):
++                    peak_prompt_per_game[game] = max(peak_prompt_per_game.get(game, 0),
++                                                     int(c.get("tokens_in") or 0)
++                                                     + int(c.get("cache_read") or 0)
++                                                     + int(c.get("cache_write") or 0))
++            ts = r.get("token_stats") or {}
++            if isinstance(ts, dict) and ts.get("max_prompt_tokens"):
++                peak_prompt_per_game[game] = max(peak_prompt_per_game.get(game, 0),
++                                                 int(ts.get("max_prompt_tokens") or 0))
++        prev_stats = {}
++        prev_calls = 0
++        for step in trace:
++            r = step.get("reasoning") or {}
++            if not isinstance(r, dict):
++                continue
++            llm_calls = r.get("llm_calls") or []
++            if isinstance(llm_calls, list) and llm_calls:
++                for c in llm_calls:
++                    if isinstance(c, dict):
++                        _add_stats(c, n_calls=1)
++                if isinstance(r.get("token_stats"), dict):
++                    prev_stats = r["token_stats"]
++                prev_calls = int(r.get("calls") or prev_calls)
++                continue
++
++            cur_calls = int(r.get("calls") or prev_calls)
++            n_calls = max(0, cur_calls - prev_calls)
++            delta = r.get("token_delta")
++            if isinstance(delta, dict):
++                _add_stats(delta, n_calls=n_calls)
++                if isinstance(r.get("token_stats"), dict):
++                    prev_stats = r["token_stats"]
++            else:
++                stats = r.get("token_stats")
++                if isinstance(stats, dict):
++                    _add_stats({k: int(stats.get(k) or 0) - int(prev_stats.get(k) or 0)
++                                for k in stats}, n_calls=n_calls)
++                    prev_stats = stats
++            prev_calls = cur_calls
++    wall = max(1e-9, wall_s)
++    comp = sum((v.get("wall_clock_s") or 0) for v in indexed_results.values()) or 1e-9
++    return {
++        "tokens_in": tin, "tokens_out": tout, "model_calls": calls,
++        "cache_read": cache_read, "cache_write": cache_write,
++        # client-side prefix-cache reuse: cache_read / total input. NOTE this is the AGENT's view
++        # (what the provider reported as cached); the vLLM server log's "Prefix cache hit rate" is
++        # the authoritative serving-side number; capture it separately.
++        "prefix_cache_hit_rate": (
++            round(cache_read / (tin + cache_read + cache_write), 3)
++            if (tin + cache_read + cache_write) else None
++        ),
++        "length_stops": length_stops, "max_tokens_out": max_tokens_out,
++        "peak_prompt_tokens_per_game": peak_prompt_per_game,           # ctx-overflow early-warning
++        "peak_prompt_tokens_max": max(peak_prompt_per_game.values()) if peak_prompt_per_game else 0,
++        "decode_tok_s_aggregate": round(tout / wall, 1),   # concurrent rate (out / true wall)
++        "decode_tok_s_per_stream": round(tout / comp, 1),  # ~single-stream (out / compute-sum)
++        "prefill_decode_ratio": round(tin / tout, 1) if tout else None,  # >>1 = prefill-bound
++        "mean_out_tokens_per_call": round(tout / calls) if calls else 0,
++        "mean_call_latency_s": round(lat / calls / 1000, 1) if calls else 0,
++    }
++
++
+ def _run_one(
+     build,
+     game_id,
+@@ -1096,111 +1203,8 @@ def main():
+     workers = args.max_workers or max(len(games), 1)
+ 
+     def _agg_throughput(result_index=None):
+-        """Aggregate per-call token counts from the saved game_*.json traces, so the manifest
+-        carries runtime telemetry for comparing serving configurations:
+-        total tokens in/out, decode tok/s (aggregate = concurrent rate, and per-stream), the
+-        prefill:decode ratio (this workload is prefill-dominated), and mean tokens/latency per call.
+-        Tokens live either as exact `llm_calls` entries (when LLM_LOG/viz is on) or as per-action
+-        `token_delta` counters. Older records only have cumulative `token_stats`, so we delta those
+-        per game instead of summing cumulative values repeatedly."""
+-        tin = tout = lat = calls = cache_read = cache_write = length_stops = max_tokens_out = 0
+-        # per-game peak single-prompt size (the context-overflow early-warning: a game whose peak
+-        # nears --max-model-len risks a late ctx-400, as one game did at 240,315 tok). Captured from each
+-        # call's per-request input size when available (llm_calls[].tokens_in is the single-call input).
+-        peak_prompt_per_game: dict = {}
+-
+-        def _add_stats(stats: dict, *, n_calls: int = 0):
+-            nonlocal tin, tout, lat, calls, cache_read, cache_write, length_stops, max_tokens_out
+-            tin += int(stats.get("tokens_in") or 0)
+-            tout += int(stats.get("tokens_out") or 0)
+-            lat += int(stats.get("latency_ms") or 0)
+-            cache_read += int(stats.get("cache_read") or 0)
+-            cache_write += int(stats.get("cache_write") or 0)
+-            length_stops += int(stats.get("length_stops") or 0)
+-            max_tokens_out = max(max_tokens_out, int(stats.get("max_tokens_out") or 0))
+-            calls += n_calls
+-
+-        indexed_results = results if result_index is None else result_index
+-        wanted = set(indexed_results)
+-        for gj in out_dir.glob("game_*.json"):
+-            game = gj.stem.replace("game_", "")
+-            if wanted and game not in wanted:
+-                continue
+-            try:
+-                trace = json.loads(gj.read_text()).get("trace", [])
+-            except Exception:
+-                continue
+-            # Peak single-call prompt occupancy includes cached buckets too. Hosted APIs
+-            # `tokens_in` is only FRESH input; context pressure is fresh + cache_read + cache_write.
+-            # Exact per-call llm_calls entries are preferred; newer cumulative token_stats also carry
+-            # max_prompt_tokens as a fallback.
+-            for step in trace:
+-                r = step.get("reasoning") or {}
+-                if not isinstance(r, dict):
+-                    continue
+-                for c in (r.get("llm_calls") or []):
+-                    if isinstance(c, dict) and (
+-                        c.get("tokens_in") or c.get("cache_read") or c.get("cache_write")
+-                    ):
+-                        peak_prompt_per_game[game] = max(peak_prompt_per_game.get(game, 0),
+-                                                         int(c.get("tokens_in") or 0)
+-                                                         + int(c.get("cache_read") or 0)
+-                                                         + int(c.get("cache_write") or 0))
+-                ts = r.get("token_stats") or {}
+-                if isinstance(ts, dict) and ts.get("max_prompt_tokens"):
+-                    peak_prompt_per_game[game] = max(peak_prompt_per_game.get(game, 0),
+-                                                     int(ts.get("max_prompt_tokens") or 0))
+-            prev_stats = {}
+-            prev_calls = 0
+-            for step in trace:
+-                r = step.get("reasoning") or {}
+-                if not isinstance(r, dict):
+-                    continue
+-                llm_calls = r.get("llm_calls") or []
+-                if isinstance(llm_calls, list) and llm_calls:
+-                    for c in llm_calls:
+-                        if isinstance(c, dict):
+-                            _add_stats(c, n_calls=1)
+-                    if isinstance(r.get("token_stats"), dict):
+-                        prev_stats = r["token_stats"]
+-                    prev_calls = int(r.get("calls") or prev_calls)
+-                    continue
+-
+-                cur_calls = int(r.get("calls") or prev_calls)
+-                n_calls = max(0, cur_calls - prev_calls)
+-                delta = r.get("token_delta")
+-                if isinstance(delta, dict):
+-                    _add_stats(delta, n_calls=n_calls)
+-                    if isinstance(r.get("token_stats"), dict):
+-                        prev_stats = r["token_stats"]
+-                else:
+-                    stats = r.get("token_stats")
+-                    if isinstance(stats, dict):
+-                        _add_stats({k: int(stats.get(k) or 0) - int(prev_stats.get(k) or 0)
+-                                    for k in stats}, n_calls=n_calls)
+-                        prev_stats = stats
+-                prev_calls = cur_calls
+-        wall = max(1e-9, _elapsed_s())
+-        comp = sum((v.get("wall_clock_s") or 0) for v in indexed_results.values()) or 1e-9
+-        return {
+-            "tokens_in": tin, "tokens_out": tout, "model_calls": calls,
+-            "cache_read": cache_read, "cache_write": cache_write,
+-            # client-side prefix-cache reuse: cache_read / total input. NOTE this is the AGENT's view
+-            # (what the provider reported as cached); the vLLM server log's "Prefix cache hit rate" is
+-            # the authoritative serving-side number; capture it separately.
+-            "prefix_cache_hit_rate": (
+-                round(cache_read / (tin + cache_read + cache_write), 3)
+-                if (tin + cache_read + cache_write) else None
+-            ),
+-            "length_stops": length_stops, "max_tokens_out": max_tokens_out,
+-            "peak_prompt_tokens_per_game": peak_prompt_per_game,           # ctx-overflow early-warning
+-            "peak_prompt_tokens_max": max(peak_prompt_per_game.values()) if peak_prompt_per_game else 0,
+-            "decode_tok_s_aggregate": round(tout / wall, 1),   # concurrent rate (out / true wall)
+-            "decode_tok_s_per_stream": round(tout / comp, 1),  # ~single-stream (out / compute-sum)
+-            "prefill_decode_ratio": round(tin / tout, 1) if tout else None,  # >>1 = prefill-bound
+-            "mean_out_tokens_per_call": round(tout / calls) if calls else 0,
+-            "mean_call_latency_s": round(lat / calls / 1000, 1) if calls else 0,
+-        }
++        return _aggregate_throughput(
++            out_dir, results if result_index is None else result_index, _elapsed_s())
+ 
+     def _is_reportable(v):
+         """A game is REPORTABLE iff it finished cleanly — not ERROR (crashed) and not PARTIAL
+-- 
+2.50.1 (Apple Git-155)
+

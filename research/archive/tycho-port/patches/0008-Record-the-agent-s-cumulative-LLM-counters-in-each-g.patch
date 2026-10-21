@@ -1,0 +1,94 @@
+From 66ab286039b2ba60c2875fcfca5d01fcae219c2e Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 10:36:20 -0700
+Subject: [PATCH 8/9] Record the agent's cumulative LLM counters in each game
+ record
+
+EnvRunRecord gains llm_usage: the agent's call count plus its
+token_stats at the moment the record is built. Trace steps are written
+only when an action is committed, so a game that the wall-clock budget
+stops mid-turn leaves that turn's calls out of the trace. These totals
+let the throughput aggregation count them. Telemetry only; play is
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ tycho/harness/harness.py | 35 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/tycho/harness/harness.py b/tycho/harness/harness.py
+index f188b3e..b8936cd 100644
+--- a/tycho/harness/harness.py
++++ b/tycho/harness/harness.py
+@@ -194,6 +194,12 @@ class EnvRunRecord:
+     error: Optional[str] = None  # set if the game ended on an exception (partial record)
+     stop_reason: Optional[str] = None
+     inference_budget: Optional[dict] = None
++    # The agent's cumulative LLM counters when the record was built: `calls` plus its token_stats
++    # (tokens_in/out, cache_read/write, latency_ms, length_stops, max_tokens_out, ...). Trace steps
++    # are written only when an action is committed, so a game cut off mid-turn (the wall-clock
++    # budget, an exception) has calls the trace never sees; throughput aggregation reconciles
++    # against these totals. None when the agent keeps no counters.
++    llm_usage: Optional[dict] = None
+     # how many times the world-model builder was invoked this game (actor-pull in orchestrator mode
+     # OR harness-fired in trigger mode). None in single mode / when the agent has no builder — so
+     # single-mode records are unchanged. Surfaced for orchestration analysis.
+@@ -650,7 +656,8 @@ def run_env(
+                     builder_invocations=(getattr(agent, "builder_invocations", None)
+                                          if getattr(agent, "builder", None) else None),
+                     inference_budget=(agent.inference_budget_state()
+-                                      if hasattr(agent, "inference_budget_state") else None)))
++                                      if hasattr(agent, "inference_budget_state") else None),
++                    llm_usage=_agent_llm_usage(agent)))
+             except Exception:  # noqa: BLE001
+                 pass
+ 
+@@ -670,13 +677,34 @@ def run_env(
+         builder_invocations=(getattr(agent, "builder_invocations", None)
+                              if getattr(agent, "builder", None) else None),
+         inference_budget=(agent.inference_budget_state()
+-                          if hasattr(agent, "inference_budget_state") else None))
++                          if hasattr(agent, "inference_budget_state") else None),
++        llm_usage=_agent_llm_usage(agent))
++
++
++def _agent_llm_usage(agent) -> Optional[dict]:
++    """Snapshot the agent's cumulative LLM call count and token counters (see
++    EnvRunRecord.llm_usage). Telemetry only: never raises."""
++    stats = getattr(agent, "token_stats", None)
++    if not isinstance(stats, dict):
++        return None
++    usage: dict = {}
++    for key, value in stats.items():
++        try:
++            usage[key] = int(value or 0)
++        except (TypeError, ValueError):
++            continue
++    try:
++        usage["calls"] = int(getattr(agent, "calls", 0) or 0)
++    except (TypeError, ValueError):
++        pass
++    return usage
+ 
+ 
+ def _build_record(game_id, n_levels, baselines, level_results, frame, resets, elapsed_s,
+                   truncated, noop_actions, distinct_frames, revisits, actions_before_first_level,
+                   run_error, trace, *, partial, current_level_index=None, current_level_actions=0,
+-                  stop_reason=None, builder_invocations=None, inference_budget=None) -> EnvRunRecord:
++                  stop_reason=None, builder_invocations=None, inference_budget=None,
++                  llm_usage=None) -> EnvRunRecord:
+     """Assemble an EnvRunRecord from loop state — used for BOTH the final return and the
+     per-level partial snapshots (live viewing). `partial=True` marks a mid-game snapshot."""
+     er = EnvResult(game_id=game_id, n_levels=n_levels, levels=level_results,
+@@ -718,6 +746,7 @@ def _build_record(game_id, n_levels, baselines, level_results, frame, resets, el
+         error=run_error,
+         stop_reason=stop_reason,
+         inference_budget=inference_budget,
++        llm_usage=llm_usage,
+         builder_invocations=builder_invocations,
+         trace=trace,
+         partial=partial,
+-- 
+2.50.1 (Apple Git-155)
+

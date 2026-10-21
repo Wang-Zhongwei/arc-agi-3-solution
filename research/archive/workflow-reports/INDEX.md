@@ -1,0 +1,29 @@
+# Workflow reports
+
+Each folder is one multi-agent workflow run; each file is one agent's final report, in run order.
+
+| Workflow | Run | Reports | What it did |
+|---|---|---|---|
+| [animation-digest-arm](animation-digest-arm--wf_fc3cd4e3-111/) | `wf_fc3cd4e3-111` | 3 | Implement the merged Wang+Franzen animation mechanism on arm/animation-digest behind default-off flags, then review and fix |
+| [animation-merge-design](animation-merge-design--wf_5ce3877c-55b/) | `wf_5ce3877c-55b` | 3 | Compare Wang vs Franzen animation-frame mechanisms with evidence, then design a merged mechanism |
+| [arc3-bottleneck-audit](arc3-bottleneck-audit--wf_4971e9bd-207/) | `wf_4971e9bd-207` | 19 | Audit the whole Franzen harness (inference, serving, TAAF, notebook, configs) for bottlenecks; verify each; classify DEFINITELY vs MAYBE for GitHub issues |
+| [arc3-idea-sweep](arc3-idea-sweep--wf_6b16ae20-e2c/) | `wf_6b16ae20-e2c` | 26 | Research sweep for ARC-AGI-3 harness improvement ideas: multi-angle search, dedup, adversarial feasibility check, ranked synthesis |
+| [engine-and-model-options](engine-and-model-options--wf_1bc9eb08-4ea/) | `wf_1bc9eb08-4ea` | 5 | Research Pennyroyal build optimization, alternative (pruned) models like Inkling Small, and alternative inference engines; verify and recommend |
+| [fable-layer-vs-ours](fable-layer-vs-ours--wf_c4d3dccd-2d7/) | `wf_c4d3dccd-2d7` | 7 | Compare leoprovorov Fable & Astra notebook (handbook + Fable layer on Franzen) with our stack: read, measure claims on our runs, compare, skeptic-verify |
+| [facts-arms-and-eviction-trap](facts-arms-and-eviction-trap--wf_d828aa65-8a9/) | `wf_d828aa65-8a9` | 13 | Revise attention-prompt from advice to harness-computed steering facts, build indicator-notes and budget-alert arms, investigate and file the memory pin/eviction trap issue; review, fix, integrate, PRs |
+| [fix-definitely-issues](fix-definitely-issues--wf_800f9fbb-745/) | `wf_800f9fbb-745` | 12 | Fix DEFINITELY issues #5, #4, #3, #6 one at a time: implement in a worktree, Sonnet review, fix |
+| [gsq-coder-gguf-runner](gsq-coder-gguf-runner--wf_0ae4547f-80a/) | `wf_0ae4547f-80a` | 8 | Serve the ISTA GSQ-RCO Coder GGUF the way its Hugging Face repo documents (llama.cpp or Strata, both shards, 256 experts, mmproj), validate the harness contract locally, build staging/engine/test notebooks and the 2-hour final-run notebook |
+| [gsq-engine-debug](gsq-engine-debug--wf_71116c3c-751/) | `wf_71116c3c-751` | 3 | Find and fix the CUDA illegal memory access in the GSQ engine self-test (both patched and int8 cases), add a production-path control case, and build a ~5-8 min GPU debug notebook |
+| [gsq-offline-staging](gsq-offline-staging--wf_af40b2af-bdd/) | `wf_af40b2af-bdd` | 3 | Make the F001-on-GSQ test run offline: CPU staging notebooks that fetch the Coder GGUF shard 1 in parts as notebook outputs, and an offline test notebook that mounts them; review and fix |
+| [idle-slot-and-tail-streams-arms](idle-slot-and-tail-streams-arms--wf_d74eec12-ff3/) | `wf_d74eec12-ff3` | 3 | Implement #2 history-state perf fix and throughput-aware tail streams in separate worktrees; review and fix each |
+| [m1-vs-m2-trajectory](m1-vs-m2-trajectory--wf_903996f8-246/) | `wf_903996f8-246` | 6 | Research what changed from ARC-AGI-3 Milestone 1 (Tufa Duck) to Milestone 2 solutions, then verify the claims |
+| [memory-v2-arm](memory-v2-arm--wf_df663b0e-1c8/) | `wf_df663b0e-1c8` | 5 | Measure memory failures in real transcripts, then design, implement, review and fix harness-extracted memory (solved levels, world-model card, action effects, seen-state notes, hypothesis deltas) on stack-v2 |
+| [memory-xml-and-level-path](memory-xml-and-level-path--wf_f7a7e5db-bad/) | `wf_f7a7e5db-bad` | 10 | Research, design, build, review and integrate two arms on memory-v2: memory writes in the Qwen3 XML tool-call format with a memory addendum and revision log, and a shortest-known-path tracker shown after every action |
+| [scheduling-policy-search](scheduling-policy-search--wf_f55d767d-e13/) | `wf_f55d767d-e13` | 4 | Find new slot-scheduling policies (competitors, theory, prior work), simulate them against D-prime, verify the best |
+| [scheduling-policy-search-continue](scheduling-policy-search-continue--wf_5fd9cbbd-e51/) | `wf_5fd9cbbd-e51` | 2 | Continue the scheduling policy simulation from existing commits on arm/sched-policies, then verify the top results |
+| [sim-v2-calibrate-validate-explore](sim-v2-calibrate-validate-explore--wf_15abaf47-5b6/) | `wf_15abaf47-5b6` | 5 | Calibrate a continuous-time scheduler simulator from real runs, validate it against held-out real policies (UCB, D-prime), then explore annealed round-robin to D-prime/UCB schedulers |
+| [throughput-900](throughput-900--wf_2e6382c4-06f/) | `wf_2e6382c4-06f` | 5 | Find serving levers to reach 900+ tok/s peak with W4A16 Flash-Next, rank them, and build a Kaggle serving benchmark arm |
+| [throughput-and-alt-models](throughput-and-alt-models--wf_f7f94969-5fa/) | `wf_f7f94969-5fa` | 12 | Win 2+ more games via throughput (sim-v2 sweep + a throughput stack of built-but-unrun fixes) and serve an alternative model (GLM-5.3-Flash EXL3, ISTA Qwen3.8-Flash-Next GSQ-RCO GGUF) by refactoring the RTX Pro 6000 SGLang launcher into per-model profiles |
+| [verify-prs-for-merge](verify-prs-for-merge--wf_4b117a88-1cb/) | `wf_4b117a88-1cb` | 5 | Adversarially verify which open PRs are certainly correct to merge (builder, ledger-on-trim, docstrings, fork README, #4/#5 fixes) before merging |
+| [verify-replay-sim-policies](verify-replay-sim-policies--wf_def48f9e-387/) | `wf_def48f9e-387` | 3 | Sonnet reviewers check the replay simulator models easy-first, D-prime and Franzen faithfully |
+| [wf_57f4538b-24c](wf_57f4538b-24c--wf_57f4538b-24c/) | `wf_57f4538b-24c` | 10 |  |

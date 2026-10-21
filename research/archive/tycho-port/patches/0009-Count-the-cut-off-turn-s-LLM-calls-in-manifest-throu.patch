@@ -1,0 +1,373 @@
+From 1a21854e8276424408be8939787f4c373671c23d Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 10:39:31 -0700
+Subject: [PATCH 9/9] Count the cut-off turn's LLM calls in manifest throughput
+
+The manifest throughput summed only committed trace steps. When
+TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS stops a game mid-turn, every
+call of that turn was dropped: the v4-tycho-port Kaggle run reported
+553k output tokens, 546 calls and 367 tok/s where the per-game counters
+held 720k, 633 and 478 tok/s.
+
+Each game's trace totals are now raised, key by key, to its cumulative
+counters: the record's llm_usage, else (older records) the llm_finished
+status events, else inference_budget.usage (tokens only). A new
+tokens_out_untraced field reports what that added.
+
+With LLM_LOG on, length_stops and max_tokens_out were also always 0,
+because the per-call log has no stop reason and the token_delta holds a
+difference of maxima. They now come from the step delta, the per-call
+output sizes and the last cumulative token_stats.
+
+Analysis only: play and score are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ tests/harness/test_throughput_aggregation.py | 173 +++++++++++++++++++
+ tycho/harness/run_parallel.py                | 110 ++++++++++--
+ 2 files changed, 268 insertions(+), 15 deletions(-)
+ create mode 100644 tests/harness/test_throughput_aggregation.py
+
+diff --git a/tests/harness/test_throughput_aggregation.py b/tests/harness/test_throughput_aggregation.py
+new file mode 100644
+index 0000000..6b16417
+--- /dev/null
++++ b/tests/harness/test_throughput_aggregation.py
+@@ -0,0 +1,173 @@
++"""Manifest throughput must count the LLM calls of a turn the wall-clock budget cut off.
++
++A trace step is written only when an action is committed. When TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS
++stops a game mid-turn, that turn's calls never reach the trace, so a trace-only aggregate
++undercounts tokens, calls and decode tok/s (the v4-tycho-port Kaggle run reported 553k output
++tokens and 546 calls; the per-game counters held 720k and 633).
++"""
++import json
++from dataclasses import asdict
++from types import SimpleNamespace
++
++from arcengine import GameAction, GameState
++
++from tycho.harness.agent import ActionChoice
++from tycho.harness.harness import run_env
++from tycho.harness.run_parallel import _aggregate_throughput
++from tycho.serving.llm_client import WallclockBudgetExceeded
++
++_KEYS = ("tokens_in", "tokens_out", "cache_read", "cache_write", "latency_ms", "length_stops",
++         "max_tokens_out")
++
++
++def _frame(state=GameState.NOT_FINISHED, levels=0):
++    return SimpleNamespace(frame=[[[0]]], levels_completed=levels, state=state,
++                           available_actions=[1])
++
++
++class _Env:
++    def reset(self):
++        return _frame()
++
++    def step(self, action, data=None, reasoning=None):
++        return _frame()
++
++
++class _Arcade:
++    def make(self, game_id, seed=0, scorecard_id=None):
++        return _Env()
++
++
++class _CutOffAgent:
++    """Turn 1 makes one call and commits ACTION1. Turn 2 makes two more calls (one hits the
++    output cap) and is then stopped by the deadline before it commits."""
++
++    builder = None
++    max_calls = 100
++
++    def __init__(self):
++        self.calls = 0
++        self.token_stats = dict.fromkeys(_KEYS, 0)
++        self.turns = 0
++
++    def reset(self, game_id, available_actions):
++        pass
++
++    def is_done(self, frames, latest_frame):
++        return False
++
++    def _call(self, tokens_out, *, capped=False):
++        self.calls += 1
++        for key, value in (("tokens_in", 100), ("tokens_out", tokens_out), ("cache_read", 300),
++                           ("latency_ms", 1000)):
++            self.token_stats[key] += value
++        self.token_stats["max_tokens_out"] = max(self.token_stats["max_tokens_out"], tokens_out)
++        if capped:
++            self.token_stats["length_stops"] += 1
++
++    def choose_action(self, frames, latest_frame, available_actions):
++        self.turns += 1
++        before = dict(self.token_stats)
++        if self.turns == 1:
++            self._call(50)
++            delta = {k: self.token_stats[k] - before[k] for k in self.token_stats}
++            return ActionChoice(GameAction.ACTION1, reasoning={
++                "calls": self.calls, "token_stats": dict(self.token_stats),
++                "token_delta": delta})
++        self._call(400)
++        self._call(1000, capped=True)
++        raise WallclockBudgetExceeded("deadline")
++
++
++def _write_record(tmp_path, short, rec: dict):
++    (tmp_path / f"game_{short}.json").write_text(json.dumps(rec))
++
++
++def test_run_env_records_counters_of_the_cut_off_turn():
++    agent = _CutOffAgent()
++    rec = run_env(agent, _Arcade(), "cut-game", [10], keep_trace=True)
++
++    assert rec.stop_reason == "wallclock_budget"
++    assert len(rec.trace) == 1  # only the committed turn reached the trace
++    assert rec.llm_usage["calls"] == 3
++    assert rec.llm_usage["tokens_out"] == 1450
++    assert rec.llm_usage["length_stops"] == 1
++    assert rec.llm_usage["max_tokens_out"] == 1000
++
++
++def test_aggregate_counts_the_cut_off_turn(tmp_path):
++    rec = asdict(run_env(_CutOffAgent(), _Arcade(), "cut-game", [10], keep_trace=True))
++    _write_record(tmp_path, "cut", rec)
++
++    tp = _aggregate_throughput(tmp_path, {"cut": {"wall_clock_s": 10.0}}, 10.0)
++
++    assert tp["model_calls"] == 3
++    assert tp["tokens_out"] == 1450
++    assert tp["tokens_out_untraced"] == 1400
++    assert tp["tokens_in"] == 300
++    assert tp["cache_read"] == 900
++    assert tp["prefix_cache_hit_rate"] == 0.75
++    assert tp["length_stops"] == 1
++    assert tp["max_tokens_out"] == 1000
++    assert tp["decode_tok_s_aggregate"] == 145.0
++    assert tp["mean_out_tokens_per_call"] == 483
++    assert tp["mean_call_latency_s"] == 1.0
++
++
++def _llm_calls_step(calls, n, tokens_out, length_stops=0):
++    """A committed step as written with LLM_LOG/viz on: exact per-call entries, plus the agent's
++    counter delta (the only place the stop count lives)."""
++    return {"reasoning": {
++        "calls": calls,
++        "llm_calls": [{"tokens_in": 10, "tokens_out": tokens_out, "cache_read": 0,
++                       "cache_write": 0, "latency_ms": 500}] * n,
++        "token_delta": {"tokens_out": n * tokens_out, "length_stops": length_stops,
++                        "max_tokens_out": 0},
++        "token_stats": {"tokens_out": calls * tokens_out, "length_stops": length_stops,
++                        "max_tokens_out": tokens_out},
++    }}
++
++
++def test_llm_calls_steps_keep_length_stops_and_peak_output(tmp_path):
++    _write_record(tmp_path, "g", {"trace": [_llm_calls_step(2, 2, 700, length_stops=1)]})
++
++    tp = _aggregate_throughput(tmp_path, {"g": {"wall_clock_s": 1.0}}, 1.0)
++
++    assert tp["model_calls"] == 2
++    assert tp["tokens_out"] == 1400
++    assert tp["length_stops"] == 1
++    assert tp["max_tokens_out"] == 700
++    assert tp["tokens_out_untraced"] == 0
++
++
++def test_records_without_llm_usage_fall_back_to_status_events(tmp_path):
++    # Records written before llm_usage existed: the status events hold one llm_finished per call.
++    _write_record(tmp_path, "g", {"trace": [_llm_calls_step(1, 1, 100)],
++                                  "inference_budget": {"usage": {"tokens_out": 999}}})
++    status = tmp_path / "status" / "g"
++    status.mkdir(parents=True)
++    events = [{"type": "llm_started"}]
++    events += [{"type": "llm_finished", "usage": {"tokens_in": 10, "tokens_out": 100,
++                                                  "cache_read": 30, "latency_ms": 500}}] * 3
++    events += [{"type": "llm_failed", "error": "WallclockBudgetExceeded"}]
++    (status / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
++
++    tp = _aggregate_throughput(tmp_path, {"g": {"wall_clock_s": 1.0}}, 1.0)
++
++    assert tp["model_calls"] == 3
++    assert tp["tokens_out"] == 300
++    assert tp["cache_read"] == 90
++    assert tp["tokens_out_untraced"] == 200
++
++
++def test_records_without_llm_usage_or_events_use_inference_budget_tokens(tmp_path):
++    _write_record(tmp_path, "g", {"trace": [_llm_calls_step(1, 1, 100)],
++                                  "inference_budget": {"usage": {
++                                      "tokens_in": 50, "tokens_out": 400,
++                                      "cache_read": 0, "cache_write": 0}}})
++
++    tp = _aggregate_throughput(tmp_path, {"g": {"wall_clock_s": 1.0}}, 1.0)
++
++    assert tp["tokens_out"] == 400
++    assert tp["tokens_in"] == 50
++    assert tp["model_calls"] == 1  # the budget usage carries no call count
+diff --git a/tycho/harness/run_parallel.py b/tycho/harness/run_parallel.py
+index e9f8434..fb7cc35 100644
+--- a/tycho/harness/run_parallel.py
++++ b/tycho/harness/run_parallel.py
+@@ -507,6 +507,51 @@ def _authoritative_manifest_results(
+     return merged
+ 
+ 
++_THROUGHPUT_SUM_KEYS = ("tokens_in", "tokens_out", "cache_read", "cache_write", "latency_ms",
++                        "length_stops", "calls")
++
++
++def _status_event_usage(out_dir: Path, game: str) -> dict | None:
++    """Per-call totals from status/<game>/events.jsonl (one `llm_finished` event per completed
++    call, written as the call returns). Used only for records older than `llm_usage`."""
++    path = out_dir / "status" / game / "events.jsonl"
++    if not path.exists():
++        return None
++    totals = dict.fromkeys(_THROUGHPUT_SUM_KEYS, 0)
++    try:
++        for line in path.read_text().splitlines():
++            try:
++                event = json.loads(line)
++            except ValueError:
++                continue
++            if not isinstance(event, dict) or event.get("type") != "llm_finished":
++                continue
++            usage = event.get("usage") or {}
++            for key in ("tokens_in", "tokens_out", "cache_read", "cache_write", "latency_ms"):
++                totals[key] += int(usage.get(key) or 0)
++            totals["calls"] += 1
++    except OSError:
++        return None
++    totals.pop("length_stops")  # events carry no stop reason
++    return totals
++
++
++def _final_llm_usage(out_dir: Path, game: str, rec: dict) -> dict | None:
++    """The game's cumulative LLM counters, which include calls made after the last committed
++    action. Newest source first: the record's `llm_usage` (exact), then the status events (exact
++    per call, no length stops), then `inference_budget.usage` (tokens only)."""
++    usage = rec.get("llm_usage")
++    if isinstance(usage, dict):
++        return usage
++    usage = _status_event_usage(out_dir, game)
++    if usage is not None:
++        return usage
++    budget = rec.get("inference_budget")
++    if isinstance(budget, dict) and isinstance(budget.get("usage"), dict):
++        return budget["usage"]
++    return None
++
++
+ def _aggregate_throughput(out_dir: Path, indexed_results: dict, wall_s: float) -> dict:
+     """Aggregate per-call token counts from the saved game_*.json traces, so the manifest
+     carries runtime telemetry for comparing serving configurations:
+@@ -514,33 +559,39 @@ def _aggregate_throughput(out_dir: Path, indexed_results: dict, wall_s: float) -
+     prefill:decode ratio (this workload is prefill-dominated), and mean tokens/latency per call.
+     Tokens live either as exact `llm_calls` entries (when LLM_LOG/viz is on) or as per-action
+     `token_delta` counters. Older records only have cumulative `token_stats`, so we delta those
+-    per game instead of summing cumulative values repeatedly."""
+-    tin = tout = lat = calls = cache_read = cache_write = length_stops = max_tokens_out = 0
++    per game instead of summing cumulative values repeatedly.
++
++    A trace step is written only when an action is committed, so the calls of a turn that never
++    committed (the wall-clock budget or an exception stopped the game mid-turn) are missing from
++    the trace. Each game's trace totals are therefore raised to its cumulative counters (see
++    `_final_llm_usage`), key by key; `tokens_out_untraced` reports how much that added."""
++    totals = dict.fromkeys(_THROUGHPUT_SUM_KEYS, 0)
++    max_tokens_out = 0
++    tokens_out_untraced = 0
+     # per-game peak single-prompt size (the context-overflow early-warning: a game whose peak
+     # nears --max-model-len risks a late ctx-400, as one game did at 240,315 tok). Captured from each
+     # call's per-request input size when available (llm_calls[].tokens_in is the single-call input).
+     peak_prompt_per_game: dict = {}
+ 
+-    def _add_stats(stats: dict, *, n_calls: int = 0):
+-        nonlocal tin, tout, lat, calls, cache_read, cache_write, length_stops, max_tokens_out
+-        tin += int(stats.get("tokens_in") or 0)
+-        tout += int(stats.get("tokens_out") or 0)
+-        lat += int(stats.get("latency_ms") or 0)
+-        cache_read += int(stats.get("cache_read") or 0)
+-        cache_write += int(stats.get("cache_write") or 0)
+-        length_stops += int(stats.get("length_stops") or 0)
+-        max_tokens_out = max(max_tokens_out, int(stats.get("max_tokens_out") or 0))
+-        calls += n_calls
+-
+     wanted = set(indexed_results)
+     for gj in out_dir.glob("game_*.json"):
+         game = gj.stem.replace("game_", "")
+         if wanted and game not in wanted:
+             continue
+         try:
+-            trace = json.loads(gj.read_text()).get("trace", [])
++            rec = json.loads(gj.read_text())
+         except Exception:
+             continue
++        trace = rec.get("trace", []) or []
++        game_totals = dict.fromkeys(_THROUGHPUT_SUM_KEYS, 0)
++
++        def _add_stats(stats: dict, *, n_calls: int = 0):
++            nonlocal max_tokens_out
++            for key in _THROUGHPUT_SUM_KEYS[:-1]:
++                game_totals[key] += int(stats.get(key) or 0)
++            max_tokens_out = max(max_tokens_out, int(stats.get("max_tokens_out") or 0))
++            game_totals["calls"] += n_calls
++
+         # Peak single-call prompt occupancy includes cached buckets too. Hosted APIs
+         # `tokens_in` is only FRESH input; context pressure is fresh + cache_read + cache_write.
+         # Exact per-call llm_calls entries are preferred; newer cumulative token_stats also carry
+@@ -571,7 +622,11 @@ def _aggregate_throughput(out_dir: Path, indexed_results: dict, wall_s: float) -
+             if isinstance(llm_calls, list) and llm_calls:
+                 for c in llm_calls:
+                     if isinstance(c, dict):
+-                        _add_stats(c, n_calls=1)
++                        _add_stats({**c, "max_tokens_out": c.get("tokens_out")}, n_calls=1)
++                # The per-call log carries no stop reason; the step's counter delta does.
++                delta = r.get("token_delta")
++                if isinstance(delta, dict):
++                    game_totals["length_stops"] += int(delta.get("length_stops") or 0)
+                 if isinstance(r.get("token_stats"), dict):
+                     prev_stats = r["token_stats"]
+                 prev_calls = int(r.get("calls") or prev_calls)
+@@ -591,11 +646,36 @@ def _aggregate_throughput(out_dir: Path, indexed_results: dict, wall_s: float) -
+                                 for k in stats}, n_calls=n_calls)
+                     prev_stats = stats
+             prev_calls = cur_calls
++
++        # The last committed step's cumulative counters bound the stop count and the output peak
++        # (`token_delta` holds a meaningless difference of maxima for max_tokens_out).
++        game_totals["length_stops"] = max(game_totals["length_stops"],
++                                          int(prev_stats.get("length_stops") or 0))
++        max_tokens_out = max(max_tokens_out, int(prev_stats.get("max_tokens_out") or 0))
++        traced_out = game_totals["tokens_out"]
++        final = _final_llm_usage(out_dir, game, rec)
++        if final is not None:
++            for key in _THROUGHPUT_SUM_KEYS:
++                if key in final:
++                    game_totals[key] = max(game_totals[key], int(final.get(key) or 0))
++            max_tokens_out = max(max_tokens_out, int(final.get("max_tokens_out") or 0))
++            if final.get("max_prompt_tokens"):
++                peak_prompt_per_game[game] = max(peak_prompt_per_game.get(game, 0),
++                                                 int(final.get("max_prompt_tokens") or 0))
++        tokens_out_untraced += game_totals["tokens_out"] - traced_out
++        for key in _THROUGHPUT_SUM_KEYS:
++            totals[key] += game_totals[key]
++
++    tin, tout, lat = totals["tokens_in"], totals["tokens_out"], totals["latency_ms"]
++    cache_read, cache_write = totals["cache_read"], totals["cache_write"]
++    calls, length_stops = totals["calls"], totals["length_stops"]
+     wall = max(1e-9, wall_s)
+     comp = sum((v.get("wall_clock_s") or 0) for v in indexed_results.values()) or 1e-9
+     return {
+         "tokens_in": tin, "tokens_out": tout, "model_calls": calls,
+         "cache_read": cache_read, "cache_write": cache_write,
++        # output tokens of calls the trace never recorded (the turn a deadline cut off)
++        "tokens_out_untraced": tokens_out_untraced,
+         # client-side prefix-cache reuse: cache_read / total input. NOTE this is the AGENT's view
+         # (what the provider reported as cached); the vLLM server log's "Prefix cache hit rate" is
+         # the authoritative serving-side number; capture it separately.
+-- 
+2.50.1 (Apple Git-155)
+

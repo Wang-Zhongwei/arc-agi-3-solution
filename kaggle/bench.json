@@ -1,0 +1,95 @@
+{
+  "_doc": "Serving benchmarks: python kaggle/build_notebook.py --bench <name> builds kernel mellamoa/v4-bench-<name>, which plays no games. Each config launches SGLang with these overrides of Franzen's launcher (serving/kaggle/launch_sglang.py), runs its phases, and kills the server. Overrides: cfg = CFG keys, env = server process env, args_set/args_add/args_remove = launch argv edits, runtime_patches = files in serving/bench_patches/ (run like serving/runtime_patches/, on a fresh copy of the installed SGLang). compose = groups of earlier configs; each group adds the overrides of its member with the best select_by metric. See kaggle/README.md.",
+  "defaults": {
+    "seed": 20261004,
+    "est_startup_s": 600,
+    "est_phase_overhead_s": 20,
+    "startup_timeout_s": 1800,
+    "request_timeout_s": 900,
+    "decode_log_interval": 40,
+    "thresholds": [800, 900, 1000],
+    "select_by": {"phase": "clean10", "metric": "tps_clean_median"},
+    "default_phases": ["warmup10", "clean10", "mixed10"]
+  },
+  "request": {
+    "_doc": "What the harness sends (ARC3-Inference tool_agent.py _chat_completion with the notebook's setup_env): T 0.7, top_p 0.95, top_k 20, thinking on, preserve_thinking, the python tool with tool_choice auto, no seed. The server's own default (T 1.0, serve.log) applies only to requests without a temperature.",
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 20,
+    "chat_template_kwargs": {"enable_thinking": true, "preserve_thinking": true},
+    "tools": "python",
+    "tool_choice": "auto",
+    "send_seed": false
+  },
+  "phases": {
+    "warmup10": {"description": "Primes the prefix cache, CUDA graphs and Triton JIT; not reported.",
+                 "concurrency": 10, "duration_s": 60, "max_tokens": 1024, "report": false},
+    "clean10": {"description": "Decode at a full batch of 10: turns already cached by the warmup, then one new exchange each; 1.5-2k output tokens so most 40-step windows hold no prefill.",
+                "concurrency": 10, "duration_s": 240, "max_tokens": 2048, "min_tokens": 1536},
+    "mixed10": {"description": "Harness-like: non-streamed like the harness, natural output lengths, deeper contexts, a quarter of requests cold (nonce first). Whole-phase tok/s and stall share.",
+                "concurrency": 10, "duration_s": 180, "max_tokens": 4096, "stream": false, "start_depth": 6,
+                "cold_fraction": 0.25},
+    "sweep1": {"concurrency": 1, "duration_s": 45, "max_tokens": 1024, "min_tokens": 768},
+    "sweep4": {"concurrency": 4, "duration_s": 45, "max_tokens": 1024, "min_tokens": 768},
+    "sweep7": {"concurrency": 7, "duration_s": 45, "max_tokens": 1536, "min_tokens": 1024},
+    "sweep8": {"concurrency": 8, "duration_s": 45, "max_tokens": 1536, "min_tokens": 1024},
+    "over12": {"description": "12 clients on 10 slots: a queued request backfills every finished one, so the batch never waits on a client.",
+               "concurrency": 12, "duration_s": 120, "max_tokens": 2048, "min_tokens": 1536},
+    "profile10": {"description": "Torch profiler trace of 20 decode steps at bs10 (bench/<config>/profile); its throughput is perturbed and not reported.",
+                  "concurrency": 10, "duration_s": 90, "max_tokens": 2048, "min_tokens": 1536, "report": false,
+                  "profile": {"start_after_s": 45, "num_steps": 20, "activities": ["CPU", "GPU"]}},
+    "warmup14": {"concurrency": 14, "duration_s": 60, "max_tokens": 1024, "report": false},
+    "clean14": {"concurrency": 14, "duration_s": 240, "max_tokens": 2048, "min_tokens": 1536},
+    "over16": {"concurrency": 16, "duration_s": 120, "max_tokens": 2048, "min_tokens": 1536},
+    "smoke-warmup": {"concurrency": 4, "duration_s": 30, "max_tokens": 256, "report": false},
+    "smoke-clean": {"concurrency": 10, "duration_s": 60, "max_tokens": 1024, "min_tokens": 768},
+    "smoke-mixed": {"concurrency": 10, "duration_s": 45, "max_tokens": 1024, "stream": false, "start_depth": 6,
+                    "cold_fraction": 0.25}
+  },
+  "configs": {
+    "C0": {"description": "Franzen's launcher unchanged (baseline), plus the bs 1/4/7/8 sweep, 12 clients on 10 slots and a profile trace.",
+           "phases": ["warmup10", "clean10", "mixed10", "sweep1", "sweep4", "sweep7", "sweep8", "over12", "profile10"]},
+    "C1": {"description": "L1: relaxed MTP acceptance 0.5/0.5. Lossy at T>0: needs a score A/B before adoption.",
+           "cfg": {"SPEC_ACCEPT_SINGLE": 0.5, "SPEC_ACCEPT_ACC": 0.5}},
+    "C2": {"description": "L1: relaxed MTP acceptance 0.3/0.3. Lossy at T>0: needs a score A/B before adoption.",
+           "cfg": {"SPEC_ACCEPT_SINGLE": 0.3, "SPEC_ACCEPT_ACC": 0.3}},
+    "C3": {"description": "L2 (issue #12): SM120 low-M BF16 GEMM up to M=64 (verify/draft-extend at bs9/10 are M=36/40) with split-K dropped; logs GEMM shapes. bs<=8 should match C0.",
+           "runtime_patches": ["m64.py", "nosplitk.py"],
+           "env": {"SGLANG_BF16_GEMM_LOG_SHAPES": "1"},
+           "phases": ["warmup10", "clean10", "mixed10", "sweep1", "sweep4", "sweep7", "sweep8"]},
+    "C4": {"description": "L3: Gabriel 0005+0006 (W8A16 FP8 dense stack, FP8 lm_head) on top of m64.",
+           "enabled": false,
+           "disabled_reason": "the FP8 port (Gabriel 0005+0006 re-anchored to Pennyroyal) is not written yet; add serving/bench_patches/fp8-port.py and set enabled true",
+           "runtime_patches": ["m64.py", "fp8-port.py"],
+           "env": {"SGLANG_SM120_LOWM_FP8_WEIGHT": "1", "SGLANG_SM120_LM_HEAD_FP8": "1"},
+           "phases": ["warmup10", "clean10", "mixed10", "sweep1", "sweep4", "sweep7", "sweep8"]},
+    "C5": {"description": "Best lossless kernel config (C0/C3/C4) plus the best acceptance threshold (C0/C1/C2), by clean bs10 median.",
+           "compose": [["C0", "C3", "C4"], ["C0", "C1", "C2"]]},
+    "C6": {"description": "C5 plus the free env/args bundle (L8): OMP_NUM_THREADS 1, overlap plan stream, CUDA graphs at every bs 1..10. Effect is C6 vs C5.",
+           "compose": [["C5"]],
+           "env": {"OMP_NUM_THREADS": "1", "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1"},
+           "args_set": {"--cuda-graph-bs-decode": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}},
+    "C7": {"description": "Franzen's launcher with 14 slots, the setting behind the 900+ peaks others report (fz-streams14: bs14 median 849, p90 1026, max 1122). Lossless.",
+           "cfg": {"MAXREQ": 14, "CUDAGRAPH_MAXBS": 14, "MAMBA_CACHE": 84},
+           "phases": ["warmup14", "clean14", "over16"]}
+  },
+  "benches": {
+    "levers": {
+      "description": "The throughput plan's session: baseline, relaxed acceptance, low-M GEMM to M=64, the FP8 port (disabled until written), the best combination, the free env bundle, and 14 slots.",
+      "configs": ["C0", "C7", "C1", "C2", "C3", "C4", "C5", "C6"],
+      "budget_min": 150,
+      "drop_order": ["C6", "C2"]
+    },
+    "tput-gates": {
+      "description": "The benches that gate the throughput-stack arms (kaggle/README.md): C3 gates tput-safe-lowm (>=1% at bs10 over C0, no loss at bs<=8), C1 gates tput-accept05 (>=3% over C0). About 70 minutes.",
+      "configs": ["C0", "C3", "C1"],
+      "budget_min": 90
+    },
+    "smoke": {
+      "description": "Checks the bench machinery on Franzen's baseline in ~15 minutes before spending a long session.",
+      "configs": ["C0"],
+      "phases_override": ["smoke-warmup", "smoke-clean", "smoke-mixed"],
+      "budget_min": 40
+    }
+  }
+}

@@ -1,0 +1,316 @@
+From 49b666a95245e588c07b6e60423d9210b74d3b6e Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 06:43:23 -0700
+Subject: [PATCH 4/9] Add a Kaggle notebook builder for the Tycho port
+
+Serving cells come unchanged from the Franzen builder (Pennyroyal SGLang,
+W4A16 + MTP drafter); the committed Tycho tree is embedded as a tarball and
+plays the balanced 10-game panel for 25 min per game.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ .gitignore               |   2 +
+ kaggle/build_notebook.py | 280 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 282 insertions(+)
+ create mode 100644 kaggle/build_notebook.py
+
+diff --git a/.gitignore b/.gitignore
+index fc6d3cc..77b1724 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,5 @@ ws/
+ build/
+ dist/
+ *.egg-info/
++kaggle/out/
++.venv/
+diff --git a/kaggle/build_notebook.py b/kaggle/build_notebook.py
+new file mode 100644
+index 0000000..9b078ff
+--- /dev/null
++++ b/kaggle/build_notebook.py
+@@ -0,0 +1,280 @@
++"""Build a Kaggle notebook that runs the Tycho harness on the W4A16 Qwen3.8-Flash-Next.
++
++Serving is taken unchanged from our Franzen-based notebook builder
++(daniel-franzen-sol/kaggle/build_notebook.py): the same offline Pennyroyal SGLang install,
++W4A16 AutoRound target, albucino MTP drafter (NEXTN 3 steps), FR-Spec map and CUDA graphs, with
++that builder's input-path resolver, fail-fast startup check and serve.log streaming. Only the
++harness differs: Franzen's Duck fork is replaced by this repo's Tycho tree, embedded in the
++notebook as a gzipped tarball of the committed HEAD.
++
++    python kaggle/build_notebook.py                 # build into kaggle/out/<slug>/
++    python kaggle/build_notebook.py --push          # build and push mellamoa/<slug>
++
++Games are the "balanced" panel (5 hard, 5 easy-but-variable) for 25 min each, all 10 at once,
++the same setup F001 v2 ran (arms.md), so the two are comparable.
++"""
++from __future__ import annotations
++
++import argparse
++import base64
++import copy
++import gzip
++import importlib.util
++import io
++import json
++import re
++import subprocess
++import tarfile
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++REPO = HERE.parent
++FRANZEN_KAGGLE = REPO.parent / "daniel-franzen-sol" / "kaggle"
++OWNER = "mellamoa"
++SLUG = "v4-tycho-port"
++KERNEL_SOURCE_LIMIT = 950_000
++SERVED_MODEL_NAME = "qwen3.8-flash-next"  # contains "qwen": Tycho's Qwen vision profile, zero price
++PANEL = ("sk48", "bp35", "tn36", "sp80", "lf52", "ft09", "vc33", "tu93", "cd82", "r11l")
++MINUTES_PER_GAME = 25
++# Files the Kaggle run needs; tests, artifacts and docs stay out of the notebook.
++SOURCE_PATHS = ("tycho", "configs", "pyproject.toml", "LICENSE")
++
++# Tycho configuration. Policy follows the paper's best public config (orchestrator: the actor
++# calls a world-model builder when useful) where it fits; context, output and image settings are
++# sized for one RTX PRO 6000 serving 10 streams at a 136Ki context.
++TYCHO_ENV = {
++    "LLM_BACKEND": "openai",
++    "LLM_MODEL": SERVED_MODEL_NAME,
++    "LLM_API_KEY": "EMPTY",
++    "LLM_HTTP_TIMEOUT": "1800",
++    "LLM_RETRY_BUDGET_S": "600",
++    # Franzen's sampling for this model, and thinking kept in history (removing it regressed Duck).
++    "LLM_SAMPLING_JSON": json.dumps({"temperature": 0.7, "top_p": 0.95, "top_k": 20}),
++    "LLM_REPLAY_REASONING": "1",
++    "TYCHO_EFFORT": "high",  # on the Chat Completions transport this only enables thinking
++    "TYCHO_MODE": "orchestrator",
++    "TYCHO_MAX_TOKENS": "12288",
++    "TYCHO_MAX_LLM_CALLS": "3500",
++    "TYCHO_MAX_TOOL_STEPS": "40",
++    "TYCHO_RENDER_SCALE": "10",  # Franzen's 10x upscale; 32 px/cell would cost 4096 tokens/image
++    "TYCHO_TEXT_GRID": "full",
++    "TYCHO_ANIMATION_SUMMARY_VIDEO": "0",  # the Chat Completions transport sends images only
++    "TYCHO_HISTORY": "tail_evict",
++    "TYCHO_GRID_KEEP": "3",
++    "TYCHO_IMAGE_KEEP": "3",
++    "TYCHO_IMAGE_CAP": "4",
++    "TYCHO_REASONING_KEEP": "3",
++    "TYCHO_TEXT_KEEP": "12",
++    "TYCHO_CONTEXT_EMERGENCY_SOFT_TOKENS": "100000",
++    "TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS": str(MINUTES_PER_GAME * 60),
++    "TYCHO_SKIP_WM_BAKE": "1",  # post-run analysis overlay only; never affects play or score
++    "TYCHO_SANDBOX_RUNTIME": "host",
++    "RUN_HARDWARE": "Kaggle RTX PRO 6000",
++}
++
++SETUP_CELL = r'''# Paths, timing and the Tycho environment.
++import json, os, subprocess, sys, time
++from pathlib import Path
++
++NOTEBOOK_START_TIME = time.time()
++# Unlike Franzen's notebook, games start only once the server is healthy, so every game gets
++# its full budget of real play; this is only how long the serving cell waits before streaming.
++SERVER_STARTUP_TIMEOUT = 25 * 60
++
++WHEELHOUSE_DIR  = '/kaggle/input/datasets/dfranzen/pennyroyal-v253'
++MODEL_DIR       = '/kaggle/input/models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/transformers/default/1'
++DRAFT_MODEL_DIR = '/kaggle/input/models/dfranzen/albucino-qwen3-8-flash-next-drafter/transformers/default/1'
++SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
++SERVED_MODEL_HOST = '127.0.0.1'
++SERVED_MODEL_PORT = 8001
++WORKING_DIR = Path('/kaggle/working')
++WORKING_DIR.mkdir(parents=True, exist_ok=True)
++os.environ['MPLBACKEND'] = 'Agg'
++__INPUT_RESOLVER__
++COMPETITION_DIR = Path(_resolve_input('/kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels')).parent
++
++TYCHO_ENV = __TYCHO_ENV__
++TYCHO_ENV['LLM_BASE_URL'] = f'http://{SERVED_MODEL_HOST}:{SERVED_MODEL_PORT}/v1'
++TYCHO_ENV['TYCHO_ENV_DIR'] = str(COMPETITION_DIR / 'environment_files')
++TYCHO_GAMES = __GAMES__
++print('Tycho env:', json.dumps(TYCHO_ENV, indent=1))
++'''
++
++RUN_CELL = r'''# Unpack Tycho, wait for the server, then play the panel with one worker per game.
++import base64, gzip, io, shutil, tarfile, urllib.request
++
++TYCHO_DIR = Path('/kaggle/tycho')
++shutil.rmtree(TYCHO_DIR, ignore_errors=True)
++TYCHO_DIR.mkdir(parents=True)
++with tarfile.open(fileobj=io.BytesIO(gzip.decompress(base64.b64decode(TYCHO_TARBALL)))) as tar:
++    tar.extractall(TYCHO_DIR, filter='data')
++print('Tycho', (TYCHO_DIR / 'TYCHO_COMMIT').read_text().strip(), 'unpacked to', TYCHO_DIR)
++
++health = f'http://{SERVED_MODEL_HOST}:{SERVED_MODEL_PORT}/health'
++while True:
++    if proc.poll() is not None:
++        show_log_tail()
++        raise RuntimeError(f'SGLang exited with code {proc.returncode}; see serve.log')
++    try:
++        with urllib.request.urlopen(health, timeout=5) as r:
++            if r.status == 200:
++                break
++    except Exception:
++        pass
++    time.sleep(5)
++print(f'server healthy at {int(time.time() - NOTEBOOK_START_TIME)}s from notebook start')
++
++RESULTS_DIR = WORKING_DIR / 'tycho-results'
++run_env = dict(os.environ, **TYCHO_ENV, PYTHONPATH=str(TYCHO_DIR), PYTHONUNBUFFERED='1')
++cmd = [sys.executable, '-m', 'tycho.harness.run_parallel', '--approach', 'tycho',
++       '--games', ','.join(TYCHO_GAMES), '--out-dir', str(RESULTS_DIR),
++       '--max-workers', str(len(TYCHO_GAMES)), '--operation-mode', 'offline']
++print('$', ' '.join(cmd), flush=True)
++RUN_START = time.time()
++with open(WORKING_DIR / 'tycho-run.log', 'w') as log:
++    runner = subprocess.Popen(cmd, cwd=TYCHO_DIR, env=run_env, stdout=subprocess.PIPE,
++                              stderr=subprocess.STDOUT, text=True, bufsize=1)
++    for line in runner.stdout:
++        print(line, end='', flush=True)
++        log.write(line)
++    runner.wait()
++print(f'run_parallel exited {runner.returncode} after {(time.time() - RUN_START) / 60:.1f} min')
++'''
++
++SUMMARY_CELL = r'''# Per-game scores (RHAE, 0-100 like the Duck harness's game scores), tokens and throughput.
++manifest = json.loads((RESULTS_DIR / 'manifest.json').read_text())
++rows = []
++for game in TYCHO_GAMES:
++    r = manifest.get('per_game', {}).get(game, {})
++    rows.append((game, r.get('rhae'), r.get('levels'), r.get('mode'), r.get('stop_reason'),
++                 r.get('total_actions_including_unfinished'), r.get('wall_clock_s')))
++print(f"{'game':6} {'rhae':>7} {'levels':>6} {'actions':>7} {'wall_s':>7}  mode / stop")
++for g, rhae, lv, mode, stop, acts, wall in rows:
++    print(f"{g:6} {rhae if rhae is not None else float('nan'):7.2f} {lv if lv is not None else '-':>6} "
++          f"{acts if acts is not None else '-':>7} {wall if wall is not None else float('nan'):7.0f}  {mode} / {stop}")
++print('mean RHAE (all requested):', manifest.get('mean_rhae'), '| clean:', manifest.get('mean_rhae_clean'))
++print('throughput:', json.dumps(manifest.get('throughput', {}), indent=1))
++proc.terminate()
++
++# Kaggle expects a submission file from a competition notebook; this run is not a submission.
++import pandas as pd
++pd.DataFrame([['1_0', '1', True, 1]], columns=['row_id', 'game_id', 'end_of_game', 'score']).to_parquet(
++    WORKING_DIR / 'submission.parquet', index=False)
++'''
++
++
++def _load_franzen_builder():
++    spec = importlib.util.spec_from_file_location("franzen_builder", FRANZEN_KAGGLE / "build_notebook.py")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _git(*args: str) -> str:
++    return subprocess.run(["git", *args], cwd=REPO, check=True, capture_output=True, text=True).stdout
++
++
++def tycho_tarball() -> tuple[str, str]:
++    """The committed tree as a base64 gzip tarball; refuses uncommitted harness changes."""
++    dirty = _git("status", "--porcelain", "--", *SOURCE_PATHS).strip()
++    if dirty:
++        raise SystemExit(f"Uncommitted changes would not reach the notebook:\n{dirty}")
++    head = _git("rev-parse", "--short", "HEAD").strip()
++    raw = subprocess.run(["git", "archive", "--format=tar", "HEAD", *SOURCE_PATHS],
++                         cwd=REPO, check=True, capture_output=True).stdout
++    buf = io.BytesIO(raw)
++    with tarfile.open(fileobj=buf, mode="a") as tar:
++        stamp = f"{head}\n".encode()
++        info = tarfile.TarInfo("TYCHO_COMMIT")
++        info.size = len(stamp)
++        tar.addfile(info, io.BytesIO(stamp))
++    return base64.b64encode(gzip.compress(buf.getvalue(), 9, mtime=0)).decode("ascii"), head
++
++
++def _code_cell(source: str) -> dict:
++    return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": source}
++
++
++def _md_cell(source: str) -> dict:
++    return {"cell_type": "markdown", "metadata": {}, "source": source}
++
++
++def build(head_tarball: str, head: str) -> tuple[dict, dict]:
++    fb = _load_franzen_builder()
++    template = json.loads((FRANZEN_KAGGLE / "template.ipynb").read_text(encoding="utf-8"))
++    template_meta = json.loads((FRANZEN_KAGGLE / "template-metadata.json").read_text(encoding="utf-8"))
++    franzen = fb.build_notebook(template, "", env={}, demo_games="balanced", demo_minutes=MINUTES_PER_GAME)
++    code = [c for c in franzen["cells"] if c["cell_type"] == "code"]
++
++    def pick(marker: str) -> dict:
++        hits = [c for c in code if marker in fb._cell_text(c)]
++        if len(hits) != 1:
++            raise SystemExit(f"Franzen notebook: expected 1 cell with {marker!r}, found {len(hits)}")
++        return copy.deepcopy(hits[0])
++
++    precache = pick("def precache(")
++    arc_install = pick("arc_agi_3_wheels")
++    serving = pick(fb.SERVE_ANCHOR)
++    # Both cells ship with the resolver call already applied by the Franzen builder.
++    if "_resolve_input(" not in fb._cell_text(arc_install):
++        raise SystemExit("arc install cell lost its input resolver")
++
++    resolver = fb.INPUT_RESOLVER.replace("ORIG_BUNDLE_DIR = _resolve_input(ORIG_BUNDLE_DIR)\n", "")
++    if "ORIG_BUNDLE_DIR" in resolver:
++        raise SystemExit("input resolver still resolves Tufa's source bundle")
++    setup = (SETUP_CELL
++             .replace("__SERVED_MODEL_NAME__", repr(SERVED_MODEL_NAME))
++             .replace("__INPUT_RESOLVER__", resolver)
++             .replace("__TYCHO_ENV__", json.dumps(TYCHO_ENV, indent=4))
++             .replace("__GAMES__", repr(list(PANEL))))
++    tarball_lines = "\n".join(head_tarball[i:i + 120] for i in range(0, len(head_tarball), 120))
++    cells = [
++        _md_cell(
++            "# Tycho on Qwen3.8-Flash-Next W4A16\n\n"
++            "[Tycho](https://github.com/NIMI-research/Tycho) (NIMI research, Apache-2.0), ported to Kaggle "
++            f"(commit `{head}` of our port). The server is Franzen's offline Pennyroyal SGLang build "
++            "with the Intel W4A16 AutoRound model and the albucino MTP drafter. Balanced 10-game panel, "
++            f"{MINUTES_PER_GAME} min per game, all games concurrently."
++        ),
++        _code_cell(setup),
++        _code_cell(f'# Tycho source (git archive of the port), gzipped + base64.\nTYCHO_TARBALL = """\n{tarball_lines}\n"""\n'),
++        precache,
++        arc_install,
++        serving,
++        _code_cell(RUN_CELL),
++        _code_cell(SUMMARY_CELL),
++    ]
++    notebook = {**{k: v for k, v in franzen.items() if k != "cells"}, "cells": cells}
++    metadata = fb.build_metadata(template_meta, SLUG, SLUG, f"{SLUG}.ipynb")
++    metadata["id"] = f"{OWNER}/{SLUG}"
++    # Tufa's source bundle is Franzen's harness; Tycho replaces it.
++    metadata["dataset_sources"] = [d for d in metadata["dataset_sources"] if "source-bundle" not in d]
++    return notebook, metadata
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--push", action="store_true", help=f"push as {OWNER}/{SLUG}")
++    args = parser.parse_args()
++    tarball, head = tycho_tarball()
++    notebook, metadata = build(tarball, head)
++    out = HERE / "out" / SLUG
++    out.mkdir(parents=True, exist_ok=True)
++    source = json.dumps(notebook, indent=1) + "\n"
++    if len(source.encode()) >= KERNEL_SOURCE_LIMIT:
++        raise SystemExit(f"notebook is {len(source.encode())} bytes; Kaggle rejects sources >= 1 MB")
++    (out / f"{SLUG}.ipynb").write_text(source, encoding="utf-8")
++    (out / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
++    print(f"built {SLUG} from tycho-port {head}: {len(source.encode()) / 1000:.0f} KB, tarball {len(tarball) / 1000:.0f} KB")
++    if not args.push:
++        return
++    pushed = subprocess.run(["kaggle", "kernels", "push", "-p", str(out), "--accelerator", metadata["machine_shape"]],
++                            capture_output=True, text=True)
++    output = (pushed.stdout + pushed.stderr).strip()
++    print(output)
++    if pushed.returncode != 0 or "error" in output.lower() or not re.search(r"version (\d+)", output, re.I):
++        raise SystemExit("push failed")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,107 @@
+From cea611bd6d7c3778741a6ee5ae3fbd00fe76eef0 Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 06:40:09 -0700
+Subject: [PATCH 3/9] Enforce TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS
+
+The key was registered but never read. The game loop now stops at the
+deadline with stop_reason wallclock_budget and keeps its score, model
+calls refuse to start after it, and an in-flight call times out at it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ tycho/harness/harness.py    | 12 ++++++++++++
+ tycho/serving/llm_client.py | 23 +++++++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/tycho/harness/harness.py b/tycho/harness/harness.py
+index 476cc03..f188b3e 100644
+--- a/tycho/harness/harness.py
++++ b/tycho/harness/harness.py
+@@ -262,6 +262,12 @@ def run_env(
+     n_levels = len(baselines)
+     env = arc.make(game_id, seed=seed, scorecard_id=scorecard_id)
+     t0 = time.time()
++    # TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS: stop the game (cleanly, keeping its score) once this
++    # much wall-clock time has passed. Model calls refuse to start after the deadline.
++    from tycho.serving.llm_client import WallclockBudgetExceeded, set_deadline
++    wallclock_budget = float(os.environ.get("TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS", "0") or 0)
++    deadline = t0 + wallclock_budget if wallclock_budget > 0 else None
++    set_deadline(deadline)
+ 
+     # Resume bookkeeping: the contiguous committed-action prefix to replay (empty on a fresh run).
+     replay = journal.steps() if (journal is not None and journal.exists()) else []
+@@ -350,6 +356,9 @@ def run_env(
+         if agent.is_done(frames, frame):
+             stop_reason = getattr(agent, "done_reason", None) or "agent_done"
+             break
++        if deadline is not None and time.time() >= deadline:
++            stop_reason = "wallclock_budget"
++            break
+ 
+         # Budget for the current level.
+         budget = ACTION_BUDGET_MULTIPLIER * baselines[cur_level]
+@@ -393,6 +402,9 @@ def run_env(
+                 data=getattr(choice, "data", None),
+                 reasoning=_engine_reasoning(choice.reasoning),  # engine-safe subset (16KB cap)
+             )
++        except WallclockBudgetExceeded:
++            stop_reason = "wallclock_budget"
++            break
+         except Exception as e:  # noqa: BLE001 — preserve partial progress on any failure
+             run_error = f"{type(e).__name__}: {e}"
+             stop_reason = "exception"
+diff --git a/tycho/serving/llm_client.py b/tycho/serving/llm_client.py
+index 6e413a5..e938229 100644
+--- a/tycho/serving/llm_client.py
++++ b/tycho/serving/llm_client.py
+@@ -138,6 +138,25 @@ def public_identity(cfg: LLMConfig | None = None) -> dict[str, str]:
+ _REC = threading.local()
+ 
+ 
++class WallclockBudgetExceeded(RuntimeError):
++    """The game's wall-clock budget ran out; no further model calls are made."""
++
++
++# Absolute time.time() after which chat_tools refuses to call the model. Each game runs in its own
++# worker process, so one process-wide value is the game's deadline.
++_DEADLINE: float | None = None
++
++
++def set_deadline(deadline: float | None) -> None:
++    global _DEADLINE
++    _DEADLINE = deadline
++
++
++def _check_deadline() -> None:
++    if _DEADLINE is not None and time.time() >= _DEADLINE:
++        raise WallclockBudgetExceeded("per-game wall-clock budget exhausted")
++
++
+ def _extension():
+     module_name = os.environ.get("TYCHO_LLM_PLUGIN", "")
+     if module_name:
+@@ -236,6 +255,7 @@ def _with_retry(fn, *, base: float = 4.0, cap: float = 30.0, is_retryable=None):
+     started = time.monotonic()
+     attempt = 0
+     while True:
++        _check_deadline()
+         try:
+             return fn()
+         except Exception as error:  # noqa: BLE001 - provider-neutral retry boundary
+@@ -363,9 +383,12 @@ def chat_tools(history: list[dict], tools: list[dict], cfg: LLMConfig | None = N
+                system: str = "", max_tokens: int = 4096, timeout: int = 600,
+                effort: str | None = None, call_type: str = "", prev_response_id: str | None = None,
+                since: int = 0, cache_anchor_index: int | None = None) -> dict:
++    _check_deadline()
+     cfg = cfg or LLMConfig.from_env()
+     effort = effort or cfg.reasoning_effort
+     timeout = max(timeout, int(os.environ.get("LLM_HTTP_TIMEOUT", "0") or 0))
++    if _DEADLINE is not None:  # an in-flight call must not outlive the game's budget
++        timeout = max(1, min(timeout, int(_DEADLINE - time.time()) + 1))
+     started = time.monotonic()
+     try:
+         from tycho.harness.run_status import process_status_store
+-- 
+2.50.1 (Apple Git-155)
+

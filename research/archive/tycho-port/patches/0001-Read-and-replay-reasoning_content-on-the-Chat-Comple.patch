@@ -1,0 +1,104 @@
+From e4777904e1eaf11c9bba2a13b8db87391a437bb1 Mon Sep 17 00:00:00 2001
+From: Advaith Vecham <advaiv2@cs.washington.edu>
+Date: Thu, 8 Oct 2026 06:39:03 -0700
+Subject: [PATCH 1/9] Read and replay reasoning_content on the Chat Completions
+ transport
+
+SGLang's qwen3 reasoning parser returns thinking as reasoning_content.
+Keep it as raw_reasoning so reasoning_keep bounds it, replay it when
+LLM_REPLAY_REASONING is set, and pass LLM_SAMPLING_JSON fields through.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AULSqB7ZpbNcZV9DbF3pfR
+---
+ tycho/config/run_config.py       |  2 ++
+ tycho/serving/public_backends.py | 35 +++++++++++++++++++++++++++++---
+ 2 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/tycho/config/run_config.py b/tycho/config/run_config.py
+index da5cd51..7b7d7b3 100644
+--- a/tycho/config/run_config.py
++++ b/tycho/config/run_config.py
+@@ -54,6 +54,8 @@ CONFIG_KEYS: list[ConfigKey] = [
+     ConfigKey("LLM_RETRY_BUDGET_S", "model", "1200", "total retry/backoff budget per call (s)"),
+     ConfigKey("OPENAI_REASONING_CONTINUITY", "model", "", "Responses previous_response_id chaining"),
+     ConfigKey("OPENAI_STATELESS_REASONING", "model", "", "client-held encrypted-reasoning replay"),
++    ConfigKey("LLM_SAMPLING_JSON", "model", "", "extra Chat Completions sampling fields as JSON (openai backend)"),
++    ConfigKey("LLM_REPLAY_REASONING", "model", "", "replay reasoning_content in history (openai backend)"),
+     # ---- reasoning / budgets ----
+     ConfigKey("TYCHO_EFFORT", "reasoning", "medium", "Tycho effort (overrides LLM_EFFORT)"),
+     ConfigKey(
+diff --git a/tycho/serving/public_backends.py b/tycho/serving/public_backends.py
+index fd7c49c..17b283c 100644
+--- a/tycho/serving/public_backends.py
++++ b/tycho/serving/public_backends.py
+@@ -478,6 +478,7 @@ def openai_chat_tools(history, tools, cfg, system, max_tokens, timeout, effort,
+                 {
+                     "role": "assistant",
+                     "content": message.get("content") or None,
++                    **_chat_reasoning_field(message),
+                     "tool_calls": [
+                         {
+                             "id": call["id"],
+@@ -498,9 +499,10 @@ def openai_chat_tools(history, tools, cfg, system, max_tokens, timeout, effort,
+                     content.append({"type": "text", "text": part["text"]})
+                 elif "image_png" in part:
+                     content.append({"type": "image_url", "image_url": {"url": _data_url(part["image_png"])}})
+-            messages.append({"role": message["role"], "content": content})
++            messages.append({"role": message["role"], "content": content, **_chat_reasoning_field(message)})
+         else:
+-            messages.append({"role": message["role"], "content": message.get("content", "")})
++            messages.append({"role": message["role"], "content": message.get("content", ""),
++                             **_chat_reasoning_field(message)})
+     body = {
+         "model": cfg.model,
+         "messages": messages,
+@@ -521,6 +523,10 @@ def openai_chat_tools(history, tools, cfg, system, max_tokens, timeout, effort,
+         body.pop("tools")
+     if effort:
+         body["chat_template_kwargs"] = {"enable_thinking": True}
++    # Served-model sampling (e.g. Qwen's temperature/top_p/top_k); keys pass through unchanged.
++    sampling = os.environ.get("LLM_SAMPLING_JSON", "").strip()
++    if sampling:
++        body.update(json.loads(sampling))
+     response = _post_json(
+         f"{cfg.base_url}/chat/completions",
+         body,
+@@ -542,10 +548,33 @@ def openai_chat_tools(history, tools, cfg, system, max_tokens, timeout, effort,
+                 "input": arguments,
+             }
+         )
++    # SGLang/vLLM reasoning parsers return the thinking as `reasoning_content` (older: `reasoning`).
++    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+     return {
+         "text": message.get("content") or "",
+         "tool_calls": calls,
+         "stop": response["choices"][0].get("finish_reason", ""),
+-        "reasoning": message.get("reasoning") or "",
++        "reasoning": reasoning,
++        # Kept as raw_reasoning so the agent's reasoning_keep eviction bounds it like Opus thinking.
++        "raw_reasoning": (
++            [{"type": "reasoning_content", "text": reasoning}] if reasoning and _chat_replay_reasoning() else None
++        ),
+         "usage": normalize_usage(response.get("usage")),
+     }
++
++
++def _chat_replay_reasoning() -> bool:
++    return os.environ.get("LLM_REPLAY_REASONING", "") in ("1", "on", "true")
++
++
++def _chat_reasoning_field(message: dict) -> dict:
++    """Replay retained thinking as `reasoning_content`, which Qwen chat templates render back into
++    the assistant turn when the server sets preserve_thinking."""
++    if message.get("role") != "assistant":
++        return {}
++    text = "".join(
++        block.get("text", "")
++        for block in (message.get("raw_reasoning") or [])
++        if isinstance(block, dict) and block.get("type") == "reasoning_content"
++    )
++    return {"reasoning_content": text} if text else {}
+-- 
+2.50.1 (Apple Git-155)
+
