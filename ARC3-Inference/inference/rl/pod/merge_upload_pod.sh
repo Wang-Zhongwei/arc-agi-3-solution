@@ -6,6 +6,10 @@
 # and stop the pod. A failed check aborts before the upload. Each step leaves a .done
 # file, so a rerun continues where the last one stopped. Nothing waits for a person.
 #
+# On a fresh pod (a CPU pod is enough with VERIFY=0: merge and uploads need no GPU) the script creates the venv and
+# downloads (FRESH=1) the base checkpoint without its PLE shard (the PLE files come from the base Kaggle model); upload only
+# inference/ and train/ (the adapters). VERIFY=0 skips the val check; verify_merged_pod.sh then runs it on a GPU pod
+# from the uploaded Hugging Face copy. KAGGLE=0 skips the Kaggle upload.
 # After a pod restart /root is empty: copy ~/.kaggle/{access_token,kaggle.json} to /root/.kaggle (mode 600) and the
 # HF write token to /workspace/.hf_token (mode 600; HF_REPO= skips Hugging Face), then
 #   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/merge_upload_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
@@ -15,6 +19,10 @@ set -uo pipefail
 WORK=${WORK:-/workspace/rft}
 VENV=${VENV:-/workspace/venv}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
+MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
+VERIFY=${VERIFY:-1}
+FRESH=${FRESH:-0}  # 1: download the base first (a new pod)
+KAGGLE=${KAGGLE:-1}
 ADAPTER=${ADAPTER:-train/adapter_final}
 EXPECT_VAL=${EXPECT_VAL:-}  # default: the adapter's last val loss in train/train_log.jsonl
 VAL_TOL=${VAL_TOL:-0.003}
@@ -49,20 +57,33 @@ export KAGGLEHUB_CACHE=/workspace/kcache  # on the volume: a fetched file moves 
 step() { [ -e "$OUT/$1.done" ]; }
 done_() { date -u > "$OUT/$1.done"; log "$1 done"; }
 
-log "publish $ADAPTER -> $OWNER/$SLUG (pod ${RUNPOD_POD_ID:-?}); disk: $(du -sh "$MODEL_DIR" | cut -f1) in $MODEL_DIR"
+log "publish $ADAPTER -> hf.co/${HF_REPO:-(none)}, Kaggle $([ "$KAGGLE" = 1 ] && echo "$OWNER/$SLUG" || echo skipped) (pod ${RUNPOD_POD_ID:-?}, verify $VERIFY)"
 [ -s "$ADAPTER/adapter_model.safetensors" ] || abort "no $ADAPTER"
-[ -s /root/.kaggle/access_token ] || abort "no /root/.kaggle/access_token (copy it after a restart)"
+[ -s /root/.kaggle/access_token ] || abort "no /root/.kaggle/access_token (kaggle_layout fetches the PLE files with it)"
+if [ ! -x "$VENV/bin/python" ]; then
+    python3 -m venv --system-site-packages "$VENV" || abort "venv"
+fi
 if [ -n "$HF_REPO" ]; then
     [ -s /workspace/.hf_token ] || abort "no /workspace/.hf_token"
     export HF_TOKEN="$(cat /workspace/.hf_token)" HF_HUB_DISABLE_PROGRESS_BARS=1
 fi
-python -c "import kagglehub, kaggle, hf_xet" 2>/dev/null || pip install -q -U kagglehub kaggle huggingface_hub hf_xet \
-    || abort "pip install"
-if [ -z "$EXPECT_VAL" ]; then
+python -c "import torch, safetensors, kagglehub, kaggle, hf_xet" 2>/dev/null \
+    || pip install -q -U safetensors kagglehub kaggle huggingface_hub hf_xet || abort "pip install"
+if [ "$VERIFY" = 1 ] && [ -z "$EXPECT_VAL" ]; then
     EXPECT_VAL=$(python -c "import json; print([r for r in map(json.loads, open('train/train_log.jsonl')) if r['event'] == 'val'][-1]['loss'])") \
         || abort "no val loss in train/train_log.jsonl"
+    log "expect val $EXPECT_VAL +- $VAL_TOL"
 fi
-log "expect val $EXPECT_VAL +- $VAL_TOL"
+export KAGGLE_USERNAME=$OWNER KAGGLE_API_TOKEN="$(cat /root/.kaggle/access_token)"
+
+if [ "$FRESH" = 1 ] && ! step download; then  # a fresh pod: the base without its PLE shard
+    step merge && abort "FRESH=1 after the merge: a download would restore the unmerged shards"
+    start=$(date +%s)
+    hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" --exclude "*.bak" --exclude "model-00016-of-00017.safetensors" \
+        > "$OUT/download.log" 2>&1 || abort "download: $(tail -1 "$OUT/download.log")"
+    log "base downloaded: $(du -sh "$MODEL_DIR" | cut -f1) in $(( $(date +%s) - start )) s"
+    done_ download
+fi
 
 if ! step merge; then
     python -m inference.rl.merge_lora --checkpoint "$MODEL_DIR" --adapter "$ADAPTER" > "$OUT/merge.log" 2>&1 \
@@ -71,13 +92,14 @@ if ! step merge; then
     done_ merge
 fi
 if ! step layout; then
+    start=$(date +%s)
     python -m inference.rl.kaggle_layout --checkpoint "$MODEL_DIR" > "$OUT/layout.log" 2>&1 \
         || abort "layout: $(tail -1 "$OUT/layout.log")"
     rm -rf /workspace/kcache
-    tail -1 "$OUT/layout.log"
+    log "$(tail -1 "$OUT/layout.log") in $(( $(date +%s) - start )) s"
     done_ layout
 fi
-if ! step verify; then
+if [ "$VERIFY" = 1 ] && ! step verify; then
     # val loss of the merged weights (with a fresh, zero LoRA on top), with training's flags and val samples
     python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out "$OUT/verify" --epochs 0 \
         $(cat results/train_flags.txt 2>/dev/null) > "$OUT/verify.log" 2>&1 || abort "verify: $(tail -1 "$OUT/verify.log")"
@@ -118,7 +140,7 @@ CHECK
     tail -1 "$OUT/check_hf.log"
     done_ upload_hf
 fi
-if ! step upload; then
+if [ "$KAGGLE" = 1 ] && ! step upload; then
     log "uploading $(du -sh "$MODEL_DIR" | cut -f1), $(ls "$MODEL_DIR" | wc -l) files"
     for attempt in 1 2 3; do
         VERSION_NOTES="RFT v1 adapter merged (attempt $attempt)" \
