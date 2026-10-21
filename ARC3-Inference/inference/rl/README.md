@@ -91,6 +91,14 @@ Built by [rft_data.py](rft_data.py) with the defaults (pass rate < 80%, best 35%
 - [check_rft_data.py](check_rft_data.py): every sample's reply markers and loss spans as intended; exact lengths 2.8% above the estimate (median).
 - Expected training time on one H200 from the 10-20 measurements (16.1 s per 64.9K step at an 80% prefix): ~2.9 h per epoch.
 
+## Kaggle A/B of RFT v1 (2026-10-21): a regression
+
+The merged 2-epoch model scored 50.21 (`jonathanwang2022/rft-model` v1) and 47.26 (v2, image upscale 10). The five latest base-model runs of the same harness scored 56.0–59.1. Pooled, that is −8.6 per game (paired p = 0.003).
+
+The loss is on the trained games: −12.1 on the 17 games with samples, −1.1 on the 8 without. The most-trained games (ls20, wa30, sp80, ka59) regressed in both runs and stall on trained levels, e.g. ka59 L4 cleared 10/10 → 0/2. The model thinks ~10% less per turn, takes 13–24% more actions, and MTP draft acceptance rose from 58% to 63%.
+
+Leading explanation: selecting the fewest-action, short-thinking clears teaches deciding sooner, not how to solve the level. Report: [docs/RL/rft-v1-kaggle-ab.md](../../../docs/RL/rft-v1-kaggle-ab.md).
+
 ## Latest results (RTX PRO 6000 96GB, 2026-10-19 evening)
 
 Real model, second step, all of `qsa_fused`, `compile_hc`, `compile_moe`, `fast_conv`, `cache_experts`, `fast_lora`:
@@ -141,7 +149,8 @@ The plan for a 10× faster training step, step by step, is in [Throughput.md](Th
 
 1. Reuse host buffers for the offload: done in [host_offload.py](host_offload.py), exact on a tiny model and on MPS. Should save ~35 s per 64K step and stop depending on the host's page-fault speed; time it on the next pod (64K with `reuse_host_buffers` true and false).
 2. QSA key/value gradients accumulate in BF16 in both gathers (1.7% error against FP32 on one real-size chunk; 0.33% with FP32 accumulation), and the same 64K step gave LoRA gradient norms 0.248 and 0.293 with the two gathers. Accumulate in FP32 and measure the spread on a repeated step.
-3. Training loop and dataset: done (10-20, above). Next: the first training run, then the merge check against vLLM (QSA parity, MTP draft acceptance) and a Kaggle A/B of the adapter.
+3. Training loop and dataset: done (10-20, above). First training run, merge and Kaggle A/B: done (10-21): −8.6 per game, see the A/B section above.
+4. Next round (under discussion): GRPO on the first levels, scored on held-out games.
 
 ## Existing training paths for this model
 
