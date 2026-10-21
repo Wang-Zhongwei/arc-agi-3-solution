@@ -36,7 +36,22 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - An episode starts at the game's reset and succeeds if it clears L2 within the budget. Generated tokens are thinking, replies and tool code; the prompt context is managed by the harness as in evaluation.
   - On our 44 runs (25 public games), 63% of attempts clear L1 + L2 within this budget (82% with no limit). 15 games have mixed outcomes (20–80%) and 5 always succeed; bp35 (0%) and sk48 (5%) give almost no signal. Analysis: [grpo-l1-l2-token-budget.md](grpo-l1-l2-token-budget.md).
   - The model spends a median of 575 tokens per human action on cleared L1 + L2, so 1,000 × h sits above most clears. The 100K cap binds on games with more than 100 human actions (dc22, ls20, ka59, m0r0, s5i5, lf52, tn36, wa30, g50t, sk48, tr87).
-  - Open: games without human action counts (some training sets) need another source for h; the reward (human-relative level score within the budget); whether the model sees its budget.
+  - Exception: bp35 gets a flat 100K (1,000 × h would be 69K). At 69K it never clears L2, its real problem; at 100K, 5% of attempts do.
+  - Open: whether the model sees its budget.
+
+- **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
+
+- **Games: train on the 25 public games, none held out (decided 2026-10-21).** We have few games, and the hidden test set is the final evaluation. This overrides "public 25 = validation only" under Data for this first GRPO round. All 25 have human action counts in `benchmark.json`.
+  - Train (20): bp35, cd82, cn04, dc22, g50t, ka59, lf52, ls20, m0r0, r11l, s5i5, sb26, sc25, sk48, sp80, su15, tn36, tu93, vc33, wa30.
+  - Guards, not trained (5): ft09, lp85, re86, ar25, tr87. They clear L1 + L2 within budget in 95–100% of historical attempts, so their groups rarely have mixed outcomes (0–34% at 8 rollouts) and training on them mostly wastes rollouts.
+  - bp35 and sk48 stay in, although they rarely clear L1 + L2 within budget (5%). With per-level credit, sk48 has mixed groups 98% of the time (only 41% clear L1 within budget), and bp35 43% at 8 rollouts (68% at 16).
+
+- **When to stop: level 3 as the held-out set (decided 2026-10-21).** Training rewards only L1–L2, so L3 of every game is never trained on, and memorized L1–L2 action sequences cannot help on it.
+  - Every 5 steps, play each game from reset through L3 with the current policy (same harness and context as evaluation), a few rollouts per game.
+  - Held-out measure: P(clear L3 within 1,000 × h₃ | reached L3), computed per game and averaged with fixed game weights, so that more hard-game attempts reaching L3 does not shift the mix. Count a game in a check only if ≥ 4 rollouts reached L3. Historically 76% (905 attempts reached L3), with mixed outcomes on 12 games.
+  - Also tracked: L1–L2 within budget (the training measure), the guard games, thinking tokens per turn and MTP draft acceptance.
+  - Stop when any of these happens: the L3 measure has not beaten its best for 2 checks in a row; a guard game drops below 95% within budget; thinking per turn falls more than 10% below the base model; training reward keeps rising while L3 stays flat (memorization).
+  - Caveat: L3 is the same game, so it measures transfer within a game, not to new games.
 
 ## Data
 

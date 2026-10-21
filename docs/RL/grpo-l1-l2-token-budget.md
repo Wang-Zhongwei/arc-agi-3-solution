@@ -105,4 +105,4 @@ Values past 200K are drawn at 200K. The level-2 panel only includes attempts tha
 - **bp35's problem is L2, not L1:** its L1 clears at 25–80K, but L2 is cleared in only 26% of the attempts that reach it.
 - **A per-level split of 1,000 · h** (1,000 × L1 human actions for L1, the same for L2) would keep a slow L1 from eating into L2. The per-level data above would size it.
 
-Not decided yet: the reward (human-relative level score within the budget), the held-out games, whether the model sees its budget, and one combined budget vs per-level budgets.
+Decided since (see [decisions.md](decisions.md)): per-level reward credit, a flat 100K budget for bp35, training on 20 public games with 5 always-succeed guard games, and level 3 (conditional on reaching it) as the held-out check for when to stop. Not decided yet: whether the model sees its budget, and one combined budget vs per-level budgets.
