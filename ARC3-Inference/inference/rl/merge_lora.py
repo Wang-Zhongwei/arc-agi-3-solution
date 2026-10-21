@@ -3,7 +3,9 @@
 The adapter covers BF16 tensors only (attention q/k/v/o and GDN projections; INT4 experts, PLE and
 everything else are untouched), so the merged checkpoint keeps the base's config, quantization and
 kernels: serving loads it like the base. Only shards holding adapted tensors are rewritten (each to a
-temporary file, then renamed over the original), so the merge needs one shard of free disk.
+temporary file, then renamed over the original), so the merge needs one shard of free disk. Each merged
+shard carries the adapter's hash in its safetensors metadata, written with the shard itself: a rerun
+after a crash skips the shards already merged instead of adding the update twice.
 
 Merged weights are stored in the base dtype (BF16). An update far below BF16's resolution (~0.4% of a
 weight) partly rounds away: the report gives, per tensor, the share of the update that survives
@@ -15,6 +17,7 @@ weight) partly rounds away: the report gives, per tensor, the share of the updat
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -45,6 +48,13 @@ def adapter_updates(adapter: Path) -> dict[str, torch.Tensor]:
     return out
 
 
+MARK = "rft_merged_lora"  # safetensors metadata key: the adapter (hash) this shard already holds
+
+
+def adapter_id(adapter: Path) -> str:
+    return hashlib.sha256((adapter / "adapter_model.safetensors").read_bytes()).hexdigest()[:16]
+
+
 def resolve(modules: list[str], weight_keys: list[str]) -> dict[str, str]:
     """adapter module -> checkpoint weight key: an exact `<module>.weight`, else the one key ending in it."""
     keys = set(weight_keys)
@@ -69,15 +79,26 @@ def merge(checkpoint: Path, adapter: Path, dry_run: bool = False) -> dict:
         with safe_open(checkpoint / "model.safetensors", "pt") as f:
             index = {k: "model.safetensors" for k in f.keys()}
     updates = adapter_updates(adapter)
+    mark = adapter_id(adapter)
+    report = checkpoint / "MERGED_LORA.json"
+    earlier = json.loads(report.read_text()) if report.exists() and not dry_run else {}
     targets = resolve(sorted(updates), sorted(index))
     by_shard: dict[str, list[str]] = defaultdict(list)
     for module, key in targets.items():
         by_shard[index[key]].append(module)
-    stats = []
+    stats = [s for s in earlier.get("per_tensor", []) if earlier.get("adapter_id") == mark]
+    skipped = []
     for shard, modules in sorted(by_shard.items()):
         path = checkpoint / shard
         with safe_open(path, "pt") as f:
-            metadata = f.metadata()
+            metadata = dict(f.metadata() or {})
+        if metadata.get(MARK):
+            if metadata[MARK] != mark:
+                raise ValueError(f"{shard} already holds another adapter ({metadata[MARK]}, this one is {mark})")
+            skipped.append(shard)
+            print(f"skipped {shard}: already merged", flush=True)
+            continue
+        metadata[MARK] = mark
         tensors = load_file(path)
         for module in modules:
             key = targets[module]
@@ -97,8 +118,11 @@ def merge(checkpoint: Path, adapter: Path, dry_run: bool = False) -> dict:
             save_file(tensors, tmp, metadata=metadata)
             os.replace(tmp, path)
         print(f"{'checked' if dry_run else 'merged'} {len(modules)} tensors in {shard}", flush=True)
-    summary = dict(adapter=str(adapter), tensors=len(stats), shards=len(by_shard), dry_run=dry_run,
-                   update_rel_median=statistics.median(s["update_rel"] for s in stats),
+    if not stats:
+        return dict(adapter=str(adapter), adapter_id=mark, tensors=0, shards=len(by_shard), skipped=skipped,
+                    dry_run=dry_run, per_tensor=[])
+    summary = dict(adapter=str(adapter), adapter_id=mark, tensors=len(stats), shards=len(by_shard), skipped=skipped,
+                   dry_run=dry_run, update_rel_median=statistics.median(s["update_rel"] for s in stats),
                    kept_median=statistics.median(s["kept"] for s in stats), kept_min=min(s["kept"] for s in stats),
                    cosine_median=statistics.median(s["cosine"] for s in stats), cosine_min=min(s["cosine"] for s in stats))
     if not dry_run:

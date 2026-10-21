@@ -58,3 +58,29 @@ def test_dry_run_writes_nothing(tmp_path):
     stamp = {f.name: f.stat().st_mtime_ns for f in (tmp_path / "ckpt").iterdir()}
     result = merge_lora.merge(tmp_path / "ckpt", tmp_path / "adapter", dry_run=True)
     assert result["tensors"] == sum(1 for n, _ in model.named_modules() if n.endswith("lora_A")) and {f.name: f.stat().st_mtime_ns for f in (tmp_path / "ckpt").iterdir()} == stamp
+
+
+def test_rerun_skips_merged_shards(tmp_path):
+    """A rerun (after a crash mid-merge) must not add the update twice; another adapter is refused."""
+    base = tiny().to(torch.bfloat16)
+    base.save_pretrained(tmp_path / "ckpt", max_shard_size="200KB")
+    for seed, name in ((0, "adapter"), (1, "other")):
+        model = peft.get_peft_model(tiny().to(torch.bfloat16),
+                                    peft.LoraConfig(r=4, lora_alpha=8, target_modules=smoke_lora.ATTENTION_GDN))
+        with torch.no_grad():
+            g = torch.Generator().manual_seed(seed)
+            for n, p in model.named_parameters():
+                if "lora_" in n:
+                    p.copy_(torch.randn(p.shape, generator=g) * 0.5)
+        model.save_pretrained(tmp_path / name)
+    first = merge_lora.merge(tmp_path / "ckpt", tmp_path / "adapter")
+    once = {}
+    for f in (tmp_path / "ckpt").glob("*.safetensors"):
+        once.update(load_file(f))
+    again = merge_lora.merge(tmp_path / "ckpt", tmp_path / "adapter")
+    assert again["skipped"] and len(again["skipped"]) == first["shards"] and again["tensors"] == first["tensors"]
+    for f in (tmp_path / "ckpt").glob("*.safetensors"):
+        for k, v in load_file(f).items():
+            assert torch.equal(v, once[k]), k
+    with pytest.raises(ValueError, match="another adapter"):
+        merge_lora.merge(tmp_path / "ckpt", tmp_path / "other")
