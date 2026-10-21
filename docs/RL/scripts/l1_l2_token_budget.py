@@ -83,8 +83,12 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def strip(ax, order, values, budgets, xmax, title, note=True, label_rows=True):
-    """One row per game; filled dots = cleared, crosses = not cleared; dashed cap and budget ticks."""
+def strip(ax, order, values, ticks, xmax, title, note=True, label_rows=True):
+    """One row per game; filled dots = cleared, crosses = not cleared; dashed cap; per-game budget ticks.
+
+    ticks: list of (game -> tokens, color, half-height). A tick past xmax is drawn at the edge as a
+    triangle labelled with its value.
+    """
     for row, game in enumerate(order):
         y = len(order) - 1 - row
         jitter = [((i * 7919) % 11 - 5) / 22 for i in range(len(values[game]))]
@@ -96,8 +100,16 @@ def strip(ax, order, values, budgets, xmax, title, note=True, label_rows=True):
         if missed:
             ax.scatter([min(v, xmax) for v, _ in missed], [b for _, b in missed], s=22, color=NOT_CLEARED,
                        marker="x", linewidths=1.4, zorder=3)
-        if budgets and budgets[game] < CAP:
-            ax.plot([budgets[game]] * 2, [y - 0.42, y + 0.42], color=INK, linewidth=2, zorder=4)
+        for k, (tokens, color, half) in enumerate(ticks or []):
+            value = tokens[game]
+            if value <= xmax:
+                ax.plot([value] * 2, [y - half, y + half], color=color, linewidth=2.4, zorder=4,
+                        solid_capstyle="butt")
+            else:
+                ax.scatter([xmax], [y + (0.22 if k == 0 else -0.22)], marker=">", s=26, color=color, zorder=4,
+                           clip_on=False)
+                ax.text(xmax * 0.985, y + (0.22 if k == 0 else -0.22), f"{value / 1000:.0f}K", color=color,
+                        fontsize=7.5, ha="right", va="center", zorder=4)
     ax.axvline(CAP, color=INK, linestyle=(0, (4, 3)), linewidth=1.2, zorder=2)
     if note:
         ax.text(CAP, len(order) - 0.3, " 100K cap", color=INK, fontsize=9, va="bottom")
@@ -111,16 +123,23 @@ def strip(ax, order, values, budgets, xmax, title, note=True, label_rows=True):
     style(ax)
 
 
-def legend(fig, extra_tick=True):
+TICK_1000, TICK_2000 = INK, "#9a988f"
+
+
+def legend(fig, ticks=True):
     handles = [
         plt.Line2D([], [], marker="o", linestyle="", color=CLEARED, markersize=6, label="cleared"),
         plt.Line2D([], [], marker="x", linestyle="", color=NOT_CLEARED, markersize=7, markeredgewidth=1.4,
                    label="not cleared (spent until the game ended)"),
         plt.Line2D([], [], linestyle=(0, (4, 3)), color=INK, label="100K cap"),
     ]
-    if extra_tick:
-        handles.append(plt.Line2D([], [], marker="|", linestyle="", color=INK, markersize=10, markeredgewidth=2,
-                                  label="2,000 × human actions, where below the cap"))
+    if ticks:
+        handles += [
+            plt.Line2D([], [], marker="|", linestyle="", color=TICK_1000, markersize=11, markeredgewidth=2.4,
+                       label="1,000 × human actions"),
+            plt.Line2D([], [], marker="|", linestyle="", color=TICK_2000, markersize=7, markeredgewidth=2.4,
+                       label="2,000 × human actions"),
+        ]
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, 0.995), ncol=len(handles), frameon=False,
                fontsize=9, labelcolor=MUTED, handletextpad=0.3, columnspacing=1.4)
 
@@ -131,21 +150,33 @@ def main():
     data, per_model_action = attempts(runs)
     games = sorted(data)
     h12 = {g: humans[g][0] + humans[g][1] for g in games}
-    budget = {g: min(CAP, PER_HUMAN_ACTION * h12[g]) for g in games}
+    rules = {  # name -> per-game budget
+        "1,000·h": {g: 1_000 * h12[g] for g in games},
+        "min(100K, 1,000·h)": {g: min(CAP, 1_000 * h12[g]) for g in games},
+        "min(100K, 2,000·h)": {g: min(CAP, PER_HUMAN_ACTION * h12[g]) for g in games},
+    }
+    within = {name: {g: sum(a["cleared"] and a["tokens"] <= budget[g] for a in data[g]) / len(data[g])
+                     for g in games} for name, budget in rules.items()}
     order = sorted(games, key=lambda g: st.median(a["tokens"] for a in data[g]))
     os.makedirs(IMAGES, exist_ok=True)
     xmax = 300_000
 
-    # Figure 1: tokens to clear L1 + L2
-    fig, ax = plt.subplots(figsize=(10, 8.6), facecolor=SURFACE)
-    strip(ax, order, {g: [(a["tokens"], a["cleared"]) for a in data[g]] for g in games}, budget, xmax,
+    # Figure 1: tokens to clear L1 + L2, with both budget ticks for every game
+    fig, ax = plt.subplots(figsize=(12, 8.8), facecolor=SURFACE)
+    ticks = [({g: 1_000 * h12[g] for g in games}, TICK_1000, 0.42),
+             ({g: PER_HUMAN_ACTION * h12[g] for g in games}, TICK_2000, 0.26)]
+    strip(ax, order, {g: [(a["tokens"], a["cleared"]) for a in data[g]] for g in games}, ticks, xmax,
           f"Generated tokens to clear levels 1-2, per game ({len(runs)} runs; values past 300K drawn at 300K)")
-    within = {g: sum(a["cleared"] and a["tokens"] <= budget[g] for a in data[g]) / len(data[g]) for g in games}
-    for row, game in enumerate(order):
-        ax.text(xmax * 1.03, len(order) - 1 - row, f"{within[game]:.0%}", fontsize=9, color=MUTED, va="center")
-    ax.text(xmax * 1.03, len(order) - 0.3, "within\nbudget", fontsize=8, color=MUTED, va="bottom")
+    for col, name in enumerate(rules):
+        x = xmax * (1.05 + 0.115 * col)
+        ax.text(x, len(order) - 0.3, name.replace("min(100K, ", "min(100K,\n"), fontsize=7.5, color=MUTED,
+                va="bottom", ha="center")
+        for row, game in enumerate(order):
+            ax.text(x, len(order) - 1 - row, f"{within[name][game]:.0%}", fontsize=9, color=MUTED, va="center",
+                    ha="center")
+    ax.text(xmax * 1.165, len(order) + 1.15, "within budget", fontsize=8, color=MUTED, ha="center")
     legend(fig)
-    fig.tight_layout(rect=(0, 0, 0.97, 0.96))
+    fig.tight_layout(rect=(0, 0, 0.83, 0.96))
     fig.savefig(os.path.join(IMAGES, "l1_l2_tokens_per_game.png"), dpi=150, facecolor=SURFACE)
     plt.close(fig)
 
@@ -156,7 +187,7 @@ def main():
     strip(axes[1], order, {g: [(a["l2_spent"], a["cleared"]) for a in data[g] if a["l2_spent"] is not None]
                            for g in games}, None, 200_000, "Level 2 (attempts that reached it)", note=True,
           label_rows=False)
-    legend(fig, extra_tick=False)
+    legend(fig, ticks=False)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(os.path.join(IMAGES, "l1_l2_tokens_by_level.png"), dpi=150, facecolor=SURFACE)
     plt.close(fig)
@@ -186,19 +217,24 @@ def main():
           f"p90 {q[8]:,.0f}; share in 1,000-2,000: {sum(1000 <= v <= 2000 for v in pooled) / len(pooled):.0%}, "
           f"below 1,000: {sum(v < 1000 for v in pooled) / len(pooled):.0%}")
     total = sum(len(data[g]) for g in games)
-    print(f"cleared L1+L2: {sum(a['cleared'] for g in games for a in data[g]) / total:.0%}; within budget: "
-          f"{sum(a['cleared'] and a['tokens'] <= budget[g] for g in games for a in data[g]) / total:.0%}")
+    print(f"cleared L1+L2: {sum(a['cleared'] for g in games for a in data[g]) / total:.0%}")
+    for name, budget in rules.items():
+        inside = sum(a["cleared"] and a["tokens"] <= budget[g] for g in games for a in data[g]) / total
+        mixed = [g for g in games if 0.2 <= within[name][g] <= 0.8]
+        print(f"{name}: within {inside:.0%}; games 20-80%: {len(mixed)} {mixed}; >=95%: "
+              f"{sum(within[name][g] >= 0.95 for g in games)}; <=5%: {sum(within[name][g] <= 0.05 for g in games)}")
     print()
-    print("| Game | Human actions L1 + L2 | Budget | Attempts | Cleared L1+L2 | Within budget | Median tokens (cleared) "
-          "| p90 tokens (cleared) | Tokens per human action (median) |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for g in sorted(games, key=lambda g: -within[g]):
+    names = list(rules)
+    print("| Game | Human actions L1 + L2 | 1,000·h | " + " | ".join(f"Within {n}" for n in names)
+          + " | Cleared at all | Median tokens (cleared) | p90 tokens (cleared) | Tokens per human action (median) |")
+    print("|---|---:|---:|" + "---:|" * len(names) + "---:|---:|---:|---:|")
+    for g in sorted(games, key=lambda g: -within[names[0]][g]):
         cleared = [a["tokens"] for a in data[g] if a["cleared"]]
         p90 = st.quantiles(cleared, n=10)[8] if len(cleared) >= 10 else max(cleared)
-        print(f"| {g} | {humans[g][0]} + {humans[g][1]} | {budget[g] / 1000:.0f}K | {len(data[g])} | "
-              f"{len(cleared) / len(data[g]):.0%} | {within[g]:.0%} | {st.median(cleared) / 1000:.0f}K | "
-              f"{p90 / 1000:.0f}K | {st.median(per_human[g]):,.0f} |")
-
+        print(f"| {g} | {humans[g][0]} + {humans[g][1]} | {1000 * h12[g] / 1000:.0f}K | "
+              + " | ".join(f"{within[n][g]:.0%}" for n in names)
+              + f" | {len(cleared) / len(data[g]):.0%} | {st.median(cleared) / 1000:.0f}K | {p90 / 1000:.0f}K | "
+              f"{st.median(per_human[g]):,.0f} |")
 
 if __name__ == "__main__":
     main()
