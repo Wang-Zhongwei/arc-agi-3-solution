@@ -1,6 +1,8 @@
 """Shared helpers for the QSA kernel tests."""
 
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 RATIO = 4
 
