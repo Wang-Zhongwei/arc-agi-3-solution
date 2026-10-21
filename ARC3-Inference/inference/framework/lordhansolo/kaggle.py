@@ -89,6 +89,11 @@ DEFAULT_VLLM_DRAFT_VOCAB = ""
 # the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
 # it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
 DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
+# kaggle.ple_model_source: a Kaggle model ref that supplies the model-ple-* files a partial target
+# lacks (an RFT merge publishes only the non-PLE files; inference/rl/kaggle_layout.py). Empty serves
+# the target as mounted. The setup script mounts it and links the target's files plus the PLE files
+# its index names into one directory.
+DEFAULT_VLLM_PLE_MODEL_SOURCE = ""
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -152,6 +157,7 @@ class DuckKaggleVllmConfig:
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
+    ple_model_source: str = DEFAULT_VLLM_PLE_MODEL_SOURCE
 
 
 def resolve_draft_vocab(path: str) -> str:
@@ -184,7 +190,7 @@ def duck_kaggle_model_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [ref for ref in (cfg.model_source, cfg.draft_model_source) if ref]
+    return [ref for ref in (cfg.model_source, cfg.draft_model_source, cfg.ple_model_source) if ref]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
@@ -199,6 +205,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
     draft_model_source_parts = (
         _split_model_source(cfg.draft_model_source) if cfg.draft_model_source else None
     )
+    ple_model_source_parts = _split_model_source(cfg.ple_model_source) if cfg.ple_model_source else None
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
     prompt_window = int(cfg.max_model_len) - VLLM_OUTPUT_RESERVE_TOKENS
@@ -223,6 +230,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
+        "__PLE_MODEL_SOURCE_PARTS__": repr(ple_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -857,6 +865,8 @@ RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 # A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
+# A checkpoint that supplies the model-ple-* files a partial target lacks, or None for a complete target.
+PLE_MODEL_SOURCE_PARTS = __PLE_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
@@ -1015,7 +1025,10 @@ def describe_kaggle_input_tree(max_depth: int = 5) -> str:
 
 
 RUNTIME_DATASET = resolve_kaggle_dataset_path(RUNTIME_OWNER, RUNTIME_SLUG)
-MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+MOUNTED_MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+# Symlinks to the partial target's files plus the PLE checkpoint's model-ple-* files; copies no weights.
+TARGET_MODEL_DIR = Path('/tmp/vllm-target')
+MODEL_PATH = TARGET_MODEL_DIR if PLE_MODEL_SOURCE_PARTS else MOUNTED_MODEL_PATH
 # Symlinks into the mounted draft checkpoint plus a filtered index; assembling it copies no weights.
 DRAFT_MODEL_DIR = Path('/tmp/vllm-mtp-draft')
 
@@ -1283,6 +1296,37 @@ def assemble_mtp_draft() -> Path | None:
     print(f'MTP draft at {DRAFT_MODEL_DIR}: {mtp_count} mtp.* tensors from {shards} of {source}', flush=True)
 
     return DRAFT_MODEL_DIR
+
+
+def assemble_target_model() -> None:
+    '''Link a partial target and the PLE files it lacks into TARGET_MODEL_DIR.
+
+    An RFT merge changes only BF16 attention and GDN weights, so it is published without the
+    102 GB PLE table (inference/rl/kaggle_layout.py) and its index still names the base model's 22
+    model-ple-* files. The directory links every file of the mounted target, then each shard its
+    index names that the target lacks from the PLE checkpoint. Only model-ple-* shards may come from
+    there: a missing weight shard fails here instead of loading base weights in place of merged ones.
+    '''
+    if PLE_MODEL_SOURCE_PARTS is None:
+        return
+    source = resolve_kaggle_model_path(PLE_MODEL_SOURCE_PARTS)
+    weight_map = json.loads((MOUNTED_MODEL_PATH / 'model.safetensors.index.json').read_text(encoding='utf-8'))['weight_map']
+    shutil.rmtree(TARGET_MODEL_DIR, ignore_errors=True)
+    TARGET_MODEL_DIR.mkdir(parents=True)
+    for entry in MOUNTED_MODEL_PATH.iterdir():
+        if entry.is_file():
+            (TARGET_MODEL_DIR / entry.name).symlink_to(entry)
+    linked = []
+    for shard in sorted(set(weight_map.values())):
+        if (TARGET_MODEL_DIR / shard).exists():
+            continue
+        if not shard.startswith('model-ple-') or not (source / shard).is_file():
+            raise FileNotFoundError(
+                f'{shard} is neither in {MOUNTED_MODEL_PATH} nor a PLE shard of {source}\n' + describe_kaggle_input_tree()
+            )
+        (TARGET_MODEL_DIR / shard).symlink_to(source / shard)
+        linked.append(shard)
+    print(f'Target at {TARGET_MODEL_DIR}: {MOUNTED_MODEL_PATH} plus {len(linked)} PLE shards from {source}', flush=True)
 
 
 def install_image_runtime() -> dict:
@@ -1723,11 +1767,12 @@ def run_vllm_api_smoke_test() -> None:
 print(f'vLLM runtime dataset path: {RUNTIME_DATASET}', flush=True)
 print(f'Qwen model path: {MODEL_PATH}', flush=True)
 assert_expected_cuda_gpu()
-missing = [str(path) for path in (RUNTIME_DATASET, MODEL_PATH) if not path.exists()]
+missing = [str(path) for path in (RUNTIME_DATASET, MOUNTED_MODEL_PATH) if not path.exists()]
 if missing:
     raise FileNotFoundError(
         'Missing attached input path(s): ' + ', '.join(missing) + '\n' + describe_kaggle_input_tree()
     )
+assemble_target_model()
 start_vllm_server()
 print_vllm_backend_summary()
 if os.environ.get('TAAF_RUN_AS_SUBMISSION') == '1':
