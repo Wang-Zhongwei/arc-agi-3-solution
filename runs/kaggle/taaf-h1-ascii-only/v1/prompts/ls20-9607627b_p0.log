@@ -1,0 +1,512 @@
+LATEST MODEL CALL SNAPSHOT
+model: Intel/Qwen3.8-Flash-Next-W4A16-AutoRound
+base_url: http://127.0.0.1:1234/v1
+analysis_step: 11
+action: 41
+request_index_within_turn: 1
+message_count: 5
+tool_choice: auto
+
+[AVAILABLE TOOLS]
+- python: Run a Python snippet against preloaded ASCII game state in a PERSISTENT per-game interpreter: the code string is ephemeral but functions, variables, and `store` you create survive to later calls. Available globals: `current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, `valid_actions`, `last_action_result`, `store`/`remember`/`recall`/`forget` for cross-turn state, `register_predictor`/`predictor_stats`/`mechanics` for a learned, auto-scored world model, and `action(actions)` for executing one or more real environment actions. `current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, and `.level`; `history[-1].frame` is the current post-action frame, not the previous frame. For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. Use `print(...)` for compact output or assign final data to `result`.
+
+[MODEL INPUT]
+[SYSTEM]
+You are a coding agent solving a grid-based puzzle game.
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- Levels often build on earlier mechanics, but layouts and interactions can still change between levels.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object. The nodes are ordered top-most-left-most, and each one has exactly these fields: `id`, `color`, `area`, `bbox`, `boundary`, `children`.
+- `id` is an 8-character signature of the object's color and shape that ignores its position -- equal ids mean the same color and shape wherever it sits, so use it to track an object across frames or to spot multiple identical objects in one frame. Identical-looking objects therefore SHARE one id; an id names a shape, not a particular node.
+- `color` is the ARC color character. `area` is the cell count as an int. `bbox` is `[min_row, min_col, max_row, max_col]`, so height is `bbox[2] - bbox[0] + 1` and width is `bbox[3] - bbox[1] + 1`. `boundary` is the clockwise outer-perimeter corner points as `[row, col]`. `children` are the ids of objects fully enclosed by this one.
+- `segmentation['adjacency_list']` is a list of `[id_a, id_b]` id pairs whose objects share an edge. Because identical objects share an id, resolve a pair back to specific nodes by filtering `segmentation['nodes']` on that id together with `bbox`.
+- Perception helpers read structured facts instead of eyeballing images; each accepts a frame (or grid). `track_objects(before, after)` matches objects by id and returns per-object motion vectors plus appeared/disappeared. `detect_transform(before, after)` classifies the change as translation/rotation/reflection/recolor/growth. `detect_symmetry(frame)` reports mirror/rotational symmetry and row/col periodicity. `detect_events(before, after)` reports moves, collisions (adjacency changes), container enter/leave, and counter (count) changes.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object ids. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `valid_actions` is the current list of valid action names.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- For `MOUSE`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+- A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+Priors and probing:
+- Approach an unfamiliar scene the way an experienced player does: start from priors about what the objects and the actions are likely to do, then probe to confirm or discard them. Priors are the hypotheses you test first, not conclusions.
+- Action priors worth considering early: the arrow actions usually move or steer something, whether a piece, a cursor, or a selection; `SPACE` often rotates, switches, or cycles the active object, or commits an attempt; `MOUSE` often selects or toggles whatever sits under it, or triggers the thing it lands on. Any of these can be wrong in a given game.
+- Objects often advertise their function through shape and color: repeated small tokens tend to be collectibles or slots, an enclosure tends to be a container or a wall, a single distinct shape tends to be either the piece you control or the target, and shared colors tend to mark things that belong together.
+- Work from mechanics outward to the goal. Once most objects and action effects are pinned down, the goal usually shows itself in what the board rewards or changes, and you can probe the goal the same way: form a candidate, test it cheaply, revise.
+- The goal is sometimes legible before the mechanics are. When it is, use it to decide which mechanics are worth probing at all, and stop probing once the ones the current goal needs are settled.
+Memory you carry between turns:
+- Each turn you receive a `<memory>` block holding what you have already established. Treat it as yours: build on it, and correct it the moment the board contradicts it.
+- To put something in it, wrap the line in one of these tags anywhere in your reply. Write normally around them; only the tagged lines are remembered.
+    `<world_model>the blue block is the piece you steer</world_model>` -- what the board is and what the actions do.
+    `<hypothesis status="confirmed">UP moves the blue block up one cell</hypothesis>` -- something you tested and it held.
+    `<hypothesis status="refuted">MOUSE on a wall opens it</hypothesis>` -- something you tested and it failed. Record these: they are what stops you spending actions on a dead idea twice.
+    `<hypothesis status="open">the key must be collected before the door</hypothesis>` -- a candidate you have not settled yet.
+    `<level_note>level 2 needed the key before the door</level_note>` -- what mattered on this level, for when you reach the next one.
+- One claim per tag, one line each, and only what you would want to be told at the start of the next turn. Re-stating a line refreshes it rather than duplicating it.
+- A refuted hypothesis is as valuable as a confirmed one. Record the failure instead of quietly dropping it.
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object ids.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- The interpreter is PERSISTENT across `python` tool calls within a game: functions, variables, and imports you define stay defined on later turns, so build a reusable game model once instead of re-deriving it every turn. Only the frame (`current_frame`, `history`, ...) is refreshed each turn.
+- `store` is a dict that survives between turns; `remember(key, value)` writes it, `recall(key, default=None)` reads it, `forget(key)` drops it. Use it to accumulate your world model: an inferred transition table, a memoized search frontier, tested hypotheses.
+- `register_predictor(fn)` registers a learned `predict(state, action) -> state` where `state` is the numeric board as a tuple-of-tuples and `action` is a name like 'LEFT'. The harness then auto-scores it on every real transition. Read `predictor_stats()` for its running exact-match rate, mean cell accuracy, and the specific cells recent mispredictions got wrong -- then refine `predict` until it matches reality. `action(...)` also returns a `prediction` field telling you whether your model called that transition correctly.
+- `mechanics()` returns a formatted `<state, action> -> outcome` table of the transitions actually observed so far. Use it to see what each action does and to catch where your model diverges from reality.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain a compact working world model: what entities or regions exist, what actions seem to do, what the goal likely is, what remains uncertain, and what plan best fits the evidence so far.
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Your code is auto-formatted with ruff before it runs; if the tool result includes `formatted_code`, that is exactly what ran (reuse it verbatim when you keep the logic). A `lint` field lists pyflakes issues such as undefined names or unused variables -- fix them.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `code` string of each call is ephemeral, but the interpreter state it produces is not: names you define and anything in `store` persist to later calls in this game. Prefer growing one reusable model over re-pasting large frameworks each call.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a default compute budget of ~30 seconds. A search- or planning-heavy call may request more by passing an integer `timeout_seconds` argument alongside `code`; time spent running real actions does not count against it. Reserve the larger budget for turns that actually run a search.
+- Tool responses are capped to about 1024 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+Per-turn protocol:
+- Each user turn carries only what changed: the outcome of the previous action sequence, the current step and level, and the valid actions right now. Everything else you need is already in this system prompt and in the conversation so far.
+- Before executing new actions, restate your working world model as revised by the newest evidence. Carry forward what still holds, and drop or correct anything that recent evidence contradicts.
+- Keep that revision to short assistant text before the tool call. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+- Whatever you want carried into later turns, also emit as a tag (see the memory section). Untagged prose is read now and then forgotten; tagged lines come back to you.
+- Then use `python` to inspect the evidence, refine the world model from the newest history, score candidate actions or short sequences against the goal as you currently understand it, and call `action(...)` with the best action or ordered batch.
+
+[USER]
+The code executed 6 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, LEFT, LEFT, LEFT.
+You are still on the same level.
+Current state: step 41, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT.
+Cost consideration" you nearly wrote '/b' (22%), '-b' (19%)
+
+[ASSISTANT]
+Measuring a per-frame digest across history to see exactly what each move changes (block, Y-budget bar, room pattern, bottom-left panel, plus switch).
+[REASONING]
+Let me carefully re-read the current frame.
+Block: orange at rows 30-31, cols 34-38. Blue trail at rows 32-34, cols 34-38.
+Plus switch: rows 31-33, cols ~19-22: row31 col21='W'? Let me index row 31 in this frame: "BBBBccccccccccGGGGGGGGGGGGGGGcccccOOOOOGGGGGGGGGGGGGGGcccccccccc" → cols 0-3 B, 4-13 c (10), 14-28 G (15), 29-33 c (5), 34-38 O, 39-53 G, 54-63 c. So NO plus in row 31! The plus is gone from row 31?
+Row 32: "BBBBccccccccccGGGGGGwWWGGGGGGcccccbbbbb..." → cols 14-19 G(6), col20='w', col21='W', col22='W', cols 23-28 G(6), 29-33 c, 34-38 b.
+Row 33: "...GGGGGGGwGGGGGGG..." → cols 14-20 G(7), col21='w'.
+Row 31 now has no W. Hmm, previously (before covering) the plus was: (31,21)=W, (32,20)=w,(32,21)=W,(32,22)=W,(33,21)=w. Now: (32,20)=w,(32,21)=W,(32,22)=W,(33,21)=w — the top arm at (31,21) has become G. So the plus changed shape: it lost its top arm! Interesting — the switch changed appearance (a "pressed" state or it rotated and now has a different shape).
+Wait, or maybe the plus rotated 90° and looks similar. A plus with a missing top arm isn't a plus. Let me get exact: read the region rows 29-35, cols 14-28 from segmentation... segmentation nodes are monochrome objects; the W node and w node. Let me query.
+Hmm, also note the block is at rows 30-31, cols 34-38 — NOT covering the plus! I moved DOWN 3 times from rows 15-16 → 20-21, 25-26, 30-31 ✓, then LEFT 3 times: cols 34→29→24→19. But the orange is at cols 34-38?! It says orange [30,34,31,38]. So the LEFT moves did NOT move the block! Hmm, actually earlier history showed RIGHT moved 5 cols. So LEFT should work... but the block is still at cols 34-38. So the three LEFT moves were blocked!
+Why? Because at rows 30-31, moving left from cols 34-38 to 29-33 requires passing cols 29-33 which are 'c' (charcoal = wall? row 30-35 cols 29-33 = 'ccccc'). Yes! In rows 30-44, cols 29-33 are 'ccccc' = a wall corridor. So the block can't go left there; the passage is elsewhere. So LEFT was blocked (probably all three).
+Interesting: the room's blue pattern changed! Now: row 11 "BBBbbbBB" (cols 35-37), row 12 "BBBBbBBG" (col 37 = b), row 13 "BBBbBbB" → cols 35,37. Wait let me recount: row 11: "GBBbbbBBG" cols 33-39 → cols 35,36,37 = b. Row 12: "GBBBBbBBG"? hmm that has 8 chars after G... Let me carefully index row 12: "BBBBccccccccccccccccccccccccccccGBBBBbBBGccccccccccccccccccccccc" → cols 0-3 B, 4-31 c (28 chars → cols 4..31), col32='G', then "GBBBBbBBG"? Hmm, that doesn't parse. Let me count: "BBBB" (4) + "cccc...c" then G at col 32. The string as printed: `BBBBccccccccccccccccccccccccccccGBBBBbBBGccccccccccccccccccccccc`. Count the c's: I'll trust segmentation.
+Segmentation gave blue objects: ([11,35,13,37],5), ([13,35,13,35],1), ([32,34,34,38],15), plus panel blues ([55,3,56,4],4) and ([55,3,60,8],20)?? Hmm, those panel ones are confusing. Wait the panel in this frame is at rows 54-62, cols 1-10: 
+row54: "cBBBBBBBBBB" 
+row55: "cBBbbBBbbBB" → cols 3,4 and 7,8 = b
+row56: "cBBbbBBbbBB" → same
+row57: "cBBBBBBbbBB" → cols 7,8
+row58: "cBBBBBBbbBB" → cols 7,8
+row59: "cBBbbbbbbBB" → cols 3-8
+row60: "cBBbbbbbbBBcBBB..." 
+So the panel pattern: rows 55-60, cols 3-8:
+r55: 110110 (cols3-8: b,b,B,b,b,B) hmm: "BBbbBBbbBB" is cols 1-10: B,B,b,b,B,B,b,b,B,B → cols 3,4 = b; cols 7,8 = b.
+r56: same
+r57: cols 7,8 = b
+r58: cols 7,8 = b
+r59: cols 3-8 = bbbbb? "BBbbbbbbBB" → cols 3,4,5,6,7,8 = b
+r60: same.
+So the panel pattern (6 rows × 6 cols, cols 3-8):
+r55: b b . b b .  → wait cols 3,4 = b,b; cols 5,6 = B,B; cols 7,8 = b,b; col 9,10 = B,B (frame). So the panel interior is cols 3-8 (6 wide): row55 = [b,b,B,B,b,b]
+row56 = [b,b,B,B,b,b]
+row57 = [B,B,B,B,b,b]
+row58 = [B,B,B,B,b,b]
+row59 = [b,b,b,b,b,b]
+row60 = [b,b,b,b,b,b]
+And rows 53-54 are the panel top frame ("cBBBBBBBBBB").
+Hmm, the room interior (rows 9-15, cols 33-39, 7 wide × 7 tall) with blue at:
+row 11: cols 35,36,37
+row 12: col 37
+row 13: cols 35, 37
+That's 5+1 = 6 cells? The segmentation says node [11,35,13,37] area 5, plus node [13,35,13,35] area 1 → so 5 cells connected in bbox 11-13/35-37 and one separate at (13,35). Cells: (11,35),(11,36),(11,37),(12,37),(13,37) = 5 ✓, and (13,35) = 1 separate ✓ (not 4-connected to (11,37)? (13,35) is isolated since (12,35) and (13,36) are not blue).
+Total 6 blue cells in the room.
+Compare with the panel: the panel has 2+2+2+2+6+6 = 20 blue cells (matches node area 20 at [55,3,60,8]).
+Earlier I thought the panel had a different pattern; the panel appears to have CHANGED? Let me compare to earlier. In the previous frame (before covering the plus), the panel was... I don't have exact data. But this is state "C" presumably (third state).
+Hmm, so I can't compare without the earlier panel pattern. Let me check history frames for the panel's blue pattern to see if it changed after my 6 moves. Since the block didn't move (LEFT blocked), maybe nothing happened and the plus is unchanged (just my ASCII misreading).
+Also: does the panel pattern relate to the room pattern? Panel 6x6, room 7x7 interior. Hmm.
+Hmm wait. New thought: maybe the bottom-left panel is a "keyhole preview" showing what the room's blue pattern should look like — or the panel shows the room in a zoomed-out way with the target. Actually: the room's pattern is 6 cells; the panel's is 20 cells.
+New hypothesis about the whole thing: maybe the room at top is a "target pattern" and the big G-region at rows 25-49 is a big canvas, and the block is a "stamp" that paints blue trail. The panel bottom-left might be a "legend"/preview of the goal. The Y bar bottom-right = 8 cells now (was 20 at rows 61-62 cols 51-54: "YYYY"). So Y went 20 → 8?? In this frame Y = [61,51,62,54] area 8 → 2 rows × 4 cols = 8 cells. Earlier: 20 cells (2 rows × 10 cols = cols 47-56). Now cols 51-54. So it shrank by 12 cells over 7+6=13 moves? Hmm, 20 → 8 = 12 cells over 13 moves. Hmm, close to 1 per move but not exact. Earlier at step 35, remaining "10"? I don't have precise history of Y. Let me measure Y in the last 6 history frames to determine the decrement rate. If Y decrements 1 per successful move... I made 13 moves (some blocked). Blocked ones don't count.
+Hmm, Y bar shrinks from the left? It went from cols 47-56 to 51-54 — hmm, the right edge stayed at 54-56, left edge 47→51: so 4 columns removed = 8 cells removed. Hmm, so 8 cells removed out of 20 in 13 moves.
+Let me be careful: the "BRRBRRBRR" at cols 57-62 is a separate decorative striped thing.
+I need a cleaner read. Let me pull the Y-node bbox+area for the last ~10 history frames, along with the orange bbox, the room's blue pattern, and the panel's blue pattern, to see exactly what changed and how the budget works. Let me write a compact per-frame digest function and store it.
+Also important: I should test whether the room's blue pattern ever changes and whether the panel is a "preview of the room". Actually, KEY INSIGHT ATTEMPT: what if the bottom-left panel is a *mirror* of the room (a mini display of the room's state) and the room's pattern IS the panel's pattern? No, they differ.
+Alternatively, the panel at bottom-left is a "goal" display showing the target shape to paint in the room, and the plus switch rotates/cycles the target. Since the block is 2x5=10 cells... hmm, the panel's pattern has 20 cells in a 6x6 box. The room has 6 blue cells.
+Honestly, the level might be: paint the room's floor so the room's blue pattern matches the panel. The room is 7x7 with 6 blue cells pre-placed; the panel shows a 6x6 pattern of 20 blue. Hmm, doesn't line up.
+Given the difficulty, maybe I should focus on what's achievable: figure out the goal by testing. But the budget: Y is at 8 and shrinking. Once it hits 0, likely the level restarts (and I get a fresh board and can plan optimally). Let me use the remaining budget to learn one thing at a time.
+Actually, hold on. Let me reconsider the room's blue pattern more carefully — could it be an arrow/hand shape that mirrors the panel? Let me compare shapes:
+Panel (6x6, cols 3-8, rows 55-60), 1 = blue:
+r55: 1 1 0 0 1 1
+r56: 1 1 0 0 1 1
+r57: 0 0 0 0 1 1
+r58: 0 0 0 0 1 1
+r59: 1 1 1 1 1 1
+r60: 1 1 1 1 1 1
+Room (7x7, rows 9-15, cols 33-39), blue at (11,35),(11,36),(11,37),(12,37),(13,37),(13,35).
+In local coords (r=row-9, c=col-33): (2,2),(2,3),(2,4),(3,4),(4,4),(4,2).
+Row2: c2,c3,c4 = 111... local row 2: 0 1 1 1 0 0 0
+Row3: 0 0 0 0 1 0 0
+Row4: 0 1 0 0 1 0 0
+Hmm, that's 6 cells. The panel's pattern in 2x blocks (each panel pixel = 2x2 room cells?):
+Panel row55-56 → room rows... The panel cells are 2x2 blocks (e.g., cols 3-4 = one logical col, rows 55-56 = one logical row). So the panel logical grid is 3 rows × 3 cols: rows (55-56),(57-58),(59-60) × cols (3-4),(5-6),(7-8):
+r0: 1 0 1
+r1: 0 0 1
+r2: 1 1 1
+That's a 3x3 pattern: 
+X . X
+. . X
+X X X
+And the room's pattern in a 3x3 grid with 2-cell... hmm, room blue cells at (2,2),(2,3),(2,4),(3,4),(4,4),(4,2) in local 7x7 — if the room logical grid is 3x3 with cell size 2 plus a border... The room interior is 7x7 = 3x3 logical cells of size 2 with separators? Or the room's logical 3x3 occupies rows 9-15 in groups: (9,10),(11,12),(13,14)? and col groups (33,34),(35,36),(37,38)? Then blue cells map: (11,35)→(r1,c1), (11,36)→(r1,c1), (11,37)→(r1,c2), (12,37)→(r1,c2), (13,37)→(r2,c2), (13,35)→(r2,c1). Hmm gives r1: c1,c2; r2: c1,c2. Not matching the panel's 3x3 (which is X.X/. .X/XXX).
+Let me try: panel logical 3x3 = [[1,0,1],[0,0,1],[1,1,1]]. Room 3x3 derived = [[0,0,0],[0,1,1],[0,1,1]]. Not equal. Under rotation? Panel rotated 90° CW: rows become cols reversed: 
+Panel:
+1 0 1
+0 0 1
+1 1 1
+rot90CW: 
+1 0 1
+1 0 0
+1 1 1
+rot180:
+1 1 1
+1 0 0
+1 0 1
+rot270:
+1 1 1
+0 0 1
+1 0 1
+Room pattern as 3x3 (with cell size 2, ignoring border row15/col39): [[0,0,0],[0,1,1],[0,1,1]] - it has a 2x2 block; none of the panel rotations have a 2x2 block... hmm, the panel's bottom-right: r1c2=1, r2c1=1, r2c2=1 → and r2c0=1. The panel has an L-tromino + ...
+I'm overanalyzing a possibly-unrelated HUD panel. Let me do the disciplined thing: measure what changed across my last 6 moves using track_objects/detect_events, and the Y-bar history, then decide.
+Priority question: is the bottom-left panel actually a *panel* (goal display) or a static decoration? And did covering the plus do anything?
+Let me check history: for the last 8 frames, record (step, action, orange bbox, Y area, room-blue pattern signature, panel-blue pattern signature, W/w node signatures).
+[ASSISTANT TOOL CALL: python]
+id: chatcmpl-tool-b9a7e6c6d7b351ac
+<tool_call>
+<function=python>
+<parameter=code>
+def sig(f):
+    seg=f.segmentation['nodes']
+    d={}
+    for n in seg:
+        if n['color']=='O': d['O']=tuple(n['bbox'])
+        if n['color']=='Y': d['Y']=tuple(n['bbox'])+(n['area'],)
+    # room pattern rows 9-15 cols 33-39
+    room=[]; panel=[]; plus=[]
+    for n in seg:
+        r0,c0,r1,c1=n['bbox']
+        if n['color']=='b' and r0<20 and r0>5:
+            room.append(tuple(n['bbox']))
+        if n['color']=='b' and r0>50:
+            panel.append(tuple(n['bbox'])+(n['area'],))
+        if n['color'] in 'Ww' and 25<r0<40:
+            plus.append((n['color'],tuple(n['bbox']),n['area']))
+    return d.get('O'),d.get('Y'),sorted(room),sorted(panel),sorted(plus)
+for h in history[-9:]:
+    o,y,ro,pa,pl=sig(h.frame)
+    print(h.frame.step,str(h.action)[:6],'O',o,'Y',y)
+    print('   room',ro); print('   panel',pa,'plus',pl)
+</parameter>
+</function>
+</tool_call>
+
+[TOOL RESULT: chatcmpl-tool-b9a7e6c6d7b351ac]
+32 UP O (20, 34, 21, 38) Y (61, 44, 62, 54, 22)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+33 UP O (15, 34, 16, 38) Y (61, 45, 62, 54, 20)
+   room [(11, 35, 13, 37), (13, 35, 13, 35), (17, 34, 19, 38)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+34 UP O (15, 34, 16, 38) Y (61, 45, 62, 54, 20)
+   room [(11, 35, 13, 37), (13, 35, 13, 35), (17, 34, 19, 38)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+35 DOWN O (20, 34, 21, 38) Y (61, 46, 62, 54, 18)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+36 DOWN O (25, 34, 26, 38) Y (61, 47, 62, 54, 16)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+37 DOWN O (30, 34, 31, 38) Y (61, 48, 62, 54, 14)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+38 LEFT O (30, 34, 31, 38) Y (61, 49, 62, 54, 12)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+39 LEFT O (30, 34, 31, 38) Y (61, 50, 62, 54, 10)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+40 LEFT O (30, 34, 31, 38) Y (61, 51, 62, 54, 8)
+   room [(11, 35, 13, 37), (13, 35, 13, 35)]
+   panel [(55, 3, 56, 4, 4), (55, 3, 60, 8, 20)] plus [('W', (31, 21, 32, 22), 3), ('w', (32, 20, 32, 20), 1), ('w', (33, 21, 33, 21), 1)]
+
+[USER]
+The code executed 6 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, LEFT, LEFT, LEFT.
+You are still on the same level.
+Current state: step 41, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT.
+Where you were least certain last turn:
+- after "...pattern IS the panel's pattern ?" you nearly wrote 'scaled' (15%), 'in' (15%)
+- after "...,1,1]]. Room " you nearly wrote 'blue' (18%), 'logical' (18%)
+- after "...pattern to see if it changed after" you nearly wrote 'when' (18%), 'at' (16%)
+Current board as ASCII (one letter per cell):
+```
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGGGGGGGGGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBBBBBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBBBBBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBbbbBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBBBbBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBbBbBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBBBBBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGBBBBBBBGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccGGGGGGGGGccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccccccccccccccccccccccGGGGGccccccccccccccccccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccOOOOOGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGWGGGGGGGcccccOOOOOGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGwWWGGGGGGcccccbbbbbGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGwGGGGGGGcccccbbbbbGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccbbbbbGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBccccccccccGGGGGGGGGGGGGGGcccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGccccccccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGccccccccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGccccccccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGccccccccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGccccccccccGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGcccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+BBBBcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBBBBBBBBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBBBBBBBBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBbbBBbbBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBbbBBbbBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBBBBBbbBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBBBBBbbBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBbbbbbbBBccccccccccccccccccccccccccccccccccccccccccccccccccccc
+cBBbbbbbbBBcBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+cBBBBBBBBBBcBGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGYYYYBRRBRRBRR
+cBBBBBBBBBBcBGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGYYYYBRRBRRBRR
+ccccccccccccBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+```
+
+[TURN TRANSCRIPT SO FAR]
+--- analysis_step=11 | action=41 | 18:58:48 | tool-agent ---
+[SYSTEM PROMPT]
+You are a coding agent solving a grid-based puzzle game.
+
+Game overview:
+- You are solving a multi-level grid puzzle game. 
+- You are called repeatedly over the course of a run. Treat each turn as one observe-plan-act cycle: re-understand the current state from the newest frame, update your working world model in Python, choose the next best action or short sequence against the goal as currently understood, execute it, and expect to re-evaluate on the next turn from the updated state.
+- Your job is to solve the entire game by clearing every level, not just the current screen.
+- Levels often build on earlier mechanics, but layouts and interactions can still change between levels.
+- Optimize for as few in-game actions as possible while still being reliable.
+- In this environment, boards are presented as 64 x 64 color grids rendered with ARC color symbols.
+- Color legend: W=white, w=light gray, g=gray, G=dark gray, c=charcoal, B=black, M=magenta, P=pink, R=red, b=blue, S=sky blue, Y=yellow, O=orange, r=dark red, N=light green, p=purple.
+
+
+Runtime variables inside every `python` tool call:
+- `current_frame` is a lightweight frame view for the latest environment state.
+- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.
+- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.
+- Each node in `segmentation['nodes']` is one 4-connected same-color object. The nodes are ordered top-most-left-most, and each one has exactly these fields: `id`, `color`, `area`, `bbox`, `boundary`, `children`.
+- `id` is an 8-character signature of the object's color and shape that ignores its position -- equal ids mean the same color and shape wherever it sits, so use it to track an object across frames or to spot multiple identical objects in one frame. Identical-looking objects therefore SHARE one id; an id names a shape, not a particular node.
+- `color` is the ARC color character. `area` is the cell count as an int. `bbox` is `[min_row, min_col, max_row, max_col]`, so height is `bbox[2] - bbox[0] + 1` and width is `bbox[3] - bbox[1] + 1`. `boundary` is the clockwise outer-perimeter corner points as `[row, col]`. `children` are the ids of objects fully enclosed by this one.
+- `segmentation['adjacency_list']` is a list of `[id_a, id_b]` id pairs whose objects share an edge. Because identical objects share an id, resolve a pair back to specific nodes by filtering `segmentation['nodes']` on that id together with `bbox`.
+- Perception helpers read structured facts instead of eyeballing images; each accepts a frame (or grid). `track_objects(before, after)` matches objects by id and returns per-object motion vectors plus appeared/disappeared. `detect_transform(before, after)` classifies the change as translation/rotation/reflection/recolor/growth. `detect_symmetry(frame)` reports mirror/rotational symmetry and row/col periodicity. `detect_events(before, after)` reports moves, collisions (adjacency changes), container enter/leave, and counter (count) changes.
+- `current_frame.step` is the current environment step count.
+- `current_frame.level` is the current level number.
+- `current_frame.shape` is a `(rows, cols)` tuple.
+- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object ids. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.
+- `history` is a chronological list of action/frame snapshots.
+- `history` is a Python list of objects, not a dict.
+- Each history entry exposes only `.action` and `.frame`; entries are not subscriptable like `entry['action']`.
+- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.
+- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.
+- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.
+- `last_action` is the most recent real environment action name/display, or `None` before any real action.
+- `last_action_frame` is the post-action frame for `last_action`; it matches `current_frame` after a real action.
+- `transitions` is a chronological list of actual action transitions, excluding the initial seeded frame. Each transition exposes `.action`, `.before_frame`, `.after_frame`, `.frame` (alias of `.after_frame`), and `.result`.
+- `last_transition` is `transitions[-1]` or `None`. Its `.result` mirrors `last_action_result`; older transitions may have an empty `.result`. For before/after diffs, compare `last_transition.before_frame` to `last_transition.after_frame`; do not compare `current_frame` to `history[-1].frame`.
+- `last_action_result` is the persisted result dict from the most recent `action(...)` call. It remains available across later Python inspection calls that do not call `action(...)`, and is `{}` before any action result exists. Read transition metadata from fields/keys such as `last_action_result['board_changed']`, `last_action_result['done']`, `last_action_result['level_completed']`, `last_action_result['game_over']`, `last_action_result['run_complete']`, `last_action_result['reward']`, and `last_action_result['valid_actions']`.
+- `valid_actions` is the current list of valid action names.
+- Call `action(actions)` to execute one or more real environment actions from Python.
+- Pass `action(actions)` a list like `['LEFT']` or `[{'action': 'MOUSE', 'row': 4, 'col': 7}]`.
+- One action usually returns one frame, but a single action can result in a short multi-frame animation.
+- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.
+
+
+Visual-game guidance:
+- Treat each board as a scene with objects, blockers, targets, adjacency, containment, motion, and symmetry.
+- Game entities are usually be rendered as connected multi-tile shapes such as 2×2, 2×3, 3×3, or longer patterned structures. Sometime they might also be 1x1 tokens.- Some games are logic or layout puzzles with no explicit player avatar or controllable sprite on the board. Do not assume a player exists; the relevant state may be an object, region, cursor, selector, or whole-board configuration.
+- Background colors are often white or gray/black-ish large regions, but not always. Verify background hypotheses by area, stability, and object boundaries rather than assuming them.
+- In many games, a long horizontal or vertical line near an edge is a timer or remaining-steps bar. It often shrinks or changes each step. If you identify such a bar, do not get distracted by it or treat it as core gameplay state unless there is concrete evidence that it interacts with the puzzle mechanics.
+- Use coordinates only to target actions or describe local evidence. Do not frame the objective as reaching a specific absolute row or column.
+- Re-ground on the newest frame after any score increase or abrupt scene change; the returned board may already be the next level.
+- `WIN` means the whole game is solved. Mid-run level completion is more likely to appear as a score increase while play continues.
+- Strategies may transfer loosely across levels, but layouts and mechanics can change. Re-check the new board before repeating a plan.
+- For `MOUSE`, pass `row` and `col` integer arguments. `row` is vertical position, `col` is horizontal position.
+- A common failure mode is to mistake a segmented edge bar for clickable puzzle pieces. If a repeated strip of small blocks sits flush against the top, bottom, left, or right border and actions only change that strip while the interior board stays the same, classify it as HUD/timer state, not as an object to click through segment by segment. DON'T DO THIS!
+
+
+Priors and probing:
+- Approach an unfamiliar scene the way an experienced player does: start from priors about what the objects and the actions are likely to do, then probe to confirm or discard them. Priors are the hypotheses you test first, not conclusions.
+- Action priors worth considering early: the arrow actions usually move or steer something, whether a piece, a cursor, or a selection; `SPACE` often rotates, switches, or cycles the active object, or commits an attempt; `MOUSE` often selects or toggles whatever sits under it, or triggers the thing it lands on. Any of these can be wrong in a given game.
+- Objects often advertise their function through shape and color: repeated small tokens tend to be collectibles or slots, an enclosure tends to be a container or a wall, a single distinct shape tends to be either the piece you control or the target, and shared colors tend to mark things that belong together.
+- Work from mechanics outward to the goal. Once most objects and action effects are pinned down, the goal usually shows itself in what the board rewards or changes, and you can probe the goal the same way: form a candidate, test it cheaply, revise.
+- The goal is sometimes legible before the mechanics are. When it is, use it to decide which mechanics are worth probing at all, and stop probing once the ones the current goal needs are settled.
+
+
+Memory you carry between turns:
+- Each turn you receive a `<memory>` block holding what you have already established. Treat it as yours: build on it, and correct it the moment the board contradicts it.
+- To put something in it, wrap the line in one of these tags anywhere in your reply. Write normally around them; only the tagged lines are remembered.
+    `<world_model>the blue block is the piece you steer</world_model>` -- what the board is and what the actions do.
+    `<hypothesis status="confirmed">UP moves the blue block up one cell</hypothesis>` -- something you tested and it held.
+    `<hypothesis status="refuted">MOUSE on a wall opens it</hypothesis>` -- something you tested and it failed. Record these: they are what stops you spending actions on a dead idea twice.
+    `<hypothesis status="open">the key must be collected before the door</hypothesis>` -- a candidate you have not settled yet.
+    `<level_note>level 2 needed the key before the door</level_note>` -- what mattered on this level, for when you reach the next one.
+- One claim per tag, one line each, and only what you would want to be told at the start of the next turn. Re-stating a line refreshes it rather than duplicating it.
+- A refuted hypothesis is as valuable as a confirmed one. Record the failure instead of quietly dropping it.
+
+
+Python tool guidance:
+- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, containment, adjacency, and cross-frame object ids.
+- Use `current_frame.ascii` only to read a small, specific region of the board when `segmentation` is not enough; never use it to scan or summarize the whole board.
+- The interpreter is PERSISTENT across `python` tool calls within a game: functions, variables, and imports you define stay defined on later turns, so build a reusable game model once instead of re-deriving it every turn. Only the frame (`current_frame`, `history`, ...) is refreshed each turn.
+- `store` is a dict that survives between turns; `remember(key, value)` writes it, `recall(key, default=None)` reads it, `forget(key)` drops it. Use it to accumulate your world model: an inferred transition table, a memoized search frontier, tested hypotheses.
+- `register_predictor(fn)` registers a learned `predict(state, action) -> state` where `state` is the numeric board as a tuple-of-tuples and `action` is a name like 'LEFT'. The harness then auto-scores it on every real transition. Read `predictor_stats()` for its running exact-match rate, mean cell accuracy, and the specific cells recent mispredictions got wrong -- then refine `predict` until it matches reality. `action(...)` also returns a `prediction` field telling you whether your model called that transition correctly.
+- `mechanics()` returns a formatted `<state, action> -> outcome` table of the transitions actually observed so far. Use it to see what each action does and to catch where your model diverges from reality.
+- The only importable standard-library modules are: bisect, collections, copy, fractions, functools, heapq, itertools, json, math, operator, random, re, statistics, string.
+- The only tool is `python`; call it with one ephemeral `code` string.
+- Always inspect `current_frame`, `history`, and `valid_actions` from Python instead of reasoning from the raw board by eye.
+- For the most recent change, compare `previous_frame` to `current_frame`, or `last_transition.before_frame` to `last_transition.after_frame`. `history[-1].frame` is the current frame, so comparing it to `current_frame` only compares the board to itself.
+- Maintain a compact working world model: what entities or regions exist, what actions seem to do, what the goal likely is, what remains uncertain, and what plan best fits the evidence so far.
+- IMPORTANT: Especially when the game is about making an agent navigate to a target, it is usually safer to write an explicit search algorithm such as BFS. More generally, when the objective is understood but the best action order is unclear, pathfinding, flood fill, BFS, DFS, beam search, shortest-path search, limited action-sequence search, or custom heuristics are all valid.
+- Optimize for the shortest reliable sequence that advances the current goal as described by your world model. If confidence is low, program a discriminating probe and revise the world model from the result.
+- Once the important state variables and action effects are sufficiently understood, stop probing and search in the inferred state space.
+- Inspect current and history frames from Python instead of describing frames freehand.
+- Never print or echo full board frames. Return only compact derived summaries such as object lists, diffs, coordinates, counts, or tiny local crops.
+- Keep tool-output context size minimal and decision-oriented so you can quickly compare before/after state. It's fine to write a lot of python code, just make the output short and interpretable
+- A strong default loop is: summarize the board, infer the desired environment change, write a small scorer or search over candidate sequences, execute the best probe or plan with `action(...)`, then inspect again until you understand exactly what changed.
+- For object tracking, match objects by color, overlap, bounding box proximity, area change, and edge contact rather than by exact coordinates alone.
+- For frame diffs, summarize changed cells, color transitions, appearing/disappearing components, movement candidates, and small local row slices around the changed region.
+- After every action, verify whether gameplay objects changed or whether only a timer, progress bar, or remaining-step bar moved. Do not treat HUD-only changes as evidence that the move worked.
+- Your code is auto-formatted with ruff before it runs; if the tool result includes `formatted_code`, that is exactly what ran (reuse it verbatim when you keep the logic). A `lint` field lists pyflakes issues such as undefined names or unused variables -- fix them.
+- Use `print(...)` for compact summaries, or assign a final compact object to `result`.
+- Call `action(...)` inside Python rather than returning action text in the chat.
+- `action(...)` accepts an ordered list of one or more actions. Once your code has selected a reliable sequence, it is often useful to batch it.
+- You can also call `action(...)` multiple times in one Python snippet, including inside loops. Each call updates the preloaded variables before execution continues.
+- If an action result reports `game_over`, `run_complete`, `level_completed`, or `done`, stop acting immediately and re-ground on the next turn.
+
+
+Tool session rules:
+- You have exactly one tool: `python`.
+- When calling `python`, emit exactly the tool-call format shown elsewhere in this prompt for this model. Use only that format; do not add markdown fences, prose wrappers, or alternate tool-call syntax. Do not quote or place tool-call markup inside explanatory text; when you decide to call the tool, emit the tool call itself.
+- The `code` string of each call is ephemeral, but the interpreter state it produces is not: names you define and anything in `store` persist to later calls in this game. Prefer growing one reusable model over re-pasting large frameworks each call.
+- You can call the `python` tool as many times as you want per step. Investigate until your code has a clear probe or plan.
+- Do not ration tool calls when the state is unclear. Spend extra tool calls to confirm what changed between frames and whether the last action affected gameplay state or only HUD elements such as countdown bars.
+- After `action(...)` returns, the structured runtime state is refreshed before the next Python statement and before the next tool call. Inspection-only Python calls do not clear `last_action_result`.
+- Each `python` tool call has a default compute budget of ~30 seconds. A search- or planning-heavy call may request more by passing an integer `timeout_seconds` argument alongside `code`; time spent running real actions does not count against it. Reserve the larger budget for turns that actually run a search.
+- Tool responses are capped to about 1024 tokens. If a response is cut off, the tool result will tell you that.
+- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.
+
+
+Per-turn protocol:
+- Each user turn carries only what changed: the outcome of the previous action sequence, the current step and level, and the valid actions right now. Everything else you need is already in this system prompt and in the conversation so far.
+- Before executing new actions, restate your working world model as revised by the newest evidence. Carry forward what still holds, and drop or correct anything that recent evidence contradicts.
+- Keep that revision to short assistant text before the tool call. Helpful optional prefixes are `World model:`, `Goal model:`, `Action model:`, `Recent findings:`, `Open questions:`, `Plan:`, and `Cross-level notes:`.
+- Whatever you want carried into later turns, also emit as a tag (see the memory section). Untagged prose is read now and then forgotten; tagged lines come back to you.
+- Then use `python` to inspect the evidence, refine the world model from the newest history, score candidate actions or short sequences against the goal as you currently understand it, and call `action(...)` with the best action or ordered batch.
+
+[USER PROMPT]
+The code executed 6 actions in the previous sequence.
+Executed actions: DOWN, DOWN, DOWN, LEFT, LEFT, LEFT.
+You are still on the same level.
+Current state: step 41, level 1.
+Valid actions right now: UP, DOWN, LEFT, RIGHT.
+
+Where you were least certain last turn:
+- after "...pattern IS the panel's pattern ?" you nearly wrote 'scaled' (15%), 'in' (15%)
+- after "...,1,1]]. Room " you nearly wrote 'blue' (18%), 'logical' (18%)
+- after "...pattern to see if it changed after" you nearly wrote 'when' (18%), 'at' (16%)
+
+[ANALYZER STATUS]
+request_error: HTTPConnectionPool(host='127.0.0.1', port=1234): Read timed out. (read timeout=123.84484015199996)
