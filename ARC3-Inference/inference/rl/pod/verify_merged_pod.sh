@@ -1,8 +1,9 @@
 #!/bin/bash
 # Check a merged model as published: on the training pod (venv, data/, train/ and results/train_flags.txt on its
-# volume), replace the unmerged base with the merged checkpoint downloaded from Hugging Face, run train_rft's
-# validation pass on it (a fresh, zero LoRA on top; training's flags and val samples) and compare with the
-# adapter's last val loss. Writes PASS or FAIL, then FULL_DONE, and stops the pod. Nothing waits for a person.
+# volume), download the merged non-PLE files from Hugging Face over the base checkpoint there (HF layout: its own
+# PLE shard and index stay, so no PLE download), run train_rft's validation pass on it (a fresh, zero LoRA on top;
+# training's flags and val samples) and compare with the adapter's last val loss. The base folder ends up merged;
+# Hugging Face has the base again if it is needed. Writes PASS or FAIL, then FULL_DONE, and stops the pod. Nothing waits for a person.
 #   HF token in /workspace/.hf_token (mode 600), then
 #   ssh ... 'cd /workspace/rft; nohup bash inference/rl/pod/verify_merged_pod.sh > /dev/null 2>&1 < /dev/null &' < /dev/null
 #   WORKDIR=/workspace/rft RUNLOG=verify_merged/verify.log PULL=verify_merged bash inference/rl/pod/watch_pod.sh POD HOST PORT DEST
@@ -11,8 +12,7 @@ set -uo pipefail
 WORK=${WORK:-/workspace/rft}
 VENV=${VENV:-/workspace/venv}
 HF_REPO=${HF_REPO:-helldriver007/qwen3.8-flash-next-w4a16-rft-v1}
-MERGED=${MERGED:-/workspace/merged}
-BASE_DIR=${BASE_DIR:-/workspace/w4a16}  # deleted first: the volume holds one checkpoint (Hugging Face has the base)
+MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}  # the base in HF layout (model-00016-of-00017.safetensors = PLE)
 EXPECT_VAL=${EXPECT_VAL:-}  # default: the adapter's last val loss in train/train_log.jsonl
 VAL_TOL=${VAL_TOL:-0.003}
 MAX_MINUTES=${MAX_MINUTES:-90}
@@ -48,16 +48,18 @@ if [ -z "$EXPECT_VAL" ]; then
 fi
 log "verify hf.co/$HF_REPO: expect val $EXPECT_VAL +- $VAL_TOL; $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 if [ ! -e "$OUT/download.done" ]; then
-    [ "$BASE_DIR" != "$MERGED" ] && rm -rf "$BASE_DIR"
+    [ -s "$MODEL_DIR/model-00016-of-00017.safetensors" ] || abort "$MODEL_DIR has no HF PLE shard (the check keeps the base's PLE)"
     start=$(date +%s)
-    hf download "$HF_REPO" --local-dir "$MERGED" --exclude "rft/*" > "$OUT/download.log" 2>&1 \
+    # the merged files only: not the Kaggle index/manifest (they name model-ple-*), not PLE files (an older full upload)
+    hf download "$HF_REPO" --local-dir "$MODEL_DIR" --exclude "rft/*" --exclude "model-ple-*" \
+        --exclude "model.safetensors.index.json" --exclude "ple_reshard_manifest.json" > "$OUT/download.log" 2>&1 \
         || abort "download: $(tail -1 "$OUT/download.log")"
-    [ -s "$MERGED/MERGED_LORA.json" ] || abort "$MERGED has no MERGED_LORA.json: not a merged checkpoint"
-    log "downloaded $(du -sh "$MERGED" | cut -f1) in $(( $(date +%s) - start )) s"
+    [ -s "$MODEL_DIR/MERGED_LORA.json" ] || abort "no MERGED_LORA.json from hf.co/$HF_REPO: not a merged checkpoint"
+    log "merged files downloaded over the base in $(( $(date +%s) - start )) s"
     date -u > "$OUT/download.done"
 fi
 rm -rf "$OUT/run"
-python -m inference.rl.train_rft --model "$MERGED" --data data --out "$OUT/run" --epochs 0 \
+python -m inference.rl.train_rft --model "$MODEL_DIR" --data data --out "$OUT/run" --epochs 0 \
     $(cat results/train_flags.txt 2>/dev/null) > "$OUT/train_rft.log" 2>&1 || abort "train_rft: $(tail -1 "$OUT/train_rft.log")"
 got=$(python -c "import json; print([r for r in map(json.loads, open('$OUT/run/train_log.jsonl')) if r['event'] == 'val'][-1]['loss'])") \
     || abort "no val row"

@@ -1,4 +1,4 @@
-"""inference/rl/kaggle_layout.py: the HF PLE shard is swapped for the base's checked PLE files and index."""
+"""inference/rl/kaggle_layout.py: a partial checkpoint (base index, no PLE) by default; --with-ple swaps in the base's checked PLE files."""
 
 import json
 import shutil
@@ -43,13 +43,13 @@ def setup(tmp_path):
 
 def test_install_swaps_the_ple_shard(tmp_path):
     ckpt, remote, fetch, calls = setup(tmp_path)
-    assert kaggle_layout.install(ckpt, fetch=fetch) == dict(ple_files=2, fetched=2)
+    assert kaggle_layout.install(ckpt, fetch=fetch, ple=True) == dict(ple_files=2, fetched=2, partial=False)
     assert not (ckpt / "model-00002-of-00002.safetensors").exists()
     assert json.loads((ckpt / "model.safetensors.index.json").read_text()) == json.loads((remote / kaggle_layout.INDEX).read_text())
     got = {**load_file(ckpt / "model-ple-00001-of-00002.safetensors"), **load_file(ckpt / "model-ple-00002-of-00002.safetensors")}
     assert sorted(got) == PLE and float(got[PLE[2]][0]) == 2.0
     calls.clear()
-    assert kaggle_layout.install(ckpt, fetch=fetch)["fetched"] == 0  # a rerun keeps what is in place
+    assert kaggle_layout.install(ckpt, fetch=fetch, ple=True)["fetched"] == 0  # a rerun keeps what is in place
     assert calls == [kaggle_layout.MANIFEST, kaggle_layout.INDEX]
 
 
@@ -59,10 +59,24 @@ def test_install_refuses_a_bad_download_or_another_layout(tmp_path):
     index["weight_map"]["a.weight"] = "elsewhere.safetensors"
     (ckpt / "model.safetensors.index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match="a.weight"):
-        kaggle_layout.install(ckpt, fetch=fetch)
+        kaggle_layout.install(ckpt, fetch=fetch, ple=True)
     assert (ckpt / "model-00002-of-00002.safetensors").exists()  # nothing deleted before the check
     index["weight_map"]["a.weight"] = "model-00001-of-00002.safetensors"
     (ckpt / "model.safetensors.index.json").write_text(json.dumps(index))
     save_file({PLE[2]: torch.zeros(8)}, remote / "model-ple-00002-of-00002.safetensors")  # corrupt remote file
     with pytest.raises(ValueError, match="sha256"):
+        kaggle_layout.install(ckpt, fetch=fetch, ple=True)
+
+
+def test_partial_by_default_fetches_no_ple(tmp_path):
+    """No PLE download, no PLE in the upload folder: the HF PLE shard moves to ple_aside/, the base's index goes in."""
+    ckpt, remote, fetch, calls = setup(tmp_path)
+    assert kaggle_layout.install(ckpt, fetch=fetch) == dict(ple_files=2, fetched=0, partial=True)
+    assert calls == [kaggle_layout.MANIFEST, kaggle_layout.INDEX]
+    assert sorted(p.name for p in ckpt.glob("*.safetensors")) == ["model-00001-of-00002.safetensors"]
+    assert (tmp_path / "ple_aside" / "model-00002-of-00002.safetensors").exists()
+    assert json.loads((ckpt / "model.safetensors.index.json").read_text()) == json.loads((remote / kaggle_layout.INDEX).read_text())
+    assert kaggle_layout.install(ckpt, fetch=fetch)["partial"]  # a rerun (base index already in place) passes
+    (ckpt / "model-00001-of-00002.safetensors").unlink()
+    with pytest.raises(ValueError, match="non-PLE"):
         kaggle_layout.install(ckpt, fetch=fetch)
