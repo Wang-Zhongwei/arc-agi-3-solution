@@ -32,6 +32,12 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - Expert LoRA is out. Merging needs the full BF16 experts in memory plus a rerun of the 4-bit quantization (NVFP4 / W4A16). Serving it unmerged slows vLLM inference.
   - Caveat: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) finds attention-only LoRA significantly worse than MLP (incl. MoE) LoRA, in SFT and in RL on MATH, while attention on top of MLP adds nothing. We accept this for deployability. From the same post: LoRA LR ≈ 10× full fine-tuning LR, rank 1 suffices for policy-gradient RL, and LoRA prefers small batches. - **Harness, context and tools identical in training and evaluation.** RL learns behaviour conditioned on what the model sees: system prompt, tool names and schemas, action interface, observation rendering (frames, frame diff, level-up board) and context management (truncation, compressed trace). Any mismatch is a distribution shift, and the LoRA gain may not transfer. Freeze this model-facing interface before RL; a later prompt or observation change means retraining. Only invisible parts may differ: scheduling (streams, priority, allocation, turn yield), training-only branching, and serving precision (BF16 rollout vs NVFP4 on Kaggle).
 
+- **GRPO on levels 1–2 first, with a token budget per episode: min(1,000 × human actions of L1 + L2, 100K) generated tokens (decided 2026-10-21).**
+  - An episode starts at the game's reset and succeeds if it clears L2 within the budget. Generated tokens are thinking, replies and tool code; the prompt context is managed by the harness as in evaluation.
+  - On our 44 runs (25 public games), 63% of attempts clear L1 + L2 within this budget (82% with no limit). 15 games have mixed outcomes (20–80%) and 5 always succeed; bp35 (0%) and sk48 (5%) give almost no signal. Analysis: [grpo-l1-l2-token-budget.md](grpo-l1-l2-token-budget.md).
+  - The model spends a median of 575 tokens per human action on cleared L1 + L2, so 1,000 × h sits above most clears. The 100K cap binds on games with more than 100 human actions (dc22, ls20, ka59, m0r0, s5i5, lf52, tn36, wa30, g50t, sk48, tr87).
+  - Open: games without human action counts (some training sets) need another source for h; the reward (human-relative level score within the budget); whether the model sees its budget.
+
 ## Data
 
 The 25 public games are validation only; train on other games so the score measures generalisation to the 110 hidden games. Local copies sit next to this repo in `../`.

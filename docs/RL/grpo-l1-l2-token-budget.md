@@ -1,5 +1,7 @@
 # Token budget for GRPO on levels 1–2 (2026-10-21)
 
+**Decision (2026-10-21): min(1,000 × human actions of L1 + L2, 100K) generated tokens per episode**, the "tighter, capped" row below. Recorded in [decisions.md](decisions.md).
+
 A GRPO rollout must clear levels 1 and 2 within a budget of generated tokens (thinking, replies and tool code). With h = the human action count of L1 + L2, three rules are compared:
 
 | Rule | Budget | Attempts within budget | Games at 20–80% | Games at ≥ 95% | Games at ≤ 5% |
