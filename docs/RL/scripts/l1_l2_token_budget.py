@@ -183,16 +183,16 @@ def main():
     strip(ax, order, {g: [(a["tokens"], a["cleared"]) for a in data[g]] for g in games}, ticks, xmax, title)
     ax.set_title(title, loc="left", fontsize=11, color=INK, pad=44)
     labels = [f"min({CAP // 1000}K,\n{PER_HUMAN_ACTION:,}·h)", f"min({CAP // 1000}K,\n{ALTERNATIVE:,}·h)",
-              f"{PER_HUMAN_ACTION:,}·h,\nuncapped", "earlier rule\n(generated)"]
+              f"{PER_HUMAN_ACTION:,}·h,\nuncapped"]  # context rules only; the earlier rule is in the tables
     for col, (name, label) in enumerate(zip(rules, labels)):
         x = xmax * (1.07 + 0.125 * col)
         ax.text(x, len(order) - 0.3, label, fontsize=7.5, color=MUTED, va="bottom", ha="center")
         for row, game in enumerate(order):
             ax.text(x, len(order) - 1 - row, f"{within[name][game]:.0%}", fontsize=9,
                     color=INK if col == 0 else MUTED, va="center", ha="center")
-    ax.text(xmax * 1.257, len(order) + 1.0, "within budget", fontsize=8, color=MUTED, ha="center")
+    ax.text(xmax * 1.195, len(order) + 1.0, "within budget", fontsize=8, color=MUTED, ha="center")
     legend(fig)
-    fig.tight_layout(rect=(0, 0, 0.75, 0.96))
+    fig.tight_layout(rect=(0, 0, 0.8, 0.96))
     fig.savefig(os.path.join(IMAGES, "l1_l2_tokens_per_game.png"), dpi=150, facecolor=SURFACE)
     plt.close(fig)
 

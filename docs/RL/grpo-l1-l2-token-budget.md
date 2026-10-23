@@ -57,7 +57,7 @@ The ratio of context to generated tokens is higher for short episodes, where the
 How to read it:
 - Each attempt is a dot (cleared) or a cross (not cleared). Games are sorted by median context.
 - The black tick is 1,750 · h; the shorter gray tick is 1,500 · h. A tick past 300K is drawn as a triangle at the edge with its value. The dashed line is the 130K cap.
-- The columns at the right give each game's share of attempts within budget under the four rules; the last one is the earlier generated-token rule.
+- The columns at the right give each game's share of attempts within budget under the three context rules. The earlier generated-token rule is in the table below.
 
 | Game | Human actions L1 + L2 | Budget | Within min(130K, 1,750·h) | Within min(130K, 1,500·h) | Within 1,750·h, uncapped | Within earlier: min(100K, 1,000·h) generated | Cleared at all | Median context (cleared) | p90 context (cleared) | Context per human action (median) | Context / generated (median) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
