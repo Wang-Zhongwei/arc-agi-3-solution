@@ -6272,9 +6272,12 @@ class ToolAgent:
             compact["stop_reason"] = payload.get("stop_reason")
         if payload.get("stop_detail"):
             compact["stop_detail"] = payload.get("stop_detail")
-        for timing_key in ("run_elapsed_seconds", "time_remaining_seconds"):
-            if timing_key in payload:
-                compact[timing_key] = payload.get(timing_key)
+        # run_elapsed_seconds and time_remaining_seconds stay out of `compact`,
+        # which is what the model reads. The game is turn-based, but the
+        # elapsed clock counts the gate wait and the remainder counts down the
+        # 532-min private cap even in a 130-min public run, so models read the
+        # edge bar as a real-time timer ("30906s remaining, so action count is
+        # less critical"). The harness still reads both below.
         # the session's own clock, which is also what decides when the game
         # stops - so the endgame phase cannot drift away from the deadline it
         # is meant to anticipate. It starts at session construction, so a game
