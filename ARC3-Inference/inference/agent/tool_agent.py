@@ -3616,6 +3616,54 @@ def _extract_reasoning_text(message: dict[str, Any]) -> str:
     return _normalize_message_content(reasoning)
 
 
+def _normalize_history_enabled() -> bool:
+    """Whether history stores each reply's normalised text (the default).
+
+    Normalising drops every blank line and literal `<think>` tag, so the next
+    request renders a reply that differs from the tokens the model generated:
+    a paragraph break `\\n\\n` comes back as `\\n`, a different token with the
+    same count. A prefix cache can then never resume inside the previous reply.
+    Off, history keeps the reply as the server returned it, trimmed at both
+    ends as the chat template trims it anyway. The transcript, the knowledge
+    parser and every decision still read the normalised text."""
+    return _get_env_bool("ARC3_NORMALIZE_HISTORY", True)
+
+
+def _verbatim_message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
+def _history_reply_texts(
+    message: dict[str, Any], reasoning: str, content: str, tool_call_markup_in_text: bool
+) -> tuple[str, str]:
+    """The reasoning and content history stores for a reply.
+
+    `reasoning` and `content` are the normalised texts the turn loop works
+    with. With ARC3_NORMALIZE_HISTORY on they are stored as they are; off, the
+    raw texts are stored instead, with tool-call markup removed just as it is
+    from the normalised copies."""
+    if _normalize_history_enabled():
+        return reasoning, content
+    raw_reasoning = message.get("reasoning")
+    if raw_reasoning in (None, ""):
+        raw_reasoning = message.get("reasoning_content", "")
+    history_reasoning = _verbatim_message_text(raw_reasoning)
+    history_content = _verbatim_message_text(message.get("content", ""))
+    if tool_call_markup_in_text:
+        history_reasoning = _strip_tool_call_markup(history_reasoning)
+        history_content = _strip_tool_call_markup(history_content)
+    return history_reasoning, history_content
+
+
 def _is_context_length_error(exc: BaseException) -> bool:
     message = str(exc).lower().replace("\u2019", "'")
     return (
@@ -7575,6 +7623,11 @@ class ToolAgent:
                     recovered_tool_calls_from_markup = bool(tool_calls)
                 reasoning = _strip_tool_call_markup(raw_reasoning) if tool_call_markup_in_text else raw_reasoning
                 content = _strip_tool_call_markup(raw_content) if tool_call_markup_in_text else raw_content
+                # only the copy stored in history differs; the transcript and
+                # every check below keep reading the normalised text
+                history_reasoning, history_content = _history_reply_texts(
+                    result.message, reasoning, content, tool_call_markup_in_text
+                )
                 malformed_argument_errors: list[str] = []
                 for tool_call in tool_calls:
                     function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
@@ -7631,13 +7684,13 @@ class ToolAgent:
                     captured_reasoning = reasoning
                     append_transcript("THINKING", reasoning)
                     for _reasoning_key in _reasoning_history_keys():
-                        assistant_message[_reasoning_key] = reasoning
+                        assistant_message[_reasoning_key] = history_reasoning
 
                 if not tool_calls:
                     if content:
                         self._update_summarized_knowledge_from_assistant(content)
                         append_transcript("ASSISTANT", content)
-                        assistant_message["content"] = content
+                        assistant_message["content"] = history_content
                     elif reasoning:
                         assistant_message["content"] = None
 
@@ -7773,7 +7826,7 @@ class ToolAgent:
                 if content:
                     self._update_summarized_knowledge_from_assistant(content)
                     append_transcript("ASSISTANT", content)
-                    assistant_message["content"] = content
+                    assistant_message["content"] = history_content
                 assistant_message["tool_calls"] = tool_calls
                 turn_tool_call_count += len(tool_calls)
                 self._append_context_message(messages, assistant_message)
