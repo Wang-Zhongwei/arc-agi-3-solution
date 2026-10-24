@@ -135,7 +135,7 @@ Animation correctness fixes preserve fatal-action information through automatic 
 | Setting | Default | Behavior |
 |---|---|---|
 | `ARC3_BATCH_NOOP_BLOCK` | Off | Stops the remaining actions of a batch after an executed action fails to change the interior gameplay area. |
-| `ARC3_STALE_STATE_BLOCK` | Off | Blocks a later `action(...)` call within the same snippet when a preceding action was ineffective, preventing continued execution from an unchecked assumption. |
+| `ARC3_STALE_STATE_BLOCK` | Off | Blocks a later `action(...)` call within the same snippet when a preceding action was ineffective, preventing continued execution from an unchecked assumption. The refusal (`StaleStateActionError`) derives from `BaseException`, so `except Exception:` cannot catch it: the snippet stops at the first refused action and the model is told once. |
 | `ARC3_NOOP_REPEAT_GUARD` | Off | Recognizes previously ineffective state/action pairs and refuses a repeat. A deliberate immediate reissue can override the refusal. |
 | `ARC3_DEATH_REPEAT_GUARD` | Off | Recognizes recorded fatal state/action continuations and refuses a repeat, with a deliberate reissue override. |
 | `ARC3_DEATH_GUARD_LOOKAHEAD` | Off | Extends fatal-continuation checking to a proposed batch before earlier actions in that batch are spent. Used with the death guard. |
