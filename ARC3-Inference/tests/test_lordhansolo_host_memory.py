@@ -35,7 +35,7 @@ def test_process_memory_is_summed_per_role(tmp_path):
     sandbox_dir = tmp_path / "rgb_python_tool_abc"
     sandbox_dir.mkdir()
     _process(proc_root, 10, ["VLLM::EngineCore"], tmp_path, 2_000_000)
-    _process(proc_root, 11, ["/usr/bin/python3", "-m", "ipykernel_launcher", "-f", "k.json"], tmp_path, 3_000_000)
+    _process(proc_root, 11, ["/usr/bin/python3", "-m", "colab_kernel_launcher", "-f", "k.json"], tmp_path, 3_000_000)
     _process(proc_root, 12, ["/usr/bin/python3", "-I", "-S", "-c", "import sys\nrun()"], sandbox_dir, 50_000)
     _process(proc_root, 13, ["/usr/bin/python3", "-I", "-S", "-c", "import sys"], sandbox_dir, 70_000)
     _process(proc_root, 14, ["python3", "/kaggle/working/vllm-watchdog.py", "c.json", "--prefetch", "0", "r"], tmp_path, 1_000)
@@ -69,7 +69,7 @@ def test_shm_reader_tolerates_a_missing_mount(tmp_path):
     assert readers["read_shm_used_bytes"](str(tmp_path)) >= 0
 
 
-def test_report_projects_the_harness_growth_per_game(tmp_path):
+def test_report_projects_growth_onto_the_rerun_play_time(tmp_path):
     from inference.tools.host_memory_report import load_samples, report
 
     gib = 1024**3
@@ -85,7 +85,6 @@ def test_report_projects_the_harness_growth_per_game(tmp_path):
             "dev_shm_used_bytes": 0,
         })
     (tmp_path / "metrics" / "host_memory.jsonl").write_text("\n".join(json.dumps(s) for s in samples))
-    text = report(load_samples(tmp_path), [30, 60], from_minute=60, games=25, project_games=100)
+    text = report(load_samples(tmp_path), [30, 60], from_minute=60, project_minutes=540)
     assert "harness" in text and "vllm_enginecore" in text
-    assert re.search(r"^  harness +\+1\.00$", text, re.M)
-    assert "+41 MiB per game over 1.00 h; 100 games → +4.0 GiB" in text
+    assert re.search(r"^  harness +\+1\.00 +\+1\.00 +\+9\.00$", text, re.M)

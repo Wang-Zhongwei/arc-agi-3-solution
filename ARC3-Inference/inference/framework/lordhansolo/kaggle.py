@@ -460,8 +460,9 @@ def read_cgroup_memory_stat(cgroup_root: Path = Path('/sys/fs/cgroup')) -> dict[
 def classify_process(cmdline: list[str], cwd: str) -> str:
     '''Name the role of a process: a vLLM process by its title, the harness by its notebook kernel.
 
-    vLLM retitles its processes VLLM::APIServer, VLLM::EngineCore and VLLM::Worker. Every game runs
-    as a thread of the notebook kernel, so the harness is one process. A python tool call runs in a
+    vLLM retitles its worker processes VLLM::EngineCore and VLLM::Worker; the API server keeps its
+    `vllm ... serve` command line. Every game runs as a thread of the notebook kernel
+    (colab_kernel_launcher on Kaggle), so the harness is one process. A python tool call runs in a
     fresh interpreter whose working directory is an rgb_python_tool_* temporary directory.
     '''
     joined = ' '.join(cmdline)
@@ -473,7 +474,7 @@ def classify_process(cmdline: list[str], cwd: str) -> str:
         return 'prefetch' if '--prefetch' in cmdline else 'watchdog'
     if 'vllm' in joined:
         return 'vllm_other'
-    if 'ipykernel' in joined:
+    if 'ipykernel' in joined or 'kernel_launcher' in joined:
         return 'harness'
 
     return 'other'

@@ -2,11 +2,12 @@
 
 Each sample records MemAvailable, the cgroup's memory.stat split and resident memory per process
 role (``read_memory_breakdown`` in the Lord launcher's watchdog). The report lists them at fixed
-minutes and the growth of each role from ``--from-minute`` to the end. With ``--games``, the
-harness growth is divided per game and projected onto ``--project-games``: every game is a thread
-of the one notebook-kernel process, so its growth is what scales with the competition's game count.
+minutes and the growth of each role from ``--from-minute`` to the end, then projects each role's
+growth rate onto ``--project-minutes`` of play. Every game is a thread of the one notebook-kernel
+process, and the agent takes as many steps as the server's throughput allows, however many games
+are queued, so the harness grows with play time rather than with the game count.
 
-    python -m inference.tools.host_memory_report runs/kaggle/<user>/<slug>/vNN --games 25
+    python -m inference.tools.host_memory_report runs/kaggle/<user>/<slug>/vNN
 """
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ def row(sample: dict, groups: list[str]) -> dict[str, float | None]:
     return values
 
 
-def report(samples: list[dict], minutes: list[float], from_minute: float, games: int | None, project_games: int) -> str:
+def report(samples: list[dict], minutes: list[float], from_minute: float, project_minutes: float) -> str:
     groups = sorted({group for sample in samples for group in sample.get("process_groups") or {}})
     if not groups:
         return "No per-process breakdown in these samples (the run predates read_memory_breakdown)."
@@ -61,16 +62,12 @@ def report(samples: list[dict], minutes: list[float], from_minute: float, games:
         return "\n".join(lines)
     hours = (samples[-1]["ts"] - base["ts"]) / 3600
     start, end = row(base, groups), row(samples[-1], groups)
-    lines.append(f"\nGrowth from {from_minute:g} min to the end ({hours:.2f} h), GiB:")
+    lines.append(f"\nGrowth from {from_minute:g} min to the end ({hours:.2f} h), GiB: total, per hour, over {project_minutes:g} min")
     for name in names:
         if start[name] is not None and end[name] is not None:
-            lines.append(f"  {name:20s} {end[name] - start[name]:+7.2f}")
-    if games and "harness" in groups:
-        per_game = (end["harness"] - start["harness"]) / games
-        lines.append(
-            f"\nharness: {per_game * 1024:+.0f} MiB per game over {hours:.2f} h; "
-            f"{project_games} games → {per_game * project_games:+.1f} GiB over the same time"
-        )
+            growth = end[name] - start[name]
+            rate = growth / hours if hours else 0.0
+            lines.append(f"  {name:20s} {growth:+7.2f} {rate:+7.2f} {rate * project_minutes / 60:+8.2f}")
     return "\n".join(lines)
 
 
@@ -82,10 +79,9 @@ def main() -> None:
         "--from-minute", type=float, default=40,
         help="start of the growth window; keep it past the server start, which took 9-35 min",
     )
-    parser.add_argument("--games", type=int, help="games the run played, to give the harness growth per game")
-    parser.add_argument("--project-games", type=int, default=110, help="game count to project the harness growth onto")
+    parser.add_argument("--project-minutes", type=float, default=532, help="play time to project growth onto (competition rerun)")
     args = parser.parse_args()
-    print(report(load_samples(args.run_dir), args.minutes, args.from_minute, args.games, args.project_games))
+    print(report(load_samples(args.run_dir), args.minutes, args.from_minute, args.project_minutes))
 
 
 if __name__ == "__main__":
