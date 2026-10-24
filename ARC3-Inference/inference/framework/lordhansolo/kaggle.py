@@ -444,14 +444,122 @@ def read_host_memory() -> dict[str, int | None]:
     }
 
 
+# memory.stat fields kept with each sample: cgroup v2 names, then the v1 hierarchy totals.
+CGROUP_MEMORY_STAT_FIELDS = (
+    'anon', 'file', 'shmem', 'file_mapped', 'unevictable', 'kernel', 'sock',
+    'total_rss', 'total_cache', 'total_shmem', 'total_mapped_file', 'total_unevictable',
+)
+# The largest processes by anonymous memory listed in each sample, next to the per-group sums.
+HOST_MEMORY_TOP_PROCESSES = 8
+
+
+def read_cgroup_memory_stat(cgroup_root: Path = Path('/sys/fs/cgroup')) -> dict[str, int]:
+    '''Split the cgroup's usage into process memory, page cache and shared memory.'''
+    for stat_path in (cgroup_root / 'memory.stat', cgroup_root / 'memory' / 'memory.stat'):
+        try:
+            lines = stat_path.read_text(encoding='ascii').splitlines()
+        except OSError:
+            continue
+        fields = (line.split(' ', 1) for line in lines)
+        return {key: int(value) for key, value in fields if key in CGROUP_MEMORY_STAT_FIELDS and value.isdigit()}
+
+    return {}
+
+
+def classify_process(cmdline: list[str], cwd: str) -> str:
+    '''Name the role of a process: a vLLM process by its title, the harness by its notebook kernel.
+
+    vLLM retitles its processes VLLM::APIServer, VLLM::EngineCore and VLLM::Worker. Every game runs
+    as a thread of the notebook kernel, so the harness is one process. A python tool call runs in a
+    fresh interpreter whose working directory is an rgb_python_tool_* temporary directory.
+    '''
+    joined = ' '.join(cmdline)
+    if cmdline and cmdline[0].startswith('VLLM::'):
+        return 'vllm_' + cmdline[0][len('VLLM::'):].split()[0].lower()
+    if Path(cwd).name.startswith('rgb_python_tool_'):
+        return 'sandbox'
+    if 'vllm-watchdog.py' in joined:
+        return 'prefetch' if '--prefetch' in cmdline else 'watchdog'
+    if 'vllm' in joined:
+        return 'vllm_other'
+    if 'ipykernel' in joined:
+        return 'harness'
+
+    return 'other'
+
+
+def read_process_memory(proc_root: Path = Path('/proc')) -> tuple[dict[str, dict[str, int]], list[dict]]:
+    '''Sum resident memory per process role and list the largest processes.
+
+    RssAnon is the process's own memory. RssFile and RssShmem count pages that other processes
+    may map too, so their group sums can exceed what the cgroup holds. Kernel threads have no Rss
+    lines and are skipped, as is a process that exits while it is read.
+    '''
+    groups: dict[str, dict[str, int]] = {}
+    processes = []
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            rss = {}
+            for line in (proc / 'status').read_text(encoding='utf-8', errors='replace').splitlines():
+                key, _, value = line.partition(':')
+                if key in ('RssAnon', 'RssFile', 'RssShmem'):
+                    rss[key] = int(value.split()[0]) * 1024
+            cmdline = [part for part in (proc / 'cmdline').read_bytes().decode('utf-8', 'replace').split('\0') if part]
+        except (OSError, ValueError, IndexError):
+            continue
+        if not rss:
+            continue
+        try:
+            cwd = os.readlink(proc / 'cwd')
+        except OSError:
+            cwd = ''
+        group = classify_process(cmdline, cwd)
+        totals = groups.setdefault(group, {'count': 0, 'anon_bytes': 0, 'file_bytes': 0, 'shmem_bytes': 0})
+        totals['count'] += 1
+        totals['anon_bytes'] += rss.get('RssAnon', 0)
+        totals['file_bytes'] += rss.get('RssFile', 0)
+        totals['shmem_bytes'] += rss.get('RssShmem', 0)
+        processes.append({
+            'pid': int(proc.name), 'group': group, 'anon_bytes': rss.get('RssAnon', 0),
+            'cmd': ' '.join(cmdline).replace('\n', ' ')[:80],
+        })
+    processes.sort(key=lambda process: process['anon_bytes'], reverse=True)
+
+    return groups, processes[:HOST_MEMORY_TOP_PROCESSES]
+
+
+def read_shm_used_bytes(path: str = '/dev/shm') -> int | None:
+    '''Bytes in /dev/shm, a tmpfs whose files count as shared memory and are never reclaimed.'''
+    try:
+        stats = os.statvfs(path)
+    except OSError:
+        return None
+
+    return (stats.f_blocks - stats.f_bfree) * stats.f_frsize
+
+
+def read_memory_breakdown() -> dict:
+    '''What holds the RAM: the cgroup's memory.stat, per-role process memory and /dev/shm.'''
+    groups, top_processes = read_process_memory()
+
+    return {
+        'cgroup_memory_stat': read_cgroup_memory_stat(),
+        'process_groups': groups,
+        'top_processes': top_processes,
+        'dev_shm_used_bytes': read_shm_used_bytes(),
+    }
+
+
 def log_host_memory() -> None:
-    '''Sample host RAM throughout server startup, inference, and restarts.'''
+    '''Sample host RAM and what holds it throughout server startup, inference, and restarts.'''
     output_path = Path(config['host_memory_log'])
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open('w', encoding='utf-8') as output:
             while True:
-                record = {'ts': round(time.time(), 3), **read_host_memory()}
+                record = {'ts': round(time.time(), 3), **read_host_memory(), **read_memory_breakdown()}
                 output.write(json.dumps(record) + '\n')
                 output.flush()
                 time.sleep(HOST_MEMORY_SAMPLE_INTERVAL_SECONDS)
