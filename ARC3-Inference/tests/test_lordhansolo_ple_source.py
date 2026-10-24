@@ -73,7 +73,7 @@ def test_render_mounts_the_ple_model_and_serves_the_assembled_dir(monkeypatch):
     config = lord.DuckKaggleVllmConfig(model_source=TARGET_REF, ple_model_source=BASE_REF)
     script = lord.duck_kaggle_setup_command(config)
     assert f"PLE_MODEL_SOURCE_PARTS = {tuple(BASE_REF.split('/'))!r}" in script
-    assert "MODEL_PATH = TARGET_MODEL_DIR if PLE_MODEL_SOURCE_PARTS else MOUNTED_MODEL_PATH" in script
+    assert "elif PLE_MODEL_SOURCE_PARTS:\n    MODEL_PATH = TARGET_MODEL_DIR" in script
     assert script.index("assemble_target_model()\nstart_vllm_server()") > 0
     assert lord.duck_kaggle_model_sources(config) == [TARGET_REF, BASE_REF]
     without = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(model_source=BASE_REF))

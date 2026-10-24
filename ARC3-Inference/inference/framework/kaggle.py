@@ -173,7 +173,13 @@ def pennyroyal_dataset_sources() -> list[str]:
 
 def pennyroyal_model_sources() -> list[str]:
     cfg = kaggle_serving_config()
-    return [ref for ref in (cfg["model_source"], cfg.get("draft_model_source"), cfg.get("ple_model_source")) if ref]
+    sources = (
+        cfg["model_source"],
+        cfg.get("draft_model_source"),
+        cfg.get("ple_fp8_model_source"),
+        cfg.get("ple_model_source"),
+    )
+    return [ref for ref in sources if ref]
 
 
 def pennyroyal_setup_command() -> str:
@@ -207,6 +213,7 @@ def lordhansolo_setup_command() -> str:
         runtime_dataset_source=cfg["wheelhouse_dataset_source"],
         model_source=cfg["model_source"],
         draft_model_source=cfg.get("draft_model_source", ""),
+        ple_fp8_model_source=cfg.get("ple_fp8_model_source", ""),
         ple_model_source=cfg.get("ple_model_source", ""),
         served_model_name=cfg.get("served_model_name", "flashnext"),
         vllm_port=int(cfg.get("port", 8001)),
