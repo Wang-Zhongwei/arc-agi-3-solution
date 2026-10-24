@@ -457,9 +457,7 @@ def _stale_detail(action: Any, stale_after: str) -> str:
         +
         "and paths computed since then may be wrong, which is why execution "
         "has been halted here. Re-read current_frame and last_action_call_result, "
-        "work out why nothing moved, then act on what you find. "
-        "(StaleStateActionError can be caught if a snippet has good reason to "
-        "keep acting through no-ops.)"
+        "work out why nothing moved, then act on what you find."
     )
 
 
