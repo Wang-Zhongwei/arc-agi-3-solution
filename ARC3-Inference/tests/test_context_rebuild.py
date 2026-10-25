@@ -7,7 +7,7 @@ was rolled back; a trim inside a turn starts at the first request over budget.
 
 import json
 
-from inference.rft.context_rebuild import rebuild
+from inference.rft.context_rebuild import estimate_tokens, image_tokens, rebuild, run_tokens_per_image, tokens_per_image
 
 
 def meta(*calls):
@@ -90,3 +90,31 @@ def test_vc_sampling_replacement_swaps_the_reply():
     history = game.requests[1].messages
     assert [m.get("reasoning") for m in history if m["role"] == "assistant"] == ["chosen"]
     assert json.loads(history[2]["tool_calls"][0]["function"]["arguments"]) == {"code": "x=9"}
+
+
+def test_image_tokens_follow_the_board_upscale():
+    assert tokens_per_image(10) == 402  # 20 x 20 merged 32-pixel patches + 2 sentinels
+    assert tokens_per_image(12) == 578  # 24 x 24 + 2
+    assert image_tokens(641, 640) == 21 * 20 + 2  # a partial patch counts, as in the harness
+
+
+def test_run_tokens_per_image_reads_the_runs_upscale(tmp_path):
+    (tmp_path / "taaf_setup_env.json").write_text(json.dumps({"MULTIMODAL_UPSCALE": "12"}))
+    assert run_tokens_per_image(tmp_path) == 578
+    assert run_tokens_per_image(tmp_path / "no-env") == 402
+    message = {"role": "user", "content": [{"type": "text", "text": "frame"}, {"type": "image_url", "image_url": {"url": None}}]}
+    assert estimate_tokens([message], 578) - estimate_tokens([message]) == 578 - 402
+
+
+def test_trim_placement_prices_images_at_the_runs_upscale():
+    def game(budget, per_image):
+        return rebuild(step(1, "a", [("t1", "x=1", "ok")], kept=3, budget=10 ** 6)
+                       + step(2, "b" + "\n[image attached]" * 8, [("t2", "x=2", "ok"), ("t3", "x=3", "ok")],
+                              kept=5, budget=budget),
+                       tokens_per_image=per_image)
+    first = game(10 ** 6, 402).requests[1]
+    low, high = (estimate_tokens(first.messages, per_image) for per_image in (402, 578))
+    budget = int((low + high) / 2)
+    assert len(game(budget, 402).requests[1].messages) == 1 + 3 + 1  # under the budget at 402 per image
+    assert roles(game(budget, 578).requests[1]) == ["system", "user"]  # over it at 578: trimmed to this turn
+

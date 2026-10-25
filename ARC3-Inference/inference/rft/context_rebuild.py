@@ -15,7 +15,9 @@ Known approximations, measured by validate_rebuild.py against request logs:
   rolled back, so a trim that happens to land on that count is missed;
 - harness-inserted messages that the transcript omits (the trimmed-history
   note of some versions) are not rebuilt;
-- images are placeholders (`url` None), to be rendered from the event boards.
+- images are placeholders (`url` None), to be rendered from the event boards;
+  the token estimate prices each one as a 64x64 board at the run's
+  MULTIMODAL_UPSCALE (run_tokens_per_image), as the harness counts images.
 """
 
 from __future__ import annotations
@@ -34,9 +36,14 @@ SECTION = re.compile(
 )
 IMAGE = "[image attached]"
 TOOL_CALL_MARKUP = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
-# Prompt tokens per text char, per image, and fixed overhead, fitted on the
-# request-logged runs in docs/reasoning/data/level_up_context/reconstruction_validation.json.
-TOKENS_PER_CHAR, TOKENS_PER_IMAGE, TOKENS_FIXED = 0.333, 402.0, 520.0
+# Prompt tokens per text char and fixed overhead, fitted on the request-logged runs in
+# docs/reasoning/data/level_up_context/reconstruction_validation.json (all drawn at MULTIMODAL_UPSCALE 10).
+TOKENS_PER_CHAR, TOKENS_FIXED = 0.333, 520.0
+# Vision tokens of one image, counted as the harness counts them (tool_agent._image_part_tokens): one per
+# 32x32-pixel merged patch (16-pixel patches, 2x2 merge) plus 2 sentinels. Images are 64x64 boards drawn at
+# the run's MULTIMODAL_UPSCALE: 402 tokens at upscale 10, 578 at 12. A flat 402 undercounted upscale-12 runs
+# by up to 17% of the context (vLLM prompt counts of 1,445 replayed requests, 2026-10-25).
+VISION_PATCH_PIXELS, VISION_SENTINEL_TOKENS, ARC_FRAME_CELLS, DEFAULT_UPSCALE = 32, 2, 64, 10
 # Above this share of the budget the estimate cannot tell whether the harness's
 # own estimate (JSON chars / calibrated chars per token) trimmed before a request.
 UNCERTAIN_SHARE = 0.85
@@ -138,15 +145,39 @@ def message_chars(message: dict[str, Any]) -> tuple[int, int]:
     return chars, images
 
 
-def estimate_tokens(messages: list[dict[str, Any]]) -> float:
+def image_tokens(width: int, height: int) -> int:
+    return -(-width // VISION_PATCH_PIXELS) * -(-height // VISION_PATCH_PIXELS) + VISION_SENTINEL_TOKENS
+
+
+def tokens_per_image(upscale: int) -> int:
+    side = ARC_FRAME_CELLS * upscale
+    return image_tokens(side, side)
+
+
+TOKENS_PER_IMAGE = tokens_per_image(DEFAULT_UPSCALE)
+
+
+def run_tokens_per_image(run_dir: Path) -> int:
+    """Vision tokens per image of a run, from MULTIMODAL_UPSCALE in its taaf_setup_env.json (default 10)."""
+    env_path = Path(run_dir) / "taaf_setup_env.json"
+    upscale = DEFAULT_UPSCALE
+    if env_path.is_file():
+        raw = str(json.loads(env_path.read_text(encoding="utf-8")).get("MULTIMODAL_UPSCALE") or "").strip()
+        if raw:
+            upscale = max(1, int(raw))
+    return tokens_per_image(upscale)
+
+
+def estimate_tokens(messages: list[dict[str, Any]], tokens_per_image: float = TOKENS_PER_IMAGE) -> float:
+    """Prompt tokens of these messages; pass the run's run_tokens_per_image (the default is upscale 10)."""
     chars = images = 0
     for message in messages:
         c, i = message_chars(message)
         chars, images = chars + c, images + i
-    return TOKENS_PER_CHAR * chars + TOKENS_PER_IMAGE * images + TOKENS_FIXED
+    return TOKENS_PER_CHAR * chars + tokens_per_image * images + TOKENS_FIXED
 
 
-def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
+def rebuild(transcript: str, *, trim_threshold: float = 1.0, tokens_per_image: float = TOKENS_PER_IMAGE) -> Game:
     """Every request of one game, with its rebuilt messages.
 
     A turn that ends with fewer history messages than it started with plus
@@ -236,7 +267,7 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
             trimmed = candidate[len(candidate) - kept:]
             # a trim inside the turn: from the first request whose untrimmed
             # input would exceed the budget, requests ran on the trimmed history
-            estimates = [estimate_tokens(r.messages) for r in step_requests]
+            estimates = [estimate_tokens(r.messages, tokens_per_image) for r in step_requests]
             over = [bool(budget) and e > trim_threshold * budget for e in estimates]
             first = over.index(True) if True in over else len(step_requests)
             for request, estimate in zip(step_requests[:first], estimates):
@@ -254,4 +285,5 @@ def rebuild(transcript: str, *, trim_threshold: float = 1.0) -> Game:
 
 
 def rebuild_file(path: Path) -> Game:
-    return rebuild(path.read_text(encoding="utf-8"))
+    """Rebuild <run>/transcripts/<game>.txt, pricing images at that run's upscale."""
+    return rebuild(path.read_text(encoding="utf-8"), tokens_per_image=run_tokens_per_image(path.parent.parent))
