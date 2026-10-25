@@ -486,11 +486,15 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             pass
 
         # Raised when a PREVIOUS action in this snippet changed nothing, and the
-        # snippet then tries to act again. Deliberately a plain Exception, not
-        # BaseException: unlike the two refusals above this is a warning about
-        # the snippet's beliefs rather than a verdict on the action, and a model
-        # that has re-read current_frame may legitimately want to proceed.
-        class StaleStateActionError(Exception):
+        # snippet then tries to act again. BaseException like the refusals above:
+        # the latch clears only when an executed action changes the board, and a
+        # refused action executes nothing, so once it fires every later action()
+        # in the snippet is refused too. As a catchable Exception, probe loops
+        # wrapped in `except Exception:` logged one refusal per remaining probe,
+        # and the model read untested probes as inert. Stopping the snippet at
+        # the first refusal reports it once; RESET and UNDO cover any real need
+        # to keep acting from this board.
+        class StaleStateActionError(BaseException):
             pass
 
         runtime_globals["KnownNoOpActionError"] = KnownNoOpActionError
@@ -784,9 +788,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             RepeatedActionInStateError,
             KnownDeathActionError,
             TerminalStateActionError,
+            StaleStateActionError,
             Exception,
         ) as exc:
-            # The three refusals derive from BaseException so a model's own
+            # The refusals derive from BaseException so a model's own
             # `except Exception:` cannot swallow them - but THIS handler is the
             # same construct, so without naming them explicitly they escaped it
             # too, killed the child process, and the host reported a bare

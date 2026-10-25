@@ -89,6 +89,12 @@ DEFAULT_VLLM_DRAFT_VOCAB = ""
 # the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
 # it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
 DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
+# kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
+# weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
+# carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
+# about 48 instead of 95.4 GiB of the 175 GiB limit. Empty serves the target's own table. The
+# setup script mounts it and links the target's files and the source's PLE files into one directory.
+DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE = ""
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 
 # The 25 official ARC-AGI-3 games. The first 16 are the original Kaggle duck
@@ -152,6 +158,7 @@ class DuckKaggleVllmConfig:
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
+    ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
 
 
 def resolve_draft_vocab(path: str) -> str:
@@ -184,7 +191,7 @@ def duck_kaggle_model_sources(
     config: DuckKaggleVllmConfig | None = None,
 ) -> list[str]:
     cfg = config or DuckKaggleVllmConfig()
-    return [ref for ref in (cfg.model_source, cfg.draft_model_source) if ref]
+    return [ref for ref in (cfg.model_source, cfg.draft_model_source, cfg.ple_fp8_model_source) if ref]
 
 
 def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str:
@@ -198,6 +205,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
     model_source_parts = _split_model_source(cfg.model_source)
     draft_model_source_parts = (
         _split_model_source(cfg.draft_model_source) if cfg.draft_model_source else None
+    )
+    ple_fp8_model_source_parts = (
+        _split_model_source(cfg.ple_fp8_model_source) if cfg.ple_fp8_model_source else None
     )
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
@@ -223,6 +233,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
+        "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
         "__VLLM_MAX_MODEL_LEN__": repr(int(cfg.max_model_len)),
@@ -359,7 +370,7 @@ GPU_SHARD_PREFETCH_WINDOW_BYTES = 8 * 1024**3
 GPU_SHARD_PREFETCH_BLOCK_BYTES = 16 * 1024**2
 GPU_SHARD_PREFETCH_POLL_SECONDS = 0.5
 GPU_SHARD_PREFETCH_STOP_TIMEOUT_SECONDS = 2
-PLE_SHARD_NAME_PREFIXES = ('ple-', 'model-ple-')
+PLE_SHARD_NAME_PREFIXES = ('ple-', 'model-ple-', 'model-plefp8-')
 GPU_SHARD_PREFETCH_ABORT = threading.Event()
 WATCHDOG_EXIT_DEFERRED = False
 WATCHDOG_EXIT_REQUESTED = False
@@ -424,14 +435,123 @@ def read_host_memory() -> dict[str, int | None]:
     }
 
 
+# memory.stat fields kept with each sample: cgroup v2 names, then the v1 hierarchy totals.
+CGROUP_MEMORY_STAT_FIELDS = (
+    'anon', 'file', 'shmem', 'file_mapped', 'unevictable', 'kernel', 'sock',
+    'total_rss', 'total_cache', 'total_shmem', 'total_mapped_file', 'total_unevictable',
+)
+# The largest processes by anonymous memory listed in each sample, next to the per-group sums.
+HOST_MEMORY_TOP_PROCESSES = 8
+
+
+def read_cgroup_memory_stat(cgroup_root: Path = Path('/sys/fs/cgroup')) -> dict[str, int]:
+    '''Split the cgroup's usage into process memory, page cache and shared memory.'''
+    for stat_path in (cgroup_root / 'memory.stat', cgroup_root / 'memory' / 'memory.stat'):
+        try:
+            lines = stat_path.read_text(encoding='ascii').splitlines()
+        except OSError:
+            continue
+        fields = (line.split(' ', 1) for line in lines)
+        return {key: int(value) for key, value in fields if key in CGROUP_MEMORY_STAT_FIELDS and value.isdigit()}
+
+    return {}
+
+
+def classify_process(cmdline: list[str], cwd: str) -> str:
+    '''Name the role of a process: a vLLM process by its title, the harness by its notebook kernel.
+
+    vLLM retitles its worker processes VLLM::EngineCore and VLLM::Worker; the API server keeps its
+    `vllm ... serve` command line. Every game runs as a thread of the notebook kernel
+    (colab_kernel_launcher on Kaggle), so the harness is one process. A python tool call runs in a
+    fresh interpreter whose working directory is an rgb_python_tool_* temporary directory.
+    '''
+    joined = ' '.join(cmdline)
+    if cmdline and cmdline[0].startswith('VLLM::'):
+        return 'vllm_' + cmdline[0][len('VLLM::'):].split()[0].lower()
+    if Path(cwd).name.startswith('rgb_python_tool_'):
+        return 'sandbox'
+    if 'vllm-watchdog.py' in joined:
+        return 'prefetch' if '--prefetch' in cmdline else 'watchdog'
+    if 'vllm' in joined:
+        return 'vllm_other'
+    if 'ipykernel' in joined or 'kernel_launcher' in joined:
+        return 'harness'
+
+    return 'other'
+
+
+def read_process_memory(proc_root: Path = Path('/proc')) -> tuple[dict[str, dict[str, int]], list[dict]]:
+    '''Sum resident memory per process role and list the largest processes.
+
+    RssAnon is the process's own memory. RssFile and RssShmem count pages that other processes
+    may map too, so their group sums can exceed what the cgroup holds. Kernel threads have no Rss
+    lines and are skipped, as is a process that exits while it is read.
+    '''
+    groups: dict[str, dict[str, int]] = {}
+    processes = []
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            rss = {}
+            for line in (proc / 'status').read_text(encoding='utf-8', errors='replace').splitlines():
+                key, _, value = line.partition(':')
+                if key in ('RssAnon', 'RssFile', 'RssShmem'):
+                    rss[key] = int(value.split()[0]) * 1024
+            cmdline = [part for part in (proc / 'cmdline').read_bytes().decode('utf-8', 'replace').split('\0') if part]
+        except (OSError, ValueError, IndexError):
+            continue
+        if not rss:
+            continue
+        try:
+            cwd = os.readlink(proc / 'cwd')
+        except OSError:
+            cwd = ''
+        group = classify_process(cmdline, cwd)
+        totals = groups.setdefault(group, {'count': 0, 'anon_bytes': 0, 'file_bytes': 0, 'shmem_bytes': 0})
+        totals['count'] += 1
+        totals['anon_bytes'] += rss.get('RssAnon', 0)
+        totals['file_bytes'] += rss.get('RssFile', 0)
+        totals['shmem_bytes'] += rss.get('RssShmem', 0)
+        processes.append({
+            'pid': int(proc.name), 'group': group, 'anon_bytes': rss.get('RssAnon', 0),
+            'cmd': ' '.join(cmdline).replace('\n', ' ')[:80],
+        })
+    processes.sort(key=lambda process: process['anon_bytes'], reverse=True)
+
+    return groups, processes[:HOST_MEMORY_TOP_PROCESSES]
+
+
+def read_shm_used_bytes(path: str = '/dev/shm') -> int | None:
+    '''Bytes in /dev/shm, a tmpfs whose files count as shared memory and are never reclaimed.'''
+    try:
+        stats = os.statvfs(path)
+    except OSError:
+        return None
+
+    return (stats.f_blocks - stats.f_bfree) * stats.f_frsize
+
+
+def read_memory_breakdown() -> dict:
+    '''What holds the RAM: the cgroup's memory.stat, per-role process memory and /dev/shm.'''
+    groups, top_processes = read_process_memory()
+
+    return {
+        'cgroup_memory_stat': read_cgroup_memory_stat(),
+        'process_groups': groups,
+        'top_processes': top_processes,
+        'dev_shm_used_bytes': read_shm_used_bytes(),
+    }
+
+
 def log_host_memory() -> None:
-    '''Sample host RAM throughout server startup, inference, and restarts.'''
+    '''Sample host RAM and what holds it throughout server startup, inference, and restarts.'''
     output_path = Path(config['host_memory_log'])
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open('w', encoding='utf-8') as output:
             while True:
-                record = {'ts': round(time.time(), 3), **read_host_memory()}
+                record = {'ts': round(time.time(), 3), **read_host_memory(), **read_memory_breakdown()}
                 output.write(json.dumps(record) + '\n')
                 output.flush()
                 time.sleep(HOST_MEMORY_SAMPLE_INTERVAL_SECONDS)
@@ -857,6 +977,8 @@ RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 # A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
+# A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
+PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
 VLLM_HOST = '127.0.0.1'
 VLLM_PORT = __VLLM_PORT__
@@ -1015,7 +1137,10 @@ def describe_kaggle_input_tree(max_depth: int = 5) -> str:
 
 
 RUNTIME_DATASET = resolve_kaggle_dataset_path(RUNTIME_OWNER, RUNTIME_SLUG)
-MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+MOUNTED_MODEL_PATH = resolve_kaggle_model_path(MODEL_SOURCE_PARTS)
+# Symlinks to the target's files with its PLE table swapped for the FP8 one; copies no weights.
+PLE_FP8_TARGET_DIR = Path('/tmp/vllm-target-fp8-ple')
+MODEL_PATH = PLE_FP8_TARGET_DIR if PLE_FP8_MODEL_SOURCE_PARTS else MOUNTED_MODEL_PATH
 # Symlinks into the mounted draft checkpoint plus a filtered index; assembling it copies no weights.
 DRAFT_MODEL_DIR = Path('/tmp/vllm-mtp-draft')
 
@@ -1239,6 +1364,185 @@ def route_inc_ple_to_unquantized(manifest: dict) -> None:
             f'{method} checkpoint needs the INC PLE route, but its anchor appears '
             f'{source.count(INC_PLE_ANCHOR)} times in {ple_py}'
         )
+
+
+# Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight in the e975732 runtime.
+EXACT_PINNED_PLE_ANCHOR = (
+    '        return torch.empty(\n'
+    '            num_embeddings,\n'
+    '            embedding_dim,\n'
+    '            dtype=dtype,\n'
+    '            device="cpu",\n'
+    '            pin_memory=True,\n'
+    '        )\n'
+)
+EXACT_PINNED_PLE_CALL = '        return _allocate_exact_pinned_cpu_weight(num_embeddings, embedding_dim, dtype)\n'
+EXACT_PINNED_PLE_HELPERS = '''
+
+def _clear_cuda_runtime_error() -> bool:
+    # A failed cudaHostRegister stays the runtime's last error, which torch's next kernel launch
+    # check would raise. Read it back through the libcudart this process already loaded.
+    import ctypes
+
+    with open("/proc/self/maps", encoding="utf-8") as maps:
+        paths = sorted({line.split()[-1] for line in maps if "libcudart.so" in line})
+    for path in paths:
+        try:
+            ctypes.CDLL(path).cudaGetLastError()
+        except (OSError, AttributeError):
+            continue
+        return True
+    return False
+
+
+def _allocate_exact_pinned_cpu_weight(num_embeddings, embedding_dim, dtype):
+    # pin_memory=True takes torch's CachingHostAllocator, which rounds every block up to the next
+    # power of two, so the 95.4 GiB BF16 table held 128 GiB of host RAM. This page-locks a CPU
+    # tensor of exactly the table's size instead: Mapped keeps the UVA device view and Portable
+    # makes it valid in every context. The table lives as long as the worker and is never
+    # unregistered.
+    weight = torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
+    nbytes = weight.numel() * weight.element_size()
+    if nbytes:
+        cuda_host_register_portable_mapped = 3
+        error = torch.cuda.cudart().cudaHostRegister(
+            weight.data_ptr(), nbytes, cuda_host_register_portable_mapped
+        )
+        if int(error) == 0:
+            logger.info("PLE table pinned at its exact size: %.2f GiB", nbytes / 2**30)
+            return weight
+        if not _clear_cuda_runtime_error():
+            raise RuntimeError(f"cudaHostRegister of the PLE table failed ({error}) and the error could not be cleared")
+        logger.warning(
+            "cudaHostRegister of the %.2f GiB PLE table failed (%s); using the power-of-two pinned allocator",
+            nbytes / 2**30,
+            error,
+        )
+        del weight
+    return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu", pin_memory=True)
+'''
+
+
+def pin_ple_table_at_exact_size(manifest: dict) -> None:
+    '''Pin the host PLE table at its own size rather than the next power of two.
+
+    torch's pinned allocator rounded the 95.4 GiB BF16 table up to 128 GiB (porting-advaith v3:
+    130 GiB of VLLM::Worker shmem with the embedding), a third of it unused. The runtime's
+    allocation is replaced by a plain CPU tensor registered with cudaHostRegister, which saves
+    about 33 GiB of host RAM for BF16 and 16 GiB for FP8. The table's values and the UVA lookup
+    are unchanged. A runtime without the anchor keeps its allocator, and so does a registration
+    that fails at load, with a warning in the server log.
+    '''
+    ple_py = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models'
+              / 'qwen4_exp' / 'nvidia' / 'ngram_embedding.py')
+    source = ple_py.read_text(encoding='utf-8') if ple_py.is_file() else ''
+    if source.count(EXACT_PINNED_PLE_ANCHOR) != 1:
+        print(
+            f'PLE table keeps the power-of-two pinned allocator: its anchor appears '
+            f'{source.count(EXACT_PINNED_PLE_ANCHOR)} times in {ple_py}',
+            flush=True,
+        )
+        return
+    ple_py.write_text(
+        source.replace(EXACT_PINNED_PLE_ANCHOR, EXACT_PINNED_PLE_CALL) + EXACT_PINNED_PLE_HELPERS, encoding='utf-8'
+    )
+    print(f'PLE table pinned at its exact size in {ple_py}', flush=True)
+
+
+# Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
+# INCConfig that check comes before the unquantized route above, which the FP8 table needs.
+FP8_PLE_RUNTIME_MARKERS = (
+    '        if embedding_dtype == "float8_e4m3fn":\n'
+    '            return Qwen4ExpPLEFp8EmbeddingMethod()\n',
+    'getattr(config, "ple_embedding_dtype", None)',
+)
+
+
+def check_runtime_reads_fp8_ple(manifest: dict) -> None:
+    '''Fail before the load when the runtime would not read the swapped PLE table as FP8.
+
+    A runtime that ignores ple_embedding_dtype keeps the BF16 method under INC and copies the FP8
+    codes into a BF16 table without their global scale, which loads and serves wrong embeddings.
+    '''
+    if PLE_FP8_MODEL_SOURCE_PARTS is None:
+        return
+    ple_py = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models'
+              / 'qwen4_exp' / 'nvidia' / 'ngram_embedding.py')
+    source = ple_py.read_text(encoding='utf-8') if ple_py.is_file() else ''
+    missing = [marker for marker in FP8_PLE_RUNTIME_MARKERS if marker not in source]
+    if missing:
+        raise RuntimeError(f'{ple_py} does not select the FP8 PLE method from ple_embedding_dtype: {missing}')
+
+
+# The tensors of the PLE n-gram table: its row shards and, in an FP8 table, the global weight_scale.
+PLE_TABLE_TENSOR_MARKER = '.ple_embedding.ngram_embedding.'
+
+
+def assemble_ple_fp8_target() -> None:
+    '''Link the target with its BF16 PLE table replaced by the FP8 checkpoint's into PLE_FP8_TARGET_DIR.
+
+    dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple holds RadixArk's FP8 table (ten
+    model-plefp8-* files, 128 row shards and one global weight_scale) next to Intel's W4A16 body,
+    while the target keeps its table in BF16 files of its own (dfranzen's Intel copy: 22
+    model-ple-* files). The directory links every file of the mounted target except its index,
+    config.json and the files of its table, then the files of the source's table. The index maps
+    the target's other tensors as before and the table to the source, and config.json is the
+    target's with text_config.ple_embedding_dtype set, which makes the runtime allocate the pinned
+    table in FP8. Only the table changes, so every GPU tensor is the target's. A source table that
+    lacks a row shard of the target's, has no scale, or shares a file with other tensors fails here.
+    '''
+    if PLE_FP8_MODEL_SOURCE_PARTS is None:
+        return
+    source = resolve_kaggle_model_path(PLE_FP8_MODEL_SOURCE_PARTS)
+    index_name = 'model.safetensors.index.json'
+    if not (source / index_name).is_file():
+        raise FileNotFoundError(f'FP8 PLE checkpoint not mounted at {source}\n' + describe_kaggle_input_tree())
+    target_map = json.loads((MOUNTED_MODEL_PATH / index_name).read_text(encoding='utf-8'))['weight_map']
+    source_map = json.loads((source / index_name).read_text(encoding='utf-8'))['weight_map']
+    source_dtype = json.loads((source / 'config.json').read_text(encoding='utf-8'))['text_config'].get('ple_embedding_dtype')
+    if source_dtype != 'float8_e4m3fn':
+        raise RuntimeError(f'{source} declares ple_embedding_dtype {source_dtype!r}, not float8_e4m3fn')
+
+    def table_files(weight_map: dict, checkpoint: Path) -> set[str]:
+        files = {shard for name, shard in weight_map.items() if PLE_TABLE_TENSOR_MARKER in name}
+        shared = sorted({shard for name, shard in weight_map.items() if PLE_TABLE_TENSOR_MARKER not in name} & files)
+        if shared:
+            raise RuntimeError(f'PLE files of {checkpoint} also hold other tensors: {shared}')
+
+        return files
+
+    target_table = {name for name in target_map if PLE_TABLE_TENSOR_MARKER in name}
+    source_table = {name: shard for name, shard in source_map.items() if PLE_TABLE_TENSOR_MARKER in name}
+    missing = sorted(target_table - set(source_table))
+    scales = [name for name in source_table if name.endswith('.weight_scale')]
+    unexpected = sorted(set(source_table) - target_table - set(scales))
+    if missing or not scales or unexpected:
+        raise RuntimeError(
+            f'{source} cannot replace the PLE table of {MOUNTED_MODEL_PATH}: missing {missing[:3]} '
+            f'({len(missing)}), scales {scales}, unexpected {unexpected[:3]}'
+        )
+    target_files = table_files(target_map, MOUNTED_MODEL_PATH)
+    source_files = table_files(source_map, source)
+    shutil.rmtree(PLE_FP8_TARGET_DIR, ignore_errors=True)
+    PLE_FP8_TARGET_DIR.mkdir(parents=True)
+    for entry in MOUNTED_MODEL_PATH.iterdir():
+        if entry.is_file() and entry.name not in target_files | {index_name, 'config.json'}:
+            (PLE_FP8_TARGET_DIR / entry.name).symlink_to(entry)
+    for shard in sorted(source_files):
+        if (PLE_FP8_TARGET_DIR / shard).exists():
+            raise RuntimeError(f'{shard} of {source} clashes with a file of {MOUNTED_MODEL_PATH}')
+        (PLE_FP8_TARGET_DIR / shard).symlink_to(source / shard)
+    weight_map = {name: shard for name, shard in target_map.items() if name not in target_table}
+    weight_map.update(source_table)
+    (PLE_FP8_TARGET_DIR / index_name).write_text(json.dumps({'metadata': {}, 'weight_map': weight_map}), encoding='utf-8')
+    config = json.loads((MOUNTED_MODEL_PATH / 'config.json').read_text(encoding='utf-8'))
+    config['text_config']['ple_embedding_dtype'] = source_dtype
+    (PLE_FP8_TARGET_DIR / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+    print(
+        f'FP8 PLE target at {PLE_FP8_TARGET_DIR}: {MOUNTED_MODEL_PATH} without {len(target_files)} BF16 '
+        f'PLE files, plus {len(source_table)} FP8 PLE tensors from {sorted(source_files)} of {source}',
+        flush=True,
+    )
 
 
 # What the MTP drafter loads from a draft checkpoint besides its mtp.* layer: the LM head and the
@@ -1653,6 +1957,8 @@ def start_vllm_server() -> None:
     '''
     manifest = install_image_runtime()
     route_inc_ple_to_unquantized(manifest)
+    pin_ple_table_at_exact_size(manifest)
+    check_runtime_reads_fp8_ple(manifest)
     draft_model_dir = assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)
     cmd = build_vllm_server_command(draft_model_dir)
@@ -1723,11 +2029,12 @@ def run_vllm_api_smoke_test() -> None:
 print(f'vLLM runtime dataset path: {RUNTIME_DATASET}', flush=True)
 print(f'Qwen model path: {MODEL_PATH}', flush=True)
 assert_expected_cuda_gpu()
-missing = [str(path) for path in (RUNTIME_DATASET, MODEL_PATH) if not path.exists()]
+missing = [str(path) for path in (RUNTIME_DATASET, MOUNTED_MODEL_PATH) if not path.exists()]
 if missing:
     raise FileNotFoundError(
         'Missing attached input path(s): ' + ', '.join(missing) + '\n' + describe_kaggle_input_tree()
     )
+assemble_ple_fp8_target()
 start_vllm_server()
 print_vllm_backend_summary()
 if os.environ.get('TAAF_RUN_AS_SUBMISSION') == '1':
@@ -1807,6 +2114,7 @@ def stop_process(pid_path: Path, name: str) -> None:
 stop_process(WORKING_DIR / 'vllm-watchdog.pid', 'vLLM watchdog')
 stop_process(WORKING_DIR / 'vllm-openai-server.pid', 'vLLM server')
 shutil.rmtree('/tmp/vllm-mtp-draft', ignore_errors=True)
+shutil.rmtree('/tmp/vllm-target-fp8-ple', ignore_errors=True)
 image_runtime_root = Path(os.environ.get('TAAF_IMAGE_RUNTIME_ROOT', '/tmp/vllm-image-runtime'))
 for runtime_path in (image_runtime_root, image_runtime_root.with_name(image_runtime_root.name + '-cache')):
     if runtime_path.exists():
