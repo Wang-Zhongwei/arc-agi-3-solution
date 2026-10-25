@@ -140,16 +140,17 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 
 **Findings**
 - **Our token estimate ran low; fixed on main (755d4749).** It priced every image at 402 tokens, the cost of a 640-pixel board. 9 of the 12 replayed runs drew 768-pixel boards at 578 tokens each. In those runs real ÷ estimate had a median of 1.04, p99 1.14 and a maximum of 1.17 on image-heavy late requests. With images priced at each run's board size, it is median 0.97, p99 1.07, max 1.07.
-- **For GRPO, check the 130K budget with the server's exact `prompt_tokens` and `completion_tokens`.** To cap `max_tokens` before sending, estimate a request as the previous request's real `prompt_tokens` plus the formula for the messages added since. On contexts above 60K that is median 1.000 and worst 1.041 ([details](grpo-l1-l2-token-budget.md#token-estimate)).
+- **For GRPO, check the 130K budget with the server's exact `prompt_tokens` and `completion_tokens`.** To cap `max_tokens` before sending, the harness's own estimate is enough. It recomputes characters per token from the previous request's real count, which is the same as the previous real count plus the new messages at that rate. On contexts above 60K it is median 0.999, between 0.94 and 1.04 ([details](grpo-l1-l2-token-budget.md#token-estimate)).
 - **Throughput fell short of the estimate.** About 3.0–3.5K tok/s per TP=2 pair, against 3.5–6.5K estimated for C = 32–48 (about 1.7× an RTX PRO 6000 per GPU). The GPUs were busy, but KV stayed under 30%.
 - **The longest rollout sets the step time**: ~95K tokens at ~99 tok/s ≈ 16 min.
 - **Concurrency: 64 per TP=2 pair (projection, not yet measured).** A linear fit of step time to the 10-s samples (R² 0.55) gives 13.5 ms + 0.52 ms per running sequence + 10.8 µs per uncached prefill token, at 2.83 tokens per sequence per step. At GRPO's prefill (0.7 × generated) it projects:
 
   | Concurrency | 40 | 48 | 56 | 64 | 72 | 80 |
   |---|---:|---:|---:|---:|---:|---:|
-  | tok/s, relative to 40 | 1.00 | 1.07 | 1.12 | **1.17** | 1.21 | 1.24 |
+  | Total tok/s per TP=2 pair | 3.2K | 3.5K | 3.6K | **3.8K** | 3.9K | 4.0K |
+  | tok/s per rollout | 81 | 72 | 65 | **59** | 54 | 50 |
   | Minutes for a 95K-token rollout, all slots full (measured at 40: 16, as the step emptied) | 20 | 22 | 24 | **27** | 29 | 32 |
   | KV if every rollout reaches 130K (9.34M available) | 5.2M | 6.2M | 7.3M | **8.3M** | 9.4M | 10.4M |
 
-  64 is the largest concurrency here that cannot run out of KV even if every rollout reaches the cap. Past it, each 8 more sequences add only 3–4%. An earlier fit with a larger prefill term gave +14% at 64, so expect about +15%. With synchronous steps the longest rollout sets the step time, so start the next group's rollouts as slots free up.
+  64 is the largest concurrency here that cannot run out of KV even if every rollout reaches the cap. Past it, each 8 more sequences add only 3–4%. An earlier fit with a larger prefill term gives 4.2K total and 65 per rollout at 64, so expect 3.8–4.2K total (+15% over 40) and about 60 tok/s per rollout. That is about the per-game speed of a Kaggle run (reset-baseline: 867 tok/s over 14 streams ≈ 62). Measured in this run, with its heavier re-prefill: 3.1K total and 79 per rollout with 40 running, 2.4K and 111 with 20. Averaged over a synchronous step the total is about 10% lower than at full batch (2.7K against 3.0K here), because the batch empties at the end. With synchronous steps the longest rollout sets the step time, so start the next group's rollouts as slots free up.
 - **Next measurements:** concurrency 64/80 (more tok/s, slower rollouts); TP=2 vs 2 × TP=1 at the same concurrency; `--enable-hc-sp`.
