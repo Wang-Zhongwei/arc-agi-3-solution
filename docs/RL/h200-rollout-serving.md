@@ -104,7 +104,7 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 3. CUDA OOM at startup → restart with `--gpu-memory-utilization` 0.88.
 
 **Workload** ([`bench_rollout.py`](../../ARC3-Inference/inference/grpo/bench_rollout.py), replay from [`build_replay.py`](../../ARC3-Inference/inference/grpo/build_replay.py)):
-- **Rollouts:** 40 = 5 games × 8 rollouts (G = 8 as in GRPO): cn04, sc25, ka59, s5i5, dc22. These are the five pilot games closest to 50% within the budget (47–53%).
+- **Rollouts:** 40 = 5 games × 8 rollouts (G = 8 as in GRPO): cn04, sc25, ka59, s5i5, dc22. These are the five pilot games closest to 50% within the budget (47–53% when chosen; 44–53% with images priced at each run's board size).
 - **Attempts:** 8 of each game's 12 recorded untrimmed attempts (seed 0), so a group shares the system prompt and the first frames, as in GRPO.
 - **Requests:** each asks for the recorded reply length at temperature 0.7, top-p 0.95, top-k 20, with a thinking budget of 10,240 and logprobs on. Tool and game time are not simulated: the server is the only clock.
 - **Reported:**
@@ -139,7 +139,17 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 | Errors | 3 of 1,448 requests, all ka59 near the cap. Real prompts of 147.9K and 148.4K tokens exceeded `max_model_len` 147,072; the third failed because vLLM shrank `max_tokens` below the requested `min_tokens`. |
 
 **Findings**
-- **Our token estimate runs low.** Against the server's real counts it is 4% low on the median, 9% at p90 and up to 17% on image-heavy late requests. For GRPO, enforce the 130K budget with the server's `prompt_tokens`, or set `max_model_len` to at least 130K × 1.17 + 12,288 ≈ 165K; KV has room for either.
+- **Our token estimate ran low; fixed on main (755d4749).** It priced every image at 402 tokens, the cost of a 640-pixel board. 9 of the 12 replayed runs drew 768-pixel boards at 578 tokens each. In those runs real ÷ estimate had a median of 1.04, p99 1.14 and a maximum of 1.17 on image-heavy late requests. With images priced at each run's board size, it is median 0.97, p99 1.07, max 1.07.
+- **For GRPO, check the 130K budget with the server's exact `prompt_tokens` and `completion_tokens`.** To cap `max_tokens` before sending, estimate a request as the previous request's real `prompt_tokens` plus the formula for the messages added since. On contexts above 60K that is median 1.000 and worst 1.041 ([details](grpo-l1-l2-token-budget.md#token-estimate)).
 - **Throughput fell short of the estimate.** About 3.0–3.5K tok/s per TP=2 pair, against 3.5–6.5K estimated for C = 32–48 (about 1.7× an RTX PRO 6000 per GPU). The GPUs were busy, but KV stayed under 30%.
 - **The longest rollout sets the step time**: ~95K tokens at ~99 tok/s ≈ 16 min.
+- **Concurrency: 64 per TP=2 pair (projection, not yet measured).** A linear fit of step time to the 10-s samples (R² 0.55) gives 13.5 ms + 0.52 ms per running sequence + 10.8 µs per uncached prefill token, at 2.83 tokens per sequence per step. At GRPO's prefill (0.7 × generated) it projects:
+
+  | Concurrency | 40 | 48 | 56 | 64 | 72 | 80 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | tok/s, relative to 40 | 1.00 | 1.07 | 1.12 | **1.17** | 1.21 | 1.24 |
+  | Minutes for a 95K-token rollout, all slots full (measured at 40: 16, as the step emptied) | 20 | 22 | 24 | **27** | 29 | 32 |
+  | KV if every rollout reaches 130K (9.34M available) | 5.2M | 6.2M | 7.3M | **8.3M** | 9.4M | 10.4M |
+
+  64 is the largest concurrency here that cannot run out of KV even if every rollout reaches the cap. Past it, each 8 more sequences add only 3–4%. An earlier fit with a larger prefill term gave +14% at 64, so expect about +15%. With synchronous steps the longest rollout sets the step time, so start the next group's rollouts as slots free up.
 - **Next measurements:** concurrency 64/80 (more tok/s, slower rollouts); TP=2 vs 2 × TP=1 at the same concurrency; `--enable-hc-sp`.
