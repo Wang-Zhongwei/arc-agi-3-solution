@@ -1387,6 +1387,89 @@ def route_inc_ple_to_unquantized(manifest: dict) -> None:
         )
 
 
+# Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight in the e975732 runtime.
+EXACT_PINNED_PLE_ANCHOR = (
+    '        return torch.empty(\n'
+    '            num_embeddings,\n'
+    '            embedding_dim,\n'
+    '            dtype=dtype,\n'
+    '            device="cpu",\n'
+    '            pin_memory=True,\n'
+    '        )\n'
+)
+EXACT_PINNED_PLE_CALL = '        return _allocate_exact_pinned_cpu_weight(num_embeddings, embedding_dim, dtype)\n'
+EXACT_PINNED_PLE_HELPERS = '''
+
+def _clear_cuda_runtime_error() -> bool:
+    # A failed cudaHostRegister stays the runtime's last error, which torch's next kernel launch
+    # check would raise. Read it back through the libcudart this process already loaded.
+    import ctypes
+
+    with open("/proc/self/maps", encoding="utf-8") as maps:
+        paths = sorted({line.split()[-1] for line in maps if "libcudart.so" in line})
+    for path in paths:
+        try:
+            ctypes.CDLL(path).cudaGetLastError()
+        except (OSError, AttributeError):
+            continue
+        return True
+    return False
+
+
+def _allocate_exact_pinned_cpu_weight(num_embeddings, embedding_dim, dtype):
+    # pin_memory=True takes torch's CachingHostAllocator, which rounds every block up to the next
+    # power of two, so the 95.4 GiB BF16 table held 128 GiB of host RAM. This page-locks a CPU
+    # tensor of exactly the table's size instead: Mapped keeps the UVA device view and Portable
+    # makes it valid in every context. The table lives as long as the worker and is never
+    # unregistered.
+    weight = torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
+    nbytes = weight.numel() * weight.element_size()
+    if nbytes:
+        cuda_host_register_portable_mapped = 3
+        error = torch.cuda.cudart().cudaHostRegister(
+            weight.data_ptr(), nbytes, cuda_host_register_portable_mapped
+        )
+        if int(error) == 0:
+            logger.info("PLE table pinned at its exact size: %.2f GiB", nbytes / 2**30)
+            return weight
+        if not _clear_cuda_runtime_error():
+            raise RuntimeError(f"cudaHostRegister of the PLE table failed ({error}) and the error could not be cleared")
+        logger.warning(
+            "cudaHostRegister of the %.2f GiB PLE table failed (%s); using the power-of-two pinned allocator",
+            nbytes / 2**30,
+            error,
+        )
+        del weight
+    return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu", pin_memory=True)
+'''
+
+
+def pin_ple_table_at_exact_size(manifest: dict) -> None:
+    '''Pin the host PLE table at its own size rather than the next power of two.
+
+    torch's pinned allocator rounded the 95.4 GiB BF16 table up to 128 GiB (porting-advaith v3:
+    130 GiB of VLLM::Worker shmem with the embedding), a third of it unused. The runtime's
+    allocation is replaced by a plain CPU tensor registered with cudaHostRegister, which saves
+    about 33 GiB of host RAM for BF16 and 16 GiB for FP8. The table's values and the UVA lookup
+    are unchanged. A runtime without the anchor keeps its allocator, and so does a registration
+    that fails at load, with a warning in the server log.
+    '''
+    ple_py = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models'
+              / 'qwen4_exp' / 'nvidia' / 'ngram_embedding.py')
+    source = ple_py.read_text(encoding='utf-8') if ple_py.is_file() else ''
+    if source.count(EXACT_PINNED_PLE_ANCHOR) != 1:
+        print(
+            f'PLE table keeps the power-of-two pinned allocator: its anchor appears '
+            f'{source.count(EXACT_PINNED_PLE_ANCHOR)} times in {ple_py}',
+            flush=True,
+        )
+        return
+    ple_py.write_text(
+        source.replace(EXACT_PINNED_PLE_ANCHOR, EXACT_PINNED_PLE_CALL) + EXACT_PINNED_PLE_HELPERS, encoding='utf-8'
+    )
+    print(f'PLE table pinned at its exact size in {ple_py}', flush=True)
+
+
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
 # INCConfig that check comes before the unquantized route above, which the FP8 table needs.
 FP8_PLE_RUNTIME_MARKERS = (
@@ -1926,6 +2009,7 @@ def start_vllm_server() -> None:
     '''
     manifest = install_image_runtime()
     route_inc_ple_to_unquantized(manifest)
+    pin_ple_table_at_exact_size(manifest)
     check_runtime_reads_fp8_ple(manifest)
     draft_model_dir = assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)
