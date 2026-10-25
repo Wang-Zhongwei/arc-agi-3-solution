@@ -171,10 +171,23 @@ def pennyroyal_dataset_sources() -> list[str]:
     return [kaggle_serving_config()["wheelhouse_dataset_source"]]
 
 
+# Kaggle sessions that mounted three models started 3-10x slower on every read or never started:
+# rft-model v1/v2 (440 GB) and porting-advaith v1 (failed mounting), v2 (ready at 2,067 s against
+# 490-988 s for 34 two-model runs) and v4 (hung in setup for two hours).
+MAX_KAGGLE_MODEL_SOURCES = 2
+
+
 def pennyroyal_model_sources() -> list[str]:
     cfg = kaggle_serving_config()
     sources = (cfg["model_source"], cfg.get("draft_model_source"), cfg.get("ple_fp8_model_source"))
-    return [ref for ref in sources if ref]
+    refs = [ref for ref in sources if ref]
+    if len(refs) > MAX_KAGGLE_MODEL_SOURCES:
+        raise ValueError(
+            f"kaggle config mounts {len(refs)} models {refs}; keep it to {MAX_KAGGLE_MODEL_SOURCES} "
+            "(three-model sessions start several times slower or hang). For FP8 PLE, serve a "
+            "checkpoint that already holds the FP8 table as model_source instead of ple_fp8_model_source."
+        )
+    return refs
 
 
 def pennyroyal_setup_command() -> str:
