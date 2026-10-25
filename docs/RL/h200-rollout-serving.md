@@ -66,3 +66,57 @@ Merged upstream since 09-23 that Lord's base lacks and that matter on H200:
 
 - **No maintainer approvals.** None of the open PRs above has one. Prefer merged ones, and check temperature-0 outputs before any speed number counts.
 - **Different KV layout.** Upstream groups the KV cache as 6 groups × 1,856 tokens; Lord's runtime used 5 × 1,664, because it merges the PLE and GDN cache groups. So upstream fits fewer tokens per GB.
+
+## First benchmark: TP=2, 40 concurrent rollouts (decided 2026-10-25, not yet run)
+
+One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run to its end. It measures step time and throughput before any GRPO code exists.
+
+**Runtime: upstream nightly `vllm/vllm-openai:nightly-83c078d` (2026-10-23, amd64 `sha256:d428631b…`), unpatched.**
+- Lord's runtime (09-23) predates the TP>1 fix for QSA's head dimension (#59945, 10-07) and sequence parallelism (#56322, 10-12).
+- The "no new bundle" decision covers only the Kaggle RTX serving.
+- RunPod pulls the image by digest; the pod has internet.
+
+**Model.** `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` from Hugging Face (181 GB). Its own BF16 MTP layer (1,565 tensors) is the drafter, so no separate draft model.
+
+**Server settings**
+
+| Setting | Value | Reason |
+|---|---|---|
+| `--tensor-parallel-size` | 2 | the configuration under test |
+| `--max-num-seqs` | 40 | the concurrency under test: every rollout of a step is in flight at once |
+| `--max-model-len` | 147,072 | 130K context cap + 12,288-token reply + estimate error; same as Kaggle |
+| `--max-num-batched-tokens` | 8,192 | Kaggle's 2,048 saved activation memory on a 96 GB card. H200 has room, and bigger chunks prefill 130K contexts in fewer steps. Decode at 40 × 4 = 160 tokens leaves ~8K tokens of prefill per step. |
+| KV / indexer / Mamba cache dtypes | `fp8_e4m3` / `fp8` / `bfloat16` | the decided FP8 caches; Mamba state as on Kaggle |
+| `--gpu-memory-utilization` | 0.92 (vLLM default) | KV is not the constraint. Per rank: ~129 GiB usable − ~35 GiB of weights (half of the 69.5 GiB at TP1) − activations ≈ 90 GiB of KV. At TP2 each rank holds half the KV and GDN heads, so that is roughly 13M tokens, against at most 40 × 130K = 5.2M. |
+| Speculative decoding | `{"method": "mtp", "num_speculative_tokens": 3, "draft_lm_head_quantization": "fp8"}` | MTP 3 as on Kaggle. FP8 runs natively on Hopper. The quantized head only affects acceptance: the target verifies with its own BF16 head. |
+| Prefix caching | on, `--prefix-match-unit 64` | Prefix caching reuses each game's growing context across turns. 64 divided upstream's 1,856-token KV blocks at TP1; the TP2 block size is unknown, hence the fallback. |
+| `--logprobs-mode` | `processed_logprobs` | GRPO's behavior logprobs (after temperature, top-p, top-k); the benchmark requests them, so their cost is included |
+| Parsers | `--reasoning-parser qwen3` (enables `thinking_token_budget`), `--tool-call-parser qwen3_coder`, `--enable-auto-tool-choice` | as on Kaggle |
+| Template | Intel's `chat_template.jinja`, `--default-chat-template-kwargs {"preserve_thinking": true}`, `--generation-config vllm` | as on Kaggle |
+| Images | `--mm-processor-kwargs {"max_pixels": 589824}`, `--limit-mm-per-prompt {"video": 0}` | 768² px = a 64×64 grid at upscale 12; the replayed runs used upscale 10 and 12 |
+| CUDA graphs | upstream default (no flags) | It captures decode sizes n × (1 + 3) on a request-count grid; with 40 sequences the ceiling is min(40 × 4 × 2, 512) = 320 tokens. |
+| PLE table | upstream default: Engram host offload | keeps ~95 GiB of BF16 table off the GPUs; host RAM is ample on a 2×H200 pod |
+| Not used | SM120 GEMM, C14 capture sizes, draft vocabulary, `embed_tokens` offload, NVFP4 drafter, `--enable-hc-sp` | RTX-specific, or a second variable. Sequence parallelism comes as an optional second job. |
+
+**Automatic fallbacks** (a fresh server start each time):
+1. `Invalid prefix_match_unit` at startup → restart without `--prefix-match-unit`.
+2. A startup error naming `draft_lm_head_quantization` → restart without it.
+3. CUDA OOM at startup → restart with `--gpu-memory-utilization` 0.88.
+
+**Workload** ([`bench_rollout.py`](../../ARC3-Inference/inference/grpo/bench_rollout.py), replay from [`build_replay.py`](../../ARC3-Inference/inference/grpo/build_replay.py)):
+- **Rollouts:** 40 = 5 games × 8 rollouts (G = 8 as in GRPO): cn04, sc25, ka59, s5i5, dc22. These are the five pilot games closest to 50% within the budget (47–53%).
+- **Attempts:** 8 of each game's 12 recorded untrimmed attempts (seed 0), so a group shares the system prompt and the first frames, as in GRPO.
+- **Requests:** each asks for the recorded reply length at temperature 0.7, top-p 0.95, top-k 20, with a thinking budget of 10,240 and logprobs on. Tool and game time are not simulated: the server is the only clock.
+- **Reported:**
+  - step wall time and generated tok/s, both overall and until half the rollouts finished (steady state at C = 40);
+  - median per-rollout tok/s;
+  - peak KV usage, peak running and waiting requests, preemptions;
+  - MTP tokens per step;
+  - kernels and KV size from the server log.
+
+**Pod and cost**
+- **Hardware:** 2×H200 SXM in one pod (NVLink), RunPod community at $7.18/h for both, secure if community is out.
+- **Disks:** 400 GB `/workspace` volume, 50 GB container disk.
+- **Run:** one script for pull, download, server, benchmark, results and `POD_END=stop`, with a 120-minute self-stop. A local watcher pulls the results and stops the pod.
+- **Time:** ~15 min setup (image, 181 GB download, load) + ~25 min for the 40-rollout step ≈ 40 min, about $5 community.
+- **Optional job B:** the same step with `--enable-hc-sp`, +~20 min (+$2.40).
