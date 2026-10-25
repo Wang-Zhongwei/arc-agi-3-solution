@@ -148,6 +148,14 @@ def _levelup_board_image() -> bool:
     return _get_env_bool("ARC3_LEVELUP_BOARD_IMAGE", False)
 
 
+def _touching_split() -> bool:
+    """A turn-message line when one segmentation node is k >= 2 same-colour
+    objects of the level start that now touch, with the colour's pixel total
+    unchanged (board_facts.py, ported from the advaith/dan-fran-arc fork).
+    ARC3_TOUCHING_SPLIT defaults off."""
+    return _get_env_bool("ARC3_TOUCHING_SPLIT", False)
+
+
 def _contains_tool_call_markup(*chunks: str) -> bool:
     for chunk in chunks:
         lowered = chunk.lower()
@@ -5305,6 +5313,21 @@ class ToolAgent:
             lines.append(f"Current state: step {step}, level {level}.")
         return lines
 
+    def _touching_lines(self, history_entries: list[HistoryEntry]) -> list[str]:
+        """ARC3_TOUCHING_SPLIT: the touching-objects lines for the newest board
+        in ``history_entries``; [] on any error, so a fact never stops a turn."""
+        try:
+            from inference.agent.board_facts import BoardFacts
+
+            facts = getattr(self, "_board_facts", None)
+            if facts is None:
+                facts = self._board_facts = BoardFacts()
+            facts.feed(history_entries)
+            return facts.touching_lines()
+        except Exception:  # noqa: BLE001
+            log.debug("touching lines skipped", exc_info=True)
+            return []
+
     def _build_user_prompt(
         self,
         action_num: int,
@@ -5620,6 +5643,9 @@ class ToolAgent:
                     current_frame, history_entries, previous_step_summary
                 )
             )
+        if _touching_split() and not getattr(self, "_resume_after_yield", False):
+            # a resumption continues the same turn, so the line is not repeated
+            lines.extend(self._touching_lines(history_entries))
         # The tool mechanics this opener used to repeat every turn - the tool and
         # its globals, no numeric grid, compact output, how to diff the latest
         # change, call and batch action(), the tool-call format, MOUSE row/col -
