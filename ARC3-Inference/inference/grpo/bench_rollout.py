@@ -98,9 +98,11 @@ async def play(session, args, slot: int, game: dict, rows: list, t0: float) -> N
 
 
 async def sample_metrics(session, args, out: Path, t0: float, done: asyncio.Event) -> None:
+    """Server /metrics every 10 s, plus one sample after the step so the counters span it."""
     base = args.url.rsplit("/v1", 1)[0]
     with open(out, "w") as f:
-        while not done.is_set():
+        while True:
+            finished = done.is_set()
             try:
                 async with session.get(f"{base}/metrics") as r:
                     text = await r.text()
@@ -112,6 +114,8 @@ async def sample_metrics(session, args, out: Path, t0: float, done: asyncio.Even
                 f.flush()
             except Exception as e:  # noqa: BLE001
                 f.write(json.dumps({"t": round(time.monotonic() - t0, 1), "error": repr(e)[:200]}) + "\n")
+            if finished:
+                return
             try:
                 await asyncio.wait_for(done.wait(), timeout=10)
             except asyncio.TimeoutError:
@@ -140,7 +144,10 @@ def summarize(rows: list[dict], metrics_path: Path, wall: float, label: str, c: 
     return {
         "label": label, "concurrency": c, "games": len(finished), "requests": len(rows),
         "errors": sum(1 for r in rows if r["error"]),
+        # The replay sends each turn's recorded reply, not the one just generated, so the cache misses from
+        # that reply on: uncached prompt tokens overstate GRPO's prefill by about the generated tokens.
         "wall_s": round(wall, 1), "generated": generated, "prompt": prompt, "cached": cached,
+        "uncached_prompt": prompt - cached,
         "tok_s": round(generated / wall, 1) if wall else None,
         "tok_s_until_half_done": round(gen_by_half / half, 1) if half else None,
         "per_game_tok_s_median": round(sorted((sum(r["completion_tokens"] or 0 for r in rows if r["slot"] == s) / finished[s])
