@@ -120,3 +120,26 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 - **Run:** one script for pull, download, server, benchmark, results and `POD_END=stop`, with a 120-minute self-stop. A local watcher pulls the results and stops the pod.
 - **Time:** ~15 min setup (image, 181 GB download, load) + ~25 min for the 40-rollout step ≈ 40 min, about $5 community.
 - **Optional job B:** the same step with `--enable-hc-sp`, +~20 min (+$2.40).
+
+### Result (2026-10-25)
+
+**Run:** pod `hl0b9na5elmeqw`, 2×H200 SXM. Community had no 2-GPU host, so it ran on secure at $10.58/h for 30.5 min, about $5.40; the pod was deleted at the end. Data in `runs/runpod/jonathanwang2022/grpo-rollout-bench/hl0b9na5elmeqw/`.
+
+| | |
+|---|---|
+| Step: 40 rollouts (5 games × 8) | **960 s.** Rollouts ended at p10 444 s, p50 855 s; the last was s5i5 at 961 s (95K tokens). Mean end per game ranged from 470 s (sc25) to 873 s (s5i5). |
+| Generated | 2.61M tokens. **2,713 tok/s** over the step, 2,814 tok/s until half the rollouts finished, **3,020 tok/s** while 36 or more ran. |
+| Per rollout | median 89 tok/s |
+| GRPO estimate | The replay re-prefills each recorded reply: 4.44M uncached prompt tokens, 1.7× the generated tokens, where GRPO would see about 0.7×. Across the 10-s samples with 36 or more running, generation falls by 133 tok/s per 1K prompt tok/s. At GRPO's ~1.9K prompt tok/s that gives about **3.5K tok/s**. |
+| MTP | 2.82 tokens per step: Intel's BF16 MTP head with an FP8 draft lm_head. Lord's NVFP4 head on RTX gave 2.67–2.75. |
+| KV cache | 79.3 GiB per rank, 9.34M tokens. Peak use **28%**, no preemptions: KV doesn't limit concurrency. |
+| GPU | 93% busy, 569 W mean |
+| Kernels | INT4 experts on `HUMMING` (Marlin on RTX), BF16 MTP experts on Triton, V2 model runner. KV blocks are 1,664 tokens at TP=2, so `prefix_match_unit` 64 is valid. |
+| Startup | SSH after 277 s (image pull); 169 GB downloaded in 182 s; server ready in 310 s on the first try, no fallback needed |
+| Errors | 3 of 1,448 requests, all ka59 near the cap. Real prompts of 147.9K and 148.4K tokens exceeded `max_model_len` 147,072; the third failed because vLLM shrank `max_tokens` below the requested `min_tokens`. |
+
+**Findings**
+- **Our token estimate runs low.** Against the server's real counts it is 4% low on the median, 9% at p90 and up to 17% on image-heavy late requests. For GRPO, enforce the 130K budget with the server's `prompt_tokens`, or set `max_model_len` to at least 130K × 1.17 + 12,288 ≈ 165K; KV has room for either.
+- **Throughput fell short of the estimate.** About 3.0–3.5K tok/s per TP=2 pair, against 3.5–6.5K estimated for C = 32–48 (about 1.7× an RTX PRO 6000 per GPU). The GPUs were busy, but KV stayed under 30%.
+- **The longest rollout sets the step time**: ~95K tokens at ~99 tok/s ≈ 16 min.
+- **Next measurements:** concurrency 64/80 (more tok/s, slower rollouts); TP=2 vs 2 × TP=1 at the same concurrency; `--enable-hc-sp`.
