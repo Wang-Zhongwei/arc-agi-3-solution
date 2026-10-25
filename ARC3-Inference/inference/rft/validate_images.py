@@ -23,7 +23,7 @@ import numpy as np
 from PIL import Image
 
 from inference.rft import rft_images
-from inference.rft.context_rebuild import rebuild
+from inference.rft.context_rebuild import rebuild_file
 from inference.rft.validate_rebuild import user_text
 
 
@@ -93,7 +93,7 @@ def check_run(run: Path, counts: dict[str, Counter], examples: dict[str, list]) 
             first = next(iter(logged.values()))[0]
             scales = rft_images.Scales(first.shape[0] // 64, first.shape[0] // 64, first.shape[0] // 64)
         completed = completed_actions(events)
-        game = rebuild(transcript.read_text(encoding="utf-8"))
+        game = rebuild_file(transcript)
         messages = [m for m in game.stream if m.get("role") == "user"]
         messages += [r.messages[1] for r in game.requests[:1] if len(r.messages) > 1 and "_action" in r.messages[1]
                      and r.messages[1] not in messages]

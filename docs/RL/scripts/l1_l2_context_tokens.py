@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path[:0] = [HERE, os.path.join(REPO, "ARC3-Inference")]
 from l1_l2_token_budget import RUNS_DIR, load_runs  # noqa: E402
-from inference.rft.context_rebuild import TOKENS_FIXED, estimate_tokens, rebuild  # noqa: E402
+from inference.rft.context_rebuild import TOKENS_FIXED, estimate_tokens, rebuild_file, run_tokens_per_image  # noqa: E402
 
 OUT = os.path.join(REPO, "docs", "RL", "data", "l1_l2_context.json")
 
@@ -39,9 +39,9 @@ def levels(events_path):
     return at_step, top
 
 
-def context_at(game, request):
+def context_at(game, request, per_image):
     """Untrimmed context sent with this request: system prompt + every stream message before its reply."""
-    return estimate_tokens([{"role": "system", "content": game.system}] + game.stream[:request.stream_end])
+    return estimate_tokens([{"role": "system", "content": game.system}] + game.stream[:request.stream_end], per_image)
 
 
 def one(job):
@@ -50,17 +50,18 @@ def one(job):
     if not events.exists():
         return None
     at_step, top = levels(events)
-    game = rebuild(Path(path).read_text(encoding="utf-8"))
+    game = rebuild_file(Path(path))
+    per_image = run_tokens_per_image(Path(path).parent.parent)  # images at this run's upscale
     if not game.requests:
         return None
-    end = estimate_tokens([{"role": "system", "content": game.system}] + game.stream)
+    end = estimate_tokens([{"role": "system", "content": game.system}] + game.stream, per_image)
     first = {}
     for request in sorted(game.requests, key=lambda r: r.stream_end):
         level = at_step.get(request.step)
         if level is not None and level >= 2 and 2 not in first:
-            first[2] = context_at(game, request)
+            first[2] = context_at(game, request, per_image)
         if level is not None and level >= 3 and 3 not in first:
-            first[3] = context_at(game, request)
+            first[3] = context_at(game, request, per_image)
     l1 = first.get(2, end if top >= 2 else None)
     l2 = first.get(3, end if top >= 3 else None)
     # estimate_tokens adds a per-request overhead; a reply alone does not carry it

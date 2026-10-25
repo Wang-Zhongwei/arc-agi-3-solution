@@ -42,8 +42,8 @@ from pathlib import Path
 from typing import Any
 
 from inference.rft import rft_images
-from inference.rft.context_rebuild import (TOKENS_FIXED, TOKENS_PER_CHAR, message_chars, rebuild, split_sections,
-                                          split_steps)
+from inference.rft.context_rebuild import (TOKENS_FIXED, TOKENS_PER_CHAR, message_chars, rebuild_file, split_sections,
+                                           split_steps)
 
 TRIM_NOTE = "Earlier conversation has been trimmed"
 EXCLUDED = {  # run path fragment -> reason
@@ -230,7 +230,7 @@ def trajectory_samples(attempt: Attempt, frames_cache: dict, images_dir: Path, m
         drops["no frames for game"] += 1
         return []
     frames = rft_images.Frames.from_run(states, events)
-    game = rebuild((run / "transcripts" / f"{attempt.stem}.txt").read_text(encoding="utf-8"))
+    game = rebuild_file(run / "transcripts" / f"{attempt.stem}.txt")  # trims placed at the run's image price
     tools = run_tools(run)
     requests = [r for r in game.requests if level_at(numbers, levels, r.action) == attempt.level]
     drawn: dict[int, list] = {}  # id(user message) -> its images

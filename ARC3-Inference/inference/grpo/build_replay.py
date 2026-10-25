@@ -26,7 +26,7 @@ from pathlib import Path
 from PIL import Image
 
 from inference.rft import rft_images
-from inference.rft.context_rebuild import TOKENS_FIXED, estimate_tokens, rebuild
+from inference.rft.context_rebuild import TOKENS_FIXED, estimate_tokens, rebuild_file, run_tokens_per_image
 from inference.rft.rft_data import GameFrames, level_after_actions, read_events, run_tools
 
 CAP = 130_000  # GRPO budget cap, context tokens (docs/RL/decisions.md)
@@ -55,6 +55,7 @@ def one_run(run: str) -> tuple[list[dict], dict]:
     except (FileNotFoundError, ValueError):  # a run saved without its source snapshot
         tools = json.loads(FALLBACK_TOOLS.read_text())
     blank_sha, blank_b64 = png(Image.new("RGB", (BLANK, BLANK), (255, 255, 255)))
+    per_image = run_tokens_per_image(run_dir)  # vision tokens of one board image at this run's upscale
     games, stats = [], {"blank_images": 0, "images": 0}
     for path in sorted((run_dir / "transcripts").glob("*_p0.txt")):
         events_path = run_dir / "artifacts" / f"{path.stem}_events.jsonl"
@@ -65,13 +66,13 @@ def one_run(run: str) -> tuple[list[dict], dict]:
         _, _, completing, _, _ = level_after_actions(events)
         frames = rft_images.Frames.from_run(states, events)
         at_step = levels_by_step(events)
-        game = rebuild(path.read_text(encoding="utf-8"))
+        game = rebuild_file(path)
         system = {"role": "system", "content": game.system}
         requests = []
         for request in sorted(game.requests, key=lambda r: r.stream_end):
             if (at_step.get(request.step) or 1) >= 3:
                 break
-            context = estimate_tokens([system] + game.stream[:request.stream_end])
+            context = estimate_tokens([system] + game.stream[:request.stream_end], per_image)
             if context > CAP:
                 break
             generated = max(1, round(estimate_tokens([request.reply]) - TOKENS_FIXED))

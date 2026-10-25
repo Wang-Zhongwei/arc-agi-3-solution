@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from statistics import median
 
-from inference.rft.context_rebuild import estimate_tokens, rebuild
+from inference.rft.context_rebuild import estimate_tokens, rebuild_file, run_tokens_per_image
 
 FULL, FORWARD = 3.5, 1.0  # relative cost per token: forward + recompute + backward vs forward only
 
@@ -30,7 +30,7 @@ def levels(events_path):
     return at_step, won
 
 
-def samples(game, at_step, won, only_won):
+def samples(game, at_step, won, only_won, per_image):
     """(prefix, total, trained) per (segment, level): requests with the same history_start share a prefix."""
     groups = {}
     for r in game.requests:
@@ -41,8 +41,8 @@ def samples(game, at_step, won, only_won):
     out = []
     for (_, level), reqs in groups.items():
         reqs.sort(key=lambda r: r.stream_end)
-        prefix = estimate_tokens(reqs[0].messages)
-        total = estimate_tokens(reqs[-1].messages) + estimate_tokens([reqs[-1].reply])
+        prefix = estimate_tokens(reqs[0].messages, per_image)
+        total = estimate_tokens(reqs[-1].messages, per_image) + estimate_tokens([reqs[-1].reply])
         trained = sum(estimate_tokens([r.reply]) for r in reqs)
         out.append((prefix, total, trained, len(reqs)))
     return out
@@ -57,7 +57,7 @@ for run in sys.argv[1:]:
               continue
           try:
               at_step, won = levels(events)
-              rows += samples(rebuild(path.read_text(encoding="utf-8")), at_step, won, only_won)
+              rows += samples(rebuild_file(path), at_step, won, only_won, run_tokens_per_image(Path(run)))
           except Exception as e:  # noqa: BLE001
               print("skip", path.name, type(e).__name__, str(e)[:80])
       if not rows:

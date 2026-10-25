@@ -34,7 +34,7 @@ from PIL import Image
 from torch.utils.checkpoint import checkpoint
 
 from inference.rft import host_offload, layer_patches, ple_mmap
-from inference.rft.context_rebuild import estimate_tokens, rebuild
+from inference.rft.context_rebuild import estimate_tokens, rebuild_file, run_tokens_per_image
 from inference.rft.qsa import patch_qsa_attention
 
 ATTENTION_GDN = r".*\.(self_attn\.(q_proj|k_proj|v_proj|o_proj)|linear_attn\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj))$"
@@ -86,11 +86,16 @@ def to_chat(messages: list[dict[str, Any]], load_image=None) -> tuple[list[dict[
     return chat, images
 
 
-def pick_request(game, length: int):
+def load_game(transcript: Path):
+    """A transcript's rebuilt game and its run's vision tokens per image, for the length estimates."""
+    return rebuild_file(transcript), run_tokens_per_image(transcript.parent.parent)
+
+
+def pick_request(game, length: int, per_image: float):
     """The non-uncertain request whose estimated prompt is largest but under `length`."""
     best = None
     for r in game.requests:
-        e = estimate_tokens(r.messages)
+        e = estimate_tokens(r.messages, per_image)
         if not r.uncertain and e <= length and (best is None or e > best[0]):
             best = (e, r)
     return best[1] if best else None
@@ -471,11 +476,11 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
                 cgroup=cgroup_memory_gb(), wall_start=round(wall_start, 1), wall_end=round(time.time(), 1))
 
 
-def build_samples(processor, tools, game, specs, loss_replies: int) -> dict[int, dict[str, torch.Tensor]]:
+def build_samples(processor, tools, game, specs, loss_replies: int, per_image: float) -> dict[int, dict[str, torch.Tensor]]:
     """One packed sample per distinct target length in `specs` (e.g. "65536o")."""
     samples = {}
     for length in sorted({int(x.rstrip("o")) for x in specs}):
-        request = pick_request(game, length)
+        request = pick_request(game, length, per_image)
         if request is None:
             continue
         chat, images = to_chat(request.messages + [request.reply])
@@ -895,7 +900,7 @@ def use_adapter(model, name: str, rank: int) -> dict[str, int]:
     return dict(adapter=name, trainable_params=trainable)
 
 
-def serve(model, device, args, processor, tools, game) -> None:
+def serve(model, device, args, processor, tools, game, per_image: float) -> None:
     """Keep the loaded model and run job files dropped in args.serve until a STOP file appears.
 
     A job `NAME.job` is JSON: {"lengths": "32768,65536o", "repeats": 2, "qsa_chunk": 256,
@@ -913,7 +918,7 @@ def serve(model, device, args, processor, tools, game) -> None:
 
     jobs = args.serve
     jobs.mkdir(parents=True, exist_ok=True)
-    games, default_game = {}, game
+    games, default_game = {}, (game, per_image)
     print("serving jobs from", jobs, flush=True)
     while not (jobs / "STOP").exists():
         pending = sorted(jobs.glob("*.job"))
@@ -959,10 +964,10 @@ def serve(model, device, args, processor, tools, game) -> None:
                     fast_lora=job.get("fast_lora", False), fast_gdn=job.get("fast_gdn", False))
             if job.get("transcript"):
                 if job["transcript"] not in games:
-                    games[job["transcript"]] = rebuild(Path(job["transcript"]).read_text(encoding="utf-8"))
-                game = games[job["transcript"]]
+                    games[job["transcript"]] = load_game(Path(job["transcript"]))
+                game, per_image = games[job["transcript"]]
             else:
-                game = default_game
+                game, per_image = default_game
             result["lora"] = module.use_adapter(model, job.get("adapter", "default"), args.rank)
             ple_mmap.set_fp8(job.get("ple_fp8"))  # "row": PLE rows through per-row FP8 (a measurement)
             if "compare_grads" in job:  # [[label, reference_label], ...] of steps kept with keep_grads
@@ -977,7 +982,7 @@ def serve(model, device, args, processor, tools, game) -> None:
                 continue
             if "qsa_overlap" in job:  # {"length": 65536, "windows": [4, 16, 64, 256], "per_window": 256}
                 spec = job["qsa_overlap"]
-                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies, per_image)
                 sample = next(iter(samples.values()))
                 result["tokens"] = int(sample["input_ids"].shape[1])
                 result["layers"] = module.qsa_overlap(model, device, sample, tuple(spec.get("windows", (4, 16, 64, 256))),
@@ -988,7 +993,7 @@ def serve(model, device, args, processor, tools, game) -> None:
                 continue
             if "layer_check" in job:
                 spec = job["layer_check"]
-                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies, per_image)
                 sample = next(iter(samples.values()))
                 result["tokens"] = int(sample["input_ids"].shape[1])
                 result["layers"] = module.check_layers(model, device, sample, spec.get("layers", [0, 1, 3]),
@@ -998,7 +1003,7 @@ def serve(model, device, args, processor, tools, game) -> None:
                 continue
             if "layer_profile" in job:
                 spec = job["layer_profile"]
-                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies)
+                samples = module.build_samples(processor, tools, game, [str(spec["length"])], args.loss_replies, per_image)
                 sample = next(iter(samples.values()))
                 result["tokens"] = int(sample["input_ids"].shape[1])
                 result["layers"] = module.profile_layers(model, device, sample, spec.get("layers", [0, 1, 3]),
@@ -1008,7 +1013,7 @@ def serve(model, device, args, processor, tools, game) -> None:
                 print("job", job_path.stem, "done", flush=True)
                 continue
             specs = [x.strip() for x in job["lengths"].split(",") if x.strip()]
-            samples = module.build_samples(processor, tools, game, specs, job.get("loss_replies", args.loss_replies))
+            samples = module.build_samples(processor, tools, game, specs, job.get("loss_replies", args.loss_replies), per_image)
             result["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
             print("job", job_path.stem, job, result["lora"], flush=True)
             out = jobs / f"{job_path.stem}.result.json"
@@ -1086,9 +1091,9 @@ def main(argv: list[str] | None = None) -> int:
 
     processor = AutoProcessor.from_pretrained(args.model)
     tools = json.loads(args.tools.read_text())
-    game = rebuild(args.transcript.read_text(encoding="utf-8"))
+    game, per_image = load_game(args.transcript)
     specs = [x.strip() for x in args.lengths.split(",") if x.strip()]
-    samples = {} if args.serve else build_samples(processor, tools, game, specs, args.loss_replies)
+    samples = {} if args.serve else build_samples(processor, tools, game, specs, args.loss_replies, per_image)
     report["samples"] = {k: int(v["input_ids"].shape[1]) for k, v in samples.items()}
     print("samples (target length -> tokens):", report["samples"], flush=True)
 
@@ -1158,7 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
     save()
 
     if args.serve:
-        serve(model, device, args, processor, tools, game)
+        serve(model, device, args, processor, tools, game, per_image)
         return 0
 
     report["steps"] = run_specs(model, device, samples, specs, args.repeats,
