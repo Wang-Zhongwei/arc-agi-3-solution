@@ -358,9 +358,19 @@ def _animation_chain(
     """
     if state is None:
         return []
-    return collapse_frames(
-        previous_grid, normalize_frames(getattr(state.raw, "frame", None))
-    )
+    frames = normalize_frames(getattr(state.raw, "frame", None))
+    if getattr(state, "just_won_level", False) and len(frames) == 2 and _is_level_padding(frames[0]):
+        # TAAF's padding for a one-frame level transition (see _level_end_grid)
+        # is not something the game showed. Left in, that level-up read as an
+        # animation in which nearly every cell changed and changed back.
+        frames = frames[1:]
+    return collapse_frames(previous_grid, frames)
+
+
+def _is_level_padding(grid: tuple[tuple[int, ...], ...]) -> bool:
+    """TAAF's all-green frame, prepended to a level transition that rendered
+    only one frame so raw.frame[-2] exists. Not a board."""
+    return {cell for row in grid for cell in row} == {14}
 
 
 def _level_end_grid(
@@ -376,7 +386,7 @@ def _level_end_grid(
     if state is None:
         return None
     frames = normalize_frames(getattr(state.raw, "frame", None))
-    if len(frames) < 2 or {cell for row in frames[-2] for cell in row} == {14}:
+    if len(frames) < 2 or _is_level_padding(frames[-2]):
         return None
     return frames[-2]
 
