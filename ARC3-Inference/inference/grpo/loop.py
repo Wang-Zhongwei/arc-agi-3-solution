@@ -112,8 +112,11 @@ def summarize_wave(eps: list[episodes_mod.Episode], rewards: dict[str, dict[str,
                 error_samples=[(e.stem, e.error) for e in eps if e.error][:5])
 
 
-def build_job(args, step: int, run: Path, tau: dict[str, float]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The trainers' job for one step from one wave's run, and the wave's summary."""
+def build_job(args, step: int, run: Path, tau: dict[str, float]) -> tuple[dict[str, Any], dict[str, Any], list]:
+    """The trainers' job for one step from one wave's run, the wave's summary and its episodes.
+
+    The job holds `args.minibatches` minibatches (reward.split_minibatches), one optimizer step each; a minibatch's
+    rollouts are balanced over the trainers by tokens, and its loss is the token mean over its own trained tokens."""
     eps = episodes_mod.load_run(run, args.thinking_budget)
     rewards = {}
     for ep in eps:
@@ -134,17 +137,21 @@ def build_job(args, step: int, run: Path, tau: dict[str, float]) -> tuple[dict[s
         for index, advantage in picked:
             chosen.append((members[index], advantage))
     lengths = {e.stem: len(e.ids) for e, _ in chosen}
-    ranks = reward_mod.assign(lengths, args.trainers)
     by_stem = {e.stem: (e, a) for e, a in chosen}
-    samples = {}
-    for r, stems in enumerate(ranks):
-        samples[str(r)] = [dict(episode=str(run / "rl" / f"{s}.jsonl"), advantage=round(by_stem[s][1], 6), id=s,
-                                reward=round(rewards[s]["reward"], 6)) for s in stems]
+    minibatches, rank_tokens = [], [0] * args.trainers
+    for batch in reward_mod.split_minibatches([(e.game, e.stem, a) for e, a in chosen], args.minibatches):
+        ranks = reward_mod.assign({s: lengths[s] for _, s, _ in batch}, args.trainers)
+        samples = {}
+        for r, stems in enumerate(ranks):
+            samples[str(r)] = [dict(episode=str(run / "rl" / f"{s}.jsonl"), advantage=round(by_stem[s][1], 6), id=s,
+                                    reward=round(rewards[s]["reward"], 6)) for s in stems]
+            rank_tokens[r] += sum(lengths[s] for s in stems)
+        minibatches.append(dict(total_tokens=sum(len(by_stem[s][0].targets) for _, s, _ in batch), samples=samples))
     total = sum(len(e.targets) for e, _ in chosen)
-    job = dict(step=step, lr=args.lr, total_tokens=total, samples=samples, wave_run=str(run))
+    job = dict(step=step, lr=args.lr, total_tokens=total, minibatches=minibatches, wave_run=str(run))
     summary = summarize_wave(eps, rewards)
-    summary.update(trained_episodes=len(chosen), trained_tokens=total, groups_with_signal=len(
-        {e.game for e, _ in chosen}), rank_tokens=[sum(lengths[s] for s in stems) for stems in ranks])
+    summary.update(trained_episodes=len(chosen), trained_tokens=total, minibatches=len(minibatches),
+                   groups_with_signal=len({e.game for e, _ in chosen}), rank_tokens=rank_tokens)
     with open(run / "rewards.json", "w") as f:
         json.dump(rewards, f, indent=1)
     return job, summary, eps
@@ -255,11 +262,8 @@ def wait_done(work: Path, step: int, timeout_s: float) -> dict[str, Any]:
     raise TimeoutError(f"step {step} not done in {timeout_s / 60:.0f} min")
 
 
-def rank_stats(work: Path, step: int) -> dict[str, Any]:
-    """Token-weighted statistics of the step's samples, over all rank files."""
-    rows = []
-    for path in sorted((work / "jobs").glob(f"step_{step:06d}.rank*.json")):
-        rows += json.loads(path.read_text()).get("samples", [])
+def sample_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Token-weighted statistics of trained samples (the trainers' rank-file rows)."""
     stats = [r["loss_stats"] for r in rows if r.get("loss_stats")]
     n = sum(s["tokens"] for s in stats)
     out = dict(samples=len(rows), failed=sum(1 for r in rows if r.get("error")), tokens=n)
@@ -273,6 +277,20 @@ def rank_stats(work: Path, step: int) -> dict[str, Any]:
     return out
 
 
+def rank_stats(work: Path, step: int) -> dict[str, Any]:
+    """The step's sample statistics over all rank files, overall and per minibatch (the later minibatches train
+    further from the weights that played the wave: their ratios and clipping show the drift)."""
+    rows = []
+    for path in sorted((work / "jobs").glob(f"step_{step:06d}.rank*.json")):
+        rows += json.loads(path.read_text()).get("samples", [])
+    out = sample_stats(rows)
+    by_minibatch = defaultdict(list)
+    for r in rows:
+        by_minibatch[r.get("minibatch", 0)].append(r)
+    out["per_minibatch"] = [sample_stats(by_minibatch[m]) for m in sorted(by_minibatch)]
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--work", type=Path, required=True)
@@ -282,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=50, help="optimizer steps (waves 0..steps)")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--keep", type=int, default=6, help="rollouts trained per group of 8")
+    parser.add_argument("--minibatches", type=int, default=4, help="optimizer steps per wave (decided 2026-10-26)")
     parser.add_argument("--trainers", type=int, default=2)
     parser.add_argument("--thinking-budget", type=int, default=10240)
     parser.add_argument("--tau", type=Path, default=reward_mod.TAU_PATH)
@@ -383,10 +402,12 @@ def main(argv: list[str] | None = None) -> int:
                 row.update(stats)
                 row.update(event="train", step=step)
                 log_row(args.work, row, wandb_run)
-                if step == 1 and stats.get("tokens"):  # wave 0 at the base weights: pure train/rollout mismatch
-                    if stats["log_ratio_abs_mean"] > GATE_MAX_LOG_RATIO or \
-                            stats["outside_kept_share"] > GATE_MAX_OUTSIDE or stats["outside_ratio_share"] > GATE_MAX_OUTSIDE:
-                        raise RuntimeError(f"gate: trainer and vLLM disagree on wave 0's tokens: {stats}")
+                first = (stats.get("per_minibatch") or [{}])[0]
+                if step == 1 and first.get("tokens"):
+                    # wave 0's first minibatch is trained at the weights that played it: pure train/rollout mismatch
+                    if first["log_ratio_abs_mean"] > GATE_MAX_LOG_RATIO or \
+                            first["outside_kept_share"] > GATE_MAX_OUTSIDE or first["outside_ratio_share"] > GATE_MAX_OUTSIDE:
+                        raise RuntimeError(f"gate: trainer and vLLM disagree on wave 0's tokens: {first}")
             job, summary, eps = build_job(args, wave + 1, run, tau)
             if wave < args.steps:  # the next step's job, from this wave
                 job_path = args.work / "jobs" / f"step_{wave + 1:06d}.json"

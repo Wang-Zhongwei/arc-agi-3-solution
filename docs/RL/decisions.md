@@ -24,6 +24,10 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - The trainer's optimizations (QSA kernel, checkpoint offload, memory-mapped PLE, token-chunked layers) live in our [train_rft.py](../../ARC3-Inference/inference/rft/train_rft.py).
   - The harness already plays the games against vLLM's OpenAI server.
   - Our own asynchronous loop around train_rft, like Chen's (multiprocessing, no Ray): built 2026-10-26 when the user asked to build the pipeline after this proposal. Design and checks: [grpo-pipeline.md](grpo-pipeline.md).
+- **Updates per wave: 4 minibatches (decided 2026-10-26).** The kept rollouts of a wave are split into 4 minibatches, each mixing the games and each game's high and low advantages, with one optimizer step per minibatch. Weights still sync to vLLM once per wave.
+  - Adam moves each weight by about the learning rate per update, whatever the batch size, so one step per wave would give only 30 updates in 30 waves. 4 per wave give 120.
+  - The cost: the trained data is 4–7 updates behind the policy that played it instead of 1. PPO's clipping and the ratio mask are made for this; the loop logs the clipping and ratio statistics per minibatch.
+  - Compute, memory and time per wave are unchanged (every rollout still runs one forward + backward). This is common practice: DAPO makes 16 updates per rollout step.
 - **Optimizer: AdamW for round 1 (2026-10-26).** Muon is built as an option (`--optimizer muon`) and is the first A/B candidate if round 1 learns slowly.
   - The agentic-RL evidence for Muon ([Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169): ALFWorld, 0.5B, one seed) traces the gain to Muon's larger updates.
   - No study pairs Muon with LoRA in RL.
@@ -63,7 +67,7 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - A 64-rollout wave of the 8 games below holds about 7.6M trajectory tokens, 4.5M of them generated (historical attempts under the 130K budget). Generating it takes about 19 min.
   - Training all 64 on the two H200s (5.7K tokens/s) takes about 22 min, so the trainers fall ~15% behind. Training 4 of each group's 8 (PODS) takes about 11 min.
   - About 3 steps per hour, about $7 per step at secure prices ($5.29 per H200-hour).
-  - Open: train on 4 or 6 of 8 (6 uses the slack, about 16 min), and the loop (see Framework). [grpo-training-throughput.md](grpo-training-throughput.md)
+  - Open: train on 4 or 6 of 8 per group (6 is the pipeline's default: it uses the slack, about 16 min). The loop is built (see Framework); training runs 4 minibatches per wave (Updates per wave). [grpo-training-throughput.md](grpo-training-throughput.md)
 
 - **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
   - **Thinking factor (decided 2026-10-26).** Each cleared level's credit is multiplied by 1 + β · clip((1 − ρₗ) / 0.5, −1, 1), with β = 0.2.

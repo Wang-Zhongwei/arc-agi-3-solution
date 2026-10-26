@@ -53,3 +53,16 @@ def test_assign_balances_tokens():
     ranks = reward.assign(lengths, 2)
     loads = [sum(lengths[k] for k in r) for r in ranks]
     assert sorted(k for r in ranks for k in r) == sorted(lengths) and abs(loads[0] - loads[1]) <= 20
+
+
+def test_minibatches_mix_games_and_signs_and_balance_sizes():
+    # 8 games x 6 kept rollouts, advantages from +0.5 down to -0.5 within each game
+    items = [(f"g{g}", f"g{g}_{r}", 0.5 - 0.2 * r) for g in range(8) for r in range(6)]
+    batches = reward.split_minibatches(items, 4)
+    assert len(batches) == 4 and sorted(len(b) for b in batches) == [12, 12, 12, 12]
+    assert sorted(i for b in batches for i in b) == sorted(items)
+    for b in batches:
+        assert len({g for g, _, _ in b}) >= 6  # mixes the games
+        assert any(a > 0 for _, _, a in b) and any(a < 0 for _, _, a in b)  # and both signs
+    assert len(reward.split_minibatches(items[:3], 4)) == 3  # fewer items than minibatches: no empty ones
+    assert reward.split_minibatches(items, 1) == [sorted(items, key=lambda it: (it[0], -it[2], it[1]))]

@@ -134,6 +134,68 @@ def finish_step(model, optimizer, lr: float, clip: float) -> float:
     return norm
 
 
+def make_prepare(settings: SimpleNamespace, thinking_budget: int, max_tokens: int, processor=None,
+                 max_pixels: int = 589_824, ngram_model=None):
+    """prepare(spec, norm) -> (model inputs, loss_fn, episode) for one job sample; raises when it cannot train."""
+    def prepare(spec: dict[str, Any], norm: float):
+        ep = episodes.load(Path(spec["episode"]), thinking_budget)
+        if ep.error:
+            raise ValueError(ep.error)
+        if len(ep.ids) > max_tokens:
+            raise ValueError(f"{len(ep.ids)} tokens")
+        inputs = build_inputs(ep, processor, max_pixels)
+        if ngram_model is not None:  # PLE rows gathered here, on the prefetch thread
+            from inference.rft import layer_patches
+
+            inputs["_ngram"] = layer_patches.precompute_ngram(ngram_model, inputs["input_ids"])
+        return inputs, make_loss_fn(ep.behavior, float(spec["advantage"]), norm, settings), ep
+
+    return prepare
+
+
+def run_job(model, device, job: dict[str, Any], rank: int, optimizer, prepare, clip: float,
+            prefix_stop_grad: bool = False, on_sample=None) -> tuple[list[dict[str, Any]], list[float]]:
+    """One job: for each minibatch, this rank's rollouts one at a time (their gradients add up), the ranks' gradients
+    summed, one optimizer step. Every rank steps for every minibatch, also when it has none of its rollouts (it adds
+    zeros). The next rollout is prepared on a thread meanwhile, across minibatch boundaries.
+    Returns the samples' rows, each with its minibatch, and each minibatch's gradient norm before clipping.
+    `on_sample(row, inputs, result, episode)` sees every trained sample (the CPU example prints and stops there)."""
+    from inference.rft import train_rft
+
+    # a job without minibatches (every group's rewards were equal) makes no update
+    minibatches = job["minibatches"] if "minibatches" in job else [dict(total_tokens=job["total_tokens"],
+                                                                         samples=job["samples"])]
+    todo = [(m, spec, max(1.0, float(batch["total_tokens"])))
+            for m, batch in enumerate(minibatches) for spec in batch["samples"].get(str(rank), [])]
+    prefetch = train_rft.Prefetch(lambda item: prepare(item[1], item[2]))
+    if todo:
+        prefetch.start(todo[0])
+    rows, norms, i = [], [], 0
+    for m in range(len(minibatches)):
+        optimizer.zero_grad(set_to_none=True)
+        while i < len(todo) and todo[i][0] == m:
+            spec = todo[i][1]
+            try:
+                inputs, loss_fn, ep = prefetch.get()
+            except Exception as exc:  # noqa: BLE001 - a bad episode is skipped, the step goes on
+                inputs = None
+                rows.append(dict(id=spec.get("id"), minibatch=m, error=f"prepare: {str(exc)[:300]}"))
+            i += 1
+            if i < len(todo):
+                prefetch.start(todo[i])
+            if inputs is None:
+                continue
+            result = train_rft.run_sample(model, device, inputs, 1.0, prefix_stop_grad, loss_fn=loss_fn)
+            row = {k: result.get(k) for k in ("tokens", "loss_tokens", "loss", "forward_s", "backward_s",
+                                              "tokens_per_s", "peak_gb", "recompute_mode", "error", "loss_stats")}
+            rows.append(dict(id=spec.get("id"), minibatch=m, advantage=spec["advantage"], **row))
+            if on_sample is not None:
+                on_sample(rows[-1], inputs, result, ep)
+            del inputs
+        norms.append(finish_step(model, optimizer, float(job["lr"]), clip))
+    return rows, norms
+
+
 def lora_modules(model):
     """(checkpoint-style module name, peft LoRA layer) for every adapted module."""
     from peft.tuners.lora import LoraLayer
@@ -254,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch.distributed as dist
 
-    from inference.rft import host_offload, layer_patches, smoke_lora, train_rft
+    from inference.rft import host_offload, smoke_lora, train_rft
 
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     jobs, ckpt, sync = args.work / "jobs", args.work / "ckpt", args.work / "sync"
@@ -295,15 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                                eps_low=args.eps_low, eps_high=args.eps_high, ratio_min=args.ratio_min,
                                ratio_max=args.ratio_max)
 
-    def prepare(spec, norm):
-        ep = episodes.load(Path(spec["episode"]), args.thinking_budget)
-        if ep.error:
-            raise ValueError(ep.error)
-        if len(ep.ids) > args.max_tokens:
-            raise ValueError(f"{len(ep.ids)} tokens")
-        inputs = build_inputs(ep, processor, args.max_pixels)
-        inputs["_ngram"] = layer_patches.precompute_ngram(model, inputs["input_ids"])
-        return inputs, make_loss_fn(ep.behavior, float(spec["advantage"]), norm, settings), ep
+    prepare = make_prepare(settings, args.thinking_budget, args.max_tokens, processor, args.max_pixels, model)
 
     while True:
         job_path = jobs / f"step_{step + 1:06d}.json"
@@ -323,36 +377,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         job = json.loads(job_path.read_text())
         step = int(job["step"])
-        norm = max(1.0, float(job["total_tokens"]))
-        specs = job["samples"].get(str(rank), [])
         t0 = time.time()
-        optimizer.zero_grad(set_to_none=True)
-        prefetch = train_rft.Prefetch(lambda s: prepare(s, norm))
-        rows = []
-        if specs:
-            prefetch.start(specs[0])
-        for i, spec in enumerate(specs):
-            try:
-                inputs, loss_fn, ep = prefetch.get()
-            except Exception as exc:  # noqa: BLE001 - a bad episode is skipped, the step goes on
-                rows.append(dict(id=spec.get("id"), error=f"prepare: {str(exc)[:300]}"))
-                if i + 1 < len(specs):
-                    prefetch.start(specs[i + 1])
-                continue
-            if i + 1 < len(specs):
-                prefetch.start(specs[i + 1])
-            result = train_rft.run_sample(model, device, inputs, 1.0, args.prefix_stop_grad, loss_fn=loss_fn)
-            row = {k: result.get(k) for k in ("tokens", "loss_tokens", "loss", "forward_s", "backward_s",
-                                              "tokens_per_s", "peak_gb", "recompute_mode", "error", "loss_stats")}
-            rows.append(dict(id=spec.get("id"), advantage=spec["advantage"], **row))
-            del inputs
-        write_json(jobs / f"step_{step:06d}.rank{rank}.json", dict(step=step, samples=rows,
-                                                                  seconds=round(time.time() - t0, 1)))
         try:
-            grad_norm = finish_step(model, optimizer, float(job["lr"]), args.clip)
+            rows, norms = run_job(model, device, job, rank, optimizer, prepare, args.clip, args.prefix_stop_grad)
         except Exception:  # noqa: BLE001 - recorded for the loop, then fatal
             write_json(jobs / f"step_{step:06d}.failed.json", dict(step=step, rank=rank, error=traceback.format_exc()))
             raise
+        write_json(jobs / f"step_{step:06d}.rank{rank}.json", dict(step=step, samples=rows, grad_norms=norms,
+                                                                  seconds=round(time.time() - t0, 1)))
         if rank == 0:
             t1 = time.time()
             save_state(model, optimizer, latest, step)
@@ -365,9 +397,10 @@ def main(argv: list[str] | None = None) -> int:
             os.replace(str(target) + ".tmp", target)
             del tensors
             write_json(jobs / f"step_{step:06d}.done.json",
-                       dict(step=step, grad_norm=round(grad_norm, 6), lr=job["lr"], sync=str(target),
+                       dict(step=step, grad_norm=round(max(norms, default=0.0), 6), grad_norms=[round(n, 6) for n in norms],
+                            updates=len(norms), lr=job["lr"], sync=str(target),
                             train_seconds=round(t1 - t0, 1), save_seconds=round(time.time() - t1, 1), **merge_stats))
-            log(event="step", step=step, grad_norm=grad_norm, samples=len(rows), **merge_stats)
+            log(event="step", step=step, grad_norms=norms, samples=len(rows), **merge_stats)
         if world > 1:
             dist.barrier()
     if world > 1:

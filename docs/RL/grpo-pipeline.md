@@ -60,7 +60,7 @@ Per trained token t, with the processed logprob log πθ(t) (the trainer applies
 - no KL term, no entropy bonus, no old-policy forward pass
 - the whole sequence runs with gradients: unlike RFT, no prefix stop-grad. The context before the first reply is ~5–8K tokens; its keys and values depend on the adapted projections, so stopping its gradient would bias the policy gradient.
 
-One AdamW step per wave over all selected trajectories. The trajectories still run one at a time (one forward + backward each, up to 130K tokens); their LoRA gradients add up, and the step comes after the last one. GPU memory therefore depends on one trajectory's length, not on how many a step trains.
+Four AdamW steps per wave (decided 2026-10-26): the selected trajectories are split into 4 minibatches (`reward.split_minibatches`: every minibatch mixes the games and each game's high and low advantages), one step after each; the loss is the token mean over the minibatch's trained tokens. The trajectories still run one at a time (one forward + backward each, up to 130K tokens); their LoRA gradients add up, and each minibatch's step comes after its last one. GPU memory therefore depends on one trajectory's length, not on how many a step trains.
 
 ## Weight sync
 
@@ -83,14 +83,14 @@ One AdamW step per wave over all selected trajectories. The trajectories still r
 | Ratio mask | [0.5, 2] | beyond 2× the rollout and trainer disagree, not learn |
 | LoRA | r 16, α 32, attention + GDN | train_rft's tested setup |
 | Optimizer | AdamW, lr 1e-5 constant, β (0.9, 0.999), no decay, clip 1.0 | ~10× a full-model RL rate (LoRA Without Regret); conservative per the 10-19 rule |
-| Steps per wave | 1 (open: 2–4) | Every wave is exactly one update stale. The cost: Adam moves each weight by about the learning rate per update, whatever the batch size, so 30 waves are 30 updates. LoRA Without Regret's SFT runs lost more to full fine-tuning at larger batches, which argues for minibatches, not against them (the 10-26 version of this row said the opposite). |
+| Updates per wave | 4 minibatches (decided 2026-10-26) | Adam moves each weight by about the learning rate per update, whatever the batch size: one step per wave would make 30 updates in 30 waves, 4 make 120. The data is then 4–7 updates behind the policy that played it instead of 1, which the clipping and ratio mask handle. LoRA Without Regret's SFT runs lost more to full fine-tuning at larger batches, another reason for minibatches. Same compute, memory and time per wave. |
 | Sync | every step, stochastic BF16 | see Weight sync |
 | Saves | adapter, optimizer, loop state every step | a resume loses at most one wave |
 
 ## Checks
 
-**On CPU (passed 2026-10-26).** `tests/test_grpo_*.py`, 35 tests:
-- reward, thinking factor, max-variance selection (against every subset), advantages, trainer balance;
+**On CPU (passed 2026-10-26).** `tests/test_grpo_*.py`, 32 tests:
+- reward, thinking factor, max-variance selection (against every subset), advantages, minibatch split, trainer balance;
 - the recorder's prefix chain, budget, episode line and images; the episode builder's trained spans, forced `</think>` mask and image check;
 - the processed logprob against vLLM's top-k/top-p algorithm on tokens sampled from it (BF16 ties included: a third of random rows tie at the 20th value; every sampled token is kept, values within 1e-5);
 - the objective's gradient against a direct formula;
@@ -111,8 +111,8 @@ The harness's GRPO mode and the loop also ran end to end on a laptop against [`f
 |---|---|---|
 | Replies trained whole (token-exact sequences) | after wave 0 | ≥ 50% |
 | Episodes with errors | after wave 0 | ≤ 25% |
-| Trainer vs vLLM on wave 0's tokens at identical weights: mean \|log ratio\| | step 1 | ≤ 0.1 |
-| Trained tokens outside the trainer's kept set / ratio band | step 1 | ≤ 5% each |
+| Trainer vs vLLM on wave 0's tokens at identical weights: mean \|log ratio\| | step 1, first minibatch | ≤ 0.1 |
+| Trained tokens outside the trainer's kept set / ratio band | step 1, first minibatch | ≤ 5% each |
 | The first sync carries the update: correlation of vLLM's and the trainer's logprob changes on a 2K-token probe | after sync 1 | ≥ 0.5 |
 
 Before the trainers start, the pod runs the trainer's CUDA tests (and the GRPO tests) on GPU 2 and switches off any feature whose test fails, as train_pod.sh does.
@@ -123,7 +123,7 @@ Before the trainers start, the pod runs the trainer's CUDA tests (and the GRPO t
 - **The server.** A plain copy of the base model samples like vLLM: temperature, top-k and top-p, returning processed logprobs. It forces `</think>` at the thinking budget, and the next prompt re-renders that reply with an extra newline, as the chat template does.
 - **The game.** Each turn is one action, and a level is cleared when the action token is a multiple of 5.
 
-The schedule is the loop's. Step 1 is on-policy: mean |log ratio| ~1e-7, only rounding between the patched and plain paths. Step 2 trains data one update behind (~1e-3). The probe after sync 1 correlates 0.996 with the trainer's change, against the pod gate of 0.5.
+The schedule is the loop's, and the job and the step are the loop's `build_job` and the trainer's `run_job`. Step 1's first minibatch is on-policy: mean |log ratio| ~1e-7, only rounding between the patched and plain paths. Each later minibatch is one update further away (~1e-3), and step 2's minibatches train a wave played a whole step earlier (~2e-3). The probe after sync 1 correlates 0.9997 with the trainer's change, against the pod gate of 0.5.
 
 ```bash
 cd ARC3-Inference
@@ -151,7 +151,7 @@ make grpo-cpu-example ARGS="--pdb"        # pdb at every stage: `summary` (the p
 | `reward.advantages` and `max_variance_subset` | which rollouts are kept, and their advantages |
 | `train_grpo.make_loss_fn`, inside `loss_fn` | `logp`, `kept` and `behavior_t` per trained token |
 | `loss.grpo_objective` | `ratio`, `use` and `clipped`: the PPO clip and the ratio mask |
-| `train_grpo.finish_step` | gradients before clipping, and the optimizer step |
+| `train_grpo.run_job` | the minibatch loop: each rollout, then `finish_step` (gradients summed, clipped, one optimizer step) |
 | `train_grpo.merged_weights` | `delta`, `merged` and the share of the update kept |
 | `cpu_example.main`, at the probe | vLLM's and the trainer's logprob changes over the first sync |
 
@@ -171,6 +171,5 @@ make grpo-cpu-example ARGS="--pdb"        # pdb at every stage: `summary` (the p
 ## Open
 
 - 4 or 6 of 8 per group (6 by default).
-- Updates per wave: 1, or 2–4 minibatches that each mix all games. Weights still sync once per wave. With 4 minibatches the trained data is 4–7 updates behind the policy that played it instead of 1, which the clipping and ratio mask exist for. The runs make 4× as many updates for the same rollouts, and memory is unchanged.
 - Held-out checks (decisions.md, When to stop): not in the loop yet. An evaluation wave every few steps costs ~19 min per check.
 - Muon: built as an option (`--optimizer muon`), not used. Evidence on 2026-10-26: [Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169) on ALFWorld (0.5B, one seed) traces Muon's gain to update size, and no study pairs it with LoRA in RL. A candidate A/B if round 1 learns slowly.

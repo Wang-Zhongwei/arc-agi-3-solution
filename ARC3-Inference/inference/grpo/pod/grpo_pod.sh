@@ -19,6 +19,7 @@ CONFIG=${CONFIG:-configs/grpo/v1.json}
 STEPS=${STEPS:-30}
 LR=${LR:-1e-5}
 KEEP=${KEEP:-6}
+MINIBATCHES=${MINIBATCHES:-4}  # optimizer steps per wave (decided 2026-10-26)
 OPTIMIZER=${OPTIMIZER:-adamw}
 MAX_HOURS=${MAX_HOURS:-12}
 ARENA_MAX_GB=${ARENA_MAX_GB:-200}  # per trainer: 130K tokens in "layer" recompute need ~127 GB
@@ -217,7 +218,7 @@ log "phase 4: the loop ($STEPS steps)"
 wandb_args=()
 [ -n "$WANDB_PROJECT" ] && wandb_args=(--wandb-project "$WANDB_PROJECT" --wandb-run-name "grpo-${RUNPOD_POD_ID:-local}")
 (cd "$REPO/ARC3-Inference" && nohup uv run --no-sync python -m inference.grpo.loop --work "$WORK" --config "$CONFIG" \
-    --environments-dir "$ENV_DIR" --base-url "http://127.0.0.1:$PORT/v1" --steps "$STEPS" --lr "$LR" --keep "$KEEP" \
+    --environments-dir "$ENV_DIR" --base-url "http://127.0.0.1:$PORT/v1" --steps "$STEPS" --lr "$LR" --keep "$KEEP" --minibatches "$MINIBATCHES" \
     --tau "$REPO/docs/RL/data/thinking_per_action.json" "${wandb_args[@]}" > "$WORK/results/loop.log" 2>&1 < /dev/null &
  echo $! > "$WORK/loop.pid")
 while kill -0 "$(cat loop.pid)" 2>/dev/null; do

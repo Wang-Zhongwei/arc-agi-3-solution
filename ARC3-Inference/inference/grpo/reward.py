@@ -8,7 +8,9 @@
 - Groups whose rewards are all equal are skipped (no gradient).
 - Selection: the `keep` rollouts of a group whose rewards spread the most: the top i and bottom keep - i for the i
   with the largest variance (max-variance down-sampling, as in PODS).
-- Balance: rollouts go to trainers longest first, each to the trainer with fewer tokens so far.
+- Minibatches: the selected rollouts are split into n minibatches (4, decided 2026-10-26), one optimizer step each,
+  every minibatch mixing the games and each game's high and low advantages.
+- Balance: within a minibatch, rollouts go to trainers longest first, each to the trainer with fewer tokens so far.
 """
 
 from __future__ import annotations
@@ -83,6 +85,22 @@ def advantages(groups: dict[str, list[float]], keep: int) -> dict[str, list[tupl
         mean = sum(rewards) / len(rewards)
         out[name] = [(j, rewards[j] - mean) for j in max_variance_subset(rewards, keep)]
     return out
+
+
+def split_minibatches(items: list[tuple[str, Any, float]], n: int) -> list[list[tuple[str, Any, float]]]:
+    """(group, key, advantage) items into n minibatches, one optimizer step each. Each group's items, sorted by
+    advantage, are dealt round-robin, continuing where the previous group stopped: a minibatch gets a group's high
+    and low rollouts where the group has enough, and sizes differ by at most one. Empty minibatches are dropped."""
+    out: list[list[tuple[str, Any, float]]] = [[] for _ in range(max(1, n))]
+    by_group: dict[str, list[tuple[str, Any, float]]] = defaultdict(list)
+    for item in items:
+        by_group[item[0]].append(item)
+    cursor = 0
+    for group in sorted(by_group):
+        for item in sorted(by_group[group], key=lambda it: (-it[2], str(it[1]))):
+            out[cursor % len(out)].append(item)
+            cursor += 1
+    return [m for m in out if m]
 
 
 def assign(lengths: dict[Any, int], trainers: int) -> list[list[Any]]:

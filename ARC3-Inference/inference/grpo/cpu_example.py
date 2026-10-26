@@ -8,15 +8,16 @@ What runs is what the pod runs, scaled down; only the server and the game are st
   reply with an extra token before `</think>`, as the chat template does.
 - "game": each turn is one action; the action is the reply's last token, and a level is cleared when it is a multiple
   of CLEAR_EVERY. Human action counts are HUMAN_ACTIONS.
-- Everything else is the pipeline: rl_record.EpisodeRecorder writes the records, episodes.load builds the training
-  sequences, reward.* computes rewards, advantages and the max-variance subset, train_grpo.build_inputs /
-  make_loss_fn / finish_step train through train_rft.run_sample (chunks, recompute, checkpointed lm_head),
+- Everything else is the pipeline: rl_record.EpisodeRecorder writes the records, the loop's build_job turns a wave
+  into the trainers' job (episodes, rewards, advantages, the max-variance subset, 4 minibatches), the trainer's
+  run_job trains it (per minibatch: each rollout through train_rft.run_sample, then one optimizer step),
   train_grpo.merged_weights merges with stochastic BF16 rounding, and the merged tensors are loaded into the server
   (vLLM's grpo_load_weights does the same with model.load_weights), followed by the loop's sync probe.
 
-The schedule is the loop's: wave k is played by the server's weights theta_{k-1}; step k trains on wave k-1; then
-theta_k is synced. Step 1 is on-policy (wave 0 was played by theta_0, the trainer is at theta_0): its log ratios are
-~0. From step 2 on, the trained wave was played one update earlier, so the ratios move.
+The schedule is the loop's: wave k is played by the server's weights theta_{k-1}; step k trains on wave k-1 in 4
+minibatches, one optimizer step each; then theta_k is synced. Step 1's first minibatch is on-policy (wave 0 was played
+by theta_0, the trainer is still at theta_0): its log ratios are ~0. Each later minibatch is one update further away,
+and from step 2 on every minibatch trains a wave played a whole step of updates earlier.
 
     PYTHONPATH=.:../tufa-arc-agi-framework/src python -m inference.grpo.cpu_example [--steps 2] [--pdb]
 
@@ -37,9 +38,9 @@ from typing import Any
 
 import torch
 
-from inference.grpo import episodes, reward, rl_record, train_grpo
+from inference.grpo import episodes, rl_record, train_grpo
 from inference.grpo.loop import (GATE_MAX_LOG_RATIO, GATE_MAX_OUTSIDE, GATE_MIN_CHANGE_CORR, GATE_MIN_WHOLE_REPLIES,
-                                 compare_probe)
+                                 build_job, compare_probe, sample_stats)
 
 THINK_END = episodes.THINK_END  # </think> in the real vocabulary (the tiny model keeps its 248,320 tokens)
 REPLY_MARKER = 248045  # <|im_start|>: starts each turn's observation
@@ -165,6 +166,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--games", nargs="+", default=["ls20", "sp80"])
     parser.add_argument("--rollouts", type=int, default=4, help="rollouts per game per wave (a group)")
     parser.add_argument("--keep", type=int, default=3, help="rollouts trained per group (6 of 8 on the pod)")
+    parser.add_argument("--minibatches", type=int, default=4, help="optimizer steps per wave, as on the pod")
     parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--budget", type=int, default=200, help="context tokens per episode")
     parser.add_argument("--system-tokens", type=int, default=40)
@@ -178,7 +180,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parser.parse_args(argv)
     import peft
 
-    from inference.rft import layer_patches, qsa, smoke_lora, train_rft
+    from inference.rft import layer_patches, qsa, smoke_lora
 
     work = args.work or Path(tempfile.mkdtemp(prefix="grpo_cpu_"))
     generator = torch.Generator().manual_seed(args.seed)
@@ -238,60 +240,52 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             if wave == 0:
                 continue
 
-            # ---- 2. rewards and advantages for wave - 1 (the job of step `wave`)
-            step, trained_wave = wave, waves[wave - 1]
-            rewards = {}
-            for ep in trained_wave:
-                if ep.error:
-                    continue
-                rewards[ep.stem] = reward.episode_reward(
-                    ep.levels_completed, ep.info["actions_per_level"], ep.info["base_actions_per_level"],
-                    ep.stats["thinking_per_level"], args.tau)
-            groups = {}
-            for ep in trained_wave:
-                if ep.stem in rewards:
-                    groups.setdefault(ep.game, []).append(ep)
-            chosen = []
-            for game, members in groups.items():
-                values = [rewards[e.stem]["reward"] for e in members]
-                for index, advantage in reward.advantages({game: values}, args.keep).get(game, []):
-                    chosen.append((members[index], advantage))
-            norm = float(sum(len(e.targets) for e, _ in chosen))
-            stage(f"step {step}: rewards and advantages (from wave {wave - 1})", args,
-                  rewards={s: round(r["reward"], 4) for s, r in rewards.items()},
-                  chosen={e.stem: round(a, 4) for e, a in chosen}, trained_tokens=int(norm),
-                  state=dict(reward_parts=rewards, groups=groups, chosen=chosen))
-            if not chosen:
+            # ---- 2. the job of step `wave`, built from wave - 1 by the loop's own build_job: rewards, advantages,
+            #         the kept rollouts and their minibatches
+            step = wave
+            job_args = SimpleNamespace(thinking_budget=args.think_budget, keep=args.keep, trainers=1, lr=args.lr,
+                                       minibatches=args.minibatches)
+            run_dir = work / f"wave_{wave - 1}"
+            job, summary, _ = build_job(job_args, step, run_dir, {game: args.tau for game in args.games})
+            rewards = json.loads((run_dir / "rewards.json").read_text())
+            stage(f"step {step}: the job (from wave {wave - 1})", args,
+                  rewards={stem: round(r["reward"], 4) for stem, r in rewards.items()},
+                  minibatches={f"minibatch {m}": {x["id"]: x["advantage"] for x in batch["samples"]["0"]}
+                               for m, batch in enumerate(job["minibatches"])},
+                  trained_tokens=job["total_tokens"], state=dict(job=job, reward_parts=rewards, summary=summary))
+            if not job["minibatches"]:
                 print("  every group's rewards were equal: no gradient this step")
                 continue
 
-            # ---- 3. the step: each chosen episode alone, gradients adding up, then one optimizer step
-            optimizer.zero_grad(set_to_none=True)
-            rows = []
-            for ep, advantage in chosen:
-                inputs = train_grpo.build_inputs(ep)
-                loss_fn = train_grpo.make_loss_fn(ep.behavior, advantage, norm, settings)
-                result = train_rft.run_sample(trainer, "cpu", inputs, 1.0, False, loss_fn=loss_fn)
-                stats = result.get("loss_stats") or {}
-                rows.append(dict(stem=ep.stem, advantage=round(advantage, 4), loss=result.get("loss"),
-                                 tokens=stats.get("tokens"), used=stats.get("used"),
-                                 log_ratio_abs_mean=stats.get("log_ratio_abs_mean"), error=result.get("error")))
-                stage(f"step {step}: sample {ep.stem}", args, **rows[-1],
-                      state=dict(inputs=inputs, result=result, episode=ep))
+            # ---- 3. the step, by the trainer's own run_job: per minibatch, each rollout alone (gradients add up),
+            #         then one optimizer step
+            def on_sample(row, inputs, result, episode, step=step):
+                stats = row.get("loss_stats") or {}
+                stage(f"step {step}: minibatch {row['minibatch']}, sample {row['id']}", args,
+                      advantage=row["advantage"], loss=row["loss"], tokens=stats.get("tokens"),
+                      used=stats.get("used"), clipped=stats.get("clipped"),
+                      log_ratio_abs_mean=stats.get("log_ratio_abs_mean"), error=row.get("error"),
+                      state=dict(inputs=inputs, result=result, episode=episode))
+
+            prepare = train_grpo.make_prepare(settings, args.think_budget, max_tokens=10**9)
             before = {n: p.detach().clone() for n, p in trainer.named_parameters() if p.requires_grad}
-            grad_norm = train_grpo.finish_step(trainer, optimizer, args.lr, 1.0)
+            rows, norms = train_grpo.run_job(trainer, "cpu", job, 0, optimizer, prepare, 1.0, False,
+                                             on_sample=on_sample)
             moved = max(float((p.detach() - before[n]).abs().max()) for n, p in trainer.named_parameters()
                         if p.requires_grad)
-            ratio = sum(r["log_ratio_abs_mean"] * r["tokens"] for r in rows if r["tokens"]) / max(1, sum(
-                r["tokens"] for r in rows if r["tokens"]))
-            stage(f"step {step}: optimizer step", args, grad_norm=round(grad_norm, 6), largest_lora_change=moved,
-                  log_ratio_abs_mean=round(ratio, 8),
-                  note=("on-policy: wave 0 was played by the same weights" if step == 1
-                        else "one update behind: the ratio moves"),
-                  state=dict(rows=rows))
+            by_minibatch = [sample_stats([r for r in rows if r["minibatch"] == m]) for m in range(len(norms))]
+            ratios = [b.get("log_ratio_abs_mean", 0.0) for b in by_minibatch]
+            stage(f"step {step}: {len(norms)} optimizer steps", args,
+                  grad_norms={f"minibatch {m}": round(n, 6) for m, n in enumerate(norms)},
+                  log_ratio_abs_mean={f"minibatch {m}": r for m, r in enumerate(ratios)},
+                  largest_lora_change=moved,
+                  note=("minibatch 0 is on-policy (wave 0 was played by the same weights); each later one is "
+                        "one update further away" if step == 1 else
+                        "the wave was played one wave of updates earlier: every minibatch is off-policy"),
+                  state=dict(rows=rows, by_minibatch=by_minibatch))
             if step == 1:
-                print(f"  gate 3, mean |log ratio| at identical weights: {ratio:.2e} (pod threshold <= "
-                      f"{GATE_MAX_LOG_RATIO}); gate 4 shares are in the rows (pod threshold <= {GATE_MAX_OUTSIDE})")
+                print(f"  gate 3, mean |log ratio| of minibatch 0 at identical weights: {ratios[0]:.2e} (pod "
+                      f"threshold <= {GATE_MAX_LOG_RATIO}); gate 4 shares are in `by_minibatch` (<= {GATE_MAX_OUTSIDE})")
 
             # ---- 4. sync: merged, stochastically rounded tensors into the server (vLLM: grpo_load_weights)
             tensors, merge = train_grpo.merged_weights(trainer, weight_keys, seed=step)
@@ -309,7 +303,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 probe_result = compare_probe(probe["v0"], v1, probe_answer["base"], probe_answer["current"])
                 stage("probe after sync 1", args, **probe_result, gate=f">= {GATE_MIN_CHANGE_CORR}",
                       state=dict(probe=probe, trainer=probe_answer, v1=v1))
-            history.append(dict(step=step, grad_norm=grad_norm, log_ratio_abs_mean=ratio,
+            history.append(dict(step=step, grad_norms=norms, log_ratio_by_minibatch=ratios,
                                 reward_mean=sum(r["reward"] for r in rewards.values()) / max(1, len(rewards))))
     finally:
         layer_patches.unpatch(server)
