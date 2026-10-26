@@ -19,18 +19,33 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
 
 ## Our decisions
 
-- **Framework: [verl](https://github.com/volcengine/verl).** Widely used. Supports LoRA, vLLM or SGLang rollout, and multi-turn tool use (`AgentLoop`). [slime](https://github.com/THUDM/slime) has no LoRA, so it would mean full-parameter RL on a multi-node cluster.
+- **Framework: [verl](https://github.com/volcengine/verl) (2026-10-12; reopened 2026-10-26).** Widely used. Supports LoRA, vLLM or SGLang rollout, and multi-turn tool use (`AgentLoop`). [slime](https://github.com/THUDM/slime) has no LoRA, so it would mean full-parameter RL on a multi-node cluster.
+  - Reopened: verl was picked for rollout and training on the same GPUs, with rollout as the bottleneck. On separate rollout and training H200s (see Hardware), training is the bottleneck.
+  - The trainer's optimizations (QSA kernel, checkpoint offload, memory-mapped PLE, token-chunked layers) live in our [train_rft.py](../../ARC3-Inference/inference/rft/train_rft.py).
+  - The harness already plays the games against vLLM's OpenAI server.
+  - Proposal: our own asynchronous loop around train_rft, like Chen's (multiprocessing, no Ray). Undecided.
 - **Rollout: vLLM.** Same engine as our Kaggle submission, so chat template, tool parsing and sampling match deployment. It is also more widely used ([vLLM](https://github.com/vllm-project/vllm) ~94k stars vs [SGLang](https://github.com/sgl-project/sglang) ~37k), and in our experience SGLang was slower and harder to configure.
   - Yi-Chia Chen's weight sync and routing replay call SGLang's HTTP endpoints directly ([`sglang_controller.py`](https://github.com/ycchen-tw/agent-factory-3/blob/main/src/agent_factory_3/trainer/sglang_controller.py)), which is why his code needs SGLang. verl does both for vLLM itself.
-  - Weight sync: verl pushes weights into vLLM over CUDA IPC. Use `lora.merge=True`: the trainer merges LoRA into the base weights before pushing. This avoids vLLM runtime LoRA, which may not support GDN's packed projections, and rollout runs the same merged model we deploy.
-  - Routing replay (R3): vLLM ≥ 0.22 returns routed experts, but verl's training-side replay exists only for the Megatron and VeOmni engines, not FSDP ([router_replay](https://github.com/volcengine/verl/tree/main/examples/router_replay)). Start without it, since experts and router are frozen. If training is unstable, switch to VeOmni (FSDP2 + expert parallelism; R3 example for Qwen3.5-35B-A3B).
+  - Weight sync: merge LoRA into the base weights before pushing (verl: `lora.merge=True`).
+    - This avoids vLLM runtime LoRA, which may not support GDN's packed projections, and rollout runs the same merged model we deploy.
+    - verl's CUDA IPC push needs training and rollout on the same GPUs. With separate GPUs, push the merged attention/GDN tensors (~5.4 GB BF16) through vLLM's NCCL weight transfer, or send only the LoRA factors and merge them in the vLLM workers.
+    - Reset the prefix cache after every sync ([h200-rollout-serving.md](h200-rollout-serving.md)).
+  - Routing replay (R3): vLLM returns each token's routed experts (`--enable-return-routed-experts`).
+    - verl's training-side replay exists only for the Megatron and VeOmni engines, not FSDP ([router_replay](https://github.com/volcengine/verl/tree/main/examples/router_replay)). In our own loop it would be a top-k override in the trainer.
+    - Start without it, since experts and router are frozen.
 - **Model code: transformers.** Loads the HF checkpoint directly, no conversion.
-- **Training: FSDP2; Megatron later if MoE efficiency is too low.** FSDP2 is the simplest start. No DeepSpeed: verl has no DeepSpeed backend, and FSDP2 is about as fast as ZeRO-3. Megatron still helps with frozen experts, since the backward pass carries activation gradients through every MoE layer. But rollout usually dominates RL time, so switch only if profiling shows training is the bottleneck.
+- **Training: a whole model per H200, LoRA data parallel (2026-10-26; replaces FSDP2 from 2026-10-12).**
+  - train_rft fits the whole model on one H200 (PLE table in host RAM) up to about 133K tokens, so nothing needs sharding.
+  - Each trainer takes its own trajectories, and the LoRA gradients are averaged before every optimizer step.
+  - train_rft is single-GPU today; the averaging is still to write.
+  - FSDP2 and Megatron shard a model that doesn't fit one GPU. Training is the bottleneck here (see Hardware), but the remedy is fewer tokens to train, not sharding.
 - **LoRA on attention + GDN, merged after training; routed experts frozen.**
   - GDN is most of the mixer layers (3 of 4 in Qwen3-Next) and controls what the recurrent state keeps or forgets.
   - Merge W′ = W + (α/r)·BA into the BF16 weights, then re-quantize. Start from BF16, not dequantized weights: a ΔW smaller than half a quantization step rounds back to the old value.
   - Expert LoRA is out. Merging needs the full BF16 experts in memory plus a rerun of the 4-bit quantization (NVFP4 / W4A16). Serving it unmerged slows vLLM inference.
-  - Caveat: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) finds attention-only LoRA significantly worse than MLP (incl. MoE) LoRA, in SFT and in RL on MATH, while attention on top of MLP adds nothing. We accept this for deployability. From the same post: LoRA LR ≈ 10× full fine-tuning LR, rank 1 suffices for policy-gradient RL, and LoRA prefers small batches. - **Harness, context and tools identical in training and evaluation.** RL learns behaviour conditioned on what the model sees: system prompt, tool names and schemas, action interface, observation rendering (frames, frame diff, level-up board) and context management (truncation, compressed trace). Any mismatch is a distribution shift, and the LoRA gain may not transfer. Freeze this model-facing interface before RL; a later prompt or observation change means retraining. Only invisible parts may differ: scheduling (streams, priority, allocation, turn yield), training-only branching, and serving precision (BF16 rollout vs NVFP4 on Kaggle).
+  - Caveat: [LoRA Without Regret](https://thinkingmachines.ai/blog/lora/) finds attention-only LoRA significantly worse than MLP (incl. MoE) LoRA, in SFT and in RL on MATH, while attention on top of MLP adds nothing. We accept this for deployability. From the same post: LoRA LR ≈ 10× full fine-tuning LR, rank 1 suffices for policy-gradient RL, and LoRA prefers small batches.
+- **Start GRPO from the base model, not RFT v1 (proposed 2026-10-26).** RFT v1 scored 8.6 points per game below the base model on Kaggle (p = 0.003), concentrated on the games and levels it trained on ([rft-v1-kaggle-ab.md](rft-v1-kaggle-ab.md)).
+- **Harness, context and tools identical in training and evaluation.** RL learns behaviour conditioned on what the model sees: system prompt, tool names and schemas, action interface, observation rendering (frames, frame diff, level-up board) and context management (truncation, compressed trace). Any mismatch is a distribution shift, and the LoRA gain may not transfer. Freeze this model-facing interface before RL; a later prompt or observation change means retraining. Only invisible parts may differ: scheduling (streams, priority, allocation, turn yield), training-only branching, and serving precision (W4A16 with FP8 KV on the H200 rollouts vs the Kaggle runtime's quantization).
 
 - **GRPO on levels 1–2 first, with a context budget per episode: min(1,750 × human actions of L1 + L2, 130K) context tokens (decided 2026-10-23; replaces min(1,000 × h, 100K) generated tokens from 2026-10-21).**
   - An episode starts at the game's reset and succeeds if it clears L2 within the budget. GRPO rollouts never trim the context, so one sequence holds the system prompt, observations, tool results, images and every generated token; the budget caps that whole sequence. One number is simpler than a generated-token budget plus a separate context limit.
@@ -40,14 +55,33 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - The bp35 exception (a flat 100K generated) is dropped: its 1,750 × h is 121K, close to the cap, and it stays at 0% either way.
   - Open: whether the model sees its budget.
 
-- **Open (2026-10-26): train on 4 of every 8 rollouts, and how many training GPUs.** One H200 trains a 110K trajectory at 2.9K tokens/s (full backward), while a 2×H200 rollout pair produces 7.4–8.2K tokens/s of trajectories. Training on the 4 rollouts with the widest reward spread (PODS) cuts the tokens to train to 45%, so 2 training H200 suffice; without it, 3. Also open: an own asynchronous loop around train_rft instead of verl. [grpo-training-throughput.md](grpo-training-throughput.md).
+- **Hardware: 4 H200 = 2 rollout + 2 training (decided 2026-10-26).**
+  - Rollout: one TP=2 vLLM server with 64 concurrent rollouts, one group of 8 per game. It measured 3,920 generated tokens/s on the replay and 3,855 with the live harness ([h200-rollout-serving.md](h200-rollout-serving.md)).
+  - A 64-rollout wave of the 8 games below holds about 7.6M trajectory tokens, 4.5M of them generated (historical attempts under the 130K budget). Generating it takes about 19 min.
+  - Training all 64 on the two H200s (5.7K tokens/s) takes about 22 min, so the trainers fall ~15% behind. Training 4 of each group's 8 (PODS) takes about 11 min.
+  - About 3 steps per hour, about $7 per step at secure prices ($5.29 per H200-hour).
+  - Open: train on 4 or 6 of 8 (6 uses the slack, about 16 min), and the loop (see Framework). [grpo-training-throughput.md](grpo-training-throughput.md)
 
 - **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
 
-- **Games: train on the 25 public games, none held out (decided 2026-10-21).** We have few games, and the hidden test set is the final evaluation. This overrides "public 25 = validation only" under Data for this first GRPO round. All 25 have human action counts in `benchmark.json`.
-  - Train (21): ar25, bp35, cd82, cn04, dc22, g50t, ka59, lf52, ls20, m0r0, r11l, s5i5, sb26, sc25, sk48, sp80, su15, tn36, tu93, vc33, wa30. ar25 joined on 2026-10-23: under the context budget it is at 93%.
-  - Guards, not trained (4): ft09, lp85, re86, tr87. They clear L1 + L2 within budget in 98–100% of historical attempts, so their groups rarely have mixed outcomes and training on them mostly wastes rollouts.
-  - bp35 and sk48 stay in, although none of their attempts in our runs clears L1 + L2 within budget (0%). With per-level credit they still give signal on L1: sk48 has mixed groups 98% of the time at 8 rollouts (only 40% clear L1 within budget), and bp35 44% (69% at 16), since 93% of its attempts clear L1 within budget.
+- **Games: 8 public games (decided 2026-10-26; replaces the 21 training games of 2026-10-21).** bp35, cd82, g50t, s5i5, sk48, sp80, tn36, wa30, one group of 8 rollouts each per wave. All have human action counts in `benchmark.json`.
+  - cd82 replaced su15 the same day: su15 cleared L1 + L2 within budget in 70% of attempts, too easy. cd82 is harder on both levels and its rollouts disagree about twice as much on the level reward.
+  - The other 17 public games stay untrained, including the 4 guards (ft09, lp85, re86, tr87). So they can measure transfer to games the policy never trained on (see When to stop).
+  - Cleared within budget in our historical attempts, L1 / L1 + L2:
+
+    | Game | L1 | L1 + L2 |
+    |---|---:|---:|
+    | bp35 | 93% | 0% |
+    | cd82 | 58% | 35% |
+    | g50t | 58% | 23% |
+    | s5i5 | 100% | 51% |
+    | sk48 | 40% | 0% |
+    | sp80 | 100% | 37% |
+    | tn36 | 91% | 14% |
+    | wa30 | 100% | 21% |
+
+  - Seven of the 8 run to the budget in most attempts (63–100%), so a wave lasts about as long as the budget allows.
+  - Caveat (undecided): bp35 and sk48 never clear L2 within budget, so they train L1 only, and every one of their rollouts runs the full budget: 16 of the 64 slots. Swapping them for two mid-range games (e.g. dc22 and m0r0) raises the mean within-group variance of the level reward (0, ⅓ or 1) from 0.092 to 0.125, with the same wave time.
 
 - **When to stop: level 3 as the held-out set (decided 2026-10-21).** Training rewards only L1–L2, so L3 of every game is never trained on, and memorized L1–L2 action sequences cannot help on it.
   - Every 5 steps, play each game from reset through L3 with the current policy (same harness and context as evaluation, so with its usual trimming: these rollouts are not trained on, so the 130K training limit does not apply), a few rollouts per game.
@@ -55,10 +89,11 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - Also tracked: L1–L2 within budget (the training measure), the guard games, thinking tokens per turn and MTP draft acceptance.
   - Stop when any of these happens: the L3 measure has not beaten its best for 2 checks in a row; a guard game drops below 95% within budget; thinking per turn falls more than 10% below the base model; training reward keeps rising while L3 stays flat (memorization).
   - Caveat: L3 is the same game, so it measures transfer within a game, not to new games.
+  - New with 8 training games (proposed 2026-10-26): the 17 untrained games measure transfer to new games, e.g. L1 + L2 within budget at every check. That costs about one extra wave per check.
 
 ## Data
 
-The 25 public games are validation only; train on other games so the score measures generalisation to the 110 hidden games. Local copies sit next to this repo in `../`.
+For later rounds. Round 1 trains on 8 of the public games (see Games). Training on other games would let all 25 public games measure generalisation to the 110 hidden games. Local copies sit next to this repo in `../`.
 
 | Source | Games | Format | Notes |
 | --- | --- | --- | --- |
