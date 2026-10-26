@@ -138,7 +138,8 @@ to each call. Retained functions use refreshed runtime globals.
 
 When animation access is enabled, `last_animation_frames` and
 `last_animation_timeline` expose intermediate frames and a compressed change
-timeline for inspection from Python.
+timeline for inspection from Python, and `history[i].animation` keeps each
+action's animation summary.
 
 ## Configuration
 
