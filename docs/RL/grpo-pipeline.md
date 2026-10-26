@@ -117,6 +117,44 @@ The harness's GRPO mode and the loop also ran end to end on a laptop against [`f
 
 Before the trainers start, the pod runs the trainer's CUDA tests (and the GRPO tests) on GPU 2 and switches off any feature whose test fails, as train_pod.sh does.
 
+## CPU example
+
+[`cpu_example.py`](../../ARC3-Inference/inference/grpo/cpu_example.py) runs one GRPO pipeline end to end on a laptop, in about a minute, with the pipeline's own code on a tiny random `qwen4_exp`. Only two parts are stand-ins:
+- **The server.** A plain copy of the base model samples like vLLM: temperature, top-k and top-p, returning processed logprobs. It forces `</think>` at the thinking budget, and the next prompt re-renders that reply with an extra newline, as the chat template does.
+- **The game.** Each turn is one action, and a level is cleared when the action token is a multiple of 5.
+
+The schedule is the loop's. Step 1 is on-policy: mean |log ratio| ~1e-7, only rounding between the patched and plain paths. Step 2 trains data one update behind (~1e-3). The probe after sync 1 correlates 0.996 with the trainer's change, against the pod gate of 0.5.
+
+```bash
+cd ARC3-Inference
+make grpo-cpu-venv                        # .venv-grpo: torch 2.8, transformers 5.20.1, peft (requirements-cpu.txt)
+make grpo-cpu-example                     # every stage printed
+make grpo-cpu-example ARGS="--pdb"        # pdb at every stage: `summary` (the printed numbers), `state` (the objects)
+```
+
+**Debugging in VS Code** (`.vscode/launch.json`; `justMyCode: false` lets you step into transformers and peft):
+
+```json
+{"name": "GRPO CPU example", "type": "debugpy", "request": "launch", "module": "inference.grpo.cpu_example",
+ "cwd": "${workspaceFolder}/ARC3-Inference", "python": "${workspaceFolder}/ARC3-Inference/.venv-grpo/bin/python",
+ "env": {"PYTHONPATH": "${workspaceFolder}/ARC3-Inference:${workspaceFolder}/tufa-arc-agi-framework/src"},
+ "args": ["--steps", "2"], "justMyCode": false}
+```
+
+**Where to put breakpoints**, in the order the data flows:
+
+| Where | What to look at |
+|---|---|
+| `cpu_example.play_wave`, at `recorder.after_response` | `prompt`, `ids` and `logprobs`: what vLLM saw and sampled |
+| `episodes.load`, after `lengths = trained_lengths(requests)` | which replies are cut, and where |
+| `reward.episode_reward` | per level: actions, efficiency, thinking factor |
+| `reward.advantages` and `max_variance_subset` | which rollouts are kept, and their advantages |
+| `train_grpo.make_loss_fn`, inside `loss_fn` | `logp`, `kept` and `behavior_t` per trained token |
+| `loss.grpo_objective` | `ratio`, `use` and `clipped`: the PPO clip and the ratio mask |
+| `train_grpo.finish_step` | gradients before clipping, and the optimizer step |
+| `train_grpo.merged_weights` | `delta`, `merged` and the share of the update kept |
+| `cpu_example.main`, at the probe | vLLM's and the trainer's logprob changes over the first sync |
+
 ## Running it
 
 - Pod: 4 × H200 SXM, image `vllm/vllm-openai@sha256:d428631bb917a33d22308265d1b8be91522f862bf9fd133bee62dde3313664ae`, a ≥ 400 GB volume at `/workspace`: checkpoint 169 GB, trainer venv, waves at ~1 GB each, the last two sync files.
