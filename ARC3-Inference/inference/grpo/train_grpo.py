@@ -356,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     log(event="loaded", world=world, args={k: str(v) for k, v in vars(args).items()}, **info,
         arena_reserve_s=round(model._rft_host_arena.reserve(), 1), cgroup=smoke_lora.cgroup_memory_gb())
     params = trainable(model)
-    optimizer = optimizer_for(params, args.optimizer, 1e-5)
+    optimizer = optimizer_for(params, args.optimizer, 1e-4)  # the job's lr replaces it at every update
     step = 0
     latest = ckpt / "latest"
     if args.resume and (latest / "state.json").exists():

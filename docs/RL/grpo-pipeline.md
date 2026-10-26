@@ -92,7 +92,7 @@ Four AdamW steps per wave (decided 2026-10-26): the selected trajectories are sp
 | Clip | 0.2 / 0.28 | PPO's 0.2; the higher upper bound (DAPO) keeps rare good tokens from being clipped early |
 | Ratio mask | [0.5, 2] | beyond 2× the rollout and trainer disagree, not learn |
 | LoRA | r 16, α 32, attention + GDN | train_rft's tested setup |
-| Optimizer | AdamW, lr 1e-5 constant, β (0.9, 0.999), no decay, clip 1.0 | ~10× a full-model RL rate (LoRA Without Regret); conservative per the 10-19 rule |
+| Optimizer | AdamW, lr 1e-4 constant, β (0.9, 0.999), no decay, clip 1.0 | RFT's LoRA recipe for this model (ms-swift: 1e-4). 30 waves × 4 minibatches = 120 updates, fewer than RFT's 178, and the clip and ratio mask bound each one; the LR-weighted total is about RFT's (1.2e-2 vs ~1.0e-2 after its cosine decay). 1e-5 until 2026-10-26: too little movement to show in 30 steps. |
 | Updates per wave | 4 minibatches (decided 2026-10-26) | Adam moves each weight by about the learning rate per update, whatever the batch size: one step per wave would make 30 updates in 30 waves, 4 make 120. The data is then 4–7 updates behind the policy that played it instead of 1, which the clipping and ratio mask handle. LoRA Without Regret's SFT runs lost more to full fine-tuning at larger batches, another reason for minibatches. Same compute, memory and time per wave. |
 | Sync | every step, stochastic BF16 | see Weight sync |
 | Saves | adapter, optimizer, loop state every step | a resume loses at most one wave |

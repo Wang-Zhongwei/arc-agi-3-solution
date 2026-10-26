@@ -31,6 +31,7 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
 - **Optimizer: AdamW for round 1 (2026-10-26).** Muon is built as an option (`--optimizer muon`) and is the first A/B candidate if round 1 learns slowly.
   - The agentic-RL evidence for Muon ([Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169): ALFWorld, 0.5B, one seed) traces the gain to Muon's larger updates.
   - No study pairs Muon with LoRA in RL.
+  - Learning rate 1e-4 constant (decided 2026-10-26; 1e-5 before): RFT's LoRA recipe for this model. GRPO makes 120 updates (30 waves × 4 minibatches), fewer than RFT's 178, and the clip and ratio mask bound each update, which SFT did not have.
 - **Rollout: vLLM.** Same engine as our Kaggle submission, so chat template, tool parsing and sampling match deployment. It is also more widely used ([vLLM](https://github.com/vllm-project/vllm) ~94k stars vs [SGLang](https://github.com/sgl-project/sglang) ~37k), and in our experience SGLang was slower and harder to configure.
   - Yi-Chia Chen's weight sync and routing replay call SGLang's HTTP endpoints directly ([`sglang_controller.py`](https://github.com/ycchen-tw/agent-factory-3/blob/main/src/agent_factory_3/trainer/sglang_controller.py)), which is why his code needs SGLang. verl does both for vLLM itself.
   - Weight sync: merge LoRA into the base weights before pushing (verl: `lora.merge=True`).

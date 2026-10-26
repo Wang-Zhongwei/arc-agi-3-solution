@@ -298,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--environments-dir", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--steps", type=int, default=50, help="optimizer steps (waves 0..steps)")
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--keep", type=int, default=6, help="rollouts trained per group of 8")
     parser.add_argument("--minibatches", type=int, default=4, help="optimizer steps per wave (decided 2026-10-26)")
     parser.add_argument("--trainers", type=int, default=2)
