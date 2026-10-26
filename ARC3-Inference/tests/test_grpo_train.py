@@ -64,7 +64,16 @@ def lora_grads(m):
     return {n: p.grad.detach().clone() for n, p in m.named_parameters() if p.requires_grad and p.grad is not None}
 
 
-def test_step_gradient_equals_the_direct_objective(model):
+@pytest.fixture(params=[False, True], ids=["bf16-kv", "fp8-kv"])
+def kv_fp8(request):
+    qsa.set_kv_fp8(request.param)
+    yield request.param
+    qsa.set_kv_fp8(False)
+
+
+def test_step_gradient_equals_the_direct_objective(model, kv_fp8):
+    """With FP8 caches simulated too: run_sample's paths (layer mode, checkpoint recompute) round as the plain
+    forward does."""
     eps = [episode(1, 48, [(20, 30), (40, 48)]), episode(2, 64, [(10, 25)])]
     advantages = [0.6, -0.4]
     norm = float(sum(len(e.targets) for e in eps))
@@ -90,6 +99,24 @@ def test_step_gradient_equals_the_direct_objective(model):
     flat = lambda d: torch.cat([d[n].flatten() for n in sorted(d)])  # noqa: E731
     rel = float((flat(got) - flat(expected)).norm() / flat(expected).norm())
     assert rel < 1e-4, rel
+
+
+def test_fp8_kv_changes_the_logprobs(model):
+    ep = episode(3, 64, [(10, 40)])
+    logps = []
+    for on in (False, True):
+        qsa.set_kv_fp8(on)
+        with torch.no_grad():
+            logps.append(direct_loss(model, ep, torch.zeros(len(ep.targets)), 0.5, 1.0)[1])
+    qsa.set_kv_fp8(False)
+    assert 1e-6 < float((logps[0] - logps[1]).abs().max()) < 0.5
+
+
+def test_kv_scale_keys():
+    keys = ["model.layers.3.self_attn.k_proj.weight", "model.layers.3.self_attn.k_proj.scales",
+            "model.layers.3.self_attn.attn.k_scale", "model.layers.3.self_attn.attn._v_scale",
+            "model.layers.3.self_attn.v_proj.output_scale", "model.layers.0.mlp.experts.0.down_proj.weight_block_scale"]
+    assert train_grpo.kv_scale_keys(keys) == keys[2:5]
 
 
 def _rank_worker(rank, world, path, init):

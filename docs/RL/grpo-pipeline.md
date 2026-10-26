@@ -47,7 +47,7 @@ The same harness, prompts, tools, observation rendering and sampling as evaluati
   - ρₗ: thinking tokens per action on the level ÷ τ̄, the base model's median for the game ([thinking_per_action.json](data/thinking_per_action.json)). Thinking tokens on a level are the reply tokens before `</think>` in requests sent while the game was on that level.
 - **Advantage:** R minus the mean of its group of 8 (no division by the group's spread).
 - **Skipped:** groups whose 8 rewards are equal (no gradient).
-- **Selection:** 6 of each group's 8 (max-variance subset: the top i and bottom 6 − i for the i with the largest spread, as PODS does). 4 is the other option in decisions.md.
+- **Selection** (decided 2026-10-26): 6 of each group's 8 (max-variance subset: the top i and bottom 6 − i for the i with the largest spread, as PODS does).
 - **Balance:** trajectories go to the two trainers longest first, each to the one with fewer tokens.
 
 ## Loss
@@ -61,6 +61,16 @@ Per trained token t, with the processed logprob log πθ(t) (the trainer applies
 - the whole sequence runs with gradients: unlike RFT, no prefix stop-grad. The context before the first reply is ~5–8K tokens; its keys and values depend on the adapted projections, so stopping its gradient would bias the policy gradient.
 
 Four AdamW steps per wave (decided 2026-10-26): the selected trajectories are split into 4 minibatches (`reward.split_minibatches`: every minibatch mixes the games and each game's high and low advantages), one step after each; the loss is the token mean over the minibatch's trained tokens. The trajectories still run one at a time (one forward + backward each, up to 130K tokens); their LoRA gradients add up, and each minibatch's step comes after its last one. GPU memory therefore depends on one trajectory's length, not on how many a step trains.
+
+**FP8 caches.** vLLM serves with `--kv-cache-dtype fp8_e4m3` and `indexer_kv_dtype: fp8`, and the behavior logprobs were computed over those caches. The trainer reads the same values (`train_grpo --kv-fp8`, the default; `qsa.set_kv_fp8`), as vLLM's `qsa_prepare` (83c078d) stores them:
+- K (normed, rotated) and V: rounded to BF16, divided by the layer's scale and rounded to e4m3 (nearest-even, saturating at ±448). The scale is 1.0: the checkpoint has no KV scales, and the trainer refuses one that has. Q stays BF16. The gradient passes straight through the rounding.
+- The indexer's queries and pooled block keys: plain e4m3, no scale (no gradient there).
+
+**Differences that remain.** These are measured by the step-1 gate, not removed:
+- QSA block selection among tied scores. vLLM picks with its CUDA top-k; the trainer prefers later blocks. Ties are mostly blocks at 0 after the relu, once fewer than 512 blocks score above 0.
+- MoE routing near ties and the W4A16 kernels' arithmetic.
+- GDN state: vLLM rounds it to BF16 after every decode step (`--mamba-ssm-cache-dtype bfloat16`); the trainer's chunked kernel rounds differently.
+- MTP: the logprobs and token ids come from speculative verification.
 
 ## Weight sync
 
@@ -77,7 +87,7 @@ Four AdamW steps per wave (decided 2026-10-26): the selected trajectories are sp
 | Episode end | L2 cleared, the budget, or 60 min | 60 min is 3× the ~20 min a full-budget rollout takes at 64 concurrent; only against hangs |
 | Request cap | min(14,336, budget − estimate − 256) | the estimate is anchored on the last real count (p99 +1.3%); 256 covers the rest |
 | Sampling | T 0.7, top-p 0.95, top-k 20, thinking 10,240 | evaluation's settings |
-| Selection | 6 of 8 per group | the most the trainers finish within a wave (~16 vs ~19 min) |
+| Selection | 6 of 8 per group (decided 2026-10-26) | the most the trainers finish within a wave (~16 vs ~19 min) |
 | Advantage | R − group mean | dividing by a near-tied group's spread turns its noise into full-size advantages |
 | Clip | 0.2 / 0.28 | PPO's 0.2; the higher upper bound (DAPO) keeps rare good tokens from being clipped early |
 | Ratio mask | [0.5, 2] | beyond 2× the rollout and trainer disagree, not learn |
@@ -89,12 +99,13 @@ Four AdamW steps per wave (decided 2026-10-26): the selected trajectories are sp
 
 ## Checks
 
-**On CPU (passed 2026-10-26).** `tests/test_grpo_*.py`, 32 tests:
+**On CPU (passed 2026-10-26).** `tests/test_grpo_*.py`, 35 tests, and the FP8 cache tests in `tests/test_qsa.py`:
 - reward, thinking factor, max-variance selection (against every subset), advantages, minibatch split, trainer balance;
 - the recorder's prefix chain, budget, episode line and images; the episode builder's trained spans, forced `</think>` mask and image check;
 - the processed logprob against vLLM's top-k/top-p algorithm on tokens sampled from it (BF16 ties included: a third of random rows tie at the 20th value; every sampled token is kept, values within 1e-5);
 - the objective's gradient against a direct formula;
-- a GRPO step through train_rft's machinery (chunks, recompute, checkpointed lm_head) against the objective computed directly on the tiny `qwen4_exp` (LoRA gradients within 1e-4);
+- a GRPO step through train_rft's machinery (chunks, recompute, checkpointed lm_head) against the objective computed directly on the tiny `qwen4_exp` (LoRA gradients within 1e-4), with BF16 and with simulated FP8 caches;
+- the FP8 cache simulation: e4m3 rounding against a brute-force nearest-even search over all 256 codes (ties and saturation included); Q and the output gate untouched, K, V and the indexer's inputs rounded; the gradient straight through; the checkpoint's KV scale names;
 - two gloo ranks' summed gradients against one rank;
 - the merged export's checkpoint names and the stochastic rounding's mean;
 - the probe with the adapter on and off;
@@ -170,6 +181,6 @@ make grpo-cpu-example ARGS="--pdb"        # pdb at every stage: `summary` (the p
 
 ## Open
 
-- 4 or 6 of 8 per group (6 by default).
+- If the step-1 gate's log ratio comes out high: capture vLLM's QSA block selection for the trainer to replay, as `--enable-return-routed-experts` does for MoE routing (a vLLM addition).
 - Held-out checks (decisions.md, When to stop): not in the loop yet. An evaluation wave every few steps costs ~19 min per check.
 - Muon: built as an option (`--optimizer muon`), not used. Evidence on 2026-10-26: [Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169) on ALFWorld (0.5B, one seed) traces Muon's gain to update size, and no study pairs it with LoRA in RL. A candidate A/B if round 1 learns slowly.

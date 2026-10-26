@@ -32,7 +32,7 @@ Merged upstream since 09-23 that Lord's base lacks and that matter on H200:
 2. **Behavior logprobs.** Use `--logprobs-mode processed_logprobs`, i.e. logprobs after temperature 0.7, top-p 0.95 and top-k 20, and request `logprobs` (not `logprob_token_ids`, so #61219 isn't needed). Check them against the trainer's.
 3. **Forced `</think>`.** The 10,240-token thinking budget is enforced in the sampler (`vllm/v1/sample/thinking_budget_state.py`), so that token isn't sampled from the policy. Mask it in the loss. vLLM doesn't flag it, so identify it by position: reasoning length equal to the budget.
 4. **MoE routing gap.** `--enable-return-routed-experts` returns each token's top-10 of 512 experts, which allows routing replay in the trainer as an alternative to TIS or masking. Lord's base has it too. QSA's top-512 block selection has no such capture; that would be a vLLM addition, if the gap turns out large.
-5. **FP8 KV and FP8 indexer cache** (decided). The trainer fake-quantizes K and V to FP8.
+5. **FP8 KV and FP8 indexer cache** (decided). The trainer reads the same rounded values (`train_grpo --kv-fp8`, built 2026-10-26): K and V as `qsa_prepare` stores them (BF16, ÷ the layer's scale, 1.0 here, e4m3), Q in BF16, and the indexer's queries and pooled keys as plain e4m3 ([grpo-pipeline.md](grpo-pipeline.md#loss)).
 
 ## Worth adding for throughput
 

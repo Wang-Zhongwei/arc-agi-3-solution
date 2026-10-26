@@ -268,3 +268,56 @@ def test_qsa_pure_functions_match_the_modules(setup):
         oq, ok = qsa.qk_prepare(q, k, attn.q_norm.weight, attn.k_norm.weight, attn.q_norm.eps, cos[0], sin[0])
         assert torch.equal(oq, qsa._rope(attn.q_norm(q), cos[0], sin[0]))
         assert torch.equal(ok, qsa._rope(attn.k_norm(k), cos[0], sin[0]))
+
+
+def nearest_e4m3(x):
+    """Brute force over every finite e4m3 code: the nearest value, ties to the even code, saturating at 448."""
+    codes = torch.arange(256, dtype=torch.uint8)
+    values = codes.view(torch.float8_e4m3fn).double()
+    keep = torch.isfinite(values)
+    codes, values = codes[keep].long(), values[keep]
+    distance = (x.double().clamp(-448, 448)[:, None] - values[None, :]).abs()
+    candidate = distance == distance.min(dim=1, keepdim=True).values
+    even = candidate & (codes[None, :] % 2 == 0)
+    return values[torch.where(even.any(1, keepdim=True), even, candidate).double().argmax(1)]
+
+
+def test_e4m3_round_is_nearest_even_and_saturates():
+    g = torch.Generator().manual_seed(0)
+    grid = nearest_e4m3(torch.linspace(-448, 448, 4001)).unique()
+    midpoints = (grid[1:] + grid[:-1]) / 2  # exact ties
+    x = torch.cat([torch.randn(20_000, generator=g) * 30, torch.randn(2_000, generator=g) * 1e-3,
+                   torch.tensor([500.0, -1e4, 448.0, 464.0, 0.0]), midpoints.float()])
+    assert torch.equal(qsa.e4m3_round(x).double(), nearest_e4m3(x))
+    b = x.bfloat16()
+    assert qsa.e4m3_round(b).dtype == torch.bfloat16
+    assert torch.equal(qsa.e4m3_round(b).double(), nearest_e4m3(b.float()))
+    torch.testing.assert_close(qsa.e4m3_round(x, 0.25), (nearest_e4m3(x / 0.25) * 0.25).float(), rtol=0, atol=0)
+
+
+def test_kv_fp8_rounds_keys_values_and_the_indexer_inputs(setup):
+    """vLLM's fp8_e4m3 KV cache holds rounded K and V (Q stays BF16); its fp8 indexer cache rounded queries
+    and pooled keys. With set_kv_fp8 the trainer reads the same values."""
+    _, _, _, c = setup
+    module, hidden = c["module"], c["hidden"]
+    n = hidden.shape[1]
+    cos, sin = (x[:, -n:, :] for x in c["pos"])
+    try:
+        with torch.no_grad():
+            plain = qsa.qsa_project(module, hidden, cos, sin, fused=False)
+            index_plain = qsa.indexer_queries_and_keys(module.indexer, hidden, cos, sin)
+            qsa.set_kv_fp8(True)
+            rounded = qsa.qsa_project(module, hidden, cos, sin, fused=False)
+            index_rounded = qsa.indexer_queries_and_keys(module.indexer, hidden, cos, sin)
+    finally:
+        qsa.set_kv_fp8(False)
+    assert torch.equal(rounded[0], plain[0]) and torch.equal(rounded[1], plain[1])  # query, output gate
+    for ours, before in [(rounded[2], plain[2]), (rounded[3], plain[3]), *zip(index_rounded, index_plain)]:
+        assert torch.equal(ours, qsa.e4m3_round(before)) and not torch.equal(ours, before)
+
+
+def test_kv_fp8_gradient_passes_straight_through():
+    x = torch.randn(64, 2, 32, requires_grad=True)
+    upstream = torch.randn(64, 2, 32)
+    (qsa._ThroughE4M3.apply(x, 1.0) * upstream).sum().backward()
+    assert torch.equal(x.grad, upstream)

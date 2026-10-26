@@ -185,6 +185,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     work = args.work or Path(tempfile.mkdtemp(prefix="grpo_cpu_"))
     generator = torch.Generator().manual_seed(args.seed)
     # the recorder's margins at this scale (the pod's: 256 tokens of estimate error, >= 1,024 left for a request)
+    margins = rl_record.REQUEST_MARGIN, rl_record.MIN_REQUEST_TOKENS
     rl_record.REQUEST_MARGIN, rl_record.MIN_REQUEST_TOKENS = 4, 24
     settings = SimpleNamespace(temperature=0.7, top_k=20, top_p=0.95, eps_low=0.2, eps_high=0.28, ratio_min=0.5,
                                ratio_max=2.0)
@@ -309,6 +310,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         layer_patches.unpatch(server)
         layer_patches.unpatch(trainer)
         qsa.unpatch_qsa_attention()
+        rl_record.REQUEST_MARGIN, rl_record.MIN_REQUEST_TOKENS = margins
     stage("done", args, steps=len(history), work=str(work), state=dict(history=history))
     return dict(history=history, probe=probe_result, work=str(work))
 

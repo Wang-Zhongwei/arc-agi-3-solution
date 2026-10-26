@@ -67,7 +67,7 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - A 64-rollout wave of the 8 games below holds about 7.6M trajectory tokens, 4.5M of them generated (historical attempts under the 130K budget). Generating it takes about 19 min.
   - Training all 64 on the two H200s (5.7K tokens/s) takes about 22 min, so the trainers fall ~15% behind. Training 4 of each group's 8 (PODS) takes about 11 min.
   - About 3 steps per hour, about $7 per step at secure prices ($5.29 per H200-hour).
-  - Open: train on 4 or 6 of 8 per group (6 is the pipeline's default: it uses the slack, about 16 min). The loop is built (see Framework); training runs 4 minibatches per wave (Updates per wave). [grpo-training-throughput.md](grpo-training-throughput.md)
+  - Train on 6 of 8 per group (decided 2026-10-26): it uses the slack, about 16 min of training per ~19-min wave. The loop is built (see Framework); training runs 4 minibatches per wave (Updates per wave). [grpo-training-throughput.md](grpo-training-throughput.md)
 
 - **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
   - **Thinking factor (decided 2026-10-26).** Each cleared level's credit is multiplied by 1 + β · clip((1 − ρₗ) / 0.5, −1, 1), with β = 0.2.

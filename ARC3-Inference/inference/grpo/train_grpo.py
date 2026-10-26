@@ -264,6 +264,13 @@ def checkpoint_keys(model_dir: Path) -> list[str]:
         return sorted(f.keys())
 
 
+def kv_scale_keys(keys: list[str]) -> list[str]:
+    """Checkpoint tensors vLLM's qwen4_exp loads as a layer's KV cache scales (_k_scale/_v_scale)."""
+    names = {"k_scale", "v_scale", "_k_scale", "_v_scale"}
+    return [k for k in keys if k.rsplit(".", 1)[-1] in names
+            or k.endswith(("k_proj.output_scale", "v_proj.output_scale"))]
+
+
 def save_state(model, optimizer, out: Path, step: int) -> None:
     tmp = out.with_name(out.name + ".tmp")
     model.save_pretrained(tmp)
@@ -309,6 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-compile-layers", dest="compile_layers", action="store_false")
     parser.add_argument("--no-fast-lora", dest="fast_lora", action="store_false")
     parser.add_argument("--no-fast-gdn", dest="fast_gdn", action="store_false")
+    # on by default: grpo_pod.sh serves with --kv-cache-dtype fp8_e4m3 and indexer_kv_dtype fp8, and the
+    # behavior logprobs were computed over those caches
+    parser.add_argument("--no-kv-fp8", dest="kv_fp8", action="store_false", help="vLLM serves BF16 caches")
     # off by default: the prefix's keys and values depend on the adapted projections too, so stopping its gradient
     # (RFT's saving, ~5% here: the first reply starts 5-8K tokens in) would bias the policy gradient
     parser.add_argument("--prefix-stop-grad", action="store_true")
@@ -316,8 +326,13 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch.distributed as dist
 
-    from inference.rft import host_offload, smoke_lora, train_rft
+    from inference.rft import host_offload, qsa, smoke_lora, train_rft
 
+    if args.kv_fp8:
+        scaled = kv_scale_keys(checkpoint_keys(args.model))
+        if scaled:  # vLLM would divide each layer's K/V by its own scale; set_kv_fp8 assumes 1.0
+            raise SystemExit(f"--kv-fp8: the checkpoint has KV cache scales ({scaled[0]}, {len(scaled)} in all)")
+    qsa.set_kv_fp8(args.kv_fp8)
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     jobs, ckpt, sync = args.work / "jobs", args.work / "ckpt", args.work / "sync"
     for d in (jobs, ckpt, sync):

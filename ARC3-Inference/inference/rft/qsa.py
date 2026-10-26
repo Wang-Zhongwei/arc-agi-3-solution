@@ -20,6 +20,9 @@ same selection and attention in query chunks:
 
 Scope: batch 1, no cache, causal mask only (training on packed single
 sequences). Anything else falls back to the original forward.
+
+GRPO's rollouts come from vLLM with FP8 caches; set_kv_fp8 makes the trainer read the same rounded keys
+and values (off by default: RFT trains on BF16).
 """
 
 from __future__ import annotations
@@ -32,6 +35,38 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from inference.rft import qsa_kernel
+
+E4M3_MAX = 448.0
+_KV_FP8 = {"on": False, "k_scale": 1.0, "v_scale": 1.0}
+
+
+def set_kv_fp8(on: bool, k_scale: float = 1.0, v_scale: float = 1.0) -> None:
+    """Simulate vLLM's `--kv-cache-dtype fp8_e4m3` and `indexer_kv_dtype: fp8` (qwen4_exp's qsa_prepare):
+    - attention: K (normed, rotated) and V are rounded to BF16, divided by the layer's scale (1.0 when the
+      checkpoint has none) and stored as e4m3, then read back times the scale; Q stays BF16. The gradient
+      passes straight through the rounding;
+    - indexer: its queries and pooled block keys are stored as e4m3 without a scale (no gradient there)."""
+    _KV_FP8.update(on=bool(on), k_scale=float(k_scale), v_scale=float(v_scale))
+
+
+def e4m3_round(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """x / scale rounded to the nearest e4m3 value (ties to even, saturating at +-448 like Triton's satfinite
+    conversion), times scale, in x's dtype."""
+    y = (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float() * scale
+    return y.to(x.dtype)
+
+
+class _ThroughE4M3(torch.autograd.Function):
+    """e4m3_round forward, identity backward."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        return e4m3_round(x, scale)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
 
 def _rope(x, cos, sin):
     """The model's own rotary embedding (it rotates only the first cos.shape[-1] dims).
@@ -56,7 +91,10 @@ def indexer_queries_and_keys(indexer, hidden_states, cos, sin):
     pooled = raw_keys[: blocks * ratio].view(blocks, ratio, d).float().mean(dim=1).to(raw_keys.dtype)
     pooled = indexer.k_layernorm(pooled)
     starts = torch.arange(blocks, device=q.device) * ratio
-    return q, _rope(pooled[:, None, :], cos[0, starts], sin[0, starts])[:, 0].float()
+    keys = _rope(pooled[:, None, :], cos[0, starts], sin[0, starts])[:, 0].float()
+    if _KV_FP8["on"]:
+        return e4m3_round(q), e4m3_round(keys)
+    return q, keys
 
 
 _COMPILE = {"on": False}
@@ -245,6 +283,8 @@ def qsa_project(self, hidden_states, cos, sin, fused: bool):
     else:
         query = _rope(self.q_norm(query.view(hidden_shape)), cos[0], sin[0])
         key = _rope(self.k_norm(key), cos[0], sin[0])
+    if _KV_FP8["on"]:
+        key, value = _ThroughE4M3.apply(key, _KV_FP8["k_scale"]), _ThroughE4M3.apply(value, _KV_FP8["v_scale"])
     return query, gate, key, value
 
 

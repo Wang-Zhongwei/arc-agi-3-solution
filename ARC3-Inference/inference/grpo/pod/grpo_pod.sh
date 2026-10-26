@@ -132,6 +132,7 @@ log "$(tail -1 results/download.log)"
 
 log "phase 2: server on GPUs 0-1, the trainers' CUDA tests on GPU 2 meanwhile"
 mkdir -p results/server
+# the trainers simulate both FP8 caches (train_grpo --kv-fp8, its default); BF16 caches here need --no-kv-fp8 there
 cmd="vllm serve $MODEL_DIR --served-model-name flashnext --host 127.0.0.1 --port $PORT \
     --tensor-parallel-size 2 --max-num-seqs 64 --max-model-len 147072 --max-num-batched-tokens 8192 \
     --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --attention-config '{\"indexer_kv_dtype\": \"fp8\"}' \
