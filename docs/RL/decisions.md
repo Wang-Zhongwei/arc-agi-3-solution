@@ -63,6 +63,13 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - Open: train on 4 or 6 of 8 (6 uses the slack, about 16 min), and the loop (see Framework). [grpo-training-throughput.md](grpo-training-throughput.md)
 
 - **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
+  - **Thinking factor (decided 2026-10-26).** Each cleared level's credit is multiplied by 1 + β · clip((1 − ρₗ) / 0.5, −1, 1), with β = 0.2.
+    - ρₗ is the thinking tokens per action on level l, divided by τ̄, the base model's median thinking tokens per action for that game. τ̄ comes from our historical runs and stays fixed during training, so the target doesn't move as the policy changes.
+    - The factor runs from 1.2 at ≤ 0.5× the game's usual thinking per action, through 1.0 at 1×, to 0.8 at ≥ 1.5×.
+    - On Kaggle each game has a time budget, so less thinking on L1–L2 leaves time for later levels. The 130K budget only cuts off a rollout at its edge; it doesn't reward a faster clear below it.
+    - Thinking tokens only (no tool code or replies), per action, so the action term and this one don't both charge for extra actions. Each game is compared with its own average.
+    - Failures stay at 0 and a slow clear keeps ≥ 80% of its credit, so clearing always beats failing. A fast clear can make up for at most a third of action efficiency: 0.67 × 1.2 ≈ 1 × 0.8.
+    - To do before the run: compute τ̄ for the 8 games, and check how far ρ spreads within groups.
 
 - **Games: 8 public games (decided 2026-10-26; replaces the 21 training games of 2026-10-21).** bp35, cd82, g50t, s5i5, sk48, sp80, tn36, wa30, one group of 8 rollouts each per wave. All have human action counts in `benchmark.json`.
   - cd82 replaced su15 the same day: su15 cleared L1 + L2 within budget in 70% of attempts, too easy. cd82 is harder on both levels and its rollouts disagree about twice as much on the level reward.
@@ -87,7 +94,7 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - Every 5 steps, play each game from reset through L3 with the current policy (same harness and context as evaluation, so with its usual trimming: these rollouts are not trained on, so the 130K training limit does not apply), a few rollouts per game.
   - Held-out measure: P(clear L3 within 1,000 × h₃ generated tokens on L3 | reached L3), computed per game and averaged with fixed game weights, so that more hard-game attempts reaching L3 does not shift the mix. Count a game in a check only if ≥ 4 rollouts reached L3. Historically 76% (905 attempts reached L3), with mixed outcomes on 12 games.
   - Also tracked: L1–L2 within budget (the training measure), the guard games, thinking tokens per turn and MTP draft acceptance.
-  - Stop when any of these happens: the L3 measure has not beaten its best for 2 checks in a row; a guard game drops below 95% within budget; thinking per turn falls more than 10% below the base model; training reward keeps rising while L3 stays flat (memorization).
+  - Stop when any of these happens: the L3 measure has not beaten its best for 2 checks in a row; a guard game drops below 95% within budget; thinking per turn falls more than 25% below the base model (10% until 2026-10-26; the reward now pays for less thinking); training reward keeps rising while L3 stays flat (memorization).
   - Caveat: L3 is the same game, so it measures transfer within a game, not to new games.
   - New with 8 training games (proposed 2026-10-26): the 17 untrained games measure transfer to new games, e.g. L1 + L2 within budget at every check. That costs about one extra wave per check.
 
