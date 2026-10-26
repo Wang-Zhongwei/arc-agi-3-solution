@@ -202,6 +202,9 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             self.action = action
             self.frame = frame
             self.result = dict(result) if isinstance(result, dict) else {}
+            # this action's animation summary, kept per action: the frames
+            # themselves exist only for the last executed action
+            self.animation = self.result.get("animation") or None
 
         def __str__(self):
             return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
@@ -642,10 +645,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         if initial.get("animation_enabled"):
             # Globals rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
-            # reset and not the action that animated. The record is simply
-            # "the last executed action that animated", and naming it that way
-            # removes the mismatch. Empty when the last executed action
-            # returned a single frame.
+            # reset and not the action that animated. The record belongs to the
+            # last executed action, animated or not, so an action that returns
+            # a single frame empties it. The automatic RESET after a death is
+            # the one exception and leaves the fatal action's record in place.
             class _LazyAnimation:
                 def __init__(self, kind, empty):
                     self._kind = kind
@@ -654,7 +657,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
                 def _get(self):
                     if self._value is None:
-                        self._value = _animation_fetch(self._kind) or self._empty
+                        self._value = _animation_fetch(self._kind) or self._empty()
                     return self._value
 
                 def invalidate(self):
@@ -678,14 +681,23 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 def keys(self):
                     return self._get().keys()
 
+                def items(self):
+                    return self._get().items()
+
+                def values(self):
+                    return self._get().values()
+
                 def get(self, key, default=None):
                     return self._get().get(key, default)
 
                 def __repr__(self):
                     return repr(self._get())
 
-            runtime_globals["last_animation_frames"] = _LazyAnimation("frames", [])
-            runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", {})
+            runtime_globals["last_animation_frames"] = _LazyAnimation("frames", list)
+            # the same keys as a real timeline, so `frame_diffs` is just empty
+            runtime_globals["last_animation_timeline"] = _LazyAnimation(
+                "timeline", lambda: {"action": None, "frame_count": 0, "frame_diffs": []}
+            )
             _animation_views.extend((runtime_globals["last_animation_frames"],
                                      runtime_globals["last_animation_timeline"]))
 
