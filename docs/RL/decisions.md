@@ -23,7 +23,10 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - Reopened: verl was picked for rollout and training on the same GPUs, with rollout as the bottleneck. On separate rollout and training H200s (see Hardware), training is the bottleneck.
   - The trainer's optimizations (QSA kernel, checkpoint offload, memory-mapped PLE, token-chunked layers) live in our [train_rft.py](../../ARC3-Inference/inference/rft/train_rft.py).
   - The harness already plays the games against vLLM's OpenAI server.
-  - Proposal: our own asynchronous loop around train_rft, like Chen's (multiprocessing, no Ray). Undecided.
+  - Our own asynchronous loop around train_rft, like Chen's (multiprocessing, no Ray): built 2026-10-26 when the user asked to build the pipeline after this proposal. Design and checks: [grpo-pipeline.md](grpo-pipeline.md).
+- **Optimizer: AdamW for round 1 (2026-10-26).** Muon is built as an option (`--optimizer muon`) and is the first A/B candidate if round 1 learns slowly.
+  - The agentic-RL evidence for Muon ([Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169): ALFWorld, 0.5B, one seed) traces the gain to Muon's larger updates.
+  - No study pairs Muon with LoRA in RL.
 - **Rollout: vLLM.** Same engine as our Kaggle submission, so chat template, tool parsing and sampling match deployment. It is also more widely used ([vLLM](https://github.com/vllm-project/vllm) ~94k stars vs [SGLang](https://github.com/sgl-project/sglang) ~37k), and in our experience SGLang was slower and harder to configure.
   - Yi-Chia Chen's weight sync and routing replay call SGLang's HTTP endpoints directly ([`sglang_controller.py`](https://github.com/ycchen-tw/agent-factory-3/blob/main/src/agent_factory_3/trainer/sglang_controller.py)), which is why his code needs SGLang. verl does both for vLLM itself.
   - Weight sync: merge LoRA into the base weights before pushing (verl: `lora.merge=True`).

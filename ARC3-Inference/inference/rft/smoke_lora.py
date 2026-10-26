@@ -329,7 +329,8 @@ class LayerTimeline:
 def step(model, sample, device, offload: bool = False, profile: bool = False,
          reuse_buffers: bool = True, keep_grads: str | None = None, gpu_keep_gb: float = 0.0,
          async_copies: bool = False, timeline: bool = False, prefix_stop_grad: bool = False,
-         memory_snapshot: str | None = None, accumulate: bool = False, loss_scale: float = 1.0) -> dict[str, Any]:
+         memory_snapshot: str | None = None, accumulate: bool = False, loss_scale: float = 1.0,
+         loss_fn=None) -> dict[str, Any]:
     """One forward + backward. `offload` keeps the tensors saved for backward (with layer
     checkpointing: each layer's [N, 4 x 2560] input) in host memory instead of on the GPU,
     in host buffers kept on the model and reused by later steps unless `reuse_buffers` is off.
@@ -338,7 +339,9 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     side stream, prefetching in backward. `memory_snapshot` (a path prefix) records CUDA allocations and
     dumps them at the end of the forward (`_fwd.pickle`) or at an out-of-memory error (`_oom.pickle`).
     `accumulate` (training): gradients are added to those already there and kept, and the loss is
-    multiplied by `loss_scale` before backward (a sample's share of its batch's trained tokens)."""
+    multiplied by `loss_scale` before backward (a sample's share of its batch's trained tokens).
+    `loss_fn(lm_head, hidden, target_ids) -> (loss, stats)` replaces the mean cross-entropy (GRPO's objective);
+    hidden holds the states predicting the trained tokens, in position order."""
     if not accumulate:
         model.zero_grad(set_to_none=True)  # a layer_check leaves its last variant's gradients on its layers
     # from_pretrained returns an eval-mode model, and transformers checkpoints layers only in
@@ -407,7 +410,10 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
         with profiler:
             with saved:
                 hidden = base.model(**inputs, use_cache=False).last_hidden_state[0, targets - 1]
-                loss = chunked_cross_entropy(base.lm_head, hidden, labels[targets])
+                if loss_fn is None:
+                    loss, loss_stats = chunked_cross_entropy(base.lm_head, hidden, labels[targets]), None
+                else:
+                    loss, loss_stats = loss_fn(base.lm_head, hidden, labels[targets])
             _sync()
             t1 = time.perf_counter()
             counters.append((_thread_major_faults(), ple_mmap.lookup_seconds(), _compiled_graphs()))
@@ -446,7 +452,7 @@ def step(model, sample, device, offload: bool = False, profile: bool = False,
     loss_value = float(loss.detach())
     del loss, hidden
     memory["end_gb"] = gb()
-    extra = {}
+    extra = {"loss_stats": loss_stats} if loss_stats is not None else {}
     if layer_timeline is not None:
         extra["timeline"] = layer_timeline.close()
         extra["timeline"]["forward_other_s"] = round(t1 - t0 - extra["timeline"]["forward_layers_s"], 3)

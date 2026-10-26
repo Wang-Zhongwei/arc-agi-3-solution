@@ -126,9 +126,9 @@ def lr_at(step: int, total: int, warmup: int, min_ratio: float) -> float:
     return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def run_sample(model, device, sample, scale: float, prefix_stop_grad: bool = True) -> dict[str, Any]:
+def run_sample(model, device, sample, scale: float, prefix_stop_grad: bool = True, loss_fn=None) -> dict[str, Any]:
     """Forward + backward of one sample, adding scale x its gradient; recompute mode and OOM fallback as in the
-    docstring."""
+    docstring. `loss_fn` replaces the cross-entropy (smoke_lora.step)."""
     params = [p for p in model.parameters() if p.requires_grad]
     saved = [None if p.grad is None else p.grad.detach().clone() for p in params]
     tokens = int(sample["input_ids"].shape[1])
@@ -146,7 +146,8 @@ def run_sample(model, device, sample, scale: float, prefix_stop_grad: bool = Tru
         try:
             cuda = torch.cuda.is_available()  # CPU: the tests
             result = smoke_lora.step(model, sample, device, offload=cuda, async_copies=cuda, gpu_keep_gb=0.0,
-                                     prefix_stop_grad=prefix_stop_grad, accumulate=True, loss_scale=scale)
+                                     prefix_stop_grad=prefix_stop_grad, accumulate=True, loss_scale=scale,
+                                     loss_fn=loss_fn)
             result.update(recompute_mode=mode, retries=len(errors), saved_tokens=saved_tokens)
             break
         except torch.cuda.OutOfMemoryError as exc:
