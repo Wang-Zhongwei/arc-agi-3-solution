@@ -16,7 +16,9 @@ nothing is missing.
 """
 from __future__ import annotations
 
+import zlib
 from collections import defaultdict
+from itertools import chain as _concat
 from typing import Any, Sequence
 
 from inference.utils.grid_utils import ARC_COLOR_CHARS, format_grid_ascii
@@ -119,6 +121,63 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
         # without spending tokens on a coordinate list.
         summary["transient_bbox"] = [min(rows), min(cols), max(rows), max(cols)]
     return summary
+
+
+class AnimationRecords:
+    """Every animated action's record by action number, for `history[i].animation`.
+
+    The one record `last_animation_*` read is replaced by the next action, so
+    the earlier actions of a batch were never readable at all. These copies are
+    zlib-packed: as tuples a 64x64 frame costs ~37 KB (65 tuples of 8-byte
+    pointers), packed about 0.2 KB, because a frame is mostly one colour and the
+    next frame repeats it. Replaying porting-advaith v7 through this class, its
+    1,585 animated actions held 14,519 frames across 25 games: 511 MB as tuples,
+    4.3 MB packed, every chain unpacking equal to the one packed. Packing took
+    0.8 ms per animated action (8 ms for the longest, 179 frames); unpacking
+    happens only when the model reads that action.
+    """
+
+    def __init__(self) -> None:
+        self._packed: dict[int, dict[str, Any]] = {}
+
+    def add(self, action_num: int, record: dict[str, Any]) -> None:
+        self._packed[action_num] = {**record, "chain": _pack_chain(record.get("chain") or ())}
+
+    def get(self, action_num: int) -> dict[str, Any] | None:
+        packed = self._packed.get(action_num)
+        if packed is None:
+            return None
+        return {**packed, "chain": _unpack_chain(packed["chain"])}
+
+
+def _pack_chain(chain: Sequence[Grid]) -> dict[str, Any]:
+    """One byte per cell, the whole chain compressed together.
+
+    A grid that does not fit that - a cell outside 0-255 or ragged rows - is
+    kept as it is, so an unpacked chain always equals the one packed.
+    """
+    shapes = [(len(grid), len(grid[0]) if grid else 0) for grid in chain]
+    if any(len(row) != cols for grid, (_, cols) in zip(chain, shapes) for row in grid):
+        return {"grids": list(chain)}
+    try:
+        flat = bytes(_concat.from_iterable(_concat.from_iterable(chain)))
+    except ValueError:
+        return {"grids": list(chain)}
+    return {"shapes": shapes, "data": zlib.compress(flat, 1)}
+
+
+def _unpack_chain(packed: dict[str, Any]) -> list[Grid]:
+    if "grids" in packed:
+        return list(packed["grids"])
+    data = zlib.decompress(packed["data"])
+    chain: list[Grid] = []
+    offset = 0
+    for rows, cols in packed["shapes"]:
+        chain.append(tuple(
+            tuple(data[offset + row * cols:offset + (row + 1) * cols]) for row in range(rows)
+        ))
+        offset += rows * cols
+    return chain
 
 
 def _bbox_phrase(bbox: Sequence[int] | None) -> str:

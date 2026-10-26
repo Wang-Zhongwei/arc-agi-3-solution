@@ -4,11 +4,25 @@ In porting-advaith v6 every int-as-list error in animation code was
 `len(timeline['frames'])`, the empty timeline raised KeyError 'steps', and the
 lazy timeline had no `.items()`. The prompt also said the frames belong to the
 last action "that animated", while every executed action replaces them.
+
+In v7 `history[i].animation` was only a summary, so an earlier action's frames
+were gone, and `transitions[i].animation` did not exist (3 AttributeErrors).
+Each action now keeps its own frames and timeline.
 """
 
-from inference.agent import prompts
+import json
+import random
+
+from inference.agent import prompts, tool_agent
 from inference.agent.python_tool_sandbox import run_sandboxed_python
-from inference.utils.animation import build_animation_frames, build_animation_view, summarize_animation
+from inference.agent.runtime_state import Frame, HistoryEntry, write_runtime_state
+from inference.framework import solver as solver_module
+from inference.utils.animation import (
+    AnimationRecords,
+    build_animation_frames,
+    build_animation_view,
+    summarize_animation,
+)
 from inference.utils.grid_utils import format_grid_ascii
 
 BEFORE = ((0, 0), (0, 0))
@@ -52,18 +66,20 @@ def _frame(grid):
             "shape": [2, 2], "grid": [list(r) for r in grid]}
 
 
-def _run(code, timeline):
+def _run(code, timeline, animation_handler=None):
     summary = summarize_animation(CHAIN)
     history = [
         {"action": "", "frame": _frame(BEFORE)},
-        {"action": "SPACE", "frame": _frame(CHAIN[-1]), "result": {"animation": summary}},
-        {"action": "UP", "frame": _frame(CHAIN[-1]), "result": {"executed": True}},
+        {"action": "SPACE", "frame": _frame(CHAIN[-1]),
+         "result": {"action_num": 1, "animation": summary}},
+        {"action": "UP", "frame": _frame(CHAIN[-1]), "result": {"action_num": 2, "executed": True}},
     ]
     return run_sandboxed_python(
         code=code, timeout_seconds=20,
         initial_state={"current_frame": _frame(CHAIN[-1]), "history": history},
         action_handler=lambda actions, stale_after=None: {"action_result": {}},
-        animation_handler=lambda request: [] if request.get("kind") == "frames" else timeline,
+        animation_handler=animation_handler
+        or (lambda request: [] if request.get("kind") == "frames" else timeline),
         kept_functions=[],
     )
 
@@ -86,12 +102,100 @@ def test_lazy_timeline_reads_like_a_dict_and_is_empty_without_animation():
     assert out["stdout"].splitlines() == ["['action', 'frame_count', 'frame_diffs']", "[] 0"], out
 
 
+def test_history_and_transitions_read_their_own_actions_frames_once():
+    record = {**RECORD, "step": 1}
+    expected = [frame["ascii"] for frame in build_animation_frames(record)]
+    requests = []
+
+    def handler(request):
+        requests.append(dict(request))
+        # only action 1 animated; UP, the last executed action, did not
+        own = record if request.get("action_num") == 1 else None
+        return build_animation_frames(own) if request.get("kind") == "frames" else build_animation_view(own)
+
+    out = _run(
+        "a = history[1].animation\n"
+        f"print(a['frame_count'], [f.ascii for f in a.frames] == {expected!r}, len(a.frames))\n"
+        "print([d['frame_index'] for d in a.timeline['frame_diffs']], a.timeline['action'])\n"
+        "print(transitions[0].animation is a, history[2].animation, transitions[1].animation)\n"
+        "print(len(last_animation_frames))",
+        None, handler,
+    )
+
+    assert out["stdout"].splitlines() == ["4 True 4", "[0, 2, 3] SPACE", "True None None", "0"], out
+    # read three times, fetched once per kind
+    assert sorted(r["kind"] for r in requests if r.get("action_num") == 1) == ["frames", "timeline"]
+
+
+def test_records_unpack_exactly_what_was_packed():
+    rng = random.Random(0)
+    board = tuple(tuple(rng.choice((0, 0, 0, 5, 11)) for _ in range(64)) for _ in range(64))
+    flash = tuple(tuple(15 if 20 <= r < 30 else cell for cell in row) for r, row in enumerate(board))
+    chain = [board, flash, board]
+    over_255 = [((0, 300), (1, 2)), ((0, 1), (2, 3))]
+    ragged = [((0, 1), (1, 2)), ((0, 1), (2,))]
+    records = AnimationRecords()
+    records.add(7, {"chain": chain, "action_display": "UP", "step": 7, "level": 2})
+    records.add(8, {"chain": over_255})
+    records.add(9, {"chain": ragged})
+
+    assert records.get(7) == {"chain": chain, "action_display": "UP", "step": 7, "level": 2}
+    assert records.get(8)["chain"] == over_255
+    assert records.get(9)["chain"] == ragged
+    assert records.get(10) is None
+
+
+def test_step_env_answers_for_the_action_it_is_asked_about(monkeypatch):
+    monkeypatch.setattr(solver_module, "ANIMATION_ENABLED", True)
+    session = object.__new__(solver_module._HarnessGameSession)
+    session.animation_record = {**RECORD, "step": 3}
+    session.animation_records = AnimationRecords()
+    session.animation_records.add(1, {**RECORD, "step": 1})
+
+    assert session.step_env({"query": "animation"})["record"]["step"] == 3
+    assert session.step_env({"query": "animation", "action_num": 1})["record"] == {**RECORD, "step": 1}
+    assert session.step_env({"query": "animation", "action_num": 2})["record"] is None
+
+
+def test_agent_serves_an_earlier_actions_frames_from_its_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("ARC3_ANIMATION", "1")
+    path = tmp_path / "state.json"
+    record = {**RECORD, "step": 1}
+    entries = [
+        HistoryEntry("", Frame(grid=BEFORE, step=0, level=1)),
+        HistoryEntry("SPACE", Frame(grid=CHAIN[-1], step=1, level=1),
+                     result={"action_num": 1, "animation": summarize_animation(CHAIN)}),
+        HistoryEntry("UP", Frame(grid=CHAIN[-1], step=2, level=1), result={"action_num": 2}),
+    ]
+    write_runtime_state(path, current_frame=entries[-1].frame, history=entries)
+    records = AnimationRecords()
+    records.add(1, record)
+
+    def step_env(arguments):
+        # UP, the last executed action, did not animate
+        own = records.get(arguments["action_num"]) if "action_num" in arguments else None
+        return {"executed": False, "query": "animation", "record": own}
+
+    agent = tool_agent.ToolAgent(model="test-model", base_url="http://127.0.0.1:8001/v1", provider="vllm")
+    agent._step_env_callback = step_env
+    code = (
+        "a = history[1].animation\n"
+        "result = [len(last_animation_frames), [f.ascii for f in a.frames],\n"
+        "          [d['frame_index'] for d in a.timeline['frame_diffs']]]\n"
+    )
+    payload = json.loads(agent._run_python_tool(path, {"code": code}).content)
+
+    assert payload["result"] == [0, [f["ascii"] for f in build_animation_frames(record)], [0, 2, 3]], payload
+
+
 def test_prompt_describes_the_record_as_it_behaves():
     text = prompts.ANIMATION_ADDENDUM + prompts.ANIMATION_ADDENDUM_TIMELINE
 
     assert "that animated" not in text
-    assert "Every executed action replaces them" in text
-    assert "`history[i].animation`" in text
+    assert "Every executed action except RESET replaces them" in text
+    for name in ("`history[i].animation`", "`.frames`", "`history[i].animation.timeline`",
+                 "`transitions[i].animation`"):
+        assert name in text
     for name in ("`frame_count`", "`frame_diffs`", "`frame_index`", "`changed_count`"):
         assert name in text
     for old in ("`frames`", "`steps`", "`step`", "`changed`"):

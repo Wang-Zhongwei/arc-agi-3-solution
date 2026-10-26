@@ -178,7 +178,8 @@ ANIMATION_ADDENDUM_TIMELINE = (
     "`last_animation_frames`), `changed_count`, `bbox`, and "
     "either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` (a "
     "count per colour change, when there were too many cells to list). "
-    "`frame_diffs` is empty when the action did not animate.\n"
+    "`frame_diffs` is empty when the action did not animate. "
+    "`history[i].animation.timeline` is that action's own timeline.\n"
 )
 
 ANIMATION_ADDENDUM = (
@@ -189,14 +190,15 @@ ANIMATION_ADDENDUM = (
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
     "in any `history[i].frame`.\n"
     "- `history[i].animation` is the same summary for that action, or `None` if it "
-    "did not animate.\n"
+    "did not animate. Its `.frames` are that action's own frames, like "
+    "`last_animation_frames` below, kept for every action, including the earlier "
+    "actions of a batch. `transitions[i].animation` is the same.\n"
     "- `last_animation_frames` is the frames of the last executed action, as views with "
     "`.ascii`, `.shape` and `.segmentation`, the same as `current_frame`. Index 0 is "
     "the first frame of the animation and the last entry is the board it settled on. "
-    "Every executed action replaces them, and they are empty when that action did not "
-    "animate. "
-    "After a death these are the frames of the FATAL action, not of the automatic "
-    "reset that followed it. Crop "
+    "Every executed action except RESET replaces them, so after a death they are "
+    "still the frames of the FATAL action. They are empty when that action did not "
+    "animate. Crop "
     "their `.ascii` yourself; printing a whole 64x64 frame will not fit the tool "
     "budget. Reading them costs no in-game action.\n"
 )

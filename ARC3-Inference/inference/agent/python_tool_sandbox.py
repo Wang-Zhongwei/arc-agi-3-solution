@@ -197,14 +197,51 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         __repr__ = __str__
 
 
+    # One action's animation summary - a dict, read as before - plus that
+    # action's own `.frames` and `.timeline`, fetched from the host by its
+    # action_num only when read.
+    class AnimationView(dict):
+        fetch = None  # set at startup when animations are enabled
+        # The last few reads by (kind, action_num), for this call only: code
+        # that indexes `.frames[k]` in a loop must not move every frame across
+        # the pipe on each pass, and a loop over all of history must not hold
+        # every frame at once.
+        _cache = {}
+
+        def __init__(self, summary, action_num):
+            super().__init__(summary)
+            self._action_num = action_num
+
+        def _read(self, kind, empty):
+            if AnimationView.fetch is None or self._action_num is None:
+                return empty
+            key = (kind, self._action_num)
+            cache = AnimationView._cache
+            if key not in cache:
+                cache[key] = AnimationView.fetch(kind, self._action_num) or empty
+                while len(cache) > 8:
+                    cache.pop(next(iter(cache)))
+            return cache[key]
+
+        @property
+        def frames(self):
+            return self._read("frames", [])
+
+        @property
+        def timeline(self):
+            return self._read("timeline", {"action": None, "frame_count": 0, "frame_diffs": []})
+
+
     class HistoryEntryView:
         def __init__(self, *, action, frame, result=None):
             self.action = action
             self.frame = frame
             self.result = dict(result) if isinstance(result, dict) else {}
-            # this action's animation summary, kept per action: the frames
-            # themselves exist only for the last executed action
-            self.animation = self.result.get("animation") or None
+            # this action's animation summary, or None. Its frames and timeline
+            # are fetched by action_num, so they stay readable after the next
+            # action replaces last_animation_*.
+            summary = self.result.get("animation")
+            self.animation = AnimationView(summary, self.result.get("action_num")) if summary else None
 
         def __str__(self):
             return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
@@ -213,12 +250,14 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     class TransitionView:
-        def __init__(self, *, action, before_frame, after_frame, result):
+        def __init__(self, *, action, before_frame, after_frame, result, animation=None):
             self.action = action
             self.before_frame = before_frame
             self.after_frame = after_frame
             self.frame = after_frame
             self.result = dict(result) if isinstance(result, dict) else {}
+            # the history entry's own view: v7 code reached for it here too
+            self.animation = animation
 
         def __str__(self):
             return (
@@ -271,6 +310,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     before_frame=before_frame,
                     after_frame=entry.frame,
                     result=entry.result,
+                    animation=getattr(entry, "animation", None),
                 )
             )
         return transitions
@@ -620,8 +660,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     _stale_state.append(str(_name))
             return action_result
 
-        def _animation_fetch(kind):
-            _send({"type": "animation", "request": {"kind": kind}})
+        def _animation_fetch(kind, action_num=None):
+            request = {"kind": kind}
+            if action_num is not None:
+                request["action_num"] = action_num
+            _send({"type": "animation", "request": request})
             reply = _recv()
             if reply.get("type") == "animation_error":
                 raise RuntimeError(str(reply.get("error", "animation failed")))
@@ -647,8 +690,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             # the harness appends a RESET entry, so last_transition is the
             # reset and not the action that animated. The record belongs to the
             # last executed action, animated or not, so an action that returns
-            # a single frame empties it. The automatic RESET after a death is
-            # the one exception and leaves the fatal action's record in place.
+            # a single frame empties it. RESET is the one exception: it never
+            # touches the record, so after a death it is the fatal action's.
+            AnimationView.fetch = staticmethod(_animation_fetch)
+
             class _LazyAnimation:
                 def __init__(self, kind, empty):
                     self._kind = kind

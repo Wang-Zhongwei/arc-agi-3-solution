@@ -6413,7 +6413,11 @@ class ToolAgent:
         def _handle_animation(request: dict[str, Any]) -> dict[str, Any]:
             if self._step_env_callback is None:
                 return {"error": "Animation frames are not available in this session."}
-            raw = self._step_env_callback({"query": "animation"})
+            query: dict[str, Any] = {"query": "animation"}
+            if request.get("action_num") is not None:
+                # history[i].animation reads its own action's record
+                query["action_num"] = request["action_num"]
+            raw = self._step_env_callback(query)
             record = raw.get("record") if isinstance(raw, dict) else None
             record = record if isinstance(record, dict) else None
             if str(request.get("kind") or "") == "frames":
