@@ -6,7 +6,8 @@
 #
 # Upload inference/, tests/, game.txt, game_ft09.txt (and wheels/ when PyPI is unreachable) to $WORK, then:
 #   ssh ... 'cd /workspace/smoke; nohup bash inference/rft/pod/full_run.sh > full_run.log 2>&1 < /dev/null &' < /dev/null
-# REHEARSAL=1: shorter lengths (16K/32K, no 123K) on a cheaper 96 GB GPU.
+# REHEARSAL=1: shorter lengths (16K/32K, no 123K) on a cheaper 96 GB GPU. GRPO=1: GRPO's training shape (full
+# backward at 64K and 110K, layer profile at 110K; make_jobs.py --grpo), without the prefix stop-grad tests.
 set -uo pipefail
 
 WORK=${WORK:-/workspace/smoke}
@@ -14,11 +15,13 @@ VENV=${VENV:-/workspace/venv}
 MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 REHEARSAL=${REHEARSAL:-0}
+GRPO=${GRPO:-0}
 PLE_FP8=${PLE_FP8:-0}  # 1: also fetch nvidia's FP8 PLE table and run make_jobs.py --ple-fp8 (BF16 vs FP8 PLE gradients)
 MAX_MINUTES=${MAX_MINUTES:-90}
 GRACE_MINUTES=${GRACE_MINUTES:-20}
 POD_END=${POD_END:-stop}  # what ends the pod (timers, abort): stop (GPU billing ends, the pod and its volume stay) or delete
 MIN_HF_MBPS=${MIN_HF_MBPS:-40}
+LOG_WAIT_SECONDS=${LOG_WAIT_SECONDS:-180}  # POD_END=delete: an abort waits this long so the watcher can pull the logs
 cd "$WORK"
 mkdir -p results
 rm -f FULL_DONE ABORTED
@@ -41,8 +44,9 @@ self_stop() {
         pkill -f "inference.rft.smoke_lora" || true
     fi
 }
-abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_stop "abort"; exit 1; }
-( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; self_stop "time limit ${MAX_MINUTES} min" ) &
+linger() { [ "$POD_END" = delete ] && sleep "$LOG_WAIT_SECONDS"; }  # a deleted pod takes its logs with it
+abort() { log "ABORTED: $*"; echo "$*" > ABORTED; linger; self_stop "abort"; exit 1; }
+( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; linger; self_stop "time limit ${MAX_MINUTES} min" ) &
 echo $! > deadman.pid
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=/usr/local/cuda/bin:$PATH
 
@@ -67,10 +71,10 @@ log "phase 1: packages"
 [ -x "$VENV/bin/python" ] || python3 -m venv --system-site-packages "$VENV" || abort "venv"
 export PATH="$VENV/bin:$PATH"
 hopper=$(python -c "import torch; print(int(torch.cuda.get_device_capability()[0] == 9))" 2>/dev/null || echo 0)
-pkgs="transformers==5.20.1 peft accelerate auto-round flash-linear-attention hf_transfer pytest pillow numpy torchvision"
-[ "$hopper" = 1 ] && pkgs="$pkgs tilelang"
+pkgs="-r inference/rft/pod/requirements-pod.txt"  # tested versions
+[ "$hopper" = 1 ] && pkgs="$pkgs tilelang==0.1.15"
 if [ "$pypi" = "200" ]; then
-    python -m pip install -q $pkgs || abort "pip install"
+    python -m pip install -q $pkgs > results/pip.log 2>&1 || abort "pip install: $(tail -3 results/pip.log)"
 else
     python -m pip install -q --no-index --no-deps wheels/*.whl || abort "wheel install"
 fi
@@ -112,12 +116,14 @@ runtest fast_gdn "tests/test_compile_hc.py::test_compiled_layer_is_as_accurate_a
 runtest compile_lora "tests/test_compile_hc.py::test_compiled_lora_matches_peft"
 runtest fused_model tests/test_qsa_fused_model.py
 runtest grouped tests/test_grouped_gemm.py
-runtest prefix_cuda "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[torch_gdn]"
-runtest prefix_cuda_fast "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[fast_gdn]"
-echo 0 > results/pytest_prefix_cpu.exit  # CPU tiny-model tests cannot run next to fla; passed locally
+if [ "$GRPO" != 1 ]; then  # GRPO trains every reply: no prefix to skip
+    runtest prefix_cuda "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[torch_gdn]"
+    runtest prefix_cuda_fast "tests/test_prefix_stop_grad_cuda.py::test_prefix_stop_grad_cuda_matches_the_cache_path[fast_gdn]"
+    echo 0 > results/pytest_prefix_cpu.exit  # CPU tiny-model tests cannot run next to fla; passed locally
+fi
 
 log "phase 3: jobs from the test outcomes"
-python inference/rft/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) $([ "$PLE_FP8" = 1 ] && echo --ple-fp8) | tee -a results/env.txt
+python inference/rft/pod/make_jobs.py results jobs.txt $([ "$REHEARSAL" = 1 ] && echo --rehearsal) $([ "$PLE_FP8" = 1 ] && echo --ple-fp8) $([ "$GRPO" = 1 ] && echo --grpo) | tee -a results/env.txt
 
 log "phase 4: wait for the checkpoint, then the model server's jobs"
 wait $download || abort "checkpoint download failed"

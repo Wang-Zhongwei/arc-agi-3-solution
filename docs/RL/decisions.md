@@ -40,6 +40,8 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
   - The bp35 exception (a flat 100K generated) is dropped: its 1,750 × h is 121K, close to the cap, and it stays at 0% either way.
   - Open: whether the model sees its budget.
 
+- **Open (2026-10-26): train on 4 of every 8 rollouts, and how many training GPUs.** One H200 trains a 110K trajectory at 2.9K tokens/s (full backward), while a 2×H200 rollout pair produces 7.4–8.2K tokens/s of trajectories. Training on the 4 rollouts with the widest reward spread (PODS) cuts the tokens to train to 45%, so 2 training H200 suffice; without it, 3. Also open: an own asynchronous loop around train_rft instead of verl. [grpo-training-throughput.md](grpo-training-throughput.md).
+
 - **Reward: per-level credit (decided 2026-10-21).** Reward = Σ over levels cleared within the budget of wₗ · min(1, (hₗ / aₗ)²), with w = 1 for L1 and 2 for L2, divided by 3. hₗ is the level's human action count, aₗ the agent's actions on it. This is the ARC score formula restricted to L1–L2. Clearing L1 alone earns credit, so games that rarely clear L2 still give signal.
 
 - **Games: train on the 25 public games, none held out (decided 2026-10-21).** We have few games, and the hidden test set is the final evaluation. This overrides "public 25 = validation only" under Data for this first GRPO round. All 25 have human action counts in `benchmark.json`.

@@ -103,6 +103,9 @@ Pitfalls hit while building the RFT pipeline (2026-10-17/18). Read before changi
 - `smoke_pod.sh` writes STOP after the last job of its jobs file and the server exits: queue every comparison in one jobs file, or remove STOP and add jobs while it still serves.
 - Tar uploads from the Mac with `COPYFILE_DISABLE=1` and `--no-xattrs`, or GNU tar on the pod prints a warning per file for Apple extended attributes (`com.apple.provenance` still gets through without `--no-xattrs`).
 - `tests/conftest.py` reads `tests/branch_divergent_tests.txt`: upload it with any subset of the tests, or pytest stops at collection (exit 4).
+- Install pod packages from [pod/requirements-pod.txt](pod/requirements-pod.txt) (the tested versions). Unpinned installs pick up releases nobody has tested: on 10-26 a pod aborted in its package phase three days after flash-linear-attention 0.6.0 came out.
+- With `POD_END=delete`, an abort that ends the pod at once takes its logs with it (10-26: the cause of an abort is unknown). `full_run.sh` and `train_pod.sh` now wait `LOG_WAIT_SECONDS` (180) for the watcher first; give any new script the same.
+- A `layer_profile` at 110K OOMed (137 GiB) when it ran after 110K step jobs in the same server: profile long lengths first, or in a fresh server.
 - Stop jobs by PID (`run.pid`). `pkill -f NAME` over ssh also matches and kills the ssh command itself.
 - `free` inside a pod shows the host. The pod's RAM is RunPod's `gpu.memory` (251 GB on 1×H200; the PLE table takes ~102 GB of it).
 - Direct SSH (needed for scp) shows up in the REST `publicIp` and `portMappings` about a minute after creation. The 181 GB checkpoint download speed depends on the data center: 52 s on US-NC-1, 665 s on US-CO-1 (both `hf_transfer`). Pin `dataCenterIds` to a fast one, or keep the checkpoint on a network volume.

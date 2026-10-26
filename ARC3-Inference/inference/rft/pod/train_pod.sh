@@ -44,8 +44,10 @@ self_stop() {
         pkill -f "inference.rft.train_rft" || true
     fi
 }
-abort() { log "ABORTED: $*"; echo "$*" > ABORTED; self_stop "abort"; exit 1; }
-( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; self_stop "time limit ${MAX_MINUTES} min" ) &
+LOG_WAIT_SECONDS=${LOG_WAIT_SECONDS:-180}  # POD_END=delete: an abort waits this long so the watcher can pull the logs
+linger() { [ "$POD_END" = delete ] && sleep "$LOG_WAIT_SECONDS"; }  # a deleted pod takes its logs with it
+abort() { log "ABORTED: $*"; echo "$*" > ABORTED; linger; self_stop "abort"; exit 1; }
+( sleep $((MAX_MINUTES * 60)); echo "time limit" > ABORTED; linger; self_stop "time limit ${MAX_MINUTES} min" ) &
 echo $! > deadman.pid
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} PATH=/usr/local/cuda/bin:$PATH
 [ -s data/train.jsonl ] || abort "no data/train.jsonl"
@@ -70,8 +72,8 @@ log "phase 1: packages"
 [ -x "$VENV/bin/python" ] || python3 -m venv --system-site-packages "$VENV" || abort "venv"
 export PATH="$VENV/bin:$PATH"
 hopper=$(python -c "import torch; print(int(torch.cuda.get_device_capability()[0] == 9))" 2>/dev/null || echo 0)
-pkgs="transformers==5.20.1 peft accelerate auto-round flash-linear-attention hf_transfer pytest pillow numpy torchvision"
-[ "$hopper" = 1 ] && pkgs="$pkgs tilelang"
+pkgs="-r inference/rft/pod/requirements-pod.txt"  # tested versions
+[ "$hopper" = 1 ] && pkgs="$pkgs tilelang==0.1.15"
 [ -n "$WANDB_PROJECT" ] && pkgs="$pkgs wandb"
 if [ "$pypi" = "200" ]; then
     python -m pip install -q $pkgs || abort "pip install"

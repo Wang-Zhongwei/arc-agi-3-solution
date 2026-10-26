@@ -23,10 +23,9 @@ log "phase 1: python packages"
 export PATH="$VENV/bin:$PATH"
 if ! python -c "import transformers, peft, auto_round, fla, pytest; assert transformers.__version__ == '5.20.1'" 2>/dev/null; then
     python -m pip install -q -U pip
-    python -m pip install -q "transformers==5.20.1" peft accelerate auto-round flash-linear-attention pytest \
-        pillow numpy torchvision || fail "pip install"
+    python -m pip install -q -r inference/rft/pod/requirements-pod.txt || fail "pip install"  # tested versions
     if python -c "import torch, sys; sys.exit(torch.cuda.get_device_capability()[0] != 9)"; then
-        python -m pip install -q tilelang || fail "tilelang"  # fla's GDN backward on Hopper (fla #640)
+        python -m pip install -q tilelang==0.1.15 || fail "tilelang"  # fla's GDN backward on Hopper (fla #640)
     fi
 fi
 python -c "import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__, torch.cuda.get_device_name(0))" \

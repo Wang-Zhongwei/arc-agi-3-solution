@@ -1,10 +1,14 @@
 """Write the jobs file of a full run from the CUDA tests' outcome: a feature whose test failed on this GPU is
 switched off in every job, so the run needs no decision after it starts.
 
-    python make_jobs.py RESULTS_DIR JOBS_FILE [--rehearsal] [--ple-fp8]
+    python make_jobs.py RESULTS_DIR JOBS_FILE [--rehearsal] [--ple-fp8] [--grpo]
 
 --ple-fp8: only the PLE precision measurement (one sample, the training configuration): LoRA gradients with the
 BF16 table twice (repeat noise), nvidia's FP8 table and a per-row FP8 rounding, then their agreement.
+
+--grpo: GRPO's training shape. Every reply of an untrimmed trajectory is trained, so there is no prefix to skip:
+the full backward at 64K (against 10-20's 22.6 s) and at 110K, the median trajectory under the 130K budget, in
+layer mode (parts mode's ~2.0 MB of checkpoints per token do not fit the host arena there), plus a layer profile.
 
 RESULTS_DIR holds pytest_<name>.exit files (0 = passed) for the test files run by full_run.sh."""
 
@@ -15,6 +19,7 @@ from pathlib import Path
 results, out = Path(sys.argv[1]), Path(sys.argv[2])
 rehearsal = "--rehearsal" in sys.argv
 ple_fp8 = "--ple-fp8" in sys.argv
+grpo = "--grpo" in sys.argv
 
 
 def passed(name: str) -> bool:
@@ -36,7 +41,7 @@ if not passed("compile_lora"):
 if not passed("fused_model"):
     off += ["compile_qsa"]
 psg_ok = passed("prefix_cuda") and passed("prefix_cpu")
-if psg_ok and not passed("prefix_cuda_fast"):  # prefix stop-grad is worth more than fast_gdn
+if psg_ok and not passed("prefix_cuda_fast") and not grpo:  # prefix stop-grad is worth more than fast_gdn
     off += ["fast_gdn"]
 for name in set(off):
     flags[name] = False
@@ -60,9 +65,21 @@ if ple_fp8:
     print("PLE FP8 measurement | features off:", sorted(set(off)) or "none", "| prefix stop-grad:", psg_ok)
     sys.exit(0)
 
+check = ("01_check", {"layer_check": {"length": 8192, "layers": [0, 1, 3],
+                                      "variants": {"reference": {"reference": True}, "opt": layer_flags}}})
+if grpo:
+    long = dict(opt, recompute="layer", transcript="game_ft09.txt")
+    jobs = [check,
+            ("02_opt64", dict(opt, lengths="65536o", repeats=3, timeline=True)),
+            ("03_opt110", dict(long, lengths="110000o", repeats=3, timeline=True)),
+            ("04_profile110", dict({"layer_profile": {"length": 110000, "layers": [0, 1, 3]}}, **long))]
+    out.write_text("".join(f"{name} {json.dumps(job)}\n" for name, job in jobs))
+    (results / "flags.json").write_text(json.dumps(dict(off=sorted(set(off)), opt=opt), indent=1))
+    print("GRPO shape | features off:", sorted(set(off)) or "none", "|", len(jobs), "jobs")
+    sys.exit(0)
+
 jobs = [
-    ("01_check", {"layer_check": {"length": 8192, "layers": [0, 1, 3],
-                                  "variants": {"reference": {"reference": True}, "opt": layer_flags}}}),
+    check,
     ("02_old", dict(old, lengths=long_len, repeats=2, timeline=True)),
     ("03_opt", dict(opt, lengths=long_len, repeats=3, timeline=True, keep_grads="opt")),
 ]
