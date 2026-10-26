@@ -194,3 +194,57 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 - Outputs then differed from the first token, which no draft setting touches.
 - `bench_rollout.py --greedy` now sends the requests one at a time.
 - None of these configurations is adopted, so nothing depends on the check.
+
+## Third benchmark: tuned dense GEMMs, Marlin MoE, live harness (2026-10-26)
+
+**Run:** pod `zn157yeall9q2i`, 2×H200 SXM on secure at $10.58/h (US-GA-2), about 70 min and $12, deleted at the end. Same image and server flags as the second benchmark (MTP 3, 64 sequences). Data in `runs/runpod/jonathanwang2022/rollout-env/zn157yeall9q2i/`.
+
+### Tuned dense GEMMs at M = 256 (PyTorch TunableOp)
+
+- A decode step verifies 64 sequences × 4 tokens = 256 rows, and vLLM's skinny-GEMM path only covers M ≤ 16. So the BF16 projections use cuBLASLt's heuristic algorithm (the idea comes from Lord's RTX tuning).
+- TunableOp times the cuBLASLt algorithms for each shape and keeps the fastest.
+- The tuned table came from a first run with tuning on. The measured run read it with tuning off.
+- The replay and the 200 s window are the same as in the second benchmark.
+
+| Configuration | Tokens/s | Tokens per step | Step |
+|---|---:|---:|---:|
+| Baseline (second benchmark) | 3,920 | 2.87 | 46.4 ms |
+| Tuned table, tuning off | 3,949 (+0.7%) | 2.84 | 45.2 ms |
+| Tuning on while serving | 1,621 (−59%) | 2.75 | 105.5 ms |
+
+- Both ranks read the table: 4,433 shapes each, and 14 have M = 256, most of them with a non-default algorithm.
+- The step is 1.2 ms shorter, but tokens per step came out lower, so tokens/s moved only +0.7%. With one run of each configuration, the gain is at most 0–3%.
+- **Why tuning can't help much:**
+  - At M = 256 a projection takes about 10 µs. The 1280×2560 one takes 10.6 µs, against 1.4 µs to read its weights from HBM.
+  - The time is fixed per-call overhead, not tile choice. The ~550 such calls per step add up to the profile's 4.8 ms.
+  - The remaining lever is fewer, larger GEMMs (fusing projections), not better tiles.
+- With tuning on while serving, every new shape stalls to be tuned, and prefill chunks keep producing new shapes.
+- **Decision:** not adopted.
+
+### Marlin MoE
+
+- `--moe-backend marlin` (draft kept on Triton) does not start: "WNA16 MoE backend 'MARLIN' does not support the deployment configuration since the MoeWNA16 checkpoint layout is not supported."
+- The INT4 MoE stays on HUMMING.
+- `--moe-backend triton` is untested.
+
+### Live harness (partial)
+
+**Setup:**
+- Real games instead of the replay: the harness runs inline on the pod (`make interactive`) with [`configs/rollout-throughput/v1.json`](../../ARC3-Inference/configs/rollout-throughput/v1.json).
+- The 8 games × 9 = 72 games share 64 slots, with a 30-minute cap.
+- Script: [`rollout_env_pod.sh`](../../ARC3-Inference/inference/grpo/pod/rollout_env_pod.sh). Summary: [`rollout_env_report.py`](../../ARC3-Inference/inference/grpo/rollout_env_report.py).
+- Stopped after 11 minutes, so the M = 256 test could run.
+
+| Window | Tokens/s | Running (of 64) | Waiting | Tokens per step | Prefix hit |
+|---|---:|---:|---:|---:|---:|
+| Minutes 3–10 | 3,555 | 63.8 | 7.3 | 2.60 | 92% |
+| Minutes 7–11 (end) | 3,855 | 63.8 | 7.2 | 2.62 | 94% |
+
+- **Slots stay full.** With 72 games for 64 slots, about 7 requests are always waiting, there are never fewer than 62 running, and nothing is preempted.
+- **The host is not the limit.** The machine is 98% idle and the harness uses about 10% of one core.
+  - vLLM's engine core process uses 92% of one core. That is one single-threaded loop, which fits the 21% idle GPU time in the step profile.
+- **GPU busy:** 94% on rank 0, 80% on rank 1.
+- **Throughput over time:**
+  - Tokens/s rose from 3.4K to 3.9K over the first 10 minutes, then stayed within 2% of the replay (3,855 vs 3,920).
+  - Acceptance was lower (2.62 vs 2.87 tokens per step), and the effective step was shorter (~43 ms vs 46.4 ms) because contexts are still short 10 minutes into a game.
+  - The replay's figure works as a planning number. How throughput holds as contexts grow to the GRPO cap is unmeasured.
