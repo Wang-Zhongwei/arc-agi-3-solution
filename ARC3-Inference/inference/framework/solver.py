@@ -26,6 +26,7 @@ from taaf.deploy_kaggle import KaggleTarget
 from taaf.solver import Solver
 
 from inference.utils.animation import (
+    AnimationRecords,
     collapse_frames,
     normalize_frames,
     summarize_animation,
@@ -537,10 +538,13 @@ class _HarnessGameSession:
     # engine can be told what that step cost, and so cannot answer "how much
     # has this game spent". This one is captured once and never moved.
     game_token_baseline: int = 0
-    # The last executed action's animation, or None. One record, not a
-    # history: the model reads it via animation() in the turn that follows,
-    # and older animations are almost never what it is asking about.
+    # The last executed action's animation, or None: what last_animation_*
+    # read. RESET never replaces it, so after a death it is the fatal action's.
     animation_record: dict[str, Any] | None = None
+    # Every animated action's record by action_num, for history[i].animation:
+    # the earlier actions of a batch are replaced in animation_record before
+    # the model can read them. Packed, so a whole run costs megabytes.
+    animation_records: AnimationRecords = field(default_factory=AnimationRecords, repr=False)
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
 
     def current_frame(self) -> Frame:
@@ -1073,10 +1077,17 @@ class _HarnessGameSession:
         if str(arguments.get("query") or "").strip() == "animation":
             # Routed through step_env so no analyzer-protocol signature has to
             # change. Executes nothing and spends no action budget.
+            record = self.animation_record
+            if arguments.get("action_num") is not None:
+                # history[i].animation: that action's own record, not the last
+                try:
+                    record = self.animation_records.get(int(arguments["action_num"]))
+                except (TypeError, ValueError):
+                    record = None
             return {
                 "executed": False,
                 "query": "animation",
-                "record": self.animation_record if ANIMATION_ENABLED else None,
+                "record": record if ANIMATION_ENABLED else None,
             }
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
@@ -1355,10 +1366,11 @@ class _HarnessGameSession:
             # level and the death exists nowhere else.
             chain = _animation_chain(previous_grid, new_state)
             animation_summary = summarize_animation(chain)
-            # ONE record, replaced by every executed action - animated or not.
-            # A no-op that animated is the case this exists for, and the guards
-            # refuse the NEXT action without executing it, so the record still
-            # describes the animated one when the model reads the opener.
+            # The record last_animation_* read, replaced by every executed
+            # action - animated or not. A no-op that animated is the case this
+            # exists for, and the guards refuse the NEXT action without
+            # executing it, so the record still describes the animated one when
+            # the model reads the opener.
             self.animation_record = (
                 {
                     "action_display": action_display,
@@ -1370,6 +1382,9 @@ class _HarnessGameSession:
                 if animation_summary
                 else None
             )
+            if self.animation_record is not None:
+                # keyed like the history entry's result["action_num"]
+                self.animation_records.add(self.action_count, self.animation_record)
         level_completed = bool(
             new_state.just_won_level and raw_state != arcengine.GameState.WIN
         )
