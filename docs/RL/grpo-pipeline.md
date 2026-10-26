@@ -60,7 +60,7 @@ Per trained token t, with the processed logprob log πθ(t) (the trainer applies
 - no KL term, no entropy bonus, no old-policy forward pass
 - the whole sequence runs with gradients: unlike RFT, no prefix stop-grad. The context before the first reply is ~5–8K tokens; its keys and values depend on the adapted projections, so stopping its gradient would bias the policy gradient.
 
-One AdamW step per wave over all selected trajectories.
+One AdamW step per wave over all selected trajectories. The trajectories still run one at a time (one forward + backward each, up to 130K tokens); their LoRA gradients add up, and the step comes after the last one. GPU memory therefore depends on one trajectory's length, not on how many a step trains.
 
 ## Weight sync
 
@@ -83,7 +83,7 @@ One AdamW step per wave over all selected trajectories.
 | Ratio mask | [0.5, 2] | beyond 2× the rollout and trainer disagree, not learn |
 | LoRA | r 16, α 32, attention + GDN | train_rft's tested setup |
 | Optimizer | AdamW, lr 1e-5 constant, β (0.9, 0.999), no decay, clip 1.0 | ~10× a full-model RL rate (LoRA Without Regret); conservative per the 10-19 rule |
-| Steps per wave | 1 | LoRA prefers small batches; one step keeps every wave exactly one step stale |
+| Steps per wave | 1 (open: 2–4) | Every wave is exactly one update stale. The cost: Adam moves each weight by about the learning rate per update, whatever the batch size, so 30 waves are 30 updates. LoRA Without Regret's SFT runs lost more to full fine-tuning at larger batches, which argues for minibatches, not against them (the 10-26 version of this row said the opposite). |
 | Sync | every step, stochastic BF16 | see Weight sync |
 | Saves | adapter, optimizer, loop state every step | a resume loses at most one wave |
 
@@ -133,5 +133,6 @@ Before the trainers start, the pod runs the trainer's CUDA tests (and the GRPO t
 ## Open
 
 - 4 or 6 of 8 per group (6 by default).
+- Updates per wave: 1, or 2–4 minibatches that each mix all games. Weights still sync once per wave. With 4 minibatches the trained data is 4–7 updates behind the policy that played it instead of 1, which the clipping and ratio mask exist for. The runs make 4× as many updates for the same rollouts, and memory is unchanged.
 - Held-out checks (decisions.md, When to stop): not in the loop yet. An evaluation wave every few steps costs ~19 min per check.
 - Muon: built as an option (`--optimizer muon`), not used. Evidence on 2026-10-26: [Ruan et al., 2607.16169](https://arxiv.org/abs/2607.16169) on ALFWorld (0.5B, one seed) traces Muon's gain to update size, and no study pairs it with LoRA in RL. A candidate A/B if round 1 learns slowly.
