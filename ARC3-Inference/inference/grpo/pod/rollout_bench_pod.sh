@@ -125,7 +125,7 @@ for job in $JOBS; do
         if [ $rc = 2 ]; then log "job $job: not ready in ${SERVER_READY_MINUTES} min"; break; fi
         if grep -q "Invalid prefix_match_unit" "$slog"; then
             log "fallback: $(grep -o 'Got group block sizes=[^.]*' "$slog" | head -1); prefix_match_unit unset"; PMU=""
-        elif grep -q "draft_lm_head_quantization" "$slog"; then
+        elif grep -v "non-default args" "$slog" | grep -q "draft_lm_head_quantization"; then  # not the args echo
             log "fallback: draft head quantization rejected; BF16 draft head"
             SPEC='{"method": "mtp", "num_speculative_tokens": 3}'
         elif grep -qiE "out of memory|OutOfMemoryError" "$slog"; then

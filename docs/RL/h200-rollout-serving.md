@@ -143,7 +143,7 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
 - **For GRPO, check the 130K budget with the server's exact `prompt_tokens` and `completion_tokens`.** To cap `max_tokens` before sending, the harness's own estimate is enough. It recomputes characters per token from the previous request's real count, which is the same as the previous real count plus the new messages at that rate. On contexts above 60K it is median 0.999, between 0.94 and 1.04 ([details](grpo-l1-l2-token-budget.md#token-estimate)).
 - **Throughput fell short of the estimate.** About 3.0–3.5K tok/s per TP=2 pair, against 3.5–6.5K estimated for C = 32–48 (about 1.7× an RTX PRO 6000 per GPU). The GPUs were busy, but KV stayed under 30%.
 - **The longest rollout sets the step time**: ~95K tokens at ~99 tok/s ≈ 16 min.
-- **Concurrency: 64 per TP=2 pair (projection, not yet measured).** A linear fit of step time to the 10-s samples (R² 0.55) gives 13.5 ms + 0.52 ms per running sequence + 10.8 µs per uncached prefill token, at 2.83 tokens per sequence per step. At GRPO's prefill (0.7 × generated) it projects:
+- **Concurrency: 64 per TP=2 pair (projection; measured on 10-26: 3,920 tok/s, below).** A linear fit of step time to the 10-s samples (R² 0.55) gives 13.5 ms + 0.52 ms per running sequence + 10.8 µs per uncached prefill token, at 2.83 tokens per sequence per step. At GRPO's prefill (0.7 × generated) it projects:
 
   | Concurrency | 40 | 48 | 56 | 64 | 72 | 80 |
   |---|---:|---:|---:|---:|---:|---:|
@@ -153,4 +153,44 @@ One GRPO-shaped step on one 2×H200 SXM pod: 40 replayed games at once, each run
   | KV if every rollout reaches 130K (9.34M available) | 5.2M | 6.2M | 7.3M | **8.3M** | 9.4M | 10.4M |
 
   64 is the largest concurrency here that cannot run out of KV even if every rollout reaches the cap. Past it, each 8 more sequences add only 3–4%. An earlier fit with a larger prefill term gives 4.2K total and 65 per rollout at 64, so expect 3.8–4.2K total (+15% over 40) and about 60 tok/s per rollout. That is about the per-game speed of a Kaggle run (reset-baseline: 867 tok/s over 14 streams ≈ 62). Measured in this run, with its heavier re-prefill: 3.1K total and 79 per rollout with 40 running, 2.4K and 111 with 20. Averaged over a synchronous step the total is about 10% lower than at full batch (2.7K against 3.0K here), because the batch empties at the end. With synchronous steps the longest rollout sets the step time, so start the next group's rollouts as slots free up.
-- **Next measurements:** concurrency 64/80 (more tok/s, slower rollouts); TP=2 vs 2 × TP=1 at the same concurrency; `--enable-hc-sp`.
+- **Next measurements:** concurrency 80; TP=2 vs 2 × TP=1 at the same concurrency. Concurrency 64, the MTP draft count and `--enable-hc-sp` were measured on 10-26 (below).
+
+## Second benchmark: MTP draft count and `--enable-hc-sp` (2026-10-26)
+
+**Run:** pod `4xquqsnaaubac9`, 2×H200 SXM on secure at $10.58/h (community had no 2-GPU host), about 45 min and $8, deleted at the end. Same nightly image as the first benchmark. Data in `runs/runpod/jonathanwang2022/spec-bench/4xquqsnaaubac9/`; script [`spec_bench_pod.sh`](../../ARC3-Inference/inference/grpo/pod/spec_bench_pod.sh).
+- 64 concurrent rollouts: 8 games (cn04, dc22, ka59, s5i5, g50t, ls20, r11l, sp80) × 8 recorded attempts.
+- Each rollout starts at its first request with at least 40K tokens of context, so decoding runs at GRPO-like lengths ([`bench_rollout.py`](../../ARC3-Inference/inference/grpo/bench_rollout.py) `--start-tokens`).
+- Each configuration is measured over a 200 s full-batch window that opens once the opening prefill is done (`--window`).
+
+| Configuration | Tokens/s | Tokens per step | Step |
+|---|---:|---:|---:|
+| **MTP 3 (current)** | **3,920** | 2.87 | 46.4 ms |
+| MTP 4 | 3,834 (−2.2%) | 3.19 | 52.7 ms |
+| MTP 5 | 3,851 (−1.8%) | 3.34 | 54.8 ms |
+| MTP 3 + `--enable-hc-sp` | 3,771 (−3.8%) | 2.87 | 47.6 ms |
+| MTP 4 + `--enable-hc-sp` | skipped: both parts lost on their own | | |
+
+- The concurrency-64 projection held: 3,920 tokens/s at a 46.4 ms step (projected 3.8–4.2K and 47.8 ms).
+- Conditional acceptance stays at 0.76–0.77 per draft position, so a 4th and 5th draft add the expected accepted tokens (+11%, +5%). At 64 sequences each extra draft also makes the target verify 64 more tokens per step and adds a draft pass, and the step grows more than the tokens.
+- `--enable-hc-sp` was on (the server args show `enable_hc_sp: True`) and made the step 1.2 ms slower.
+- **Decision:** keep MTP 3 and leave `--enable-hc-sp` off.
+
+**Where a decode step goes** (MTP 3; a torch profile of 30 engine iterations, rank 1; [`profile_summary.py`](../../ARC3-Inference/inference/grpo/profile_summary.py)):
+
+| Part of the step | ms | Share |
+|---|---:|---:|
+| Target forward (one CUDA graph) | 26.2 | 55% |
+| Drafter passes (~5 small graphs) | 4.2 | 9% |
+| Eager kernels (~360 per step: sampling, top-k/top-p, log-softmax, all-gathers, some MoE) | 7.5 | 16% |
+| GPU idle | 10.0 | 21% |
+
+- r, one draft token's cost against the target forward, is about 0.053.
+- Inside the target forward, the INT4 MoE GEMMs (HUMMING) take 11 ms (42%), about 60% of the HBM bound for reading the expert weights.
+- Rank 0's kernel time includes ~9 ms per step of all-reduce waiting for rank 1.
+- **Next lever:** the 37% of the step outside the two graphs (eager kernels and idle GPU), which points at host-side work per step, not at the draft count.
+
+**Temperature-0 check: inconclusive.**
+- The 8 check requests were sent together, so each server split their prefills into chunks differently.
+- Outputs then differed from the first token, which no draft setting touches.
+- `bench_rollout.py --greedy` now sends the requests one at a time.
+- None of these configurations is adopted, so nothing depends on the check.
