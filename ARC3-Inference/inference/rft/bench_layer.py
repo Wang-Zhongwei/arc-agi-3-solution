@@ -230,7 +230,7 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--selection", default="realistic", choices=["realistic", "indexer"],
                         help="realistic: run the indexer for its cost, attend over realistic_blocks")
-    parser.add_argument("--union-dkv", default="on", choices=["on", "off"])
+    parser.add_argument("--union-dkv", default="off", choices=["on", "off"])
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 

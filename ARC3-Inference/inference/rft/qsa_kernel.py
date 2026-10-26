@@ -6,12 +6,14 @@ handles one query and one KV head, i.e. the G query heads sharing that head (12 
 padded to 16 rows): it reads the selected keys and values straight from K and V,
 runs an online softmax and stores the output and the log-sum-exp (base 2).
 
-Backward recomputes the probabilities from the LSE. dQ comes from a per-query kernel
-like the forward, written once. dK and dV come from tiles of 16 neighbouring queries:
-each tile walks the union of its queries' blocks (with a bit mask of which query chose
-which block), reads every key once and adds its gradient with one FP32 atomic per
-element into FP32 buffers. Neighbours overlap a lot (16 queries select ~3.5x one
-query's tokens), so this needs ~4.6x fewer atomics and reads than per query.
+Backward recomputes the probabilities from the LSE in a per-query kernel like the
+forward: it writes dQ once and adds dK and dV with one FP32 atomic per element into
+FP32 buffers. The alternative (UNION_DKV) takes dK and dV from tiles of 16 neighbouring
+queries: each tile walks the union of its queries' blocks (with a bit mask of which query
+chose which block), reads every key once and needs ~4.6x fewer atomics, but computes every
+tile query against the whole union, ~3.3x the useful work. On the H200 the atomics cost
+no more than plain stores, so the per-query path is faster: 238.9 ms against 343.5 ms
+for one QSA layer's backward at 64K on a realistic selection (bench_qsa.py, 10-26).
 
 The PyTorch path this replaces (qsa._attend_chunk) gathered [chunk, 2051, 2, 256]
 keys and values per chunk of queries, ran SDPA on 12-row problems and scattered
@@ -229,7 +231,7 @@ def union_tiles(blocks: torch.Tensor, qt: int):
 UNION_QUERIES = 16  # queries per dK/dV tile: 16 neighbours select ~3.5x one query's tokens (10-19 overlap job)
 
 
-def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, union: bool = True,
+def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, union: bool = False,
                  q_offset: int = 0, key_start: int = 0):
     """dQ, dK, dV; dK and dV stay zero for keys before `key_start` (constants under prefix stop-grad)."""
     n, h, d = q.shape
@@ -259,7 +261,9 @@ def qsa_backward(q, k, v, blocks, out, lse, dout, scale: float, ratio: int, unio
     return dq, dk.to(k.dtype), dv.to(v.dtype)
 
 
-UNION_DKV = True  # dK/dV per tile of neighbouring queries (False: per query, one atomic per element each)
+# dK/dV per query, one atomic per element each (True: per tile of neighbouring queries over their union). Per query
+# is 30% faster on the H200 (bench_qsa.py, 10-26): its atomics cost what stores do, the union's extra work does not.
+UNION_DKV = False
 
 
 class QSAAttention(torch.autograd.Function):
