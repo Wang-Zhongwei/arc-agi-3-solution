@@ -197,51 +197,11 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         __repr__ = __str__
 
 
-    # One action's animation summary - a dict, read as before - plus that
-    # action's own `.frames` and `.timeline`, fetched from the host by its
-    # action_num only when read.
-    class AnimationView(dict):
-        fetch = None  # set at startup when animations are enabled
-        # The last few reads by (kind, action_num), for this call only: code
-        # that indexes `.frames[k]` in a loop must not move every frame across
-        # the pipe on each pass, and a loop over all of history must not hold
-        # every frame at once.
-        _cache = {}
-
-        def __init__(self, summary, action_num):
-            super().__init__(summary)
-            self._action_num = action_num
-
-        def _read(self, kind, empty):
-            if AnimationView.fetch is None or self._action_num is None:
-                return empty
-            key = (kind, self._action_num)
-            cache = AnimationView._cache
-            if key not in cache:
-                cache[key] = AnimationView.fetch(kind, self._action_num) or empty
-                while len(cache) > 8:
-                    cache.pop(next(iter(cache)))
-            return cache[key]
-
-        @property
-        def frames(self):
-            return self._read("frames", [])
-
-        @property
-        def timeline(self):
-            return self._read("timeline", {"action": None, "frame_count": 0, "frame_diffs": []})
-
-
     class HistoryEntryView:
         def __init__(self, *, action, frame, result=None):
             self.action = action
             self.frame = frame
             self.result = dict(result) if isinstance(result, dict) else {}
-            # this action's animation summary, or None. Its frames and timeline
-            # are fetched by action_num, so they stay readable after the next
-            # action replaces last_animation_*.
-            summary = self.result.get("animation")
-            self.animation = AnimationView(summary, self.result.get("action_num")) if summary else None
 
         def __str__(self):
             return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
@@ -250,14 +210,12 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
 
     class TransitionView:
-        def __init__(self, *, action, before_frame, after_frame, result, animation=None):
+        def __init__(self, *, action, before_frame, after_frame, result):
             self.action = action
             self.before_frame = before_frame
             self.after_frame = after_frame
             self.frame = after_frame
             self.result = dict(result) if isinstance(result, dict) else {}
-            # the history entry's own view: v7 code reached for it here too
-            self.animation = animation
 
         def __str__(self):
             return (
@@ -310,7 +268,6 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     before_frame=before_frame,
                     after_frame=entry.frame,
                     result=entry.result,
-                    animation=getattr(entry, "animation", None),
                 )
             )
         return transitions
@@ -660,11 +617,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     _stale_state.append(str(_name))
             return action_result
 
-        def _animation_fetch(kind, action_num=None):
-            request = {"kind": kind}
-            if action_num is not None:
-                request["action_num"] = action_num
-            _send({"type": "animation", "request": request})
+        def _animation_fetch(kind):
+            _send({"type": "animation", "request": {"kind": kind}})
             reply = _recv()
             if reply.get("type") == "animation_error":
                 raise RuntimeError(str(reply.get("error", "animation failed")))
@@ -688,12 +642,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         if initial.get("animation_enabled"):
             # Globals rather than attributes on last_transition: after a death
             # the harness appends a RESET entry, so last_transition is the
-            # reset and not the action that animated. The record belongs to the
-            # last executed action, animated or not, so an action that returns
-            # a single frame empties it. RESET is the one exception: it never
-            # touches the record, so after a death it is the fatal action's.
-            AnimationView.fetch = staticmethod(_animation_fetch)
-
+            # reset and not the action that animated. The record is simply
+            # "the last executed action that animated", and naming it that way
+            # removes the mismatch. Empty when the last executed action
+            # returned a single frame.
             class _LazyAnimation:
                 def __init__(self, kind, empty):
                     self._kind = kind
@@ -702,7 +654,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
                 def _get(self):
                     if self._value is None:
-                        self._value = _animation_fetch(self._kind) or self._empty()
+                        self._value = _animation_fetch(self._kind) or self._empty
                     return self._value
 
                 def invalidate(self):
@@ -726,23 +678,14 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 def keys(self):
                     return self._get().keys()
 
-                def items(self):
-                    return self._get().items()
-
-                def values(self):
-                    return self._get().values()
-
                 def get(self, key, default=None):
                     return self._get().get(key, default)
 
                 def __repr__(self):
                     return repr(self._get())
 
-            runtime_globals["last_animation_frames"] = _LazyAnimation("frames", list)
-            # the same keys as a real timeline, so `frame_diffs` is just empty
-            runtime_globals["last_animation_timeline"] = _LazyAnimation(
-                "timeline", lambda: {"action": None, "frame_count": 0, "frame_diffs": []}
-            )
+            runtime_globals["last_animation_frames"] = _LazyAnimation("frames", [])
+            runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", {})
             _animation_views.extend((runtime_globals["last_animation_frames"],
                                      runtime_globals["last_animation_timeline"]))
 

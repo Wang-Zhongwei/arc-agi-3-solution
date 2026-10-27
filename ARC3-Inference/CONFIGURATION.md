@@ -123,7 +123,7 @@ Added capture of intermediate frames returned by an action, consecutive-frame de
 
 The image-mode variables are enums, not booleans: an invalid value such as `1` raises a configuration error. Image attachments require the multimodal image path to be enabled.
 
-The model can inspect `last_animation_frames` and `last_animation_timeline` for the last executed action, and each `history[i].animation` (also `transitions[i].animation`) keeps that action's summary, with its own `.frames` and `.timeline`. The harness keeps every animated action's frames, zlib-packed (about 4 MB for a 25-game run). The frames and timeline are loaded lazily through a read-only environment query, without spending a game action. The prompt points out transient activity so that the model knows intermediate information is available.
+The model can inspect `last_animation_frames` and `last_animation_timeline`. These are loaded lazily through a read-only environment query, without spending a game action. The prompt points out transient activity so that the model knows intermediate information is available.
 
 A composite is explicitly not a real single board state. It retains the last non-final transient colors, with brightness encoding duration. A peak image is an actual intermediate frame, which avoids combining moments but may omit important parts of a longer animation.
 
