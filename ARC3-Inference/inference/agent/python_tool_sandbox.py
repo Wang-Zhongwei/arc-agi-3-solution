@@ -175,7 +175,53 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return json.loads(line)
 
 
-    class FrameView:
+    # Every view reads both ways, `frame.step` and `frame["step"]`, and so does
+    # every record dict, `animation.frame_count` and `animation["frame_count"]`:
+    # the model picks a style at random (animation-history-frames v1: 7 x
+    # `.frame_count` on the animation dict). Integer keys still fail, so a
+    # frame is never mistaken for its grid.
+    class _KeyAccess:
+        __iter__ = None  # still not iterable
+
+        def __getitem__(self, key):
+            if not isinstance(key, str):
+                raise TypeError(f"'{type(self).__name__}' object is not subscriptable")
+            if key.startswith("_"):
+                raise KeyError(key)
+            try:
+                return getattr(self, key)
+            except AttributeError:
+                raise KeyError(key) from None
+
+        def get(self, key, default=None):
+            try:
+                return self[key]
+            except (KeyError, TypeError):
+                return default
+
+
+    class _Record(dict):
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            try:
+                return self[name]
+            except KeyError:
+                keys = ", ".join(map(str, self))
+                raise AttributeError(
+                    f"'{type(self).__name__}' object has no attribute {name!r} (keys: {keys})"
+                ) from None
+
+
+    def _record(value):
+        if isinstance(value, dict):
+            return _Record({key: _record(item) for key, item in value.items()})
+        if isinstance(value, list):
+            return [_record(item) for item in value]
+        return value
+
+
+    class FrameView(_KeyAccess):
         def __init__(self, *, ascii, step, level, shape, grid):
             self.ascii = ascii
             self.step = step
@@ -199,8 +245,8 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
     # One action's animation summary - a dict, read as before - plus that
     # action's own `.frames` and `.timeline`, fetched from the host by its
-    # action_num only when read.
-    class AnimationView(dict):
+    # action_num only when read. `["frames"]` and `["timeline"]` read them too.
+    class AnimationView(_Record):
         fetch = None  # set at startup when animations are enabled
         # The last few reads by (kind, action_num), for this call only: code
         # that indexes `.frames[k]` in a loop must not move every frame across
@@ -229,14 +275,24 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
         @property
         def timeline(self):
-            return self._read("timeline", {"action": None, "frame_count": 0, "frame_diffs": []})
+            return self._read("timeline", _Record(action=None, frame_count=0, frame_diffs=[]))
+
+        def __getitem__(self, key):
+            if key in ("frames", "timeline") and not dict.__contains__(self, key):
+                return getattr(self, key)
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            if key in ("frames", "timeline") and not dict.__contains__(self, key):
+                return getattr(self, key)
+            return super().get(key, default)
 
 
-    class HistoryEntryView:
+    class HistoryEntryView(_KeyAccess):
         def __init__(self, *, action, frame, result=None):
             self.action = action
             self.frame = frame
-            self.result = dict(result) if isinstance(result, dict) else {}
+            self.result = _record(result) if isinstance(result, dict) else _Record()
             # this action's animation summary, or None. Its frames and timeline
             # are fetched by action_num, so they stay readable after the next
             # action replaces last_animation_*.
@@ -246,18 +302,36 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         def __str__(self):
             return f"AsciiHistoryEntryView(action={self.action!r}, frame={self.frame})"
 
+        # `h.step` and `h.level` are its frame's: the most common wrong guess
+        # (4-9 AttributeErrors a run, porting-advaith v3-v7)
+        @property
+        def step(self):
+            return self.frame.step if self.frame is not None else None
+
+        @property
+        def level(self):
+            return self.frame.level if self.frame is not None else None
+
         __repr__ = __str__
 
 
-    class TransitionView:
+    class TransitionView(_KeyAccess):
         def __init__(self, *, action, before_frame, after_frame, result, animation=None):
             self.action = action
             self.before_frame = before_frame
             self.after_frame = after_frame
             self.frame = after_frame
-            self.result = dict(result) if isinstance(result, dict) else {}
+            self.result = _record(result) if isinstance(result, dict) else _Record()
             # the history entry's own view: v7 code reached for it here too
             self.animation = animation
+
+        @property
+        def step(self):
+            return self.after_frame.step if self.after_frame is not None else None
+
+        @property
+        def level(self):
+            return self.after_frame.level if self.after_frame is not None else None
 
         def __str__(self):
             return (
@@ -672,7 +746,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 raise RuntimeError("Invalid animation response from sandbox host.")
             payload = reply.get("animation")
             if kind != "frames":
-                return payload or {}
+                return _record(payload or {})
             return [
                 FrameView(
                     ascii=item.get("ascii", ""),
@@ -735,13 +809,19 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 def get(self, key, default=None):
                     return self._get().get(key, default)
 
+                def __getattr__(self, name):
+                    # `last_animation_timeline.frame_diffs`, as on any timeline
+                    if name.startswith("_"):
+                        raise AttributeError(name)
+                    return getattr(self._get(), name)
+
                 def __repr__(self):
                     return repr(self._get())
 
             runtime_globals["last_animation_frames"] = _LazyAnimation("frames", list)
             # the same keys as a real timeline, so `frame_diffs` is just empty
             runtime_globals["last_animation_timeline"] = _LazyAnimation(
-                "timeline", lambda: {"action": None, "frame_count": 0, "frame_diffs": []}
+                "timeline", lambda: _Record(action=None, frame_count=0, frame_diffs=[])
             )
             _animation_views.extend((runtime_globals["last_animation_frames"],
                                      runtime_globals["last_animation_timeline"]))

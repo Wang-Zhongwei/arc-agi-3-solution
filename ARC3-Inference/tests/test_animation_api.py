@@ -200,3 +200,56 @@ def test_prompt_describes_the_record_as_it_behaves():
         assert name in text
     for old in ("`frames`", "`steps`", "`step`", "`changed`"):
         assert old not in text
+
+
+def test_animation_reads_as_keys_and_as_attributes():
+    # animation-history-frames v1: 7 x `h.animation.frame_count`, 1 x `h.animation['timeline']`
+    def handler(request):
+        own = RECORD if request.get("action_num") in (1, None) else None
+        return build_animation_frames(own) if request.get("kind") == "frames" else build_animation_view(own)
+
+    out = _run(
+        "a = history[1].animation\n"
+        "print(a.frame_count, a['frame_count'], len(a['frames']), len(a.get('frames')))\n"
+        "tl = a['timeline']\n"
+        "print([d.frame_index for d in tl.frame_diffs], tl.action, a.get('timeline')['frame_count'])\n"
+        "print([d.changed_count for d in last_animation_timeline.frame_diffs], last_animation_timeline.frame_count)\n"
+        "try:\n"
+        "    a.nope\n"
+        "except AttributeError as e:\n"
+        "    print('AttributeError', 'frame_count' in str(e))\n",
+        None, handler,
+    )
+
+    timeline = build_animation_view(RECORD)
+    changed = [d["changed_count"] for d in timeline["frame_diffs"]]
+    assert out["stdout"].splitlines() == [
+        "4 4 4 4",
+        "[0, 2, 3] SPACE 4",
+        f"{changed} 4",
+        "AttributeError True",
+    ], out
+
+
+def test_views_read_fields_as_keys_and_step_from_their_frame():
+    # porting-advaith v3-v7: 4-9 x `history[i].step` a run (the step is the frame's)
+    out = _run(
+        "h, t = history[1], transitions[0]\n"
+        "print(h['action'], h.step == h.frame.step == h['step'], h.level, t['action'], t.step == t.after_frame.step)\n"
+        "print(h.result.action_num, h['result']['animation'].frame_count, current_frame['shape'], current_frame.get('nope'))\n"
+        "for probe in (lambda: current_frame[0], lambda: list(current_frame), lambda: h['nope'], lambda: h['_grid']):\n"
+        "    try:\n"
+        "        probe()\n"
+        "    except Exception as e:\n"
+        "        print(type(e).__name__)\n",
+        build_animation_view(RECORD),
+    )
+
+    assert out["stdout"].splitlines() == [
+        "SPACE True 1 SPACE True",
+        "1 4 (2, 2) None",
+        "TypeError",
+        "TypeError",
+        "KeyError",
+        "KeyError",
+    ], out
