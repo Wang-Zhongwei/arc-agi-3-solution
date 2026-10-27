@@ -31,6 +31,7 @@ CAP, PER_HUMAN_ACTION = 130_000, 1_750  # decided 2026-10-23
 GROUP = 8
 ROUND_1 = {"bp35", "cd82", "g50t", "s5i5", "sk48", "sp80", "tn36", "wa30"}  # decided 2026-10-26
 GUARDS = {"ft09", "lp85", "re86", "tr87"}  # kept untrained (decisions.md, When to stop)
+ADDED = ("su15", "lf52")  # the B200 run's 2 games on top of round 1 (decided 2026-10-27)
 
 
 def variance(values):
@@ -91,16 +92,12 @@ def main():
         print(f"| {r['rank']} | {r['game']} | {r['attempts']} | {r['budget'] / 1000:.0f}K | {r['l1']:.0%} | "
               f"{r['l1_l2']:.0%} | {r['var_level']:.3f} | {r['var_reward']:.3f} | {r['mean_reward']:.2f} | "
               f"{r['p_flat_group']:.2f} | {r['mean_tokens'] / 1000:.0f}K | {r['var_per_100k_tokens']:.3f} | {note} |")
-    pick = [r for r in table if not r["guard"]]
-    for k in (8, 10, 12):
-        chosen = pick[:k]
-        wave = sum(r["mean_tokens"] for r in chosen) * GROUP
-        print(f"top {k} without guards: {' '.join(r['game'] for r in chosen)}; mean Var(reward) "
-              f"{sum(r['var_reward'] for r in chosen) / k:.3f}; wave {k * GROUP} rollouts, {wave / 1e6:.1f}M context tokens")
     r1 = [r for r in table if r["round_1"]]
-    print(f"round 1 (8 games): mean Var(reward) {sum(r['var_reward'] for r in r1) / 8:.3f}, "
-          f"Var(level) {sum(r['var_level'] for r in r1) / 8:.3f}; "
-          f"wave {sum(r['mean_tokens'] for r in r1) * GROUP / 1e6:.1f}M context tokens")
+    added = [r for r in table if r["game"] in ADDED]
+    for name, chosen in (("round 1", r1), (f"round 1 + {' '.join(r['game'] for r in added)}", r1 + added)):
+        print(f"{name} ({len(chosen)} games): mean Var(reward) {sum(r['var_reward'] for r in chosen) / len(chosen):.3f}, "
+              f"Var(level) {sum(r['var_level'] for r in chosen) / len(chosen):.3f}; wave {len(chosen) * GROUP} rollouts, "
+              f"{sum(r['mean_tokens'] for r in chosen) * GROUP / 1e6:.1f}M context tokens")
 
 
 if __name__ == "__main__":

@@ -98,6 +98,7 @@ Example from Yi-Chia Chen: [Agent-Factory-3 blog](https://huggingface.co/blog/yc
 
   - Seven of the 8 run to the budget in most attempts (63–100%), so a wave lasts about as long as the budget allows.
   - Caveat (undecided): bp35 and sk48 never clear L2 within budget, so they train L1 only, and every one of their rollouts runs the full budget: 16 of the 64 slots. Swapping them for two mid-range games (e.g. dc22 and m0r0) raises the mean within-group variance of the level reward (0, ⅓ or 1) from 0.092 to 0.125, with the same wave time.
+  - **B200 run: these 8 + su15 and lf52 (decided 2026-10-27).** 80 rollouts; mean reward variance 0.081 against 0.083 ([grpo-game-ranking.md](grpo-game-ranking.md)).
 
 - **When to stop: level 3 as the held-out set (decided 2026-10-21).** Training rewards only L1–L2, so L3 of every game is never trained on, and memorized L1–L2 action sequences cannot help on it.
   - Every 5 steps, play each game from reset through L3 with the current policy (same harness and context as evaluation, so with its usual trimming: these rollouts are not trained on, so the 130K training limit does not apply), a few rollouts per game.

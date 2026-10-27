@@ -10,7 +10,7 @@ Our own asynchronous GRPO loop for Qwen3.8-Flash-Next on the ARC-AGI-3 games. Th
 |---|---|
 | [grpo-pipeline.md](../../../docs/RL/grpo-pipeline.md) | The design: episodes, training sequences, reward, loss, FP8 caches, weight sync, settings, gates, CPU example |
 | [decisions.md](../../../docs/RL/decisions.md) | Every decision with its date and reason: stack, budget, reward, games, hardware, when to stop |
-| [grpo-game-ranking.md](../../../docs/RL/grpo-game-ranking.md) | All 25 games ranked by signal per group; the 10 proposed for the B200 run |
+| [grpo-game-ranking.md](../../../docs/RL/grpo-game-ranking.md) | All 25 games ranked by signal per group; the B200 run's 2 extra games |
 | [grpo-l1-l2-token-budget.md](../../../docs/RL/grpo-l1-l2-token-budget.md) | The episode budget min(1,750 × human actions of L1 + L2, 130K) context tokens |
 | [grpo-training-throughput.md](../../../docs/RL/grpo-training-throughput.md) | Trainer speed (H200: 2,878 tokens/s at 110K) and why 6 of 8 rollouts per group |
 | [h200-rollout-serving.md](../../../docs/RL/h200-rollout-serving.md) | vLLM flags and rollout benchmarks (TP=2, 64 rollouts: 3,920 generated tokens/s) |
@@ -44,7 +44,7 @@ The harness is **porting-advaith v6** (main a3b57e6e, 59.83 on Kaggle), the best
 | [pod/patch_fla_sm100.py](pod/patch_fla_sm100.py) | fla's GDN backward on B200 |
 | [container/Dockerfile](container/Dockerfile) | Image for a GPU node: vLLM nightly + trainer venv + harness venv |
 | [bench_rollout.py](bench_rollout.py), [build_replay.py](build_replay.py), [pod/rollout_*_pod.sh](pod/), [pod/spec_bench_pod.sh](pod/spec_bench_pod.sh), [profile_summary.py](profile_summary.py), [rollout_env_report.py](rollout_env_report.py) | The H200 serving benchmarks |
-| Configs | [configs/grpo/v1.json](../../configs/grpo/v1.json) (round 1: 8 games, 64 rollouts), [configs/grpo-b200/v1.json](../../configs/grpo-b200/v1.json) (top 10, 80 rollouts) |
+| Configs | [configs/grpo/v1.json](../../configs/grpo/v1.json) (round 1: 8 games, 64 rollouts), [configs/grpo-b200/v1.json](../../configs/grpo-b200/v1.json) (round 1 + su15, lf52: 10 games, 80 rollouts) |
 
 ## Run on a B200 node
 
@@ -99,7 +99,7 @@ The loop drives one vLLM server (one URL) and any number of trainers. Rollouts s
 | 8 × B200, fallback | `SERVER_GPUS=0,1` (TP=2, the H200-tested shape) | `TRAINER_GPUS=2,3,4,5` | Not measured on B200 |
 | 4 × H200 pod | `0,1` (defaults) | `2,3` (defaults) | Built for it; [grpo-pipeline.md](../../../docs/RL/grpo-pipeline.md#running-it) |
 
-Rough sizes for the 10-game wave (80 rollouts) from historical attempts: ~8.0M context tokens, ~4.7M generated, ~6.0M trained (6 of 8). At the H200 rates, rollouts take ~20 min on one TP=2 server, and training takes ~17 min on 2 trainers or ~9 min on 4. B200 rates are not measured. KV: 80 × 130K = 10.4M tokens. A TP=2 H200 pair held 9.34M (79 GiB per GPU after ~35 GiB of weights); a B200 has ~1.3× the memory, so a TP=2 pair should hold ~13.5M (estimate).
+Rough sizes for the 10-game wave (80 rollouts) from historical attempts: ~9.3M context tokens, ~5.5M generated, ~7.0M trained (6 of 8). At the H200 rates, rollouts take ~24 min on one TP=2 server, and training takes ~20 min on 2 trainers or ~10 min on 4. B200 rates are not measured. KV: 80 × 130K = 10.4M tokens. A TP=2 H200 pair held 9.34M (79 GiB per GPU after ~35 GiB of weights); a B200 has ~1.3× the memory, so a TP=2 pair should hold ~13.5M (estimate).
 
 ### B200 differences
 
@@ -137,7 +137,6 @@ Breakpoints, in the order the data flows: [grpo-pipeline.md](../../../docs/RL/gr
 ## Open
 
 - First GPU run: the gates (wave 0, step 1, sync 1) decide whether the setup is sound.
-- Games for the B200 run: the top 10 of [grpo-game-ranking.md](../../../docs/RL/grpo-game-ranking.md) are proposed, not decided.
 - Held-out checks (L3 and untrained games) are not in the loop yet ([decisions.md](../../../docs/RL/decisions.md), When to stop).
 - Two servers (e.g. 2 × TP=2) need the loop to sync and split waves across URLs: not built.
 - The Dockerfile has not been built yet.

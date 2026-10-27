@@ -1,6 +1,6 @@
 # GRPO games ranked by signal per group
 
-Round 1 trains 8 games, one group of 8 rollouts each per wave ([decisions.md](decisions.md), Games). A B200 node has room for more rollouts per wave, so this ranks all 25 public games to pick the next ones. Proposed for the B200 run: the top 10 without the guards, in [configs/grpo-b200/v1.json](../../ARC3-Inference/configs/grpo-b200/v1.json). Not decided.
+Round 1 trains 8 games, one group of 8 rollouts each per wave ([decisions.md](decisions.md), Games). A B200 node has room for more rollouts per wave, so this ranks all 25 public games to pick the next ones. The B200 run keeps round 1's 8 and adds su15 and lf52 (decided 2026-10-27): [configs/grpo-b200/v1.json](../../ARC3-Inference/configs/grpo-b200/v1.json).
 
 ## Measure
 
@@ -54,13 +54,12 @@ L1, L1 + L2: share of attempts that cleared within the budget. P(flat group): ch
 | Set (guards excluded) | Games | Mean Var(reward) | Rollouts | Context tokens per wave |
 |---|---|---:|---:|---:|
 | Round 1 (decided 2026-10-26) | bp35 cd82 g50t s5i5 sk48 sp80 tn36 wa30 | 0.083 | 64 | 7.6M |
-| Top 8 | sc25 dc22 m0r0 g50t ka59 ls20 s5i5 vc33 | 0.151 | 64 | 6.4M |
-| **Top 10 (proposed for B200)** | top 8 + cn04 r11l | 0.144 | 80 | 8.0M |
-| Top 12 | top 10 + sp80 cd82 | 0.137 | 96 | 9.7M |
+| **B200 run (decided 2026-10-27)** | round 1 + su15 lf52 | 0.081 | 80 | 9.3M |
 
-- The top 10 give 1.7× round 1's signal per group at 5% more tokens per wave: sc25, vc33 and r11l have short budgets.
-- Round 1 keeps g50t and s5i5 in the top 10. bp35 and sk48 never clear L2 within budget and rank 21 and 23; cd82's level outcomes vary most after sc25, but its L2 takes 8 human actions, so its clears earn little efficiency credit.
-- The guards (ft09, lp85, re86, tr87) stay untrained; they are near 100% anyway. The 15 games outside the top 10 measure transfer to untrained games.
+- su15 (rank 13) clears L1 + L2 within budget in 70% of attempts, lf52 (rank 18) in 14%; both always clear L1. Their reward variance is 0.094 and 0.049, so the set's mean stays at round 1's level.
+- The highest-signal games not trained: sc25 and dc22 (ranks 1 and 2, 0.204 and 0.166), then m0r0, ka59, ls20.
+- In round 1, bp35 and sk48 never clear L2 within budget (ranks 23 and 21) and train L1 only. cd82's level outcomes vary most after sc25, but its L2 takes 8 human actions, so its clears earn little efficiency credit.
+- The guards (ft09, lp85, re86, tr87) stay untrained; they are near 100% anyway. The other 11 untrained games measure transfer to new games.
 
 ## Caveats
 
