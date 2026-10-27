@@ -2542,6 +2542,26 @@ def _guards_active(level: Any) -> bool:
         return True  # unknown level: guard rather than not
 
 
+def _method_lines_active(level: Any) -> bool:
+    """Whether the opener's two methodology lines are shown at this level.
+
+    "Use Python to inspect the evidence from the newest history, ..." (the
+    ARC3_MEMORY_SECTIONS=off wording) and "Focus on what changed most recently
+    in `history`, ..." repeat on every turn. ARC3_METHOD_LINES_UNTIL_LEVEL=2
+    shows them on levels 1-2 only; 0, the default, on every level.
+    """
+    try:
+        ceiling = int(os.environ.get("ARC3_METHOD_LINES_UNTIL_LEVEL", "0") or 0)
+    except ValueError:
+        ceiling = 0
+    if ceiling <= 0:
+        return True
+    try:
+        return int(level) <= ceiling
+    except (TypeError, ValueError):
+        return True  # unknown level: keep the lines
+
+
 def _persistent_functions() -> bool:
     """Retain eligible function sources across calls; off by default.
 
@@ -5660,10 +5680,12 @@ class ToolAgent:
         # revise a world model it was never shown, and replies carrying any
         # assistant text dropped from 76% to 43%. That arm keeps the first
         # sentence without its world-model clause.
+        method_lines = _method_lines_active(current_level)
         if _memory_sections_disabled():
-            lines.append(
-                "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
-            )
+            if method_lines:
+                lines.append(
+                    "Use Python to inspect the evidence from the newest history, and search or score candidate actions or short sequences against the current goal as you currently understand it."
+                )
         else:
             lines.extend(
                 [
@@ -5687,7 +5709,7 @@ class ToolAgent:
             lines.append(
                 "Ground yourself in `current_frame` before acting, but start with a compact structural summary rather than restating the full frame."
             )
-        else:
+        elif method_lines:
             lines.append(
                 "Focus on what changed most recently in `history`, update the target environment change if needed, and separate gameplay-object changes from HUD-only changes."
             )

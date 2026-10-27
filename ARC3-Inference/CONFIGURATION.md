@@ -48,6 +48,7 @@ The descriptions clarify that action semantics depend on the game. MOUSE uses in
 | `ARC3_NEW_CHANGED_PROMPTS` | Off | Uses more precise language about no change in the board’s gameplay area, rather than equating every HUD-only change with useful progress. Also changes related guard feedback. |
 | `ARC3_REPORT_GAMEPLAY_CHANGED` | Off | Exposes `gameplay_changed` and `no_op` in model-facing action results. The harness can calculate these internally even when reporting is off. |
 | `ARC3_EXPLAIN_GAMEPLAY_CHANGED` | Inherits `ARC3_REPORT_GAMEPLAY_CHANGED` | Adds the explanation distinguishing full-board changes from changes inside the gameplay area. Can be explicitly enabled independently. |
+| `ARC3_METHOD_LINES_UNTIL_LEVEL` | `0` | Shows the opener's "Use Python to inspect the evidence from the newest history..." (memory sections off) and "Focus on what changed most recently in `history`..." lines only up to this level. `0` shows them on every level. |
 | `ARC3_OPENER_COMMIT_HINT` | Off | Adds encouragement to commit to an action sequence when the mechanics are sufficiently understood. |
 | `ARC3_PREFER_TOOL_CALLS` | Off | Adds guidance about using Python inspection/computation rather than spending excessive deliberation without testing. |
 | `ARC3_DEDUPE_MULTICALL_LINE` | Off | Removes duplicated prompt wording about multiple action calls. This is text deduplication, not deduplication of tool execution. |
