@@ -176,7 +176,8 @@ make grpo-cpu-example ARGS="--pdb"        # pdb at every stage: `summary` (the p
   - run the trainers' CUDA tests;
   - start both trainers;
   - start the loop.
-- Settings: `STEPS` (30), `LR`, `KEEP`, `OPTIMIZER` (adamw or muon), `MAX_HOURS` (12), `POD_END` (stop), `WANDB_PROJECT`.
+- Settings: `STEPS` (30), `LR`, `KEEP`, `OPTIMIZER` (adamw or muon), `MAX_HOURS` (12), `POD_END` (stop), `WANDB_PROJECT`, `SERVER_GPUS` / `TRAINER_GPUS` (0,1 / 2,3).
+- Other nodes (8 × B200) run the same script in a container: [inference/grpo/README.md](../../ARC3-Inference/inference/grpo/README.md).
 - Host memory: the trainers get the RAM left after the server is up, minus their shared PLE page cache (103 GB) and 60 GB, split in two, up to 200 GB each. 130K-token episodes in "layer" recompute need ~127 GB, so the script aborts below 120 GB per trainer.
 
 ## Open

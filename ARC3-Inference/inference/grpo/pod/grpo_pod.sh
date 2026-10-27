@@ -1,12 +1,15 @@
 #!/bin/bash
-# GRPO on one 4xH200 pod (docs/RL/grpo-pipeline.md): vLLM on GPUs 0-1 (TP=2, 64 sequences, MTP 3, processed logprobs,
-# the weight-sync extension), two trainers on GPUs 2 and 3 (LoRA data parallel), the harness and the loop on the CPU.
+# GRPO on one node (docs/RL/grpo-pipeline.md): vLLM on SERVER_GPUS (default 0,1: TP=2; MTP 3, processed logprobs, the
+# weight-sync extension, one sequence per rollout of a wave), one trainer per GPU in TRAINER_GPUS (default 2,3: LoRA
+# data parallel), the harness and the loop on the CPU. Defaults are the 4xH200 RunPod pod; an 8xB200 node in the
+# container (inference/grpo/container/) sets e.g. SERVER_GPUS=0,1,2,3 TRAINER_GPUS=4,5,6,7 (inference/grpo/README.md).
 # The image is the vLLM nightly (torch 2.14); the trainers run in their own venv with the tested torch 2.8 stack.
 # Nothing waits for a person: the loop's gates abort a broken setup in the first waves (token-exact sequences,
 # trainer/vLLM agreement at the base weights, the first sync carrying the update). Results go to results/, then
 # FULL_DONE; the pod ends itself (POD_END=stop|delete) GRACE_MINUTES after the end, or at MAX_HOURS.
-#   upload repo.tgz (ARC3-Inference + tufa-arc-agi-framework + docs/RL/data, no runs/ or .venv) and env.tgz
+#   pod: upload repo.tgz (ARC3-Inference + tufa-arc-agi-framework + docs/RL/data, no runs/ or .venv) and env.tgz
 #   (environment_files/) to $WORK, then ssh ... 'cd /workspace/grpo; nohup bash grpo_pod.sh > run.log 2>&1 < /dev/null &'
+#   container: the code is in $REPO (/opt/repo) and the trainer venv is built; set ENV_DIR and MODEL_DIR to the mounts
 #   WORKDIR=/workspace/grpo RUNLOG=run.log PULL="results run.log" bash inference/rft/pod/watch_pod.sh POD HOST PORT DEST
 set -uo pipefail
 
@@ -16,6 +19,10 @@ MODEL_DIR=${MODEL_DIR:-/workspace/w4a16}
 MODEL_REPO=${MODEL_REPO:-Intel/Qwen3.8-Flash-Next-W4A16-AutoRound}
 TRAINER_VENV=${TRAINER_VENV:-/workspace/trainer-venv}
 CONFIG=${CONFIG:-configs/grpo/v1.json}
+SERVER_GPUS=${SERVER_GPUS:-0,1}  # vLLM; tensor parallel over all of them
+TRAINER_GPUS=${TRAINER_GPUS:-2,3}  # one trainer process per GPU
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-}  # default: the config's environment.concurrent_jobs (games x 8)
+ENV_DIR=${ENV_DIR:-$WORK/env/environment_files}
 STEPS=${STEPS:-30}
 LR=${LR:-1e-4}
 KEEP=${KEEP:-6}
@@ -23,23 +30,26 @@ MINIBATCHES=${MINIBATCHES:-4}  # optimizer steps per wave (decided 2026-10-26)
 OPTIMIZER=${OPTIMIZER:-adamw}
 MAX_HOURS=${MAX_HOURS:-12}
 ARENA_MAX_GB=${ARENA_MAX_GB:-200}  # per trainer: 130K tokens in "layer" recompute need ~127 GB
+ARENA_MIN_GB=${ARENA_MIN_GB:-120}
 WANDB_PROJECT=${WANDB_PROJECT:-}
 POD_END=${POD_END:-stop}
 GRACE_MINUTES=${GRACE_MINUTES:-5}
 LOG_WAIT_SECONDS=${LOG_WAIT_SECONDS:-180}
 SERVER_READY_MINUTES=${SERVER_READY_MINUTES:-30}
 PORT=8000
-cd "$WORK"
+TP=$(echo "$SERVER_GPUS" | tr ',' '\n' | grep -c .)
+IFS=, read -ra TRAINERS <<< "$TRAINER_GPUS"
+N_TRAINERS=${#TRAINERS[@]}
+mkdir -p "$WORK" && cd "$WORK" || exit 1
 mkdir -p results
-rm -f FULL_DONE ABORTED
+rm -f FULL_DONE ABORTED STOP jobs/STOP  # a re-run resumes (loop_state.json, ckpt/)
 for var in RUNPOD_POD_ID RUNPOD_API_KEY; do  # an ssh session lacks the container's RUNPOD_* variables
     [ -n "${!var:-}" ] || export "$(tr '\0' '\n' < /proc/1/environ | grep "^$var=")" 2>/dev/null || true
 done
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 stop_all() {
     touch "$WORK/STOP" "$WORK/jobs/STOP" 2>/dev/null
-    [ -s trainer0.pid ] && kill "$(cat trainer0.pid)" 2>/dev/null
-    [ -s trainer1.pid ] && kill "$(cat trainer1.pid)" 2>/dev/null
+    for f in trainer*.pid; do [ -s "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
     [ -s loop.pid ] && kill "$(cat loop.pid)" 2>/dev/null
     [ -s server.pid ] && kill "$(cat server.pid)" 2>/dev/null
     sleep 10
@@ -74,15 +84,24 @@ echo $! > timer.pid
 
 log "phase 0: machine"
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader | tee results/gpus.txt
-[ "$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -c H200)" -ge 4 ] || abort "need 4 H200: $(cat results/gpus.txt)"
-{ nproc | sed 's/^/vcpus: /'; free -g; df -h /workspace; } | tee results/machine.txt
-command -v runpodctl > /dev/null || { curl -sSL -m 120 -o /usr/local/bin/runpodctl \
-    https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 && chmod +x /usr/local/bin/runpodctl; } \
-    || log "no runpodctl: self-stop falls back to REST"
-for f in repo.tgz env.tgz; do [ -s "$f" ] || abort "missing $f"; done
+[ "$(nvidia-smi -L | grep -c '^GPU')" -ge $((TP + N_TRAINERS)) ] || abort "need $((TP + N_TRAINERS)) GPUs: $(cat results/gpus.txt)"
+# 9.x Hopper (H200): tilelang + nvcc for fla's GDN backward; 10.x Blackwell (B200): fla's GDN backward unpipelined
+ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | cut -d. -f1)
+log "server GPUs $SERVER_GPUS (TP=$TP), trainer GPUs $TRAINER_GPUS ($N_TRAINERS), compute capability $ARCH"
+{ nproc | sed 's/^/vcpus: /'; free -g; df -h "$WORK"; } | tee results/machine.txt
+if [ -n "${RUNPOD_POD_ID:-}" ]; then
+    command -v runpodctl > /dev/null || { curl -sSL -m 120 -o /usr/local/bin/runpodctl \
+        https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 && chmod +x /usr/local/bin/runpodctl; } \
+        || log "no runpodctl: self-stop falls back to REST"
+fi
 # --no-same-owner: as root, tar restores the Mac's uid and the /workspace volume refuses chown
-mkdir -p "$REPO" env && tar --no-same-owner -xzf repo.tgz -C "$REPO" && tar --no-same-owner -xzf env.tgz -C env || abort "unpacking"
-ENV_DIR=$WORK/env/environment_files
+if [ -s repo.tgz ]; then mkdir -p "$REPO" && tar --no-same-owner -xzf repo.tgz -C "$REPO" || abort "unpacking repo.tgz"; fi
+if [ -s env.tgz ]; then mkdir -p env && tar --no-same-owner -xzf env.tgz -C env || abort "unpacking env.tgz"; fi
+[ -d "$REPO/ARC3-Inference" ] || abort "no code in $REPO: upload repo.tgz, or run in the container (REPO=/opt/repo)"
+[ -s "$REPO/ARC3-Inference/$CONFIG" ] || abort "no config $CONFIG"
+[ -n "$MAX_NUM_SEQS" ] || MAX_NUM_SEQS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["environment"]["concurrent_jobs"])' \
+    "$REPO/ARC3-Inference/$CONFIG") || abort "no environment.concurrent_jobs in $CONFIG"
+log "config $CONFIG: $MAX_NUM_SEQS sequences"
 [ "$(find "$ENV_DIR" -name metadata.json | wc -l)" -ge 8 ] || abort "no game files in $ENV_DIR"
 [ -s "$REPO/docs/RL/data/thinking_per_action.json" ] || abort "missing docs/RL/data/thinking_per_action.json in repo.tgz"
 
@@ -105,36 +124,47 @@ download=$!
         python3 -m venv "$TRAINER_VENV" && "$TRAINER_VENV/bin/python" -m pip install -q --upgrade pip \
             && "$TRAINER_VENV/bin/python" -m pip install -q "torch==2.8.0" "torchvision==0.23.0" \
             && "$TRAINER_VENV/bin/python" -m pip install -q -r "$REPO/ARC3-Inference/inference/rft/pod/requirements-pod.txt" \
-                "tilelang==0.1.15" safetensors $( [ -n "$WANDB_PROJECT" ] && echo wandb ) \
-            && date -u > "$TRAINER_VENV/INSTALL_DONE"
+                $( [ "$ARCH" = 9 ] && echo "tilelang==0.1.15" ) safetensors $( [ -n "$WANDB_PROJECT" ] && echo wandb ) \
+            && date -u > "$TRAINER_VENV/INSTALL_DONE" || exit 1
+    fi
+    if [ "$ARCH" = 9 ]; then  # also when the venv came from an image built for Blackwell
+        "$TRAINER_VENV/bin/python" -c "import tilelang" 2>/dev/null || "$TRAINER_VENV/bin/python" -m pip install -q "tilelang==0.1.15" || exit 1
+    fi
+    if [ "$ARCH" = 10 ]; then
+        "$TRAINER_VENV/bin/python" "$REPO/ARC3-Inference/inference/grpo/pod/patch_fla_sm100.py" || exit 1
     fi
 ) > results/trainer_venv.log 2>&1 &
 trainer_venv=$!
 pip install -q py-spy > /dev/null 2>&1 || true
 command -v uv > /dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh > results/uv_install.log 2>&1; }
 export PATH="$HOME/.local/bin:$PATH"
-(cd "$REPO/ARC3-Inference" && uv sync --frozen > "$WORK/results/uv_sync.log" 2>&1) || abort "uv sync: $(tail -3 results/uv_sync.log)"
+# the container's harness venv is already synced (and may be read-only)
+(cd "$REPO/ARC3-Inference" && { uv run --no-sync python -c 'import arcengine, arc_agi, taaf' > /dev/null 2>&1 \
+    || uv sync --frozen; } > "$WORK/results/uv_sync.log" 2>&1) || abort "uv sync: $(tail -3 results/uv_sync.log)"
 [ -n "$WANDB_PROJECT" ] && (cd "$REPO/ARC3-Inference" && uv pip install -q wandb > /dev/null 2>&1)
 log "harness venv: $(cd "$REPO/ARC3-Inference" && uv run --no-sync python -c 'import arcengine, arc_agi, taaf; print("ok")' 2>&1 | tail -1)"
 wait $trainer_venv || abort "trainer venv: $(tail -5 results/trainer_venv.log)"
-"$TRAINER_VENV/bin/python" -c "import torch, transformers, peft, fla, tilelang; print('torch', torch.__version__, 'transformers', transformers.__version__, 'peft', peft.__version__)" \
+"$TRAINER_VENV/bin/python" -c "import torch, transformers, peft, fla$( [ "$ARCH" = 9 ] && echo ", tilelang" ); print('torch', torch.__version__, 'transformers', transformers.__version__, 'peft', peft.__version__)" \
     | tee results/trainer_env.txt || abort "trainer imports: $(tail -5 results/trainer_venv.log)"
+grep -h "fla sm100 patch" results/trainer_venv.log | tee -a results/trainer_env.txt
 # tilelang JIT-compiles fla's GDN backward kernels on Hopper: it needs nvcc
 NVCC_HOME=/usr/local/cuda
-if [ ! -x "$NVCC_HOME/bin/nvcc" ]; then
-    "$TRAINER_VENV/bin/python" -m pip install -q "nvidia-cuda-nvcc-cu12==12.8.*" >> results/trainer_venv.log 2>&1
-    NVCC_HOME=$("$TRAINER_VENV/bin/python" -c "import nvidia.cuda_nvcc, os; print(os.path.dirname(nvidia.cuda_nvcc.__file__))" 2>/dev/null)
+if [ "$ARCH" = 9 ]; then
+    if [ ! -x "$NVCC_HOME/bin/nvcc" ]; then
+        "$TRAINER_VENV/bin/python" -m pip install -q "nvidia-cuda-nvcc-cu12==12.8.*" >> results/trainer_venv.log 2>&1
+        NVCC_HOME=$("$TRAINER_VENV/bin/python" -c "import nvidia.cuda_nvcc, os; print(os.path.dirname(nvidia.cuda_nvcc.__file__))" 2>/dev/null)
+    fi
+    [ -x "$NVCC_HOME/bin/nvcc" ] || abort "no nvcc for tilelang"
+    log "nvcc: $("$NVCC_HOME/bin/nvcc" --version | tail -1)"
 fi
-[ -x "$NVCC_HOME/bin/nvcc" ] || abort "no nvcc for tilelang"
-log "nvcc: $("$NVCC_HOME/bin/nvcc" --version | tail -1)"
 wait $download || abort "download: $(tail -2 results/download.log)"
 log "$(tail -1 results/download.log)"
 
-log "phase 2: server on GPUs 0-1, the trainers' CUDA tests on GPU 2 meanwhile"
+log "phase 2: server on GPUs $SERVER_GPUS, the trainers' CUDA tests on GPU ${TRAINERS[0]} meanwhile"
 mkdir -p results/server
 # the trainers simulate both FP8 caches (train_grpo --kv-fp8, its default); BF16 caches here need --no-kv-fp8 there
 cmd="vllm serve $MODEL_DIR --served-model-name flashnext --host 127.0.0.1 --port $PORT \
-    --tensor-parallel-size 2 --max-num-seqs 64 --max-model-len 147072 --max-num-batched-tokens 8192 \
+    --tensor-parallel-size $TP --max-num-seqs $MAX_NUM_SEQS --max-model-len 147072 --max-num-batched-tokens 8192 \
     --dtype bfloat16 --kv-cache-dtype fp8_e4m3 --attention-config '{\"indexer_kv_dtype\": \"fp8\"}' \
     --mamba-ssm-cache-dtype bfloat16 --gpu-memory-utilization 0.92 --async-scheduling \
     --enable-prefix-caching --prefix-match-unit 64 \
@@ -146,12 +176,12 @@ cmd="vllm serve $MODEL_DIR --served-model-name flashnext --host 127.0.0.1 --port
     --mm-processor-kwargs '{\"max_pixels\": 589824}' --limit-mm-per-prompt '{\"video\": 0}' \
     --enable-prompt-tokens-details --worker-extension-cls inference.grpo.vllm_sync.WeightSyncExtension"
 echo "$cmd" > results/server/args.txt
-CUDA_VISIBLE_DEVICES=0,1 VLLM_SERVER_DEV_MODE=1 PYTHONPATH="$REPO/ARC3-Inference" \
+CUDA_VISIBLE_DEVICES=$SERVER_GPUS VLLM_SERVER_DEV_MODE=1 PYTHONPATH="$REPO/ARC3-Inference" \
     bash -c "exec $cmd" > results/server/server.log 2>&1 &
 echo $! > server.pid
 runtest() {  # name, pytest args: the trainer's CUDA tests, as train_pod.sh
     local name=$1; shift
-    (cd "$REPO/ARC3-Inference" && CUDA_VISIBLE_DEVICES=2 CUDA_HOME=$NVCC_HOME timeout 1200 env PYTHONPATH=.:tests \
+    (cd "$REPO/ARC3-Inference" && CUDA_VISIBLE_DEVICES=${TRAINERS[0]} CUDA_HOME=$NVCC_HOME timeout 1200 env PYTHONPATH=.:tests \
         "$TRAINER_VENV/bin/python" -m pytest -q -p no:logging "$@") > "results/pytest_$name.log" 2>&1
     echo $? > "results/pytest_$name.exit"
     log "  $name: exit $(cat results/pytest_$name.exit), $(tail -1 results/pytest_$name.log)"
@@ -192,24 +222,24 @@ print(json.dumps(v))')" >> results/metrics.jsonl
 done ) &
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used,power.draw --format=csv -l 10 > results/gpu.csv &
 
-log "phase 3: trainers on GPUs 2 and 3"
-# host memory left for the two pinned arenas: what is available now (server up, its PLE table pinned) minus the
+log "phase 3: trainers on GPUs $TRAINER_GPUS"
+# host memory left for the pinned arenas: what is available now (server up, its PLE table pinned) minus the
 # trainers' shared PLE page cache (~103 GB), their processes and the harness (~60 GB)
 available=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)
-arena=$(python3 -c "print(max(0, min($ARENA_MAX_GB, ($available - 103 - 60) // 2)))")
+arena=$(python3 -c "print(max(0, min($ARENA_MAX_GB, ($available - 103 - 60) // $N_TRAINERS)))")
 log "host memory available ${available} GB -> arena ${arena} GB per trainer"
-[ "$arena" -ge 120 ] || abort "only ${arena} GB of host arena per trainer (130K-token episodes need ~127)"
+[ "$arena" -ge "$ARENA_MIN_GB" ] || abort "only ${arena} GB of host arena per trainer (130K-token episodes need ~127)"
 mkdir -p "$WORK/jobs"
-for rank in 0 1; do
-    (cd "$REPO/ARC3-Inference" && CUDA_VISIBLE_DEVICES=$((rank + 2)) CUDA_HOME=$NVCC_HOME RANK=$rank WORLD_SIZE=2 \
+for rank in $(seq 0 $((N_TRAINERS - 1))); do
+    (cd "$REPO/ARC3-Inference" && CUDA_VISIBLE_DEVICES=${TRAINERS[$rank]} CUDA_HOME=$NVCC_HOME RANK=$rank WORLD_SIZE=$N_TRAINERS \
         MASTER_ADDR=127.0.0.1 MASTER_PORT=29511 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONPATH=. \
         nohup "$TRAINER_VENV/bin/python" -m inference.grpo.train_grpo --model "$MODEL_DIR" --work "$WORK" \
         --arena-gb "$arena" --optimizer "$OPTIMIZER" --resume $flags > "$WORK/results/trainer$rank.log" 2>&1 < /dev/null &
      echo $! > "$WORK/trainer$rank.pid")
 done
 deadline=$(( $(date +%s) + 20 * 60 ))
-until grep -q '"event": "loaded"' "$WORK/train_rank0.jsonl" 2>/dev/null && grep -q '"event": "loaded"' "$WORK/train_rank1.jsonl" 2>/dev/null; do
-    for rank in 0 1; do kill -0 "$(cat trainer$rank.pid)" 2>/dev/null || abort "trainer $rank exited: $(tail -5 results/trainer$rank.log)"; done
+until [ "$(grep -l '"event": "loaded"' "$WORK"/train_rank*.jsonl 2>/dev/null | wc -l)" -ge "$N_TRAINERS" ]; do
+    for rank in $(seq 0 $((N_TRAINERS - 1))); do kill -0 "$(cat trainer$rank.pid)" 2>/dev/null || abort "trainer $rank exited: $(tail -5 results/trainer$rank.log)"; done
     [ "$(date +%s)" -lt $deadline ] || abort "trainers not loaded in 20 min"
     sleep 15
 done
@@ -219,11 +249,11 @@ log "phase 4: the loop ($STEPS steps)"
 wandb_args=()
 [ -n "$WANDB_PROJECT" ] && wandb_args=(--wandb-project "$WANDB_PROJECT" --wandb-run-name "grpo-${RUNPOD_POD_ID:-local}")
 (cd "$REPO/ARC3-Inference" && nohup uv run --no-sync python -m inference.grpo.loop --work "$WORK" --config "$CONFIG" \
-    --environments-dir "$ENV_DIR" --base-url "http://127.0.0.1:$PORT/v1" --steps "$STEPS" --lr "$LR" --keep "$KEEP" --minibatches "$MINIBATCHES" \
+    --environments-dir "$ENV_DIR" --base-url "http://127.0.0.1:$PORT/v1" --steps "$STEPS" --lr "$LR" --keep "$KEEP" --minibatches "$MINIBATCHES" --trainers "$N_TRAINERS" \
     --tau "$REPO/docs/RL/data/thinking_per_action.json" "${wandb_args[@]}" > "$WORK/results/loop.log" 2>&1 < /dev/null &
  echo $! > "$WORK/loop.pid")
 while kill -0 "$(cat loop.pid)" 2>/dev/null; do
-    for rank in 0 1; do kill -0 "$(cat trainer$rank.pid)" 2>/dev/null || abort "trainer $rank died: $(tail -5 results/trainer$rank.log)"; done
+    for rank in $(seq 0 $((N_TRAINERS - 1))); do kill -0 "$(cat trainer$rank.pid)" 2>/dev/null || abort "trainer $rank died: $(tail -5 results/trainer$rank.log)"; done
     kill -0 "$(cat server.pid)" 2>/dev/null || abort "server died: $(tail -5 results/server/server.log)"
     collect
     sleep 60
