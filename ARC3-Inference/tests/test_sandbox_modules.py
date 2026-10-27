@@ -44,3 +44,18 @@ def test_open_is_not_a_builtin():
     out = _run("open('x.txt', 'w')\nresult = 1")
     assert "open" in str(out.get("error") or out) and out.get("result") != 1, out
 
+
+
+def test_listed_modules_and_collections_helpers_are_preloaded():
+    # a forgotten import cost 2-10 NameErrors a run (Counter, deque, collections, itertools, math)
+    out = _run(
+        "result = [Counter('aab')['a'], deque([1, 2]).pop(), defaultdict(int)['x'],\n"
+        "          math.isqrt(10), len(list(itertools.permutations(range(3)))), collections.OrderedDict is not None,\n"
+        "          heapq.nsmallest(1, [3, 1]), json.dumps([1]), re.sub('a', 'b', 'a'), statistics.mean([1, 3])]\n"
+    )
+    assert out.get("result") == [2, 2, 0, 3, 6, True, [1], "[1]", "b", 2], out
+
+
+def test_preloaded_modules_still_import_and_can_be_shadowed():
+    out = _run("import math\nfrom collections import Counter\nre = 5\nresult = [math.pi > 3, Counter('a')['a'], re]")
+    assert out.get("result") == [True, 1, 5], out

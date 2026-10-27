@@ -47,6 +47,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
 
     HOST_STDOUT = sys.stdout
 
+    PRELOADED_MODULES = (
+        "bisect", "collections", "copy", "fractions", "functools", "heapq", "itertools",
+        "json", "math", "operator", "random", "re", "statistics", "string",
+    )
     SAFE_MODULES = {
         "bisect",
         "collections",
@@ -512,6 +516,20 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             "result": None,
         }
         runtime_globals["__builtins__"]["__import__"] = _safe_import
+        # The modules the system prompt lists come preloaded, plus Counter,
+        # defaultdict and deque: a forgotten import cost 2-10 NameErrors a run
+        # (porting-advaith v3-v7, animation-history-frames v1-v2). They add ~6 ms
+        # to a fresh process; all of SAFE_MODULES would add ~20 ms (inspect,
+        # typing, dataclasses, decimal), and none of those was ever missed.
+        # Importing them again still works.
+        for _module in PRELOADED_MODULES:
+            runtime_globals[_module] = _safe_import(_module)
+        _collections = runtime_globals["collections"]
+        runtime_globals.update(
+            Counter=_collections.Counter,
+            defaultdict=_collections.defaultdict,
+            deque=_collections.deque,
+        )
         _animation_views = []
 
         def frame_diff(before=None, after=None):
