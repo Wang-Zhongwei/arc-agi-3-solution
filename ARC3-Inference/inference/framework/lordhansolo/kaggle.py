@@ -89,6 +89,13 @@ DEFAULT_VLLM_DRAFT_VOCAB = ""
 # the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
 # it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
 DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
+# server.draft_method: "mtp" drafts with an MTP head, the target's own or draft_model_source's.
+# "dflash" serves draft_model_source as a DFlash/DFlash2 block drafter (vLLM method "dflash"),
+# which reads the target's hidden states after its configured layers. The e975732 rc3 runtime
+# cannot feed one to Qwen4Exp, so the setup script patches the unpacked runtime for it
+# (patch_runtime_for_dflash). The target still verifies every draft, so outputs are unchanged.
+DEFAULT_VLLM_DRAFT_METHOD = "mtp"
+VLLM_DRAFT_METHODS = ("mtp", "dflash")
 # kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
 # weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
 # carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
@@ -158,6 +165,7 @@ class DuckKaggleVllmConfig:
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
+    draft_method: str = DEFAULT_VLLM_DRAFT_METHOD
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
 
 
@@ -209,6 +217,13 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
     ple_fp8_model_source_parts = (
         _split_model_source(cfg.ple_fp8_model_source) if cfg.ple_fp8_model_source else None
     )
+    if cfg.draft_method not in VLLM_DRAFT_METHODS:
+        raise ValueError(f"vLLM draft_method must be one of {VLLM_DRAFT_METHODS}, got {cfg.draft_method!r}")
+    if cfg.draft_method == "dflash" and not (cfg.draft_model_source and cfg.mtp_tokens > 0 and not cfg.draft_vocab):
+        raise ValueError(
+            "draft_method 'dflash' needs a draft_model_source, mtp_tokens > 0 and no draft_vocab "
+            "(the draft vocabulary restricts the MTP head only)"
+        )
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
     prompt_window = int(cfg.max_model_len) - VLLM_OUTPUT_RESERVE_TOKENS
@@ -233,6 +248,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
+        "__VLLM_DRAFT_METHOD__": repr(cfg.draft_method),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
@@ -977,6 +993,8 @@ RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 # A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
+# 'mtp' assembles that checkpoint's MTP head; 'dflash' serves it as a DFlash block drafter.
+VLLM_DRAFT_METHOD = __VLLM_DRAFT_METHOD__
 # A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
 PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
@@ -1589,6 +1607,145 @@ def assemble_mtp_draft() -> Path | None:
     return DRAFT_MODEL_DIR
 
 
+# DFlash on the e975732 rc3 runtime: (relative path, anchor, replacement). Each anchor must occur
+# exactly once, otherwise the setup fails before the load instead of serving without a drafter.
+DFLASH_RUNTIME_PATCHES = (
+    # Qwen4Exp's config check admits only its MTP and n-gram proposers.
+    (
+        'vllm/model_executor/models/config.py',
+        '            "ngram_gpu",\n        }:\n',
+        '            "ngram_gpu",\n            "dflash",\n        }:\n',
+    ),
+    # The V2 runner feeds the drafter the target's MTP buffer whenever the target has the getter,
+    # but Qwen4Exp allocates that buffer only for method "mtp" and returns None otherwise.
+    (
+        'vllm/v1/worker/gpu/model_runner.py',
+        '                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]\n',
+        '                if pre_hc_hidden_states is not None:\n'
+        '                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]\n',
+    ),
+    (
+        'vllm/v1/worker/gpu/model_runner.py',
+        '                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]\n',
+        '                if pre_hc_hidden_states is not None:\n'
+        '                    spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]\n',
+    ),
+    # Qwen4ExpModel returns the target's hidden states after the requested layers. vLLM's aux id L
+    # is the output of layer L - 1. Lord's layers defer their hyper-connection combine to the next
+    # layer, so the completed multi-stream state is combined here (hc_combine is pure and its
+    # result feeds nothing else, so the target's own computation is unchanged) and averaged over
+    # the streams, the 2560-wide feature DFlash2 was trained on.
+    (
+        'vllm/models/qwen4_exp/nvidia/model.py',
+        '    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:\n'
+        '        return self.embed_tokens(input_ids)\n',
+        '    aux_hidden_state_layers: tuple[int, ...] = ()\n\n'
+        '    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:\n'
+        '        return self.embed_tokens(input_ids)\n',
+    ),
+    (
+        'vllm/models/qwen4_exp/nvidia/model.py',
+        '        block_output = None\n        injection = None\n        last_layer = None\n',
+        '        block_output = None\n        injection = None\n        last_layer = None\n'
+        '        aux_hidden_states: list[torch.Tensor] = []\n',
+    ),
+    (
+        'vllm/models/qwen4_exp/nvidia/model.py',
+        '                hidden_states = hidden_states + deepstack_embed\n\n'
+        '        if not get_pp_group().is_last_rank:\n',
+        '                hidden_states = hidden_states + deepstack_embed\n'
+        '            if layer_idx + 1 in self.aux_hidden_state_layers:\n'
+        '                completed = (\n'
+        '                    hidden_states\n'
+        '                    if block_output is None\n'
+        '                    else layer.mlp_hyper_connection.combine(\n'
+        '                        hidden_states, block_output, injection\n'
+        '                    )\n'
+        '                )\n'
+        '                aux_hidden_states.append(\n'
+        '                    completed.unflatten(\n'
+        '                        -1, (self.config.hc_count, self.config.hidden_size)\n'
+        '                    ).mean(dim=-2)\n'
+        '                )\n\n'
+        '        if not get_pp_group().is_last_rank:\n',
+    ),
+    (
+        'vllm/models/qwen4_exp/nvidia/model.py',
+        '            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)\n'
+        '        return sample_hidden_states\n',
+        '            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)\n'
+        '        if self.aux_hidden_state_layers:\n'
+        '            return sample_hidden_states, aux_hidden_states\n'
+        '        return sample_hidden_states\n',
+    ),
+    # SupportsEagle3 is a runtime-checked protocol: the runner asks the target for these members
+    # before it requests auxiliary hidden states.
+    (
+        'vllm/models/qwen4_exp/nvidia/model.py',
+        '    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:\n'
+        '        return self.language_model.get_mtp_target_hidden_states()\n',
+        '    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:\n'
+        '        return self.language_model.get_mtp_target_hidden_states()\n\n'
+        '    supports_eagle3 = True\n'
+        '    has_own_lm_head = False\n'
+        '    has_own_embed_tokens = False\n\n'
+        '    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:\n'
+        '        layers = tuple(sorted(set(layers)))\n'
+        '        self.language_model.model.aux_hidden_state_layers = layers\n'
+        '        logger.info(\n'
+        '            "Qwen4Exp DFlash taps: outputs of layers %s, mean over HC streams",\n'
+        '            [layer - 1 for layer in layers],\n'
+        '        )\n\n'
+        '    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:\n'
+        '        num_layers = len(self.language_model.model.layers)\n'
+        '        return (2, num_layers // 2, num_layers - 3)\n',
+    ),
+)
+
+
+def patch_runtime_for_dflash(manifest: dict) -> None:
+    '''Let the e975732 rc3 runtime serve a DFlash drafter for Qwen4Exp (vllm#56088).
+
+    The runtime has vLLM's DFlash2 speculator, but Qwen4Exp rejects the method, the V2 runner
+    dereferences the MTP buffer that Qwen4Exp allocates only for MTP, and the model never returns
+    the auxiliary hidden states the drafter reads. DFLASH_RUNTIME_PATCHES fixes all three, and
+    an anchor that does not match exactly once fails the setup. MTP runs leave the runtime as is.
+    '''
+    if VLLM_DRAFT_METHOD != 'dflash':
+        return
+    dist_packages = IMAGE_RUNTIME_ROOT / manifest['dist_packages']
+    sources = {}
+    for relative_path, anchor, replacement in DFLASH_RUNTIME_PATCHES:
+        path = dist_packages / relative_path
+        source = sources.get(path) or (path.read_text(encoding='utf-8') if path.is_file() else '')
+        if source.count(anchor) != 1:
+            raise RuntimeError(f'DFlash runtime patch anchor appears {source.count(anchor)} times in {path}:\n{anchor}')
+        sources[path] = source.replace(anchor, replacement)
+    for path, source in sources.items():
+        path.write_text(source, encoding='utf-8')
+    print(f'Patched the runtime for DFlash drafting: {len(DFLASH_RUNTIME_PATCHES)} edits in {len(sources)} files', flush=True)
+
+
+def resolve_dflash_draft() -> Path:
+    '''Return the mounted DFlash checkpoint, which vLLM loads as it is.
+
+    It ships no embedding or LM head; the DFlash loader binds the target's.
+    '''
+    source = resolve_kaggle_model_path(DRAFT_MODEL_SOURCE_PARTS)
+    config_path = source / 'config.json'
+    if not config_path.is_file():
+        raise FileNotFoundError(f'DFlash draft checkpoint not mounted at {source}\n' + describe_kaggle_input_tree())
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    dflash_config = config.get('dflash_config') or {}
+    print(
+        f'DFlash draft at {source}: {config.get("architectures")}, target layers '
+        f'{dflash_config.get("target_layer_ids")}, block {dflash_config.get("block_size")}, '
+        f'{VLLM_MTP_TOKENS} draft tokens',
+        flush=True,
+    )
+    return source
+
+
 def install_image_runtime() -> dict:
     '''Unpack the image layers in index order, replay whiteouts and apply the runtime overlay.'''
     manifest = read_runtime_manifest()
@@ -1830,10 +1987,10 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
             str(VLLM_PREFIX_CACHE_RETENTION_INTERVAL),
         ]
     if VLLM_MTP_TOKENS > 0:
-        speculative_config = {'method': 'mtp', 'num_speculative_tokens': VLLM_MTP_TOKENS}
+        speculative_config = {'method': VLLM_DRAFT_METHOD, 'num_speculative_tokens': VLLM_MTP_TOKENS}
         if draft_model_dir is not None:
             speculative_config['model'] = str(draft_model_dir)
-        if VLLM_DRAFT_VOCAB:
+        if VLLM_DRAFT_VOCAB and VLLM_DRAFT_METHOD == 'mtp':
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]
     if VLLM_GPU_MEMORY_UTILIZATION:
@@ -1959,7 +2116,8 @@ def start_vllm_server() -> None:
     route_inc_ple_to_unquantized(manifest)
     pin_ple_table_at_exact_size(manifest)
     check_runtime_reads_fp8_ple(manifest)
-    draft_model_dir = assemble_mtp_draft()
+    patch_runtime_for_dflash(manifest)
+    draft_model_dir = resolve_dflash_draft() if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)
     cmd = build_vllm_server_command(draft_model_dir)
     configure_cache_diagnostics(manifest, server_env, cmd)

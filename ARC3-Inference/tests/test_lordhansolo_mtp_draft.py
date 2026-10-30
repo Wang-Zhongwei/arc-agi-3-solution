@@ -68,7 +68,7 @@ def test_render_passes_the_draft_dir_to_the_mtp_speculative_config(monkeypatch):
     with_draft = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
         model_source=TARGET_REF, draft_model_source=DRAFT_REF))
     assert f"DRAFT_MODEL_SOURCE_PARTS = {tuple(DRAFT_REF.split('/'))!r}" in with_draft
-    assert re.search(r"draft_model_dir = assemble_mtp_draft\(\)\n.*\n\s+cmd = build_vllm_server_command\(draft_model_dir\)", with_draft)
+    assert re.search(r"draft_model_dir = resolve_dflash_draft\(\) if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft\(\)\n.*\n\s+cmd = build_vllm_server_command\(draft_model_dir\)", with_draft)
     assert "speculative_config['model'] = str(draft_model_dir)" in with_draft
     without = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(model_source=TARGET_REF))
     assert "DRAFT_MODEL_SOURCE_PARTS = None" in without
