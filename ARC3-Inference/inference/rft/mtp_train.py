@@ -264,6 +264,24 @@ def run_sample(target: Target, head: MTPHead, lm_head, embed, rotary, item: dict
                 target_s=round(target_s, 2), total_s=round(time.perf_counter() - started, 2))
 
 
+def game_round_robin(samples: list[dict[str, Any]], count: int, seed: int) -> list[int]:
+    """`count` sample indices taking one sample of each game in turn (each game shuffled), so every game gives the
+    same number of samples while it has them and the token-heavy games do not dominate."""
+    rng = random.Random(seed)
+    by_game: dict[str, list[int]] = {}
+    for i, sample in enumerate(samples):
+        by_game.setdefault(sample["game"], []).append(i)
+    queues = [by_game[g] for g in sorted(by_game)]
+    for queue in queues:
+        rng.shuffle(queue)
+    order: list[int] = []
+    while len(order) < count and any(queues):
+        for queue in queues:
+            if queue and len(order) < count:
+                order.append(queue.pop())
+    return order
+
+
 def inputs_position_ids(model, inputs):
     """transformers' M-RoPE position ids for the sample: [3, 1, T] (text axes of get_rope_index)."""
     base = model.model
@@ -348,10 +366,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--accumulate", type=int, default=1, help="samples per optimizer step")
-    parser.add_argument("--train-samples", type=int, default=600, help="samples drawn from train.jsonl (one epoch)")
-    parser.add_argument("--eval-samples", type=int, default=24)
+    parser.add_argument("--train-samples", type=int, default=1400,
+                        help="samples drawn from train.jsonl, round-robin over games (one pass, no repeats)")
+    parser.add_argument("--eval-samples", type=int, default=48)
     parser.add_argument("--eval-every", type=int, default=100, help="optimizer steps")
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--best-margin", type=float, default=0.002,
+                        help="eval acceptance length a checkpoint must beat the best by to replace it")
     parser.add_argument("--max-tokens", type=int, default=131072)
     parser.add_argument("--max-hours", type=float, default=20.0)
     parser.add_argument("--token-chunk", type=int, default=8192)
@@ -427,9 +448,11 @@ def main(argv: list[str] | None = None) -> int:
                 chains.append(r["chain"])
         anchors = sum(c["anchors"] for c in chains)
         rates = [sum(c["rates"][k] * c["anchors"] for c in chains) / max(1, anchors) for k in range(args.steps)]
-        log(event="eval", tag=tag, samples=len(chains), rows=totals["rows"], anchors=anchors,
-            loss=[round(x / max(1, totals["rows"]), 5) for x in totals["loss"]],
-            rates=[round(x, 4) for x in rates], length=round(1 + sum(rates), 4))
+        record = dict(tag=tag, samples=len(chains), rows=totals["rows"], anchors=anchors,
+                      loss=[round(x / max(1, totals["rows"]), 5) for x in totals["loss"]],
+                      rates=[round(x, 4) for x in rates], length=round(1 + sum(rates), 4))
+        log(event="eval", **record)
+        return record
 
     if args.eval_only:
         evaluate("as loaded")
@@ -438,11 +461,9 @@ def main(argv: list[str] | None = None) -> int:
     masters = [p.detach().float().clone().requires_grad_() for _, p in params]
     optimizer = torch.optim.AdamW(masters, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     train_samples = train_rft.load_samples(args.data / "train.jsonl")
-    order = list(range(len(train_samples)))
-    random.Random(args.seed).shuffle(order)
-    order = order[:args.train_samples]
+    order = game_round_robin(train_samples, args.train_samples, args.seed)
     total_steps = math.ceil(len(order) / args.accumulate)
-    state = dict(position=0, step=0)
+    state = dict(position=0, step=0, best_length=None, best_step=None)
     latest = args.out / "latest"
     if args.resume and (latest / "state.json").exists():
         from safetensors.torch import load_file
@@ -464,8 +485,14 @@ def main(argv: list[str] | None = None) -> int:
         (target_dir / "state.json").write_text(json.dumps(state))
         log(event="saved", name=name, step=state["step"])
 
+    def consider(record):
+        """Keep the head as best/ when its eval acceptance length beats the best so far by best_margin."""
+        if state["best_length"] is None or record["length"] > state["best_length"] + args.best_margin:
+            state["best_length"], state["best_step"] = record["length"], state["step"]
+            save("best")
+
     if state["step"] == 0:
-        evaluate("step 0")
+        consider(evaluate("step 0"))  # the head as loaded: training must beat it to be exported
     prefetch = train_rft.Prefetch(lambda i: prepare(train_samples[order[i]]))
     if state["position"] < len(order):
         prefetch.start(state["position"])
@@ -515,13 +542,19 @@ def main(argv: list[str] | None = None) -> int:
         state["step"] += 1
         log(event="step", step=state["step"], lr=lr, grad_norm=round(float(norm), 4))
         if state["step"] % args.eval_every == 0:
-            evaluate(f"step {state['step']}")
+            consider(evaluate(f"step {state['step']}"))
         if state["step"] % args.save_every == 0:
             save("latest")
     save("latest")
-    evaluate(f"final step {state['step']}")
+    if state["step"] % args.eval_every:
+        consider(evaluate(f"final step {state['step']}"))
+    from safetensors.torch import load_file
+    best = load_file(args.out / "best" / "head.safetensors")  # export the best head, not the last
+    with torch.no_grad():
+        for name, p in params:
+            p.copy_(best[name].to(p.device))
     export_draft(head, args.mtp, args.out / "draft")
-    log(event="exported", path=str(args.out / "draft"))
+    log(event="exported", path=str(args.out / "draft"), best_step=state["best_step"], best_length=state["best_length"])
     return 0
 
 

@@ -104,3 +104,13 @@ def test_head_names_are_lords_checkpoint_names_and_it_runs():
     assert out.shape == (1, n, 64) and h2.shape == (1, n, 256)
     out.sum().backward()
     assert head.fc_hidden.weight.grad is not None
+
+
+def test_game_round_robin_draws_each_game_in_turn():
+    samples = [{"game": g} for g in ["a"] * 5 + ["b"] * 2 + ["c"] * 4]
+    order = mtp_train.game_round_robin(samples, 7, seed=0)
+    assert len(order) == len(set(order)) == 7
+    games = [samples[i]["game"] for i in order]
+    assert sorted(games[:3]) == ["a", "b", "c"] and sorted(games[3:6]) == ["a", "b", "c"]
+    assert games[6] in ("a", "c")  # b is exhausted after two rounds
+    assert mtp_train.game_round_robin(samples, 7, seed=0) == order

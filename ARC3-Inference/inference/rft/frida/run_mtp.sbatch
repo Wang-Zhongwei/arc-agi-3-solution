@@ -8,7 +8,6 @@
 #SBATCH --gpus-per-node=B200:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --reservation=maint_arc
 #SBATCH --output=/shared/workspace/arc-agi-3/mtp_finetune/runs/%x-%j.txt
 
 # MTP draft-head fine-tuning on Frida (inference/rft/mtp_train.py) in the GRPO container, one B200: the frozen Intel
@@ -18,11 +17,13 @@
 #   sbatch run_mtp.sbatch --eval_only=1 --positions=mrope     # the same with the target's M-RoPE positions
 #   sbatch run_mtp.sbatch                                     # train (resumes <version> when it has latest/)
 #   sbatch run_mtp.sbatch --version=<v> --lr=3e-5 --train_samples=600 --extra_args="--accumulate 2"
+# No reservation: any free B200 (sbatch --reservation=maint_arc ... to use the team's reserved nodes).
 # Results: mtp_finetune/runs/<version>/: train_log.jsonl (eval, sample and step records), latest/ (head + optimizer),
-# draft/ (a vLLM draft directory: lordhansolo's files with the fine-tuned mtp.* tensors in
+# best/ (the head with the best eval acceptance length, step 0 included),
+# draft/ (a vLLM draft directory of the best head: lordhansolo's files with the fine-tuned mtp.* tensors in
 # mtp-finetuned-bf16.safetensors; the other files are hard links to lord_mtp/, ready to upload).
 # Settings, as --key=value (or the environment variable KEY): version (date-time), data, eval_only (0), positions
-# (index), lr (3e-5), train_samples (600), eval_samples (24), eval_every (100), steps (3), max_hours (22),
+# (index), lr (3e-5), train_samples (1400), eval_samples (48), eval_every (100), steps (3), max_hours (22),
 # extra_args (more mtp_train.py flags, quoted).
 
 for argument in "$@"; do
@@ -44,8 +45,8 @@ VERSION=${VERSION:-$(date "+%Y%m%d-%H%M")}
 EVAL_ONLY=${EVAL_ONLY:-0}
 POSITIONS=${POSITIONS:-index}
 LR=${LR:-3e-5}
-TRAIN_SAMPLES=${TRAIN_SAMPLES:-600}
-EVAL_SAMPLES=${EVAL_SAMPLES:-24}
+TRAIN_SAMPLES=${TRAIN_SAMPLES:-1400}  # ~50M trained tokens, 70 per game
+EVAL_SAMPLES=${EVAL_SAMPLES:-48}
 EVAL_EVERY=${EVAL_EVERY:-100}
 STEPS=${STEPS:-3}
 MAX_HOURS=${MAX_HOURS:-22}
