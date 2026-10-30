@@ -1678,6 +1678,16 @@ DFLASH_RUNTIME_PATCHES = (
         '            return sample_hidden_states, aux_hidden_states\n'
         '        return sample_hidden_states\n',
     ),
+    # The QSA key ring holds whole 4-token groups and must divide the 1664-token attention block:
+    # 4 + k rows round up to 8 for k <= 4 but to 12 for k = 5..8, which fails that assert. More
+    # whole groups only enlarge the ring, whose size the kernels take from the cache spec.
+    (
+        'vllm/models/qwen4_exp/common/qsa_cache.py',
+        '        capacity = self.compress_ratio * cdiv(span, self.compress_ratio)\n',
+        '        capacity = self.compress_ratio * cdiv(span, self.compress_ratio)\n'
+        '        while self.cache_config.block_size % capacity:\n'
+        '            capacity += self.compress_ratio\n',
+    ),
     # SupportsEagle3 is a runtime-checked protocol: the runner asks the target for these members
     # before it requests auxiliary hidden states.
     (
@@ -1708,8 +1718,9 @@ def patch_runtime_for_dflash(manifest: dict) -> None:
 
     The runtime has vLLM's DFlash2 speculator, but Qwen4Exp rejects the method, the V2 runner
     dereferences the MTP buffer that Qwen4Exp allocates only for MTP, and the model never returns
-    the auxiliary hidden states the drafter reads. DFLASH_RUNTIME_PATCHES fixes all three, and
-    an anchor that does not match exactly once fails the setup. MTP runs leave the runtime as is.
+    the auxiliary hidden states the drafter reads; QSA also rejects more than 4 draft tokens.
+    DFLASH_RUNTIME_PATCHES fixes all four, and an anchor that does not match exactly once fails
+    the setup. MTP runs leave the runtime as is.
     '''
     if VLLM_DRAFT_METHOD != 'dflash':
         return
