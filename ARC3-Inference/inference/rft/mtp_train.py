@@ -373,14 +373,19 @@ def wandb_metrics(record: dict[str, Any]) -> dict[str, float]:
 
 def load_target(args):
     """train_rft.load_model without LoRA: frozen, patched for long forwards (QSA kernel, grouped INT4 experts)."""
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    from transformers import AutoModelForImageTextToText, AutoProcessor, AutoRoundConfig
 
     processor = AutoProcessor.from_pretrained(args.model)
     patch_qsa_attention(256, fused=args.qsa_kernel)
     ple_mmap.install()
     model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.bfloat16,
                                                         device_map=smoke_lora.gpu_device_map(args.model),
-                                                        attn_implementation="sdpa")
+                                                        attn_implementation="sdpa",
+                                                        # tritonv2_zp keeps the packed qweight that
+                                                        # layer_patches.expert_weights dequantizes; with vLLM in the
+                                                        # container AutoRound would pick a backend that repacks it
+                                                        # (QuantLinearGPTQ, no qweight: mtp-v1-50m job 209704)
+                                                        quantization_config=AutoRoundConfig(backend="auto_round:tritonv2_zp"))
     ple = ple_mmap.attach(model, args.model)
     model.config.use_cache = False
     model.requires_grad_(False)
