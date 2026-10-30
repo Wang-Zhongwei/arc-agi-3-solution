@@ -96,6 +96,11 @@ DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
 # (patch_runtime_for_dflash). The target still verifies every draft, so outputs are unchanged.
 DEFAULT_VLLM_DRAFT_METHOD = "mtp"
 VLLM_DRAFT_METHODS = ("mtp", "dflash")
+# server.draft_attention_backend: the draft model's attention backend (speculative_config
+# attention_backend), e.g. "TRITON_ATTN". Empty lets vLLM pick. A DFlash draft gets FlashInfer
+# there, whose XQA decode kernel for its sliding window is JIT-built at startup and fails to link
+# on the image runtime (no libcudart.so, dflash2-k3/k7 v1).
+DEFAULT_VLLM_DRAFT_ATTENTION_BACKEND = ""
 # kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
 # weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
 # carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
@@ -166,6 +171,7 @@ class DuckKaggleVllmConfig:
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
     draft_method: str = DEFAULT_VLLM_DRAFT_METHOD
+    draft_attention_backend: str = DEFAULT_VLLM_DRAFT_ATTENTION_BACKEND
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
 
 
@@ -249,6 +255,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
         "__VLLM_DRAFT_METHOD__": repr(cfg.draft_method),
+        "__VLLM_DRAFT_ATTENTION_BACKEND__": repr(cfg.draft_attention_backend),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
@@ -995,6 +1002,8 @@ MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
 # 'mtp' assembles that checkpoint's MTP head; 'dflash' serves it as a DFlash block drafter.
 VLLM_DRAFT_METHOD = __VLLM_DRAFT_METHOD__
+# The draft model's attention backend, or '' for vLLM's choice.
+VLLM_DRAFT_ATTENTION_BACKEND = __VLLM_DRAFT_ATTENTION_BACKEND__
 # A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
 PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
@@ -2001,6 +2010,8 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
         speculative_config = {'method': VLLM_DRAFT_METHOD, 'num_speculative_tokens': VLLM_MTP_TOKENS}
         if draft_model_dir is not None:
             speculative_config['model'] = str(draft_model_dir)
+        if VLLM_DRAFT_ATTENTION_BACKEND:
+            speculative_config['attention_backend'] = VLLM_DRAFT_ATTENTION_BACKEND
         if VLLM_DRAFT_VOCAB and VLLM_DRAFT_METHOD == 'mtp':
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]

@@ -93,6 +93,12 @@ def test_render_serves_the_mounted_checkpoint_as_a_dflash_draft(monkeypatch):
     assert "if VLLM_DRAFT_VOCAB and VLLM_DRAFT_METHOD == 'mtp':" in script
     assert lord.duck_kaggle_model_sources(lord.DuckKaggleVllmConfig(
         model_source=TARGET_REF, draft_model_source=DFLASH_REF, draft_method="dflash")) == [TARGET_REF, DFLASH_REF]
+    assert "VLLM_DRAFT_ATTENTION_BACKEND = ''" in script
+    triton = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
+        model_source=TARGET_REF, draft_model_source=DFLASH_REF, draft_method="dflash",
+        draft_attention_backend="TRITON_ATTN"))
+    assert "VLLM_DRAFT_ATTENTION_BACKEND = 'TRITON_ATTN'" in triton
+    assert "speculative_config['attention_backend'] = VLLM_DRAFT_ATTENTION_BACKEND" in triton
     mtp = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(model_source=TARGET_REF))
     assert "VLLM_DRAFT_METHOD = 'mtp'" in mtp
 
