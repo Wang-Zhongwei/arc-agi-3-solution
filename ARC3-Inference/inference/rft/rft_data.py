@@ -52,6 +52,7 @@ EXCLUDED = {  # run path fragment -> reason
 }
 GENERATED = ("THINKING", "ASSISTANT", "TOOL CALL")
 MIN_PIXELS = 65536  # preprocessor_config shortest_edge: smaller images are scaled up to this many pixels
+ALL_LEVELS = 0  # Attempt.level for a whole game: trajectory_samples then keeps every request (mtp_data)
 
 
 @dataclass
@@ -232,7 +233,7 @@ def trajectory_samples(attempt: Attempt, frames_cache: dict, images_dir: Path, m
     frames = rft_images.Frames.from_run(states, events)
     game = rebuild_file(run / "transcripts" / f"{attempt.stem}.txt")  # trims placed at the run's image price
     tools = run_tools(run)
-    requests = [r for r in game.requests if level_at(numbers, levels, r.action) == attempt.level]
+    requests = [r for r in game.requests if attempt.level == ALL_LEVELS or level_at(numbers, levels, r.action) == attempt.level]
     drawn: dict[int, list] = {}  # id(user message) -> its images
 
     def images_of(message):
