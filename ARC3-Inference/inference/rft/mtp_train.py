@@ -390,7 +390,10 @@ def load_target(args):
     model.config.use_cache = False
     model.requires_grad_(False)
     model.train()  # the patched layers' token chunks; dropout is 0
-    patches = layer_patches.patch_for_training(model, args.token_chunk, 128, "layer", cache_experts=True)
+    layers = args.compile_layers  # train_rft's default: compiled hyper-connections and MoE, fast conv and GDN
+    patches = layer_patches.patch_for_training(model, args.token_chunk, 128, "layer", compile_hc=layers,
+                                               compile_moe=layers, cache_experts=True, fast_conv=layers,
+                                               fast_gdn=layers and args.fast_gdn)
     check = layer_patches.check_experts(model)
     if check["max_rel_error"] > 0.05:
         raise RuntimeError(f"grouped experts disagree with AutoRound's: {check}")
@@ -428,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-hours", type=float, default=20.0)
     parser.add_argument("--token-chunk", type=int, default=8192)
     parser.add_argument("--no-qsa-kernel", dest="qsa_kernel", action="store_false")
+    parser.add_argument("--no-compile-layers", dest="compile_layers", action="store_false",
+                        help="without compile_hc, compile_moe, fast_conv, fast_gdn (train_rft's switch)")
+    parser.add_argument("--no-fast-gdn", dest="fast_gdn", action="store_false")
     parser.add_argument("--eval-only", action="store_true", help="measure the head as loaded and stop")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
