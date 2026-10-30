@@ -114,3 +114,14 @@ def test_game_round_robin_draws_each_game_in_turn():
     assert sorted(games[:3]) == ["a", "b", "c"] and sorted(games[3:6]) == ["a", "b", "c"]
     assert games[6] in ("a", "c")  # b is exhausted after two rounds
     assert mtp_train.game_round_robin(samples, 7, seed=0) == order
+
+
+def test_wandb_metrics_map_the_log_records():
+    eval_row = dict(event="eval", step=100, length=2.9, rows=5, rates=[0.8, 0.6, 0.5], loss=[1.0, 1.2, 1.4])
+    assert mtp_train.wandb_metrics(eval_row) == {"eval/step": 100, "eval/length": 2.9, "eval/rows": 5,
+                                                 "eval/rate1": 0.8, "eval/rate2": 0.6, "eval/rate3": 0.5,
+                                                 "eval/loss1": 1.0, "eval/loss2": 1.2, "eval/loss3": 1.4}
+    sample = dict(event="sample", position=3, tokens=9, rows=4, total_s=1.0, target_s=0.5, losses=[1.0],
+                  chain=dict(anchors=2, rates=[0.7], length=1.7))
+    assert mtp_train.wandb_metrics(sample)["sample/length"] == 1.7
+    assert mtp_train.wandb_metrics(dict(event="loaded")) == {}

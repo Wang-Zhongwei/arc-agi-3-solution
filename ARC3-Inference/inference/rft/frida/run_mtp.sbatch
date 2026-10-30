@@ -24,7 +24,7 @@
 # mtp-finetuned-bf16.safetensors; the other files are hard links to lord_mtp/, ready to upload).
 # Settings, as --key=value (or the environment variable KEY): version (date-time), data, eval_only (0), positions
 # (index), lr (3e-5), train_samples (1400), eval_samples (48), eval_every (100), steps (3), max_hours (22),
-# extra_args (more mtp_train.py flags, quoted).
+# wandb_project (arc3-mtp), wandb_entity (jonathan_wang1999-epsilla), extra_args (more mtp_train.py flags, quoted).
 
 for argument in "$@"; do
   if [[ $argument == --*=* ]]; then
@@ -61,6 +61,11 @@ RESUME=""
 FLAGS="--steps $STEPS --positions $POSITIONS --lr $LR --train-samples $TRAIN_SAMPLES --eval-samples $EVAL_SAMPLES"
 FLAGS="$FLAGS --eval-every $EVAL_EVERY --max-hours $MAX_HOURS --draft-vocab /repo/ARC3-Inference/configs/draft_vocab_32k.json"
 [ "$EVAL_ONLY" = 1 ] && FLAGS="$FLAGS --eval-only"
+# wandb: WANDB_API_KEY from the team's .env (offline into <out>/wandb without it: wandb sync <out>/wandb/offline-run-*)
+WANDB_KEY=$(grep -s "^WANDB_API_KEY=" $WORK_DIR/.env | head -1 | cut -d= -f2-)
+WANDB_PROJECT=${WANDB_PROJECT:-arc3-mtp}
+WANDB_ENTITY=${WANDB_ENTITY:-jonathan_wang1999-epsilla}
+FLAGS="$FLAGS --wandb-project $WANDB_PROJECT --wandb-entity $WANDB_ENTITY --wandb-run-name mtp-$VERSION"
 (cd $REPO_DIR && git rev-parse HEAD 2>/dev/null || cat $REPO_DIR/COMMIT 2>/dev/null) > $OUTPUT_DIR/commit_${SLURM_JOB_ID:-local}.txt
 echo "version $VERSION, data $DATA ($(wc -l < $DATA/train.jsonl) train / $(wc -l < $DATA/eval.jsonl) eval samples), flags '$FLAGS $RESUME $EXTRA_ARGS', started $(date)"
 
@@ -68,6 +73,7 @@ SCRIPT=$OUTPUT_DIR/run_${SLURM_JOB_ID:-local}.sh
 cat > $SCRIPT <<EOF
 #!/bin/bash
 export PYTHONUNBUFFERED=TRUE TOKENIZERS_PARALLELISM=false
+[ -n "\$WANDB_API_KEY" ] || echo "no WANDB_API_KEY: wandb offline into /output/wandb"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=/repo/ARC3-Inference:/repo/tufa-arc-agi-framework/src
 cd /output
@@ -77,6 +83,9 @@ python3 -m inference.rft.mtp_train --model /model --mtp /lord --data /data --out
 EOF
 chmod a+x $SCRIPT
 
+# the key reaches the container through the environment only, never a file in the run folder
+[ -n "$WANDB_KEY" ] && export WANDB_API_KEY="$WANDB_KEY"
+unset WANDB_KEY
 srun \
   --container-mounts $REPO_DIR:/repo,$MODEL_DIR:/model,$LORD_DIR:/lord,$DATA:/data,$OUTPUT_DIR:/output \
   --container-image $CONTAINER \

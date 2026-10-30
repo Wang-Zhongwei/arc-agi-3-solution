@@ -325,6 +325,52 @@ def export_draft(head: MTPHead, mtp_dir: Path, out: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def start_wandb(args):
+    """A wandb run (resumed through OUT/wandb_id.txt), or None. Without WANDB_API_KEY it runs offline into
+    OUT/wandb, for `wandb sync` later."""
+    if not args.wandb_project:
+        return None
+    try:
+        import wandb
+
+        from inference.rft import wandb_log
+        if not os.environ.get("WANDB_API_KEY"):
+            os.environ.setdefault("WANDB_MODE", "offline")
+        os.environ.setdefault("WANDB_DIR", str(args.out))
+        id_file = args.out / "wandb_id.txt"
+        run_id = id_file.read_text().strip() if id_file.exists() else wandb.util.generate_id()
+        id_file.write_text(run_id)
+        run = wandb_log.start(args.wandb_project, args.wandb_run_name, run_id,
+                              {k: str(v) for k, v in vars(args).items()}, args.wandb_entity)
+        for prefix, x in (("eval", "eval/step"), ("sample", "sample/position"), ("train", "train/step")):
+            run.define_metric(x)
+            run.define_metric(f"{prefix}/*", step_metric=x)
+        return run
+    except Exception as exc:  # noqa: BLE001
+        print(f"wandb disabled: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def wandb_metrics(record: dict[str, Any]) -> dict[str, float]:
+    """train_log records as wandb metrics: eval per optimizer step, samples per position, optimizer steps."""
+    event = record.get("event")
+    if event == "eval":
+        out = {"eval/step": record["step"], "eval/length": record["length"], "eval/rows": record["rows"]}
+        out.update({f"eval/rate{k + 1}": r for k, r in enumerate(record["rates"])})
+        out.update({f"eval/loss{k + 1}": x for k, x in enumerate(record["loss"])})
+        return out
+    if event == "sample":
+        out = {"sample/position": record["position"], "sample/tokens": record["tokens"], "sample/rows": record["rows"],
+               "sample/total_s": record["total_s"], "sample/target_s": record["target_s"]}
+        out.update({f"sample/loss{k + 1}": x for k, x in enumerate(record["losses"])})
+        if record["chain"].get("anchors"):
+            out["sample/length"] = record["chain"]["length"]
+        return out
+    if event == "step":
+        return {"train/step": record["step"], "train/lr": record["lr"], "train/grad_norm": record["grad_norm"]}
+    return {}
+
+
 def load_target(args):
     """train_rft.load_model without LoRA: frozen, patched for long forwards (QSA kernel, grouped INT4 experts)."""
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -380,18 +426,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eval-only", action="store_true", help="measure the head as loaded and stop")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb-project", help="also log to this wandb project (key: WANDB_API_KEY; offline without it)")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-run-name")
     args = parser.parse_args(argv)
     args.step_weights = [float(w) for w in args.step_weights.split(",")][:args.steps]
     if len(args.step_weights) < args.steps:
         raise SystemExit("--step-weights needs one weight per step")
     args.out.mkdir(parents=True, exist_ok=True)
     log_file = open(args.out / "train_log.jsonl", "a")
+    run = start_wandb(args)
 
     def log(**record):
         record["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         log_file.write(json.dumps(record) + "\n")
         log_file.flush()
         print(json.dumps(record), flush=True)
+        if run is not None:
+            try:
+                metrics = wandb_metrics(record)
+                if metrics:
+                    run.log(metrics)
+            except Exception as exc:  # noqa: BLE001 - monitoring must never stop training
+                print(f"wandb log failed: {exc}", flush=True)
 
     started = time.time()
     model, processor, info = load_target(args)
@@ -451,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         record = dict(tag=tag, samples=len(chains), rows=totals["rows"], anchors=anchors,
                       loss=[round(x / max(1, totals["rows"]), 5) for x in totals["loss"]],
                       rates=[round(x, 4) for x in rates], length=round(1 + sum(rates), 4))
-        log(event="eval", **record)
+        log(event="eval", step=state["step"], **record)
         return record
 
     if args.eval_only:
