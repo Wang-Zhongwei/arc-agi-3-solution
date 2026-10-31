@@ -369,7 +369,7 @@ We serve the fine-tuned head with FP8 drafter KV, not BF16:
 - **v1 cannot start.** k = 4 raises the attention block from 1664 to 1680 tokens, and 1680 is not divisible by v6's
   `prefix_match_unit` 128. Frida job 209959 stopped at engine start with "Invalid prefix_match_unit=128;
   prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit. Got group block sizes=[1680,
-  1680, 1680, 8, 1680]" (`runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-fp8-k4/server.log`). Kaggle v1
+  1680, 1680, 8, 1680]" (`runs/local/frida/vllm-replay-draft-kv/runs/arc3_vllm_lord-209959.txt`). Kaggle v1
   has the same config.
 - **v2:** [`configs/tuned-mtp-k4/v2.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/ece901afb5ef701260b1a6e4d12798a4251e0a5c/ARC3-Inference/configs/tuned-mtp-k4/v2.json) at
   [`ece901af`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/ece901afb5ef701260b1a6e4d12798a4251e0a5c), v1 with `prefix_match_unit: 112`.
