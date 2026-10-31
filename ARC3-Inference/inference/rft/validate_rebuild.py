@@ -7,7 +7,7 @@ request index is compared with what was actually sent:
 - size: rebuilt vs logged text chars, and the token estimate vs the server's
   prompt_tokens.
 
-    python -m inference.rl.validate_rebuild runs/kaggle/<owner>/<notebook>/vNN [...]
+    python -m inference.rft.validate_rebuild runs/kaggle/<owner>/<notebook>/vNN [...]
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from inference.rl.context_rebuild import estimate_tokens, message_chars, rebuild, run_tokens_per_image
+from inference.rft.context_rebuild import estimate_tokens, message_chars, rebuild, run_tokens_per_image
 
 NOTICE = "Earlier conversation has been trimmed."
 REQUESTS = re.compile(r"(.+)_requests\.jsonl$")

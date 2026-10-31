@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := interactive
 
-.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval evaluate_run score_run significance view pull-kaggle pull-runpod trace traces zip clean cluster_view_queue
+.PHONY: install install-local-sources prepare-ci server stop-server check-server interactive sbatch kaggle-duck runpod-duck run _taaf-run chat eval evaluate_run score_run significance view pull-kaggle pull-runpod grpo-cpu-venv grpo-cpu-example trace traces zip clean cluster_view_queue
 
 -include .env
 
@@ -740,6 +740,17 @@ significance:
 		$(if $(BOOTSTRAP_SAMPLES),--bootstrap-samples "$(BOOTSTRAP_SAMPLES)") \
 		$(if $(BOOTSTRAP_SEED),--bootstrap-seed "$(BOOTSTRAP_SEED)") \
 		$(if $(filter true TRUE 1 yes YES on ON,$(ALLOW_INTERSECTION)),--allow-intersection)
+
+GRPO_VENV ?= $(REPO_ROOT)/.venv-grpo
+
+# CPU environment for the GRPO example and tests: torch 2.8, transformers 5.20.1, peft (inference/grpo/requirements-cpu.txt)
+grpo-cpu-venv:
+	$(UV) venv "$(GRPO_VENV)" --python 3.12
+	$(UV) pip install --python "$(GRPO_VENV)/bin/python" -r inference/grpo/requirements-cpu.txt
+
+# The GRPO pipeline on a tiny model, every stage printed; ARGS="--pdb" stops at each stage (docs/RL/grpo-pipeline.md)
+grpo-cpu-example:
+	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src" "$(GRPO_VENV)/bin/python" -m inference.grpo.cpu_example $(ARGS)
 
 view:
 	PYTHONPATH="$(REPO_ROOT):$(REPO_ROOT)/../tufa-arc-agi-framework/src:$$PYTHONPATH" $(UV_RUN) python -m viewer.server \

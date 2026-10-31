@@ -489,6 +489,22 @@ def _is_run_complete(game: taaf.game.Game) -> bool:
     return game.current_state.raw.state == arcengine.GameState.WIN
 
 
+def _attach_rl_recorder(session: Any, path: Path) -> None:
+    """GRPO mode (ARC3_RL_RECORD=1): give the game's analyzer an episode recorder (inference/grpo/rl_record.py),
+    with the context budget from the game's human action counts."""
+    from inference.grpo import rl_record
+
+    if not rl_record.enabled():
+        return
+    run = session.game.game_run
+    session.analyzer._rl_recorder = rl_record.EpisodeRecorder(
+        path,
+        budget=rl_record.episode_budget(getattr(run, "base_actions_per_level", None)),
+        levels_completed=lambda: int(session.game.current_state.levels_completed),
+        action_count=lambda: session.action_count,
+    )
+
+
 def _write_transcript_html(transcript_path: Path, html_path: Path, title: str) -> None:
     if not transcript_path.exists():
         return
@@ -673,6 +689,9 @@ class _HarnessGameSession:
             return True
         if self.token_limit_reached():
             return True
+        rl = getattr(self.analyzer, "_rl_recorder", None)
+        if rl is not None and rl.should_stop():  # GRPO mode: levels to play cleared, or the budget is spent
+            return True
         return False
 
     def _queue_position(self) -> int:
@@ -827,6 +846,12 @@ class _HarnessGameSession:
             if run.solver_note is None:
                 run.solver_note = f"tokens={total_tokens}"
             self._finish_if_needed()
+            rl = getattr(self.analyzer, "_rl_recorder", None)
+            if rl is not None:
+                try:
+                    rl.finish(run)
+                except Exception as exc:  # the game's own result stands; the episode is dropped from training
+                    log.error("%s: GRPO episode record failed: %s", run.game_id, exc)
             discard_runtime_state(self.state_path)
             self._write_analysis_html()
             self.write_viewer_payload()
@@ -2021,6 +2046,7 @@ class HarnessSolver(Solver):
                 stop_event=self._stop_event,
                 viewer_data_path=viewer_data_path,
             )
+            _attach_rl_recorder(session, (self.job_dir or Path.cwd() / "taaf_harness_artifacts") / "rl" / f"{run_stem}.jsonl")
             session.play()
         except Exception as exc:
             self._finish_after_error(game, exc)

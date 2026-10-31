@@ -7,7 +7,7 @@ was rolled back; a trim inside a turn starts at the first request over budget.
 
 import json
 
-from inference.rl.context_rebuild import estimate_tokens, image_tokens, rebuild, run_tokens_per_image, tokens_per_image
+from inference.rft.context_rebuild import estimate_tokens, image_tokens, rebuild, run_tokens_per_image, tokens_per_image
 
 
 def meta(*calls):
