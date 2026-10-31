@@ -39,3 +39,16 @@ def test_timeline_buckets_by_minutes_after_the_first_metrics_line(tmp_path):
     assert rows[0]["prompt"] == 2000 and rows[0]["gen"] == 800 and rows[0]["kv"] == 30.0 and rows[0]["kv_max"] == 40.0
     assert rows[0]["length"] == round(1 + 90 / (120 / 3), 3)
     assert rows[1]["prompt"] == 9000 and rows[1]["length"] == 1.0 and rows[1]["waiting"] == 2.0
+
+
+def test_steps_window_and_decode_part(tmp_path):
+    log = write_log(tmp_path)
+    # each 180 s interval: 30 drafted / k 3 / 14 running = 5/7 steps per request -> 252 s per step (synthetic numbers)
+    whole = drafter_stats.step_times(log, min_running=12)
+    assert whole["intervals"] == 2 and whole["step_ms"] == 252000.0 and whole["us_per_prefill_token"] == 0.0
+    early = drafter_stats.step_times(log, min_running=12, until=5, prefill_us=0.1)
+    assert early["intervals"] == 1 and early["prefill_tokens_per_step"] == 3000 * 252
+    assert early["decode_ms"] == round(252000 - 3000 * 252 * 0.1 / 1000, 1) and "fixed_ms" not in early
+    late = drafter_stats.step_times(log, min_running=12, start=5)
+    assert late["intervals"] == 1 and late["prefill_tokens_per_step"] == 9000 * 252 and "decode_ms" not in late
+    assert drafter_stats.step_times(log, min_running=15)["intervals"] == 0

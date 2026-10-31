@@ -392,6 +392,10 @@ MTP-3 on throughput:
 - **k = 7, Kaggle (RTX PRO 6000):** acceptance length 3.34 against v6's 2.74, but generation is 10% slower over
   the first 30 minutes. The decode part of a step costs 1.21× MTP-3's, and the prefix-hit rate stays at 88–89%
   against 92–93%, which adds prefill.
+- **k = 4, Kaggle, BF16 drafter KV:** acceptance length 2.90, equal to k = 7's first four positions, so BF16 adds
+  nothing. The pool shrinks by 35.5%, and a prefill storm starts at minute 10. k = 7 is better than or equal to
+  k = 4 ([k = 7 vs k = 4](#k--7-vs-k--4)): DFlash2's drafting cost barely depends on k, so a shorter block saves
+  only verify rows.
 
 Drafting is cheaper than MTP's three sequential passes: at k = 3 the decode part of a step is 0.87–0.90× MTP-3's on
 the B200. At k = 7 the extra verify rows outweigh that saving. [Step time](#step-time-drafting-vs-verification) has
@@ -590,31 +594,103 @@ The step count assumes that every running request drafts in every step. A reques
 steps are slightly undercounted. That is at most about one request in 14 while a 2,048-token chunk prefills, and
 more in prefill-heavy runs.
 
-### k = 4 with a BF16 drafter KV (next)
+### k = 4 with a BF16 drafter KV (dflash2-k4-bf16-kv v1)
 
-Prediction for Kaggle, against v6's MTP-3:
-- **Acceptance.** The first four positions of k7 v3 give 1 + .740 + .529 + .376 + .270 = 2.92. The same sum over
-  three positions gives 2.65, and k3 v2 measured 2.68.
-- **Decode part of a step.** RTX k = 3 is not measured. B200's ratios (k3 / MTP-3 0.87–0.90×, k7 / k3 1.25×),
-  applied to the RTX numbers, give about 31–36 ms. k = 4 adds one row per sequence: 383 against 342 experts, 36% of
-  the k = 3 → 7 step. That gives about 36–39 ms.
-- **Throughput.** 2.92 / (36–39 ms + 9–13.5 ms of prefill) against 2.74 / 45.0 ms: −9% to +6%.
-- **BF16 drafter KV.** For MTP it raised acceptance by 4.8% at the same step time
-  ([above](#measured-in-vllm-on-frida)).
-  - MTP lost most of that at positions 2–3, where it reads its own drafts back from the cache. DFlash2 drafts its
-    block in one pass and never does that, so a smaller gain is expected. It is not measured.
-  - The sliding-window group's pages double (2,048 → 4,096 B per token per layer). Whether it boots and what the KV
-    pool becomes are also unknown.
+[`jonathanwang2022/dflash2-k4-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k4-bf16-kv) v1
+([`6a3a741f`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6a3a741ff60b07babf2d2918354a28855f51410c),
+[`configs/dflash2-k4-bf16-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6a3a741ff60b07babf2d2918354a28855f51410c/ARC3-Inference/configs/dflash2-k4-bf16-kv/v1.json),
+branch [`dflash2-k4-bf16kv`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/tree/dflash2-k4-bf16kv), 2026-10-31).
+- The branch is `dflash2-drafter` with `draft-bf16-kv` merged.
+- The config is [`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6a3a741ff60b07babf2d2918354a28855f51410c/ARC3-Inference/configs/dflash2-k7/v3.json) with two
+  changes: `mtp_tokens` 7 → 4 and `draft_kv_cache_dtype` `"auto"` (BF16).
+- The target KV stays `fp8_e4m3`, the indexer `fp8`, at 14 sequences.
 
-The run measures those unknowns: the RTX decode cost at small k and DFlash2 with a BF16 drafter KV. The MTP
-comparison that counts now is `tuned-mtp-fp8-kv` (fine-tuned MTP head with FP8 drafter KV, [the chosen
-setup](#decision-fine-tuned-head-with-fp8-drafter-kv)), not v6.
+From each run's `vllm-openai-server.log` (`drafter_stats accept`, `timeline --bucket 10`,
+`steps --from 2 --until 10 --prefill-us 68`, and the "GPU KV cache size" / "kv cache group sizes" lines):
+
+| | dflash2-k4-bf16-kv v1 | dflash2-k7 v3 | porting-advaith v6 |
+|---|---|---|---|
+| Drafter, drafter KV | DFlash2 k = 4, BF16 | DFlash2 k = 7, FP8 | MTP-3, FP8 |
+| Acceptance, whole run | 2.902 (.743 .533 .378 .270) | 3.336; first 4 positions 2.915 | 2.743 |
+| Acceptance, first 10 min | 2.890 | 3.203; first 4 positions 2.874 | 2.638 |
+| KV pool | **1,019,208 tokens** / 22.21 GiB | 1,580,652 / 21.91 GiB | 1,564,172 / 21.73 GiB |
+| KV group block sizes | 1680 × 5, 8 | 1744 × 6, 16 | 1664 × 4, 8 |
+| Min 0–10: gen tok/s, KV max, prefix hit | 738, 97.8%, 75.0% | 790, 68.1%, 68.8% | 909, 67.0%, 85.6% |
+| Min 10–20 | **261**, 99.7%, 64.3% | 820, 89.1%, 87.8% | 930, 87.5%, 93.1% |
+| Min 20–30 | **231**, 99.7%, 45.9% | 864, 79.4%, 88.2% | 916, 85.1%, 92.9% |
+| Min 2–10: mean step, prefill tokens per step | 60.2 ms, 286 | 53.1 ms, 150 | 39.4 ms, 69 |
+| Min 2–10: decode part (prefill at 68 µs per token) | 40.8 ms | 42.9 ms | 34.7 ms |
+
+68 µs is mid-range of the RTX PRO 6000 fitted slopes (63–73 µs, [above](#step-time-drafting-vs-verification)).
+Minutes 2–10 are before k = 4's storm, and they skip each run's ramp-up.
+
+What this shows:
+- **BF16 drafter KV gives DFlash2 nothing.** k = 4 accepts what k = 7's FP8 first four positions accept: 2.902 vs
+  2.915 over the whole run, 2.890 vs 2.874 in the first 10 minutes, each position within .004. That fits the
+  prediction: DFlash2 drafts its block in one pass and never reads its own drafts back from the cache.
+- **It costs a third of the pool.** BF16 doubles the drafter's sliding-window pages, and Lord's pool spaces every
+  block by its largest page ([KV pool](#kv-pool)). Space per block rises from about 26.0 MB (21.91 GiB / 906 blocks
+  of 1744) to about 39.3 MB (22.21 GiB / 607 blocks of 1680), so the pool falls by 35.5%.
+  - KV use reaches 97.8% within 10 minutes. A prefill storm follows: the hit rate falls 75 → 64 → 46% and generation
+    falls 738 → 261 → 231 tok/s.
+  - tuned-mtp-bf16-kv v1 showed the same pattern ([above](#served-on-kaggle-with-bf16-drafter-kv-tuned-mtp-bf16-kv-v1)),
+    later and milder: it lost 7% of the pool, not 35.5%.
+- **Three fewer draft positions save 5% of the decode part.** Before the storm, k = 4's decode part is 40.8 ms
+  against k = 7's 42.9 ms. Prefill per step was already about twice k = 7's, so 40.8 ms may still hold some cost
+  from mixed prefill and decode batches.
+
+### k = 7 vs k = 4
+
+Conclusion: for DFlash2 on this target, k = 7 is better than or equal to k = 4. As measured, k = 7 is 4–8% faster.
+For a clean FP8 k = 4, the estimate is a tie. Even under a bound that favours k = 4, k = 7 gives up at most 3% over
+the run. The reason is that a shorter DFlash2 block saves almost no drafting, unlike MTP. It saves only verify
+rows, and those cost less than the tokens positions 5–7 add.
+
+- **Drafting is flat in k.** DFlash2 drafts all k positions in one pass of its 5 layers and the target's lm_head
+  ([checkpoint](#the-checkpoint)).
+  - That pass reads 1.206 GB of drafter weights
+    ([`model.safetensors@a22a1744`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/blob/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors)).
+    At most it also reads the 1.271 GB BF16 lm_head (248,320 × 2,560, untied, in
+    [`model-00017-of-00017.safetensors`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/blob/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/model-00017-of-00017.safetensors)).
+    That is about 1.4 ms at the RTX PRO 6000's 1.79 TB/s
+    ([spec](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/)), whatever k is.
+  - Its compute is 14 × (k + 1) rows × 2 × about 1.24 B parameters: 0.17 TFLOP at k = 4 and 0.28 TFLOP at k = 7.
+    That is a fraction of a millisecond either way.
+  - MTP is different: it runs one full drafter pass per draft token, so a shorter k saves drafting time.
+- **Verification grows less than acceptance.**
+  - k = 7 verifies 14 × 8 = 112 rows against 70 at k = 4.
+  - Each token routes to 10 of 512 experts in each of 48 layers
+    ([`config.json`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/blob/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/config.json)).
+    With independent routing, 512 · (1 − (1 − 10/512)ⁿ) gives 456 experts touched per layer against 383: +19% routed
+    weights.
+  - Attention, GDN and dense weights are read once per step, whatever k is.
+  - Positions 5–7 add .197 + .148 + .111 = 0.456 accepted tokens per step: +15.7% over k = 4's 2.902.
+- **Throughput.** Time per accepted token is (decode part / acceptance) + prefill per accepted token. The games and
+  the hit rate set the prefill tokens, not k, so the prefill term is taken equal in both: k = 7's, 150 × 68 µs ÷
+  acceptance. A clean k = 4's acceptance is k = 7's first four positions, since BF16 added nothing.
+
+| k = 4 decode part | Basis | k = 7 vs k = 4, whole-run acceptance | First 10 minutes |
+|---|---|---|---|
+| 40.8 ms | measured (BF16 drafter KV run, minutes 2–10) | **k = 7 +7.5%** | **+4.4%** |
+| 37.4 ms | B200's k = 3 → 7 growth (+25% for +114 experts), interpolated to 383 experts, applied to RTX k = 7's 42.9 ms | −0.2% (tie) | −2.3% |
+| 36.1 ms | bound: the whole decode part scales with routed experts (42.9 / 1.189) | −3.0% | −5.1% |
+
+- The bound is pessimistic for k = 7. The drafter pass, attention and GDN state reads, and the dense weights do not
+  grow with rows.
+- The first 10 minutes favour k = 4 because k = 7's later positions accept least early on (3.203 vs 3.336 over the
+  whole run).
+- Neither k reaches MTP-3: v6's decode part is 34.7 ms over the same minutes. The MTP comparison that counts is now
+  `tuned-mtp-fp8-kv`, the fine-tuned MTP head with FP8 drafter KV ([the chosen
+  setup](#decision-fine-tuned-head-with-fp8-drafter-kv)), not v6.
+- These are one run per arm, compared on server step times, not scores.
 
 ## Reproduce
 
 From `ARC3-Inference/` ([`inference/tools/drafter_stats.py`](../../ARC3-Inference/inference/tools/drafter_stats.py)).
 It reads safetensors headers with HTTP range requests and downloads no weights. Kaggle files need
 `~/.kaggle/access_token`.
+The GitHub commit/config links and the `jonathanwang2022/*` Kaggle notebooks are private: open them while signed in
+with access. The Hugging Face and NVIDIA links are public.
 
 ```sh
 P=https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/resolve/07915ee79ec217c117e8a57bf2557a4a1418c10f
@@ -632,6 +708,15 @@ python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dfla
 for r in porting-advaith/v06 dflash2-k7/v03 dflash2-k3/v02; do                                    # step-time table
   python -m inference.tools.drafter_stats steps runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log; done
 # B200 rows: the same on /shared/workspace/arc-agi-3/dflash2_b200/out/{209821/C,209829/B,209829/A}/vllm-openai-server.log
+make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k4-bf16-kv VERSION=1                                    # the k = 4 run
+for r in dflash2-k4-bf16-kv/v01 dflash2-k7/v03 porting-advaith/v06; do L=runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log
+  python -m inference.tools.drafter_stats accept $L; python -m inference.tools.drafter_stats accept $L --until 10  # 2.902 / 3.336 / 2.743; 2.890 / 3.203 / 2.638
+  python -m inference.tools.drafter_stats timeline $L --bucket 10
+  python -m inference.tools.drafter_stats steps $L --from 2 --until 10 --prefill-us 68                    # decode_ms 40.8 / 42.9 / 34.7
+  grep -E "GPU KV cache size|Available KV cache memory|kv cache group sizes" $L; done                       # k = 4: 1,019,208 tokens
+python -m inference.tools.drafter_stats bytes \
+  https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/resolve/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/model-00017-of-00017.safetensors \
+  --prefix lm_head                                                          # target lm_head: 1.271 GB BF16
 make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k7 VERSION=3                                             # the k = 7 run
 make pull-kaggle NOTEBOOK=jonathanwang2022/tuned-mtp-bf16-kv VERSION=1                                      # fine-tuned + BF16
 python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log  # 2.888

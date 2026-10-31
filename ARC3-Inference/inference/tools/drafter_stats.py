@@ -16,12 +16,15 @@ acceptance of that bucket.
 steps: decode-step time from a vLLM server log's 10-s stats lines. Each interval's steps are its drafts (drafted
 tokens / k) over the running requests, so step time = interval x running / drafts. Prefill tokens per step are the
 interval's prompt tokens over its steps. A least-squares line, step = fixed + slope x prefill tokens, splits off the
-prefill. Intervals with fewer than --min-running requests are skipped (start-up and wind-down).
+prefill. Intervals with fewer than --min-running requests are skipped (start-up and wind-down). `--from` / `--until`
+keep the intervals ending in that window (minutes after the first metrics line), and `--prefill-us` adds the decode part
+of a step, the mean step less its prefill at that cost per token, for comparing runs whose prefill differs.
 
     python -m inference.tools.drafter_stats bytes URL [URL ...] [--prefix mtp.]
     python -m inference.tools.drafter_stats accept runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log [--until M]
     python -m inference.tools.drafter_stats timeline runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log [--bucket 5]
-    python -m inference.tools.drafter_stats steps runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log
+    python -m inference.tools.drafter_stats steps runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log \
+        [--from 2 --until 10 --prefill-us 68]
 """
 
 from __future__ import annotations
@@ -117,7 +120,8 @@ def acceptance(log: Path, until: float | None = None) -> dict:
     return dict(engine=None)
 
 
-def step_times(log: Path, min_running: int = 12) -> dict:
+def step_times(log: Path, min_running: int = 12, start: float | None = None, until: float | None = None,
+               prefill_us: float | None = None) -> dict:
     engine: dict[str, tuple[float, int]] = {}
     spec: dict[str, tuple[int, int]] = {}
     for line in open(log, errors="ignore"):
@@ -128,10 +132,14 @@ def step_times(log: Path, min_running: int = 12) -> dict:
             engine[stamp.group(1)] = (float(m.group(1)), int(m.group(2)))
         elif m := re.search(r"Drafted: (\d+) tokens, Per-position acceptance rate: ([\d., ]+)", line):
             spec[stamp.group(1)] = (int(m.group(1)), len([x for x in m.group(2).split(",") if x.strip()]))
-    clock = lambda s: datetime.strptime("2026-" + s, "%Y-%m-%d %H:%M:%S")
+    clock = lambda s: datetime.strptime("2000-" + s, "%Y-%m-%d %H:%M:%S")
+    first = min(map(clock, engine)) if engine else None  # minutes count from here, as in vllm_lines
     stamps = sorted(set(engine) & set(spec))
     rows = []  # (step ms, prefill tokens per step)
     for before, now in zip(stamps, stamps[1:]):
+        minute = (clock(now) - first).total_seconds() / 60
+        if (start is not None and minute < start) or (until is not None and minute >= until):
+            continue
         seconds = (clock(now) - clock(before)).total_seconds()
         prompt, running = engine[now]
         drafted, k = spec[now]
@@ -140,15 +148,21 @@ def step_times(log: Path, min_running: int = 12) -> dict:
         steps = drafted / k / running
         rows.append((1000 * seconds / steps, prompt * seconds / steps))
     n = len(rows)
-    if n < 2:
-        return dict(intervals=n)
+    if not n:
+        return dict(intervals=0)
     mean_t, mean_p = sum(t for t, _ in rows) / n, sum(p for _, p in rows) / n
-    slope = sum((p - mean_p) * (t - mean_t) for t, p in rows) / sum((p - mean_p) ** 2 for _, p in rows)
-    fixed = mean_t - slope * mean_p
-    residual = sum((t - fixed - slope * p) ** 2 for t, p in rows)
-    r2 = 1 - residual / sum((t - mean_t) ** 2 for t, _ in rows)
-    return dict(intervals=n, step_ms=round(mean_t, 1), prefill_tokens_per_step=round(mean_p),
-                fixed_ms=round(fixed, 1), us_per_prefill_token=round(1000 * slope, 1), r2=round(r2, 2))
+    out = dict(intervals=n, step_ms=round(mean_t, 1), prefill_tokens_per_step=round(mean_p))
+    if prefill_us is not None:  # the decode part at a given prefill cost per token
+        out["decode_ms"] = round(mean_t - mean_p * prefill_us / 1000, 1)
+    spread = sum((p - mean_p) ** 2 for _, p in rows)
+    if n >= 2 and spread:
+        slope = sum((p - mean_p) * (t - mean_t) for t, p in rows) / spread
+        fixed = mean_t - slope * mean_p
+        residual = sum((t - fixed - slope * p) ** 2 for t, p in rows)
+        total = sum((t - mean_t) ** 2 for t, _ in rows)
+        out.update(fixed_ms=round(fixed, 1), us_per_prefill_token=round(1000 * slope, 1),
+                   r2=round(1 - residual / total, 2) if total else None)
+    return out
 
 
 ENGINE_FIELDS = (("prompt", "Avg prompt throughput"), ("gen", "Avg generation throughput"),
@@ -186,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("steps")
     s.add_argument("log", type=Path)
     s.add_argument("--min-running", type=int, default=12)
+    s.add_argument("--from", dest="start", type=float, default=None, help="minutes after the first metrics line")
+    s.add_argument("--until", type=float, default=None, help="minutes after the first metrics line")
+    s.add_argument("--prefill-us", type=float, default=None, help="prefill cost per token; adds decode_ms")
     a.add_argument("--until", type=float, default=None, help="minutes after the first metrics line")
     t = sub.add_parser("timeline")
     t.add_argument("log", type=Path)
@@ -204,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"{r['kv_max']:5.1f} {r['hit']:5.1f} {r['waiting']:5.1f} {length:>6s}  {pos}")
         return 0
     if args.command == "steps":
-        print(json.dumps(step_times(args.log, args.min_running)))
+        print(json.dumps(step_times(args.log, args.min_running, args.start, args.until, args.prefill_us)))
         return 0
     rows = tensor_bytes(args.urls, args.prefix)
     total = 0
