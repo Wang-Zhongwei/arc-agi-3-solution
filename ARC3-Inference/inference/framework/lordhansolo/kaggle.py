@@ -1719,6 +1719,106 @@ DFLASH_RUNTIME_PATCHES = (
         '        num_layers = len(self.language_model.model.layers)\n'
         '        return (2, num_layers // 2, num_layers - 3)\n',
     ),
+    # Prefix hits apply the EAGLE drop only to the drafter's KV groups, and when none is identified
+    # every group gets it (kv_cache_coordinator: "no KV cache group could be identified as the draft
+    # model's"). DFlash2's layers are all sliding-window and register after the target's, as MTP's
+    # do, so the positional rule finds their group. Without it the target's GDN groups drop a
+    # recurrent checkpoint they do not keep, and turns miss down to 0 tokens (B200 replay of
+    # dflash2-k3 v2: 41% of continuing turns, none with MTP-3). With the hold below, the hit rate
+    # goes 48% -> 90% and generation 545 -> 1,315 tokens/s (MTP-3: 93%, 1,298); alone, 63% and 681.
+    (
+        'vllm/v1/core/kv_cache_utils.py',
+        '    if spec_config.method == "mtp":\n        return True\n',
+        '    if spec_config.method in ("mtp", "dflash"):\n        return True\n',
+    ),
+    # The drafter's sliding-window group hits at a replay boundary only if the blocks of the window
+    # below it are still cached, but the window frees them while the request prefills and decodes,
+    # so they are evicted long before the request's full-attention blocks and the next turn's hit
+    # fails once the pool fills (B200 replay with the draft-group rule above only: 26% of continuing
+    # turns miss). The request keeps the blocks get_replay_boundaries makes reachable until it
+    # finishes, out of its block table.
+    (
+        'vllm/v1/core/single_type_kv_cache_manager.py',
+        '        self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens\n\n'
+        '    @classmethod\n'
+        '    def _contiguous_blocks_for_hit(\n',
+        '        self.extra_retained_tokens = kv_cache_spec.extra_retained_tokens\n'
+        '        # Block indices of the replay-boundary tails, and those of them the window\n'
+        '        # has passed, held until the request is freed.\n'
+        '        self._replay_tail_idx: dict[str, frozenset[int]] = {}\n'
+        '        self._held_replay_tail: dict[str, dict[int, KVCacheBlock]] = {}\n\n'
+        '    def cache_blocks(\n'
+        '        self,\n'
+        '        request: Request,\n'
+        '        num_tokens: int,\n'
+        '        retention_interval: int | None = None,\n'
+        '        *,\n'
+        '        replay_boundaries: Sequence[int],\n'
+        '    ) -> None:\n'
+        '        super().cache_blocks(\n'
+        '            request, num_tokens, retention_interval, replay_boundaries=replay_boundaries\n'
+        '        )\n'
+        '        alignment = self.cache_hit_alignment_tokens\n'
+        '        if (\n'
+        '            request.request_id in self._replay_tail_idx\n'
+        '            or not self.kv_cache_spec.prefix_cacheable\n'
+        '            or not alignment\n'
+        '        ):\n'
+        '            return\n'
+        '        block_size = self.block_size * self.dcp_world_size\n'
+        '        need = self._contiguous_blocks_for_hit(\n'
+        '            window_size=self.sliding_window,\n'
+        '            block_size=block_size,\n'
+        '            use_eagle=self.use_eagle,\n'
+        '        )\n'
+        '        shift = 1 if self.use_eagle else 0\n'
+        '        boundaries = [*replay_boundaries]\n'
+        '        if request.shared_prefix_boundary:\n'
+        '            boundaries.append(request.shared_prefix_boundary)\n'
+        '        tail: set[int] = set()\n'
+        '        for boundary in boundaries:\n'
+        '            end = boundary // alignment * alignment // block_size + shift\n'
+        '            tail.update(range(max(0, end - need), end))\n'
+        '        self._replay_tail_idx[request.request_id] = frozenset(tail)\n\n'
+        '    def _remove_blocks_in_range(\n'
+        '        self,\n'
+        '        request_id: str,\n'
+        '        first_block: int,\n'
+        '        last_block: int,\n'
+        '    ) -> None:\n'
+        '        hold = self._replay_tail_idx.get(request_id)\n'
+        '        if not hold:\n'
+        '            super()._remove_blocks_in_range(request_id, first_block, last_block)\n'
+        '            return\n'
+        '        if request_id not in self.req_to_blocks or first_block >= last_block:\n'
+        '            return\n'
+        '        blocks = self.req_to_blocks[request_id]\n'
+        '        held = self._held_replay_tail.setdefault(request_id, {})\n'
+        '        freed: list[KVCacheBlock] = []\n'
+        '        for i in range(min(last_block, len(blocks)) - 1, first_block - 1, -1):\n'
+        '            if blocks[i] == self._null_block:\n'
+        '                if i in held:\n'
+        '                    continue\n'
+        '                break\n'
+        '            if i in hold:\n'
+        '                held[i] = blocks[i]\n'
+        '            else:\n'
+        '                freed.append(blocks[i])\n'
+        '            blocks[i] = self._null_block\n'
+        '        if freed:\n'
+        '            self.block_pool.free_blocks(freed)\n\n'
+        '    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:\n'
+        '        blocks = super().pop_blocks_for_free(request_id)\n'
+        '        self._replay_tail_idx.pop(request_id, None)\n'
+        '        for i, block in sorted(self._held_replay_tail.pop(request_id, {}).items()):\n'
+        '            if i < len(blocks) and blocks[i] == self._null_block:\n'
+        '                blocks[i] = block\n'
+        '            else:\n'
+        '                blocks.append(block)\n'
+        '        return blocks\n\n'
+        '    @classmethod\n'
+        '    def _contiguous_blocks_for_hit(\n',
+    ),
 )
 
 

@@ -19,20 +19,26 @@
 #   sbatch run.sbatch                      # open partition
 #   ARMS="A" sbatch run.sbatch             # one arm (then --gpus-per-node=B200:1)
 #   sbatch --reservation=maint_arc run.sbatch
+#   SETUPS=$D/run/hold ARMS="A B" sbatch --gpus-per-node=B200:2 run.sbatch   # setups from make_arms.py --repo-patches
 
 D=/shared/workspace/arc-agi-3/dflash2_b200
 W=/shared/workspace/arc-agi-3
 export ARMS=${ARMS:-A B C}
+export SETUPS=${SETUPS:-$D/run}
 export BENCH_ARGS=${BENCH_ARGS:-"--workload $D/run/workload.jsonl --concurrency 14 --window 900 --gen-scale 1.0 --warmup-max 1500"}
 export OUT=$D/out/$SLURM_JOB_ID
 mkdir -p $OUT
-echo "job $SLURM_JOB_ID on $(hostname), GPUs $CUDA_VISIBLE_DEVICES, arms $ARMS"
+echo "job $SLURM_JOB_ID on $(hostname), GPUs $CUDA_VISIBLE_DEVICES, arms $ARMS, setups $SETUPS"
 
-srun --container-mounts $W:$W,$D/input:/kaggle/input --container-image $W/containers/pytorch_26.09-py3.sqsh \
+srun --container-writable --container-mounts $W:$W,$D/input:/kaggle/input --container-image $W/containers/pytorch_26.09-py3.sqsh \
   bash -c '
     set -u
     python3 --version; nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
     df -BG --output=target,avail /tmp | tail -1
+    # Kaggle'"'"'s image has no b12x/flash_attn/fla/auto_round/...; this NGC container does, and the server would import
+    # them where Lord'"'"'s runtime lacks them (b12x crashed every arm in job 209819). Launcher, watchdog and bench
+    # need only the standard library, so the container'"'"'s own packages go out of sys.path.
+    mv /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages.ngc && mkdir /usr/local/lib/python3.12/dist-packages
     # unpacked runtimes (~20 GB each) on node-local /tmp when it has room, else on the job folder
     if [ "$(df -BG --output=avail /tmp | tail -1 | tr -dc 0-9)" -gt 120 ]; then RT=/tmp/dflash2_b200_$SLURM_JOB_ID; else RT=$OUT/rt; fi
     IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"

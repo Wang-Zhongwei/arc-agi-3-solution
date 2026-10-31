@@ -23,7 +23,8 @@ os.environ['TAAF_KAGGLE_WORKING_DIR'] = str(out)
 os.environ['TAAF_KAGGLE_SETUP_ENV'] = str(out / 'taaf_setup_env.json')
 
 namespace = {'__name__': f'setup_{arm}'}
-exec(compile((HERE / f'setup_{arm}.py').read_text(), f'setup_{arm}.py', 'exec'), namespace)
+SETUPS = Path(os.environ.get('SETUPS') or HERE)  # e.g. hold/, setups made with make_arms.py --repo-patches
+exec(compile((SETUPS / f'setup_{arm}.py').read_text(), f'setup_{arm}.py', 'exec'), namespace)
 kaggle_env = namespace['build_image_runtime_env']
 
 
