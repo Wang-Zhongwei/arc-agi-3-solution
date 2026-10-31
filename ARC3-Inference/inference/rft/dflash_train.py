@@ -456,6 +456,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--best-margin", type=float, default=0.002,
                         help="eval acceptance length a checkpoint must beat the best by to replace it")
+    parser.add_argument("--select", choices=("greedy", "sampled"), default="greedy",
+                        help="the eval length best/ is chosen by: greedy = chained p_target(greedy path pick), as vLLM "
+                             "serves DFlash2 by default (draft_sample_method greedy); sampled = chained sum min(p, q), "
+                             "for draft_sample_method probabilistic")
     parser.add_argument("--max-tokens", type=int, default=131072)
     parser.add_argument("--max-hours", type=float, default=20.0)
     parser.add_argument("--token-chunk", type=int, default=8192)
@@ -576,9 +580,10 @@ def main(argv: list[str] | None = None) -> int:
         log(event="saved", name=name, step=state["step"])
 
     def consider(record):
-        """Keep the drafter as best/ when its eval acceptance length beats the best so far by best_margin."""
-        if state["best_length"] is None or record["length"] > state["best_length"] + args.best_margin:
-            state["best_length"], state["best_step"] = record["length"], state["step"]
+        """Keep the drafter as best/ when its eval acceptance length (--select) beats the best so far by best_margin."""
+        length = record["greedy_length" if args.select == "greedy" else "length"]
+        if state["best_length"] is None or length > state["best_length"] + args.best_margin:
+            state["best_length"], state["best_step"] = length, state["step"]
             save("best")
 
     if state["step"] == 0:
