@@ -255,14 +255,20 @@ The same harness, requests and sampling as [the drafter KV replay](#measured-in-
 |---|---|---|---|---|---|---|
 | Lord | FP8 | 2.777 | 0.776 / 0.578 / 0.422 | 37.10 ms | 26.52 | 209838 |
 | Lord | BF16 | 2.910 | 0.790 / 0.624 / 0.496 | 35.23 ms | 27.77 | 209834 |
+| fine-tuned | FP8 | 2.898 | 0.799 / 0.623 / 0.476 | 35.38 ms | 27.80 | 209926 |
 | **fine-tuned** | BF16 | **3.020** | 0.820 / 0.664 / 0.537 | **34.14 ms** | **28.75** | 209913 |
 
-- **Where the gain comes from:** BF16 drafter KV adds +0.133 and the fine-tuned head another +0.110. Together that is
-  +0.243 (+8.8%) over v6's served setup.
+- **Where the gain comes from:** the head and the drafter KV add up independently:
+  - the fine-tuned head adds +0.122 with FP8 drafter KV and +0.110 with BF16;
+  - BF16 drafter KV adds +0.133 with Lord's head and +0.122 with the fine-tuned one;
+  - together that is +0.243 (+8.8%) over v6's served setup.
+- **The head was trained with BF16 KV but keeps its gain on FP8:** with FP8 drafter KV it matches Lord's head with BF16
+  (2.898 vs 2.910) at v6's pool size (7,447,052 tokens on the B200), so it pays no KV.
 - **Speed:** time per token × tokens per step is 103.1 ms, the same step cost as both Lord arms, so the gain is all
   acceptance.
 - **Wall time:** 946 s end to end, the same as the other arms (the replay is prefill-bound).
-- **Files:** `runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16/` and `arc3_vllm_lord-209913.txt`.
+- **Files:** `runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-{fp8,bf16}/` and
+  `arc3_vllm_lord-2099{26,13}.txt`.
 
 ### Served on Kaggle with BF16 drafter KV (tuned-mtp-bf16-kv v1)
 
@@ -299,8 +305,9 @@ Minutes after the server's first metrics line, means of vLLM's 10 s lines, per-p
   - The run ended during the storm, so it does not show whether it recovers.
 - **Cause:** the storm comes from the BF16 drafter KV's smaller pool, not from the head, whose weights are the same size.
 - **Ways to keep the gain without the storm:**
-  - Serve the fine-tuned head with FP8 drafter KV. The pool is then v6's, but the head was trained with BF16 KV, so its
-    gain there is unmeasured.
+  - Serve the fine-tuned head with FP8 drafter KV. The pool is then v6's, and on Frida the head keeps +0.122 there
+    (2.898). Kaggle run: `jonathanwang2022/tuned-mtp-fp8-kv` v1 (config `configs/tuned-mtp-fp8-kv/v1.json`, branch
+    `draft-bf16-kv`).
   - Keep BF16 drafter KV at 13 streams: 1,455,400 / 13 ≈ 112.0K tokens per stream, against v6's 111.7K.
 - **Logs:** `runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log` and
   `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log`.
@@ -562,6 +569,7 @@ python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/port
 python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log --bucket 5
 python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --bucket 5
 python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16  # 3.020
+python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-fp8   # 2.898
 curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
   | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256
 ```
