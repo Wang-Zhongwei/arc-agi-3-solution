@@ -197,14 +197,16 @@ The files are in `runs/local/frida/vllm-replay-draft-kv/runs/`: `metrics_before.
 Conclusion: once both prefix-cache patches are in, DFlash2 matches MTP-3's prefix-hit rate. It still does not beat
 MTP-3 on throughput:
 - **k = 3:** the same acceptance as MTP-3 at about the same step cost.
-- **k = 7, B200 replay:** acceptance length 3.66 against 2.87 (+28% tokens per step), but each step costs about
-  1.25× as much, because the target verifies 8 rows per sequence instead of 4. Net +2%.
+- **k = 7, B200 replay:** acceptance length 3.66 against 2.87 (+28% tokens per step), but each step takes 1.25× as
+  long, prefill included. The decode part alone is 1.09–1.13× MTP-3's and 1.25× DFlash2 k = 3's, because the target
+  verifies 8 rows per sequence instead of 4. Net +2%.
 - **k = 7, Kaggle (RTX PRO 6000):** acceptance length 3.34 against v6's 2.74, but generation is 10% slower over
-  the first 30 minutes. The step costs about 1.35× MTP-3's, and the prefix-hit rate stays at 88–89% against
-  92–93%.
+  the first 30 minutes. The decode part of a step costs 1.21× MTP-3's, and the prefix-hit rate stays at 88–89%
+  against 92–93%, which adds prefill.
 
-Drafting is cheaper than MTP's three sequential passes (k = 3 steps cost 0.98× MTP-3's), but at k = 7 the extra
-verify rows dominate.
+Drafting is cheaper than MTP's three sequential passes: at k = 3 the decode part of a step is 0.87–0.90× MTP-3's on
+the B200. At k = 7 the extra verify rows outweigh that saving. [Step time](#step-time-drafting-vs-verification) has
+the split.
 
 ### The checkpoint
 
@@ -292,9 +294,9 @@ replayed at 14 streams from 40K-token contexts, with the harness's sampling, ove
 [`bench.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/bench.py)).
 Numbers are from each arm's `bench/summary.json` on Frida in
 `/shared/workspace/arc-agi-3/dflash2_b200/out/<job>/<arm>/`. The acceptance length is 1 + the sum of the
-per-position rates. The step cost is acceptance length ÷ gen tok/s, relative to MTP-3.
+per-position rates. The step time is acceptance length ÷ gen tok/s, relative to MTP-3, prefill included.
 
-| Job | Drafter | Patches | Prefix hit | Gen tok/s | Acceptance per position | Acceptance length | Step cost |
+| Job | Drafter | Patches | Prefix hit | Gen tok/s | Acceptance per position | Acceptance length | Step time vs MTP-3 |
 |---|---|---|---|---|---|---|---|
 | 209821 | MTP-3 (v6) | n/a | 92.8% | 1,298 | .785 .610 .470 | 2.865 | 1 |
 | 209821 | DFlash2 k = 3 | none | 47.4% | 545 | .791 .619 .485 | 2.894 | |
@@ -308,8 +310,8 @@ What the table shows:
   209824, in the README).
 - At positions 1–3, DFlash2 accepts slightly less than MTP-3 (k = 7: .744 / .552 / .414 against .785 / .610 / .470).
   Positions 4–7 add 0.95 tokens per step, at the price of 4 more verify rows per sequence.
-- The step cost is only the ratio of two measured numbers. The step time itself was not logged. The step-cost column
-  is filled only for the patched rows; an unpatched run's gen tok/s is set by prefill, not by the step.
+- The step-time column is the ratio of two measured numbers, filled only for the patched rows; an unpatched run's gen
+  tok/s is set by prefill. [Step time](#step-time-drafting-vs-verification) splits it into decode and prefill.
 - B200 tokens/s are not Kaggle numbers.
 - Unpatched hit rates here are from `summary.json` and differ from the README's table by up to 0.9 points
   (42.1% / 48.3%). The patched rows agree.
@@ -347,12 +349,76 @@ What this shows:
   (2.74 against 2.87). Why is not known: the replay starts at 40K-token contexts and skips early-game turns.
 - **Prefix hits.** They now work on Kaggle, but they reach 85% only after 10 minutes and level off at 88–89%, below
   v6's 92–93%. The extra prefill is +62%.
-- **Throughput.** With +21.6% tokens per step and −10.1% generation, a k = 7 step costs about 1.35× an MTP-3
-  step, prefill included. The B200 ratio was 1.25×.
+- **Throughput.** With +21.6% tokens per step and −10.1% generation, a k = 7 step takes about 1.35× an MTP-3 step
+  over these 30 minutes, prefill included. Over the whole run it takes 1.28× (57.4 vs 45.0 ms, below).
 - **Over time.** Most of the shortfall is in the first 20 minutes, while the hit rate builds. In minutes 20–30
   the harness rates are equal (847 vs 852), and the server rate is −6% (864 vs 916).
 
 This is one run, and 30 minutes of play is not a score comparison.
+
+### Step time: drafting vs verification
+
+From `drafter_stats steps` on each run's server log (10-s intervals with at least 12 running requests):
+
+| Run | GPU | Mean step | Prefill tokens per step | Fit: fixed + per prefill token | R² |
+|---|---|---|---|---|---|
+| porting-advaith v6, MTP-3 | RTX PRO 6000 | 45.0 ms | 130 | 35.5 ms + 73.0 µs | 0.82 |
+| dflash2-k7 v3 | RTX PRO 6000 | 57.4 ms | 199 | 44.9 ms + 62.8 µs | 0.80 |
+| dflash2-k3 v2 (no patches) | RTX PRO 6000 | 101.5 ms | 905 | 48.5 ms + 58.6 µs | 0.75 |
+| 209821 C, MTP-3 | B200 | 32.0 ms | 166 | 25.2 ms + 40.8 µs | 0.93 |
+| 209829 B, DFlash2 k = 3 | B200 | 31.3 ms | 210 | 20.4 ms + 52.0 µs | 0.81 |
+| 209829 A, DFlash2 k = 7 | B200 | 40.1 ms | 283 | 25.2 ms + 52.4 µs | 0.96 |
+
+When a run's prefill varies little, the fixed term trades off against the slope: B200 k = 7 and MTP-3 both fit
+25.2 ms. A steadier split subtracts prefill at one per-token cost per GPU, across the range of that GPU's fitted
+slopes:
+
+| Decode part of a step | MTP-3 | DFlash2 k = 3 | DFlash2 k = 7 |
+|---|---|---|---|
+| B200 (prefill at 41–52 µs per token) | 23.4–25.2 ms | 20.4–22.7 ms (0.87–0.90×) | 25.4–28.5 ms (1.09–1.13×) |
+| RTX PRO 6000 (prefill at 63–73 µs per token) | 35.5–36.8 ms | not measured | 42.9–44.9 ms (1.21–1.22×) |
+
+What the tables show:
+- **Drafting.** At k = 3 both drafters' steps verify 4 rows per sequence, so the gap is the drafter.
+  - DFlash2's single pass costs about 3 ms less per step on the B200 than MTP's three sequential passes, 10–13% of
+    the step.
+  - DFlash2 drafts the whole block in that one pass, so its draft cost barely grows with k.
+- **Verification.** With the same drafter, k = 3 → 7 adds 25% to the decode part on the B200.
+  - The target runs 14 × (k + 1) rows through its 48 layers: 56 rows at k = 3, 112 at k = 7.
+  - Each token routes to 10 of 512 experts. With independent routing, a layer touches about 342 experts at 56 rows
+    and 456 at 112: 33% more expert weights to read. Attention and GDN work also grow linearly with rows.
+  - So verifying more is not free for this MoE, unlike a dense model at small batch. Even for one sequence, 8 rows
+    touch about 75 experts against 39 for 4.
+- **RTX PRO 6000.** The k = 7 decode part is 1.21× MTP-3's, against 1.09–1.13× on the B200. With no clean RTX
+  k = 3 run, the drafting saving and the verify growth cannot be separated there.
+- **Prefill.** k = 7 computes more prefill per second than MTP-3 on both GPUs. On the B200 that is
+  283 / 40.1 ms ≈ 7.1K against 166 / 32.0 ms ≈ 5.2K tokens/s. This is the cost of the lower hit rate (90% vs
+  92.8% on the B200, 88–89% vs 92–93% on Kaggle).
+- **dflash2-k3 v2 is not used.** Its fixed term is inflated: during its prefill storm, most steps were mixed
+  prefill and decode batches.
+
+The step count assumes that every running request drafts in every step. A request in prefill does not draft, so
+steps are slightly undercounted. That is at most about one request in 14 while a 2,048-token chunk prefills, and
+more in prefill-heavy runs.
+
+### k = 4 with a BF16 drafter KV (next)
+
+Prediction for Kaggle, against v6's MTP-3:
+- **Acceptance.** The first four positions of k7 v3 give 1 + .740 + .529 + .376 + .270 = 2.92. The same sum over
+  three positions gives 2.65, and k3 v2 measured 2.68.
+- **Decode part of a step.** RTX k = 3 is not measured. B200's ratios (k3 / MTP-3 0.87–0.90×, k7 / k3 1.25×),
+  applied to the RTX numbers, give about 31–36 ms. k = 4 adds one row per sequence: 383 against 342 experts, 36% of
+  the k = 3 → 7 step. That gives about 36–39 ms.
+- **Throughput.** 2.92 / (36–39 ms + 9–13.5 ms of prefill) against 2.74 / 45.0 ms: −9% to +6%.
+- **BF16 drafter KV.** For MTP it raised acceptance by 4.8% at the same step time
+  ([above](#measured-in-vllm-on-frida)).
+  - MTP lost most of that at positions 2–3, where it reads its own drafts back from the cache. DFlash2 drafts its
+    block in one pass and never does that, so a smaller gain is expected. It is not measured.
+  - The sliding-window group's pages double (2,048 → 4,096 B per token per layer). Whether it boots and what the KV
+    pool becomes are also unknown.
+
+The run measures those unknowns: the RTX decode cost at small k and DFlash2 with a BF16 drafter KV. The MTP
+comparison that counts now is `tuned-mtp-bf16-kv` (fine-tuned MTP head plus BF16 drafter KV), not v6.
 
 ## Reproduce
 
@@ -373,6 +439,9 @@ python -m inference.tools.drafter_stats bytes $K/mtp-dense.safetensors $K/mtp-ro
 python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log
 python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k3/v02/vllm-openai-server.log   # 2.676
 python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k7/v03/vllm-openai-server.log   # 3.336
+for r in porting-advaith/v06 dflash2-k7/v03 dflash2-k3/v02; do                                    # step-time table
+  python -m inference.tools.drafter_stats steps runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log; done
+# B200 rows: the same on /shared/workspace/arc-agi-3/dflash2_b200/out/{209821/C,209829/B,209829/A}/vllm-openai-server.log
 make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k7 VERSION=3                                             # the k = 7 run
 curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
   | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256

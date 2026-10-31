@@ -8,8 +8,14 @@ KAGGLE_API_TOKEN or ~/.kaggle/access_token). `--prefix mtp.` keeps the draft hea
 accept: mean acceptance length and per-position rates from a vLLM server log ("SpecDecoding metrics" lines,
 token-weighted), or SGLang's mean "accept len" over its decode lines.
 
+steps: decode-step time from a vLLM server log's 10-s stats lines. Each interval's steps are its drafts (drafted
+tokens / k) over the running requests, so step time = interval x running / drafts. Prefill tokens per step are the
+interval's prompt tokens over its steps. A least-squares line, step = fixed + slope x prefill tokens, splits off the
+prefill. Intervals with fewer than --min-running requests are skipped (start-up and wind-down).
+
     python -m inference.tools.drafter_stats bytes URL [URL ...] [--prefix mtp.]
     python -m inference.tools.drafter_stats accept runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log
+    python -m inference.tools.drafter_stats steps runs/kaggle/<owner>/<notebook>/vNN/vllm-openai-server.log
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ import struct
 import sys
 import urllib.request
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 ROLES = (  # first match wins
@@ -81,6 +88,40 @@ def acceptance(log: Path) -> dict:
     return dict(engine=None)
 
 
+def step_times(log: Path, min_running: int = 12) -> dict:
+    engine: dict[str, tuple[float, int]] = {}
+    spec: dict[str, tuple[int, int]] = {}
+    for line in open(log, errors="ignore"):
+        stamp = re.search(r" (\d\d-\d\d \d\d:\d\d:\d\d) ", line)
+        if not stamp:
+            continue
+        if m := re.search(r"Avg prompt throughput: ([\d.]+) tokens/s.*Running: (\d+) reqs", line):
+            engine[stamp.group(1)] = (float(m.group(1)), int(m.group(2)))
+        elif m := re.search(r"Drafted: (\d+) tokens, Per-position acceptance rate: ([\d., ]+)", line):
+            spec[stamp.group(1)] = (int(m.group(1)), len([x for x in m.group(2).split(",") if x.strip()]))
+    clock = lambda s: datetime.strptime("2026-" + s, "%Y-%m-%d %H:%M:%S")
+    stamps = sorted(set(engine) & set(spec))
+    rows = []  # (step ms, prefill tokens per step)
+    for before, now in zip(stamps, stamps[1:]):
+        seconds = (clock(now) - clock(before)).total_seconds()
+        prompt, running = engine[now]
+        drafted, k = spec[now]
+        if running < min_running or not drafted or seconds <= 0:
+            continue
+        steps = drafted / k / running
+        rows.append((1000 * seconds / steps, prompt * seconds / steps))
+    n = len(rows)
+    if n < 2:
+        return dict(intervals=n)
+    mean_t, mean_p = sum(t for t, _ in rows) / n, sum(p for _, p in rows) / n
+    slope = sum((p - mean_p) * (t - mean_t) for t, p in rows) / sum((p - mean_p) ** 2 for _, p in rows)
+    fixed = mean_t - slope * mean_p
+    residual = sum((t - fixed - slope * p) ** 2 for t, p in rows)
+    r2 = 1 - residual / sum((t - mean_t) ** 2 for t, _ in rows)
+    return dict(intervals=n, step_ms=round(mean_t, 1), prefill_tokens_per_step=round(mean_p),
+                fixed_ms=round(fixed, 1), us_per_prefill_token=round(1000 * slope, 1), r2=round(r2, 2))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -89,9 +130,15 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--prefix", default="")
     a = sub.add_parser("accept")
     a.add_argument("log", type=Path)
+    s = sub.add_parser("steps")
+    s.add_argument("log", type=Path)
+    s.add_argument("--min-running", type=int, default=12)
     args = parser.parse_args(argv)
     if args.command == "accept":
         print(json.dumps(acceptance(args.log)))
+        return 0
+    if args.command == "steps":
+        print(json.dumps(step_times(args.log, args.min_running)))
         return 0
     rows = tensor_bytes(args.urls, args.prefix)
     total = 0
