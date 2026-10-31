@@ -1456,6 +1456,51 @@ def pin_ple_table_at_exact_size(manifest: dict) -> None:
     print(f'PLE table pinned at its exact size in {ple_py}', flush=True)
 
 
+# A draft kv_cache_dtype gives the drafter a replace()d copy of the cache config before the platform raises the
+# attention block size to 1664 in place on the engine's config, so the draft's QSA caches kept block_size 16: its
+# indexer compressed-key cache became a group of 16-token blocks strided by the widest packed page (24.5 MB), 9,192
+# blocks for one 147,072-token request, "211.88 GiB KV cache is needed" (draft-bf16-kv v1; Frida job 209822). The
+# QSA caches take the block size from the engine config get_kv_cache_spec is handed instead.
+DRAFT_QSA_BLOCK_SIZE_PATCHES = (
+    (
+        '    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n'
+        '        del vllm_config\n'
+        '        return MLAAttentionSpec(\n'
+        '            block_size=self.cache_config.block_size,\n',
+        '    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n'
+        '        return MLAAttentionSpec(\n'
+        '            block_size=vllm_config.cache_config.block_size,\n',
+    ),
+    (
+        '        assert self.cache_config.block_size % capacity == 0, (\n',
+        '        assert vllm_config.cache_config.block_size % capacity == 0, (\n',
+    ),
+    (
+        '            f"size {self.cache_config.block_size}"\n',
+        '            f"size {vllm_config.cache_config.block_size}"\n',
+    ),
+)
+
+
+def use_engine_block_size_for_draft_qsa(manifest: dict) -> None:
+    '''With a draft kv_cache_dtype, let the draft's QSA caches see the engine's final block size.
+
+    Without a draft dtype the drafter shares the engine's cache config and nothing changes. Each anchor must occur
+    exactly once in the runtime's qsa_cache.py, otherwise the setup fails before the load.
+    '''
+    if not VLLM_DRAFT_KV_CACHE_DTYPE:
+        return
+    path = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models' / 'qwen4_exp' / 'common'
+            / 'qsa_cache.py')
+    source = path.read_text(encoding='utf-8') if path.is_file() else ''
+    for anchor, replacement in DRAFT_QSA_BLOCK_SIZE_PATCHES:
+        if source.count(anchor) != 1:
+            raise RuntimeError(f'draft QSA block-size anchor appears {source.count(anchor)} times in {path}:\n{anchor}')
+        source = source.replace(anchor, replacement)
+    path.write_text(source, encoding='utf-8')
+    print(f'Draft QSA caches take the engine block size in {path}', flush=True)
+
+
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
 # INCConfig that check comes before the unquantized route above, which the FP8 table needs.
 FP8_PLE_RUNTIME_MARKERS = (
@@ -1967,6 +2012,7 @@ def start_vllm_server() -> None:
     manifest = install_image_runtime()
     route_inc_ple_to_unquantized(manifest)
     pin_ple_table_at_exact_size(manifest)
+    use_engine_block_size_for_draft_qsa(manifest)
     check_runtime_reads_fp8_ple(manifest)
     draft_model_dir = assemble_mtp_draft()
     server_env = build_image_runtime_env(manifest)

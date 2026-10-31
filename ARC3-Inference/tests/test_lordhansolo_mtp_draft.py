@@ -92,3 +92,43 @@ def test_draft_kv_cache_dtype_reaches_the_speculative_config(monkeypatch, dtype)
         model_source=TARGET_REF, draft_model_source=DRAFT_REF, draft_kv_cache_dtype=dtype))
     assert f"VLLM_DRAFT_KV_CACHE_DTYPE = {dtype!r}" in script
     assert "speculative_config['kv_cache_dtype'] = VLLM_DRAFT_KV_CACHE_DTYPE" in script
+
+
+def _draft_qsa_namespace(dtype: str, root):
+    script = lord._DUCK_VLLM_SETUP_SCRIPT
+    start = script.index("DRAFT_QSA_BLOCK_SIZE_PATCHES = (")
+    end = script.index("\n\n\n", script.index("def use_engine_block_size_for_draft_qsa"))
+    namespace = {"Path": Path, "IMAGE_RUNTIME_ROOT": root, "VLLM_DRAFT_KV_CACHE_DTYPE": dtype}
+    exec(script[start:end], namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("dtype", ["", "auto"])
+def test_draft_qsa_caches_take_the_engine_block_size(tmp_path, dtype):
+    ns = _draft_qsa_namespace(dtype, tmp_path)
+    path = tmp_path / "dist" / "vllm" / "models" / "qwen4_exp" / "common" / "qsa_cache.py"
+    path.parent.mkdir(parents=True)
+    original = "# filler\n".join(["", *(anchor for anchor, _ in ns["DRAFT_QSA_BLOCK_SIZE_PATCHES"]), ""])
+    path.write_text(original)
+    ns["use_engine_block_size_for_draft_qsa"]({"dist_packages": "dist"})
+    text = path.read_text()
+    if not dtype:
+        assert text == original  # the drafter shares the engine's cache config: nothing to change
+        return
+    assert "self.cache_config.block_size" not in text
+    assert text.count("vllm_config.cache_config.block_size") == 3
+    assert "del vllm_config" not in text
+
+
+def test_draft_qsa_patch_fails_on_a_missing_anchor(tmp_path):
+    ns = _draft_qsa_namespace("auto", tmp_path)
+    path = tmp_path / "dist" / "vllm" / "models" / "qwen4_exp" / "common" / "qsa_cache.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("nothing here\n")
+    with pytest.raises(RuntimeError, match="anchor appears 0 times"):
+        ns["use_engine_block_size_for_draft_qsa"]({"dist_packages": "dist"})
+
+
+def test_setup_patches_the_draft_qsa_block_size_after_the_ple_pin():
+    assert re.search(r"pin_ple_table_at_exact_size\(manifest\)\n\s+use_engine_block_size_for_draft_qsa\(manifest\)",
+                     lord._DUCK_VLLM_SETUP_SCRIPT)
