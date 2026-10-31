@@ -101,6 +101,9 @@ VLLM_DRAFT_METHODS = ("mtp", "dflash")
 # there, whose XQA decode kernel for its sliding window is JIT-built at startup and fails to link
 # on the image runtime (no libcudart.so, dflash2-k3/k7 v1).
 DEFAULT_VLLM_DRAFT_ATTENTION_BACKEND = ""
+# server.draft_kv_cache_dtype: the draft model's KV cache dtype (speculative_config kv_cache_dtype); "auto" is the
+# model dtype (BF16). Empty lets the draft inherit kv_cache_dtype, as every run before draft-bf16-kv did.
+DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE = ""
 # kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
 # weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
 # carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
@@ -177,6 +180,7 @@ class DuckKaggleVllmConfig:
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
     draft_method: str = DEFAULT_VLLM_DRAFT_METHOD
     draft_attention_backend: str = DEFAULT_VLLM_DRAFT_ATTENTION_BACKEND
+    draft_kv_cache_dtype: str = DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
     ple_model_source: str = DEFAULT_VLLM_PLE_MODEL_SOURCE
 
@@ -264,6 +268,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
         "__VLLM_DRAFT_METHOD__": repr(cfg.draft_method),
         "__VLLM_DRAFT_ATTENTION_BACKEND__": repr(cfg.draft_attention_backend),
+        "__VLLM_DRAFT_KV_CACHE_DTYPE__": repr(str(cfg.draft_kv_cache_dtype)),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__PLE_MODEL_SOURCE_PARTS__": repr(ple_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
@@ -1013,6 +1018,8 @@ DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
 VLLM_DRAFT_METHOD = __VLLM_DRAFT_METHOD__
 # The draft model's attention backend, or '' for vLLM's choice.
 VLLM_DRAFT_ATTENTION_BACKEND = __VLLM_DRAFT_ATTENTION_BACKEND__
+# The draft model's KV cache dtype, or '' to inherit the target's.
+VLLM_DRAFT_KV_CACHE_DTYPE = __VLLM_DRAFT_KV_CACHE_DTYPE__
 # A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
 PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 # A checkpoint that supplies the model-ple-* files a partial target lacks, or None for a complete target.
@@ -1495,6 +1502,51 @@ def pin_ple_table_at_exact_size(manifest: dict) -> None:
         source.replace(EXACT_PINNED_PLE_ANCHOR, EXACT_PINNED_PLE_CALL) + EXACT_PINNED_PLE_HELPERS, encoding='utf-8'
     )
     print(f'PLE table pinned at its exact size in {ple_py}', flush=True)
+
+
+# A draft kv_cache_dtype gives the drafter a replace()d copy of the cache config before the platform raises the
+# attention block size to 1664 in place on the engine's config, so the draft's QSA caches kept block_size 16: its
+# indexer compressed-key cache became a group of 16-token blocks strided by the widest packed page (24.5 MB), 9,192
+# blocks for one 147,072-token request, "211.88 GiB KV cache is needed" (draft-bf16-kv v1; Frida job 209822). The
+# QSA caches take the block size from the engine config get_kv_cache_spec is handed instead.
+DRAFT_QSA_BLOCK_SIZE_PATCHES = (
+    (
+        '    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n'
+        '        del vllm_config\n'
+        '        return MLAAttentionSpec(\n'
+        '            block_size=self.cache_config.block_size,\n',
+        '    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n'
+        '        return MLAAttentionSpec(\n'
+        '            block_size=vllm_config.cache_config.block_size,\n',
+    ),
+    (
+        '        assert self.cache_config.block_size % capacity == 0, (\n',
+        '        assert vllm_config.cache_config.block_size % capacity == 0, (\n',
+    ),
+    (
+        '            f"size {self.cache_config.block_size}"\n',
+        '            f"size {vllm_config.cache_config.block_size}"\n',
+    ),
+)
+
+
+def use_engine_block_size_for_draft_qsa(manifest: dict) -> None:
+    '''With a draft kv_cache_dtype, let the draft's QSA caches see the engine's final block size.
+
+    Without a draft dtype the drafter shares the engine's cache config and nothing changes. Each anchor must occur
+    exactly once in the runtime's qsa_cache.py, otherwise the setup fails before the load.
+    '''
+    if not VLLM_DRAFT_KV_CACHE_DTYPE:
+        return
+    path = (IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models' / 'qwen4_exp' / 'common'
+            / 'qsa_cache.py')
+    source = path.read_text(encoding='utf-8') if path.is_file() else ''
+    for anchor, replacement in DRAFT_QSA_BLOCK_SIZE_PATCHES:
+        if source.count(anchor) != 1:
+            raise RuntimeError(f'draft QSA block-size anchor appears {source.count(anchor)} times in {path}:\n{anchor}')
+        source = source.replace(anchor, replacement)
+    path.write_text(source, encoding='utf-8')
+    print(f'Draft QSA caches take the engine block size in {path}', flush=True)
 
 
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
@@ -2164,6 +2216,8 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
             speculative_config['model'] = str(draft_model_dir)
         if VLLM_DRAFT_ATTENTION_BACKEND:
             speculative_config['attention_backend'] = VLLM_DRAFT_ATTENTION_BACKEND
+        if VLLM_DRAFT_KV_CACHE_DTYPE:
+            speculative_config['kv_cache_dtype'] = VLLM_DRAFT_KV_CACHE_DTYPE
         if VLLM_DRAFT_VOCAB and VLLM_DRAFT_METHOD == 'mtp':
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]
@@ -2289,6 +2343,7 @@ def start_vllm_server() -> None:
     manifest = install_image_runtime()
     route_inc_ple_to_unquantized(manifest)
     pin_ple_table_at_exact_size(manifest)
+    use_engine_block_size_for_draft_qsa(manifest)
     check_runtime_reads_fp8_ple(manifest)
     patch_runtime_for_dflash(manifest)
     draft_model_dir = resolve_dflash_draft() if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft()
