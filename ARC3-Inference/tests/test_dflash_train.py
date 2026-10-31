@@ -134,13 +134,15 @@ def test_blocks_trained_together_equal_blocks_drafted_alone(window):
 
 
 def test_flex_attention_matches_dense():
-    model = tiny_draft(6)
+    device = "cuda" if torch.cuda.is_available() else "cpu"  # flex_attention compiles for GPUs only
+    model = tiny_draft(6).to(device)
     features, anchors, embeds = torch.randn(40, 64), torch.tensor([3, 11, 30]), torch.randn(3, 8, 32)
+    features, anchors, embeds = features.to(device), anchors.to(device), embeds.to(device)
     dense = model(embeds, anchors, features, attention="dense")
     try:
         flex = model(embeds, anchors, features, attention="flex")
     except Exception as exc:  # noqa: BLE001 - flex_attention needs a compiler backend on this host
-        pytest.skip(f"flex_attention unavailable on CPU here: {type(exc).__name__}")
+        pytest.skip(f"flex_attention unavailable here: {type(exc).__name__}")
     assert torch.allclose(dense, flex, atol=1e-4)
 
 

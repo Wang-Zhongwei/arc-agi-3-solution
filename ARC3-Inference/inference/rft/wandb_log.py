@@ -72,6 +72,15 @@ class WandbLogger:
         self.run.log({k: v for k, v in metrics.items() if v is not None})
 
 
+def new_run_id() -> str:
+    """A fresh wandb run id: wandb.util.generate_id where it exists (newer wandb dropped it), else 8 base-36 chars."""
+    import secrets
+
+    import wandb
+    generate = getattr(wandb.util, "generate_id", None)
+    return generate() if generate else "".join(secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(8))
+
+
 def start(project: str, name: str | None, run_id: str | None, config: dict[str, Any], entity: str | None = None):
     import wandb
     return wandb.init(project=project, entity=entity, name=name, id=run_id, resume="allow" if run_id else None,

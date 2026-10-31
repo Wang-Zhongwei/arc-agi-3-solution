@@ -278,8 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             id_file = args.out / "wandb_id.txt"
             run_id = id_file.read_text().strip() if id_file.exists() else None
             if run_id is None:
-                import wandb
-                run_id = wandb.util.generate_id()
+                run_id = wandb_log.new_run_id()
                 id_file.write_text(run_id)
             run = wandb_log.start(args.wandb_project, args.wandb_run_name, run_id,
                                   {k: str(v) for k, v in vars(args).items()}, args.wandb_entity)
