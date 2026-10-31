@@ -6,17 +6,18 @@ GitHub links and `jonathanwang2022/*` Kaggle notebooks are private; Hugging Face
 
 ## Summary
 
-**Served: the fine-tuned MTP head with an FP8 drafter KV** ([decision](#decision)). Kaggle acceptance length is 2.805
-against v6's 2.662 over the same 15 minutes, with v6's KV pool and no prefill storm.
+**Decision: if we serve MTP, it is the fine-tuned head with an FP8 drafter KV and k = 3** ([decision](#decision),
+[config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/b35f2e9715d09f9bc80a1315c4a4d15bd774f059/ARC3-Inference/configs/tuned-mtp-fp8-kv/v1.json)). Kaggle acceptance length is 2.805 against v6's 2.662 over the same 15 minutes, with v6's KV pool
+and no prefill storm. BF16 drafter KV storms; k = 4 accepts more but is not faster on the RTX PRO 6000.
 
 | Drafter | Acceptance length (Kaggle) | Gen tok/s vs its baseline | Verdict | Section |
 |---|---|---|---|---|
 | Intel BF16 MTP, 3 tokens | 2.752 | 737 vs 820 (Lord) | 5.2 GB; replaced by Lord's | [Quantization](#expert-quantization-costs-no-acceptance) |
 | Lord NVFP4 MTP, 3 tokens (porting-advaith v6) | 2.743 | 894 | baseline | [Quantization](#expert-quantization-costs-no-acceptance) |
 | Lord MTP, BF16 drafter KV | 2.910 (Frida) | step cost unchanged | +0.13 acceptance, −6.9% pool | [Drafter KV](#drafter-kv-precision) |
-| **Fine-tuned MTP, FP8 drafter KV** | **2.805** (v6: 2.662, first 15 min) | **+3.3%** | **served** | [Kaggle](#on-kaggle) |
+| **Fine-tuned MTP, FP8 drafter KV, k = 3** | **2.805** (v6: 2.662, first 15 min) | **+3.3%** | **chosen** | [Kaggle](#on-kaggle) |
 | Fine-tuned MTP, BF16 drafter KV | 2.882 (first 15 min) | +5–7% until a storm at minute 13 | rejected | [Kaggle](#on-kaggle) |
-| Fine-tuned MTP, FP8 KV, 4 tokens | 3.055 (Kaggle 0–15 min; k = 3: 2.805); Frida 3.249 | Kaggle gen −1.2% vs k = 3 (Frida −9.9% time per token) | no gain on the RTX: a step costs ~10% more | [k = 4](#k--4) |
+| Fine-tuned MTP, FP8 KV, 4 tokens | 3.055 (Kaggle 0–15 min; k = 3: 2.805); Frida 3.249 | Kaggle gen −1.2% vs k = 3 (Frida −9.9% time per token) | rejected: a step costs ~10% more on the RTX | [k = 4](#k--4) |
 | DFlash2 k = 3 (B200 replay) | 2.843 (B200) | +1% (B200) | no gain | [DFlash2](#dflash2-block-drafter-incoai) |
 | DFlash2 k = 7 | 3.336 | −10.1% (first 30 min) | slower | [DFlash2](#dflash2-block-drafter-incoai) |
 | DFlash2 k = 4, BF16 drafter KV | 2.902 | storm from minute 10 (pool −35.5%) | rejected; k = 7 ≥ k = 4 | [k = 4 vs k = 7](#k--4-vs-k--7) |
@@ -182,11 +183,18 @@ server's first metrics line (90 lines each; the FP8 run winds down after that).
 
 ### Decision
 
-Serve the fine-tuned head with the FP8 drafter KV.
-- BF16 adds only +0.08 acceptance on Kaggle (2.882 vs 2.805) and +0.12 on Frida (3.020 vs 2.898).
-- BF16 costs 7% of the pool and storms at 14 streams. Avoiding the storm takes 13 streams (1,455,400 / 13 ≈ 112.0K
-  tokens each, as v6's 111.7K). Losing a stream likely costs more than the gain; that is not measured.
-- FP8 keeps v6's pool and leaves room for a fourth draft token.
+Decided 2026-10-31: if we serve MTP, we serve the fine-tuned head (mtp-v1-50m) with an FP8 drafter KV and k = 3
+(`mtp_tokens: 3`), as in [`tuned-mtp-fp8-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv) v1
+([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/b35f2e9715d09f9bc80a1315c4a4d15bd774f059/ARC3-Inference/configs/tuned-mtp-fp8-kv/v1.json)): the draft model
+`jonathanwang2022/qwen3-8-flash-next-mtp-tuned/PyTorch/default/1`, `draft_kv_cache_dtype` empty (inherits
+`fp8_e4m3`), v6's `prefix_match_unit` 128 and the runtime's CUDA graph list.
+- **FP8 over BF16 drafter KV.** BF16 adds only +0.08 acceptance on Kaggle (2.882 vs 2.805) and +0.12 on Frida (3.020
+  vs 2.898). It costs 7% of the pool and storms at 14 streams. Avoiding the storm takes 13 streams (1,455,400 / 13 ≈
+  112.0K tokens each, as v6's 111.7K), and losing a stream likely costs more than the gain (not measured).
+- **k = 3 over k = 4.** k = 4 raises Kaggle acceptance to 3.055 (+8.9%), but generation is 934 against 945 tok/s
+  (−1.2%) over the same 15 minutes: on the RTX PRO 6000 a k = 4 step costs about 10% more, against 1% on the B200
+  ([k = 4](#k--4)). It also needs `prefix_match_unit` 112 and its own CUDA graph list, and it peaked at 92.4% KV.
+- **Over v6 (Lord's head):** +5.4% acceptance and +3.3% generation over the first 15 minutes, with the same pool.
 
 ### k = 4
 
@@ -252,7 +260,7 @@ Serve the fine-tuned head with the FP8 drafter KV.
   - KV peaked at 92.4% in minute 14–15, near where BF16 drafter KV started storming (93–95%); no storm in 15 minutes.
   - **v2 is not usable:** its server took 25 minutes to come up (17:25 → 17:50 UTC), leaving about 2.5 minutes of
     play, so the graph-list A/B on the RTX did not happen.
-  - One run, 15 minutes: k = 4 does not raise throughput on Kaggle; k = 3 with the fine-tuned head stays the setup.
+  - One run, 15 minutes: k = 4 does not raise throughput on Kaggle, so the [decision](#decision) keeps k = 3.
 
 ## DFlash2 block drafter (incoai)
 
