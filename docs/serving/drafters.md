@@ -1,8 +1,9 @@
 # Flash-Next draft heads: quantization, size and acceptance
 
-All three drafters we have served are the same MTP layer of Qwen3.8-Flash-Next (one decoder layer with QSA attention,
+All four drafters we have served are the same MTP layer of Qwen3.8-Flash-Next (one decoder layer with QSA attention,
 hyper-connections and a 512-expert MoE, plus `fc_embedding`, `fc_hidden`, two pre-norms and a final mixer). They differ
 only in how the 512 routed experts are stored, and whether the checkpoint carries its own `embed_tokens` / `lm_head`.
+The fine-tuned head is Lord's with retrained dense tensors ([its section](#fine-tuned-mtp-head-mtp-v1-50m)).
 DFlash2, a separate block drafter, has [its own section](#dflash2-block-drafter-incoai) below.
 
 | Drafter | Source | Routed experts | Everything else in the MTP layer | Own embed + lm_head | Bytes |
@@ -10,6 +11,7 @@ DFlash2, a separate block drafter, has [its own section](#dflash2-block-drafter-
 | Intel BF16 MTP (the target checkpoint's own layer) | Kaggle [`dfranzen/intel-qwen3.8-flash-next-w4a16-autoround`](https://www.kaggle.com/models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround) = HF [`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/tree/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897), `model_extra_tensors.safetensors` | BF16 (5.033 GB) | BF16 (0.181 GB) | no (the target's) | **5.214 GB** |
 | Lord NVFP4 MTP | Kaggle [`lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8`](https://www.kaggle.com/models/lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8), variation `hf-mixed-mtp-nvfp4/1` = HF [`primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8@07915ee`](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/tree/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4) `mtp_nvfp4/` | NVFP4 W4A4 (1.416 GB: U8 codes 1.258 + FP8 E4M3 scales 0.157) | BF16 (0.181 GB), **bit-identical to Intel's** (29 of 29 tensors) | no (the target's) | **1.597 GB** |
 | Daniel's albucino INT4 | Kaggle [`dfranzen/albucino-qwen3-8-flash-next-drafter`](https://www.kaggle.com/models/dfranzen/albucino-qwen3-8-flash-next-drafter) `default/1` | INT4 (1.416 GB: I32-packed codes 1.258 + BF16 scales 0.157) | BF16 (0.181 GB) | yes, BF16 (2.542 GB) | **4.140 GB** |
+| Fine-tuned MTP (mtp-v1-50m, step 1300) | Kaggle [`jonathanwang2022/qwen3-8-flash-next-mtp-tuned`](https://www.kaggle.com/models/jonathanwang2022/qwen3-8-flash-next-mtp-tuned) `PyTorch/default/1` (private) | Lord's NVFP4 file, unchanged (1.416 GB) | BF16 (0.181 GB), retrained: same 29 tensors, names, dtypes and shapes | a byte copy of the target's (2.542 GB), replaced by the target's at load | **1.597 GB** |
 
 ## Quantization of each layer
 
@@ -186,11 +188,122 @@ Reading the table:
 What this does not show:
 - the RTX PRO 6000 (Kaggle's GPU) kernels;
 - KV pressure. The B200's pool is 7× Kaggle's, so the 6.9% smaller pool was never stressed. v6 ran its 21.7 GiB pool at
-  89% (p99) and 93% (peak) with 14 streams, so only a Kaggle run shows whether the smaller pool costs queueing late in
-  a game.
+  89% (p99) and 93% (peak) with 14 streams. The first Kaggle run with BF16 drafter KV hit a prefill storm at minute 13
+  (see [Served on Kaggle](#served-on-kaggle-with-bf16-drafter-kv-tuned-mtp-bf16-kv-v1)).
 
 The files are in `runs/local/frida/vllm-replay-draft-kv/runs/`: `metrics_before.txt`, `metrics_after.txt`,
 `replay.jsonl`, `server.log`, and the job output.
+
+## Fine-tuned MTP head (mtp-v1-50m)
+
+Lord's NVFP4 head with its 29 dense (non-expert) tensors retrained; the routed experts, `embed_tokens` and `lm_head`
+are frozen.
+
+### Training
+
+- **Trainer:** [`inference/rft/mtp_train.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_train.py) (branch
+  `mtp-data`, commit [`e0d1f88e`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/e0d1f88e36af708602cc026a973bd70ccbf1529f), as recorded by the job), Slurm job 209705 on one Frida B200.
+  The frozen Intel W4A16 target runs forward only. The head learns the target's sampling distribution (T 0.7, top-k 20,
+  top-p 0.95) with a soft cross-entropy at each of the 3 draft positions. Embedding and `lm_head` are the target's.
+- **Data:** `mtp_v1` from [`inference/rft/mtp_data.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_data.py),
+  every request of 54 Intel-W4A16 runs. Train: 3,821 samples, 137M trained tokens. Eval: 842 samples from games ar25,
+  cd82, cn04, g50t and sk48, none of which are in train.
+- **Run:** 1,400 samples drawn round-robin over games (about 50M trained tokens), LR 3e-5, eval every 100 steps on 48
+  eval samples, best checkpoint kept.
+- **Offline result:** the acceptance length rises from 2.943 at step 0 (Lord's head as loaded) to **3.080** at step 1300
+  (per position 0.839 / 0.686 / 0.555), the best of 15 evals. This offline eval runs in transformers with BF16 KV
+  everywhere. Log: `/shared/workspace/arc-agi-3/mtp_finetune/runs/mtp-v1-50m/train_log.jsonl` on Frida.
+
+### The served checkpoint
+
+The trainer's own export (`draft/`) cannot be served as it is:
+- It adds the retrained tensors in `mtp-finetuned-bf16.safetensors` and hard-links Lord's other files.
+- Three of those files (`carry-model-bf16-00010/11/12`) are needed for `embed_tokens` and `lm_head`, but they also
+  still hold Lord's original 29 dense tensors.
+- The runtime's loader picks tensors by name (`mtp.*`), not by the file the index assigns them to
+  (`_filter_safetensors_files_by_weight_name` in `vllm/model_executor/model_loader/default_loader.py`). Both copies
+  would load, and the load order would decide which one is served.
+
+[`inference/rft/frida/build_tuned_draft.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/68b1a5c63fc476652f69e82f077a1bcdfd603285/ARC3-Inference/inference/rft/frida/build_tuned_draft.py)
+(standard library only) writes each draft tensor once:
+
+| File | Tensors | Bytes |
+|---|---|---|
+| `mtp-experts-nvfp4.safetensors` | 6,144: Lord's NVFP4 experts, unchanged | 1,416,330,416 |
+| `mtp-finetuned-bf16.safetensors` | 29: the retrained dense tensors | 181,140,352 |
+| `draft-shared-bf16.safetensors` | `lm_head.weight` and `model.language_model.embed_tokens.weight`, byte copies | 2,542,797,048 |
+| `config.json`, `model.safetensors.index.json` | Lord's config; an index of exactly these 6,175 tensors | |
+
+- **Checks:** the build stops unless the retrained tensors have Lord's exact names, dtypes and shapes.
+- **Embedding and `lm_head`:** these are byte-identical in Intel's target, Lord's checkpoint and this folder (SHA-256
+  of the tensor bytes begins `40bddd25` for `lm_head` and `62288a3f` for `embed_tokens`).
+- **What VRAM holds:** at load the runtime replaces the draft's embedding and `lm_head` with the target's
+  (`maybe_share_target_embed` and the `lm_head` share in `vllm/v1/worker/gpu/spec_decode/eagle/utils.py`;
+  `Qwen4ExpMTP` sets no `has_own_*` flag).
+- **The 32K draft-vocabulary head:** it is cut from the draft's own `lm_head` before that swap (`build_draft_vocab_head`
+  in `vllm/models/qwen4_exp/nvidia/mtp.py`), and that copy is identical to the target's.
+- **Weight memory:** the drafter adds 1.597 GB, as Lord's head does. "Model loading took 69.54 GiB" in both v6 and the
+  Kaggle run below.
+
+### Measured in vLLM on Frida
+
+The same harness, requests and sampling as [the drafter KV replay](#measured-in-vllm-on-frida), on one B200 (job
+209913). The draft directory is the folder above, mounted in place of Lord's through the `LORD_DIR` override in
+`run_vllm.sbatch`.
+
+| Head | Drafter KV | Acceptance length | Per position | Time per output token | Decode tok/s per request | Job |
+|---|---|---|---|---|---|---|
+| Lord | FP8 | 2.777 | 0.776 / 0.578 / 0.422 | 37.10 ms | 26.52 | 209838 |
+| Lord | BF16 | 2.910 | 0.790 / 0.624 / 0.496 | 35.23 ms | 27.77 | 209834 |
+| **fine-tuned** | BF16 | **3.020** | 0.820 / 0.664 / 0.537 | **34.14 ms** | **28.75** | 209913 |
+
+- **Where the gain comes from:** BF16 drafter KV adds +0.133 and the fine-tuned head another +0.110. Together that is
+  +0.243 (+8.8%) over v6's served setup.
+- **Speed:** time per token × tokens per step is 103.1 ms, the same step cost as both Lord arms, so the gain is all
+  acceptance.
+- **Wall time:** 946 s end to end, the same as the other arms (the replay is prefill-bound).
+- **Files:** `runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16/` and `arc3_vllm_lord-209913.txt`.
+
+### Served on Kaggle with BF16 drafter KV (tuned-mtp-bf16-kv v1)
+
+[`jonathanwang2022/tuned-mtp-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-bf16-kv) v1:
+- **Config:** [`configs/tuned-mtp-bf16-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/d2532fe17c3e2ea709bd23126739a62b48752269/ARC3-Inference/configs/tuned-mtp-bf16-kv/v1.json)
+  at [`d2532fe1`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/d2532fe17c3e2ea709bd23126739a62b48752269) on branch `draft-bf16-kv`.
+- **Against porting-advaith v6:** the fine-tuned draft, `draft_kv_cache_dtype: auto` with the
+  [block-size fix](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6c8bffd173c72b657e10052c755d749411614f6f), and a 30-minute public run (17.7 minutes after the server came up). Everything
+  else is identical.
+- **KV pool:** 1,455,400 tokens against v6's 1,564,172 (−7.0%), from the same 21.73 GiB.
+
+Minutes after the server's first metrics line, means of vLLM's 10 s lines, per-position rates as in the table above:
+
+| Minutes | Run | Prompt tok/s | Gen tok/s | KV % (max) | Prefix hit % | Acceptance length | Per position |
+|---|---|---|---|---|---|---|---|
+| 0–5 | fine-tuned + BF16 | 2,090 | 916 | 28.7 (46.3) | 80.7 | 2.825 | 0.783 / 0.594 / 0.463 |
+| | v6 | 2,018 | 862 | 26.9 (41.6) | 80.9 | 2.601 | 0.731 / 0.518 / 0.363 |
+| 5–10 | fine-tuned + BF16 | 1,754 | 1,016 | 60.3 (75.8) | 90.0 | 2.888 | 0.790 / 0.617 / 0.484 |
+| | v6 | 1,649 | 957 | 55.0 (67.0) | 90.4 | 2.671 | 0.745 / 0.541 / 0.385 |
+| 10–15 | fine-tuned + BF16 | 4,677 | 750 | 86.9 (94.7) | 91.8 | 2.947 | 0.806 / 0.642 / 0.511 |
+| | v6 | 1,644 | 959 | 77.9 (86.5) | 92.7 | 2.708 | 0.755 / 0.557 / 0.398 |
+| 15–17.7 | fine-tuned + BF16 | 9,232 | 229 | 74.0 (91.9) | 85.1 | 3.007 | 0.818 / 0.664 / 0.541 |
+| | v6 | 1,753 | 942 | 69.5 (87.5) | 93.6 | 2.700 | 0.753 / 0.551 / 0.396 |
+| **0–17.7** | **fine-tuned + BF16** | | | | | **2.888** | 0.797 / 0.625 / 0.494 |
+| | **v6** | | | | | **2.668** | 0.746 / 0.541 / 0.384 |
+
+- **Acceptance:** +0.220 (+8.2%) over the same window, close to the Frida replay's +0.243.
+- **Before the storm (minutes 0–12):** generation ran about 5–7% faster than v6 (1,000–1,030 against 944–989 tok/s).
+- **The storm:**
+  - The smaller pool, filled by faster generation, was 90.5% full at minute 12; v6 was at 79.8%.
+  - From minute 13, at 93–95%, prompt throughput jumped from about 1.7K to 8–10K tok/s. Generation fell to 190–430 tok/s
+    and the prefix-cache hit rate slid from 93% to 83%.
+  - v6 never stormed at 14 streams; its maximum in the first hour was 88.5%.
+  - The run ended during the storm, so it does not show whether it recovers.
+- **Cause:** the storm comes from the BF16 drafter KV's smaller pool, not from the head, whose weights are the same size.
+- **Ways to keep the gain without the storm:**
+  - Serve the fine-tuned head with FP8 drafter KV. The pool is then v6's, but the head was trained with BF16 KV, so its
+    gain there is unmeasured.
+  - Keep BF16 drafter KV at 13 streams: 1,455,400 / 13 ≈ 112.0K tokens per stream, against v6's 111.7K.
+- **Logs:** `runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log` and
+  `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log`.
 
 ## DFlash2 block drafter (incoai)
 
@@ -443,6 +556,12 @@ for r in porting-advaith/v06 dflash2-k7/v03 dflash2-k3/v02; do                  
   python -m inference.tools.drafter_stats steps runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log; done
 # B200 rows: the same on /shared/workspace/arc-agi-3/dflash2_b200/out/{209821/C,209829/B,209829/A}/vllm-openai-server.log
 make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k7 VERSION=3                                             # the k = 7 run
+make pull-kaggle NOTEBOOK=jonathanwang2022/tuned-mtp-bf16-kv VERSION=1                                      # fine-tuned + BF16
+python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log  # 2.888
+python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --until 17.7  # 2.668
+python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log --bucket 5
+python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --bucket 5
+python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16  # 3.020
 curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
   | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256
 ```
