@@ -3,6 +3,7 @@
 All three drafters we have served are the same MTP layer of Qwen3.8-Flash-Next (one decoder layer with QSA attention,
 hyper-connections and a 512-expert MoE, plus `fc_embedding`, `fc_hidden`, two pre-norms and a final mixer). They differ
 only in how the 512 routed experts are stored, and whether the checkpoint carries its own `embed_tokens` / `lm_head`.
+DFlash2, a separate block drafter, has [its own section](#dflash2-block-drafter-incoai) below.
 
 | Drafter | Source | Routed experts | Everything else in the MTP layer | Own embed + lm_head | Bytes |
 |---|---|---|---|---|---|
@@ -191,6 +192,168 @@ What this does not show:
 The files are in `runs/local/frida/vllm-replay-draft-kv/runs/`: `metrics_before.txt`, `metrics_after.txt`,
 `replay.jsonl`, `server.log`, and the job output.
 
+## DFlash2 block drafter (incoai)
+
+Conclusion: once both prefix-cache patches are in, DFlash2 matches MTP-3's prefix-hit rate. It still does not beat
+MTP-3 on throughput:
+- **k = 3:** the same acceptance as MTP-3 at about the same step cost.
+- **k = 7, B200 replay:** acceptance length 3.66 against 2.87 (+28% tokens per step), but each step costs about
+  1.25× as much, because the target verifies 8 rows per sequence instead of 4. Net +2%.
+- **k = 7, Kaggle (RTX PRO 6000):** acceptance length 3.34 against v6's 2.74, but generation is 10% slower over
+  the first 30 minutes. The step costs about 1.35× MTP-3's, and the prefix-hit rate stays at 88–89% against
+  92–93%.
+
+Drafting is cheaper than MTP's three sequential passes (k = 3 steps cost 0.98× MTP-3's), but at k = 7 the extra
+verify rows dominate.
+
+### The checkpoint
+
+| | |
+|---|---|
+| Source | HF [`incoai/Qwen3.8-Flash-Next-DFlash2@a22a1744`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/tree/a22a1744e85c17364dcc54a6a420af7135d4c7f6) ([`config.json`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/blob/a22a1744e85c17364dcc54a6a420af7135d4c7f6/config.json)) |
+| Our Kaggle copy | `jonathanwang2022/qwen3-8-flash-next-dflash2/Transformers/default/1` (private) |
+| File | `model.safetensors`, 1,206,140,008 B, BF16, sha256 `d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f` (HF `x-linked-etag`) |
+| Layers | 5, all `sliding_attention`, window 2048, non-causal (`is_causal: false`); hidden 2560, 32 query / 8 KV heads × 128 |
+| Draft block | `block_size` 8; `selector_top_k` 16, `selector_rank` 256 |
+| Target taps | `target_layer_ids` [5, 15, 25, 35, 45] of the target's 48 layers |
+| Embed / lm_head | not in the checkpoint; shared with the target |
+
+Serving it on Lord's runtime takes setup-time patches,
+[`DFLASH_RUNTIME_PATCHES`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1621-L1822)
+in the launcher (branch `dflash2-drafter`). They are:
+- admitting `dflash` for Qwen4Exp;
+- guarding the MTP hidden-state buffer;
+- capturing the five taps in the target;
+- rounding the QSA key ring for k > 4;
+- the two prefix-cache fixes below.
+
+### KV pool
+
+From each run's `vllm-openai-server.log` ("GPU KV cache size", "Available KV cache memory", "kv cache group sizes"):
+
+| Run | Drafter | KV pool | Group block sizes |
+|---|---|---|---|
+| porting-advaith v6 | Lord MTP-3 | 1,564,172 tokens / 21.73 GiB | 1664 × 4, 8 |
+| dflash2-k3 v2 | DFlash2, k = 3 | 1,616,364 tokens / 22.23 GiB | 1664 × 6, 8 |
+| dflash2-k7 v3 | DFlash2, k = 7 | 1,580,652 tokens / 21.91 GiB | 1744 × 6, 16 |
+
+- DFlash2 adds two sliding-window groups. The pool is still larger: "Model loading took" 69.11 GiB against v6's
+  69.54 GiB (drafter 1.2 GB vs 1.6 GB).
+- Every block of any group costs the same page in Lord's pool (22.23 GiB / 971 blocks ≈ 24.6 MB per block). So each
+  sequence's sliding-window blocks (about 3 per group) cost full blocks, even though they hold only 2048 tokens.
+- With k = 7 the GDN conv state grows by 4 rows, and the attention block grows from 1664 to 1744 to stay at least as
+  large as the GDN page. 1744 is not a multiple of 128, so
+  [`dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v2 died at startup with "Invalid
+  prefix_match_unit=128; prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit"
+  (`runs/kaggle/jonathanwang2022/dflash2-k7/v02/vllm-openai-server.log` line 199).
+- v3 uses `prefix_match_unit` 16
+  ([`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json)).
+
+### Prefix cache
+
+Without patches, DFlash2's prefix-hit rate collapses. Two runtime patches fix it, and both are needed (B200 table below):
+- **Draft-group rule**
+  ([L1722-L1733](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1722-L1733)).
+  - vLLM did not identify DFlash2's KV group as the drafter's, so it applied the EAGLE drop to every group.
+  - The target's GDN groups then fell back to a recurrent checkpoint they do not keep, and turns missed down to
+    0 tokens.
+  - Adding `dflash` to `_uses_trailing_mtp_layers` flags exactly the drafter's group.
+- **Replay-tail hold**
+  ([L1734-L1821](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1734-L1821)).
+  - A hit at the replay boundary (the previous prompt's end) needs the sliding-window blocks just below it.
+  - The window frees those blocks during decode, so they are evicted before the request's full-attention blocks.
+  - The request now keeps them out of its block table until it finishes. The cost is up to 3 more blocks per
+    sliding-window group per running request.
+
+### Served on Kaggle, k = 3, no prefix-cache patches
+
+[`jonathanwang2022/dflash2-k3`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k3) v2
+([`fc12dafd`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/fc12dafdeaada5ab6fa1f1cf73ae08a15f51bc81),
+[`configs/dflash2-k3/v2.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/fc12dafdeaada5ab6fa1f1cf73ae08a15f51bc81/ARC3-Inference/configs/dflash2-k3/v2.json),
+45-minute public run) against [`porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith) v6.
+Per 10 minutes from the first stats line: mean "Avg generation throughput" / last "Prefix cache hit rate".
+
+| Minutes | 0–10 | 10–20 | 20–30 | 30–40 |
+|---|---|---|---|---|
+| dflash2-k3 v2 | 764 / 74% | 382 / 58% | 283 / 47% | 359 / 43% |
+| porting-advaith v6 | 909 / 92% | 930 / 93% | 916 / 93% | 869 / 93% |
+
+- Acceptance length: 2.676 (0.757 / 0.554 / 0.397), against v6's 2.743 (0.767 / 0.568 / 0.412). Both are from
+  `drafter_stats accept` on the runs' `vllm-openai-server.log`.
+- The collapse is the prefix cache, not the drafter. The draft attention runs on `TRITON_ATTN` (v1 failed when
+  FlashInfer JIT-built its sliding-window kernel against a missing `libcudart.so`).
+
+### B200 replay, both patches
+
+Frida `ixb2`, Lord's runtime rebuilt from his image and overlay, each arm's Kaggle setup with
+`--kv-cache-memory-bytes` set to its Kaggle pool. The load is recorded GRPO episodes (porting-advaith v6 harness)
+replayed at 14 streams from 40K-token contexts, with the harness's sampling, over a 900-s window
+([`scripts/dflash2_b200/README.md`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/README.md),
+[`bench.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/bench.py)).
+Numbers are from each arm's `bench/summary.json` on Frida in
+`/shared/workspace/arc-agi-3/dflash2_b200/out/<job>/<arm>/`. The acceptance length is 1 + the sum of the
+per-position rates. The step cost is acceptance length ÷ gen tok/s, relative to MTP-3.
+
+| Job | Drafter | Patches | Prefix hit | Gen tok/s | Acceptance per position | Acceptance length | Step cost |
+|---|---|---|---|---|---|---|---|
+| 209821 | MTP-3 (v6) | n/a | 92.8% | 1,298 | .785 .610 .470 | 2.865 | 1 |
+| 209821 | DFlash2 k = 3 | none | 47.4% | 545 | .791 .619 .485 | 2.894 | |
+| 209829 | DFlash2 k = 3 | rule only | 62.1% | 681 | .786 .612 .478 | 2.876 | |
+| 209829 | DFlash2 k = 3 | rule + hold | 90.1% | 1,315 | .780 .600 .463 | 2.843 | 0.98 |
+| 209821 | DFlash2 k = 7 | none | 41.5% | 505 | .754 .559 .418 .324 .258 .211 .176 | 3.700 | |
+| 209829 | DFlash2 k = 7 | rule + hold | 90.0% | **1,329** | .744 .552 .414 .318 .253 .207 .174 | **3.662** | **1.25** |
+
+What the table shows:
+- Both patches together bring DFlash2 to MTP-3's hit rate. The rule alone gets 62%, and the hold alone 54% (job
+  209824, in the README).
+- At positions 1–3, DFlash2 accepts slightly less than MTP-3 (k = 7: .744 / .552 / .414 against .785 / .610 / .470).
+  Positions 4–7 add 0.95 tokens per step, at the price of 4 more verify rows per sequence.
+- The step cost is only the ratio of two measured numbers. The step time itself was not logged. The step-cost column
+  is filled only for the patched rows; an unpatched run's gen tok/s is set by prefill, not by the step.
+- B200 tokens/s are not Kaggle numbers.
+- Unpatched hit rates here are from `summary.json` and differ from the README's table by up to 0.9 points
+  (42.1% / 48.3%). The patched rows agree.
+
+### Served on Kaggle, k = 7, both patches
+
+[`jonathanwang2022/dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v3
+([`6fd99257`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6fd992579012872e5f8926468d78f4c7fb53137f),
+[`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json),
+2026-10-31, 55-minute run), against [`porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith)
+v6. The games ran 14:42–15:13 UTC, when the run's time cap stopped them (KV use 80% → 16%, then 1–3 requests drained
+until 15:15). So the comparison covers the first 30 minutes of stats lines in each `vllm-openai-server.log`
+(180 lines each).
+
+| First 30 min | dflash2-k7 v3 | porting-advaith v6 | change |
+|---|---|---|---|
+| Acceptance length (`drafter_stats accept`, whole run) | **3.336** | 2.743 | +21.6% |
+| Per position | .740 .529 .376 .270 .197 .148 .111 | .767 .568 .412 | |
+| Mean "Avg generation throughput" | **825** tok/s | 918 tok/s | −10.1% |
+| Mean "Avg prompt throughput" (prefill) | 3,106 tok/s | 1,923 tok/s | +62% |
+| Mean running requests | 13.73 | 13.91 | |
+| Prefix hit rate at 2 / 10 / 20 / 30 min | 61% / 85% / 88% / 89% | 92% from 10 min | |
+
+The harness's own 10-minute summaries in each `stdout.log` (the token difference ÷ the time between summaries, each time being "total tokens" ÷ "generated tokens/sec") show the
+gap closing:
+
+| Minutes of play | 0–10 | 10–20 | 20–30 |
+|---|---|---|---|
+| dflash2-k7 v3 | 702 tok/s | 744 | 847 |
+| porting-advaith v6 | 806 | 956 | 852 |
+
+What this shows:
+- **Acceptance.** Kaggle accepts less than the B200 replay: 3.34 against 3.66, almost all of it at positions
+  4–7 (.270 / .197 / .148 / .111 against .318 / .253 / .207 / .174). MTP-3 loses less in the same comparison
+  (2.74 against 2.87). Why is not known: the replay starts at 40K-token contexts and skips early-game turns.
+- **Prefix hits.** They now work on Kaggle, but they reach 85% only after 10 minutes and level off at 88–89%, below
+  v6's 92–93%. The extra prefill is +62%.
+- **Throughput.** With +21.6% tokens per step and −10.1% generation, a k = 7 step costs about 1.35× an MTP-3
+  step, prefill included. The B200 ratio was 1.25×.
+- **Over time.** Most of the shortfall is in the first 20 minutes, while the hit rate builds. In minutes 20–30
+  the harness rates are equal (847 vs 852), and the server rate is −6% (864 vs 916).
+
+This is one run, and 30 minutes of play is not a score comparison.
+
 ## Reproduce
 
 From `ARC3-Inference/` ([`inference/tools/drafter_stats.py`](../../ARC3-Inference/inference/tools/drafter_stats.py)).
@@ -208,6 +371,11 @@ python -m inference.tools.drafter_stats bytes \
 K=https://www.kaggle.com/api/v1/models/dfranzen/albucino-qwen3-8-flash-next-drafter/transformers/default/1/download
 python -m inference.tools.drafter_stats bytes $K/mtp-dense.safetensors $K/mtp-routed-experts-int4.safetensors  # 4.140 GB
 python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log
+python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k3/v02/vllm-openai-server.log   # 2.676
+python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k7/v03/vllm-openai-server.log   # 3.336
+make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k7 VERSION=3                                             # the k = 7 run
+curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
+  | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256
 ```
 
 Two checks were done in a Python session on Frida against the shared copies of both checkpoints (2026-10-30), not with
