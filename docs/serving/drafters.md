@@ -1,696 +1,420 @@
-# Flash-Next draft heads: quantization, size and acceptance
+# Flash-Next draft heads
 
-All four drafters we have served are the same MTP layer of Qwen3.8-Flash-Next (one decoder layer with QSA attention,
-hyper-connections and a 512-expert MoE, plus `fc_embedding`, `fc_hidden`, two pre-norms and a final mixer). They differ
-only in how the 512 routed experts are stored, and whether the checkpoint carries its own `embed_tokens` / `lm_head`.
-The fine-tuned head is Lord's with retrained dense tensors ([its section](#fine-tuned-mtp-head-mtp-v1-50m)).
-DFlash2, a separate block drafter, has [its own section](#dflash2-block-drafter-incoai) below.
+Which drafter we serve for Qwen3.8-Flash-Next, and why. Log paths starting with `runs/` are relative to `ARC3-Inference/`.
+That is the Google Drive folder (see [AGENTS.md](../../AGENTS.md)); Frida outputs are copied into `runs/local/frida/`.
+GitHub links and `jonathanwang2022/*` Kaggle notebooks are private; Hugging Face and NVIDIA links are public.
 
-| Drafter | Source | Routed experts | Everything else in the MTP layer | Own embed + lm_head | Bytes |
+## Summary
+
+**Served: the fine-tuned MTP head with an FP8 drafter KV** ([decision](#decision)). Kaggle acceptance length is 2.805
+against v6's 2.662 over the same 15 minutes, with v6's KV pool and no prefill storm.
+
+| Drafter | Acceptance length (Kaggle) | Gen tok/s vs its baseline | Verdict | Section |
+|---|---|---|---|---|
+| Intel BF16 MTP, 3 tokens | 2.752 | 737 vs 820 (Lord) | 5.2 GB; replaced by Lord's | [Quantization](#expert-quantization-costs-no-acceptance) |
+| Lord NVFP4 MTP, 3 tokens (porting-advaith v6) | 2.743 | 894 | baseline | [Quantization](#expert-quantization-costs-no-acceptance) |
+| Lord MTP, BF16 drafter KV | 2.910 (Frida) | step cost unchanged | +0.13 acceptance, −6.9% pool | [Drafter KV](#drafter-kv-precision) |
+| **Fine-tuned MTP, FP8 drafter KV** | **2.805** (v6: 2.662, first 15 min) | **+3.3%** | **served** | [Kaggle](#on-kaggle) |
+| Fine-tuned MTP, BF16 drafter KV | 2.882 (first 15 min) | +5–7% until a storm at minute 13 | rejected | [Kaggle](#on-kaggle) |
+| Fine-tuned MTP, FP8 KV, 4 tokens | 3.249 (Frida; k = 3: 2.898) | −9.9% time per token (Frida) | promising; Kaggle v2/v3 pending | [k = 4](#k--4-in-progress) |
+| DFlash2 k = 3 (B200 replay) | 2.843 (B200) | +1% (B200) | no gain | [DFlash2](#dflash2-block-drafter-incoai) |
+| DFlash2 k = 7 | 3.336 | −10.1% (first 30 min) | slower | [DFlash2](#dflash2-block-drafter-incoai) |
+| DFlash2 k = 4, BF16 drafter KV | 2.902 | storm from minute 10 (pool −35.5%) | rejected; k = 7 ≥ k = 4 | [k = 4 vs k = 7](#k--4-vs-k--7) |
+
+## Checkpoints
+
+The four MTP drafters are the same Qwen3.8-Flash-Next MTP layer: one decoder layer with QSA attention, hyper-connections
+and a 512-expert MoE, plus `fc_embedding`, `fc_hidden`, two pre-norms and a final mixer. They differ only in how the
+routed experts are stored, and whether the checkpoint carries its own `embed_tokens` / `lm_head`.
+
+| Drafter | Source | Routed experts | Rest of the layer | Own embed + lm_head | Bytes |
 |---|---|---|---|---|---|
-| Intel BF16 MTP (the target checkpoint's own layer) | Kaggle [`dfranzen/intel-qwen3.8-flash-next-w4a16-autoround`](https://www.kaggle.com/models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround) = HF [`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/tree/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897), `model_extra_tensors.safetensors` | BF16 (5.033 GB) | BF16 (0.181 GB) | no (the target's) | **5.214 GB** |
-| Lord NVFP4 MTP | Kaggle [`lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8`](https://www.kaggle.com/models/lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8), variation `hf-mixed-mtp-nvfp4/1` = HF [`primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8@07915ee`](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/tree/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4) `mtp_nvfp4/` | NVFP4 W4A4 (1.416 GB: U8 codes 1.258 + FP8 E4M3 scales 0.157) | BF16 (0.181 GB), **bit-identical to Intel's** (29 of 29 tensors) | no (the target's) | **1.597 GB** |
-| Daniel's albucino INT4 | Kaggle [`dfranzen/albucino-qwen3-8-flash-next-drafter`](https://www.kaggle.com/models/dfranzen/albucino-qwen3-8-flash-next-drafter) `default/1` | INT4 (1.416 GB: I32-packed codes 1.258 + BF16 scales 0.157) | BF16 (0.181 GB) | yes, BF16 (2.542 GB) | **4.140 GB** |
-| Fine-tuned MTP (mtp-v1-50m, step 1300) | Kaggle [`jonathanwang2022/qwen3-8-flash-next-mtp-tuned`](https://www.kaggle.com/models/jonathanwang2022/qwen3-8-flash-next-mtp-tuned) `PyTorch/default/1` (private) | Lord's NVFP4 file, unchanged (1.416 GB) | BF16 (0.181 GB), retrained: same 29 tensors, names, dtypes and shapes | a byte copy of the target's (2.542 GB), replaced by the target's at load | **1.597 GB** |
+| Intel BF16 MTP | [`dfranzen/intel-qwen3.8-flash-next-w4a16-autoround`](https://www.kaggle.com/models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround) = HF [`Intel/…-W4A16-AutoRound@4c67bf6`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/tree/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897) `model_extra_tensors.safetensors` | BF16, 5.033 GB | BF16, 0.181 GB | no | **5.214 GB** |
+| Lord NVFP4 MTP | [`lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8`](https://www.kaggle.com/models/lordhansolo/qwen3-8-flash-next-mixed-nvfp4-fp8) `hf-mixed-mtp-nvfp4/1` = HF [`primitive-ai/…-mixed-NVFP4-FP8@07915ee`](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/tree/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4) `mtp_nvfp4/` | NVFP4 W4A4, 1.416 GB | BF16, **bit-identical to Intel's** (29/29 tensors) | no | **1.597 GB** |
+| Daniel's albucino INT4 | [`dfranzen/albucino-qwen3-8-flash-next-drafter`](https://www.kaggle.com/models/dfranzen/albucino-qwen3-8-flash-next-drafter) `default/1` | INT4, 1.416 GB | BF16, 0.181 GB | yes, 2.542 GB | **4.140 GB** |
+| Fine-tuned MTP (mtp-v1-50m, step 1300) | [`jonathanwang2022/qwen3-8-flash-next-mtp-tuned`](https://www.kaggle.com/models/jonathanwang2022/qwen3-8-flash-next-mtp-tuned) `PyTorch/default/1` (private) | Lord's, unchanged | BF16, retrained | byte copy of the target's, replaced at load | **1.597 GB** |
+| DFlash2 (block drafter) | HF [`incoai/Qwen3.8-Flash-Next-DFlash2@a22a174`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/tree/a22a1744e85c17364dcc54a6a420af7135d4c7f6); our copy `jonathanwang2022/qwen3-8-flash-next-dflash2/Transformers/default/1` (private) | none (dense) | 5 layers, BF16 | no | **1.206 GB** |
 
-## Quantization of each layer
+Quantization:
+- **Intel:** `extra_config` keeps `.*mtp.*` at 16 bits. Only the target's routed experts are quantized (AutoRound INT4,
+  symmetric, group 128).
+- **Lord** ([`mtp_nvfp4/config.json`](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/blob/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4/config.json)):
+  - Only `mlp.experts.N.{gate,up,down}_proj` are `nvfp4-pack-quantized`: FP4 E2M1 codes, an FP8 scale per 16 inputs
+    and an F32 global scale, with activations quantized the same way at runtime. Gate and up share one global scale.
+  - Attention, `mtp.fc_*`, norms, router, shared expert, hyper-connections and indexer are on the `ignore` list (BF16).
+  - Dequantized experts match Intel's at cosine 0.995 (experts 0, 7, 300). So Lord's head is Intel's layer with
+    experts rounded to NVFP4.
+- **Albucino** ([`compact_sources.json`](https://www.kaggle.com/models/dfranzen/albucino-qwen3-8-flash-next-drafter/transformers/default/1)):
+  from `RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225`, with routed experts RTN-quantized to INT4 (symmetric, group 32,
+  weights only). It carries 31 dense tensors, including its own `embed_tokens` and `lm_head`.
+- **DFlash2** ([`config.json`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/blob/a22a1744e85c17364dcc54a6a420af7135d4c7f6/config.json)):
+  5 non-causal `sliding_attention` layers (window 2048, hidden 2560, 32 Q / 8 KV heads × 128). It drafts a block of
+  8 (`selector_top_k` 16, `selector_rank` 256) from target taps at layers [5, 15, 25, 35, 45], and shares embed and
+  `lm_head` with the target. sha256 `d6723f2a…3186f`.
 
-- **Intel**: `quantization_config.extra_config` of the checkpoint's `config.json` sets `.*mtp.*` to 16 bits, so the MTP
-  layer is BF16 throughout. In the target, only the routed experts are quantized (AutoRound INT4, symmetric, group 128,
-  `auto_round:auto_gptq` packing).
-- **Lord** ([`mtp_nvfp4/config.json`](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/blob/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4/config.json),
-  compressed-tensors `mixed-precision`):
-  - group_1 is `nvfp4-pack-quantized` on `mlp.experts.N.{gate,up,down}_proj`: FP4 E2M1 weights with an FP8 scale per
-    16 inputs and an F32 global scale, `W = code x scale / weight_global_scale`. Activations are quantized the same way
-    at runtime (`dynamic: local`).
-  - The MTP layer's `self_attn` and `mtp.fc_*` are on the `ignore` list, so they stay BF16. group_0's FP8 attention
-    applies to the target's own layers in that checkpoint, which we don't serve.
-  - Also ignored, so BF16: norms, router gate, shared expert, hyper-connections, indexer.
-  - Gate and up use the same global scale in all 512 experts. vLLM uses the gate's scale for both.
-  - Dequantized experts match Intel's BF16 experts at cosine 0.995 (relative error 0.095, checked on experts 0, 7 and
-    300). With 29 of 29 non-expert tensors identical, Lord's head is Intel's MTP layer with its experts rounded to
-    NVFP4.
-- **Albucino**
-  ([`compact_sources.json`](https://www.kaggle.com/models/dfranzen/albucino-qwen3-8-flash-next-drafter/transformers/default/1),
-  `config.json`):
-  - Source: `RadixArk/Qwen3.8-Flash-Next-NVFP4` @ `7b719225`.
-  - "MTP routed experts locally RTN-quantized to INT4 symmetric group-32 with min/max scales; other MTP tensors
-    unchanged".
-  - `quantization_config` is compressed-tensors `pack-quantized`, 4 bits, group 32, targets `RoutedExperts`; weights
-    only.
-  - It carries 31 dense tensors, including its own `embed_tokens` and `lm_head`.
+The bit-identity and dequantization checks were run interactively on Frida (2026-10-30), not with a repo script. The
+same decode is `dequant_nvfp4` in `inference/rft/mtp_train.py` (branch `mtp-data`).
 
-## Acceptance as served (3 draft tokens)
+## MTP head
 
-| Run | Drafter | Engine | Acceptance length | Per position | Mean gen tok/s | Log |
+### Expert quantization costs no acceptance
+
+3 draft tokens, as served:
+
+| Run | Drafter | Engine | Acceptance length | Per position | Gen tok/s | Log |
 |---|---|---|---|---|---|---|
-| [`matijaludvig/arc3-vcintel-25x1`](https://www.kaggle.com/code/matijaludvig/arc3-vcintel-25x1) v1 | Intel BF16 | vLLM (Lord's e975732 runtime), 13 streams | **2.752** | 0.767 / 0.572 / 0.418 | 737 | `runs/kaggle/matijaludvig/arc3-vcintel-25x1/v01/vllm-openai-server.log` |
-| [`matijaludvig/arc3-vcintel-lorddraft-25x1`](https://www.kaggle.com/code/matijaludvig/arc3-vcintel-lorddraft-25x1) v1 | Lord NVFP4 | vLLM, 14 streams | **2.726** | 0.763 / 0.562 / 0.406 | 820 | `runs/kaggle/matijaludvig/arc3-vcintel-lorddraft-25x1/v01/vllm-openai-server.log` |
-| [`jonathanwang2022/porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith) v6 | Lord NVFP4, 32K draft vocabulary | vLLM, 14 streams | **2.743** | 0.767 / 0.568 / 0.412 | 894 | `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log` |
-| [`dangthuygiang/arc3-v207-danibase-base-dfranzen`](https://www.kaggle.com/code/dangthuygiang/arc3-v207-danibase-base-dfranzen) v5 | albucino INT4 (Pennyroyal draft view) | SGLang (EAGLE, 3 steps, top-1) | **2.688** | not logged | — | `runs/kaggle/dangthuygiang/arc3-v207-danibase-base-dfranzen/v05/serve.log` |
+| [`matijaludvig/arc3-vcintel-25x1`](https://www.kaggle.com/code/matijaludvig/arc3-vcintel-25x1) v1 | Intel BF16 | vLLM, 13 streams | 2.752 | .767 / .572 / .418 | 737 | `runs/kaggle/matijaludvig/arc3-vcintel-25x1/v01/vllm-openai-server.log` |
+| [`matijaludvig/arc3-vcintel-lorddraft-25x1`](https://www.kaggle.com/code/matijaludvig/arc3-vcintel-lorddraft-25x1) v1 | Lord NVFP4 | vLLM, 14 streams | 2.726 | .763 / .562 / .406 | 820 | `runs/kaggle/matijaludvig/arc3-vcintel-lorddraft-25x1/v01/vllm-openai-server.log` |
+| [`jonathanwang2022/porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith) v6 | Lord NVFP4, 32K draft vocab | vLLM, 14 streams | 2.743 | .767 / .568 / .412 | 894 | `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log` |
+| [`dangthuygiang/arc3-v207-danibase-base-dfranzen`](https://www.kaggle.com/code/dangthuygiang/arc3-v207-danibase-base-dfranzen) v5 | albucino INT4 | SGLang EAGLE, top-1 | 2.688 | not logged | — | `runs/kaggle/dangthuygiang/arc3-v207-danibase-base-dfranzen/v05/serve.log` |
 
-`runs/` is the Google Drive folder (see [AGENTS.md](../../AGENTS.md)). How each number is computed:
-- **vLLM:** token-weighted from the "SpecDecoding metrics" lines: `1 + accepted / (drafted / 3)`. Per-position rates are
-  the mean of the logged rates.
-- **SGLang:** the mean of `accept len` over its decode lines, which is unweighted.
-- **tok/s:** the mean of the 10 s "Avg generation throughput" lines.
+The gaps between rows are within run-to-run variation. Lord's head pays off in memory: 1.6 GB against 5.2 GB, and the
+difference went to the KV pool (a 14th stream). It also decodes faster, from smaller expert reads. Switching vcintel
+to lorddraft raised throughput from 737 to 820 tok/s at the same score (56.92 vs 56.89;
+[lord-vllm-daniel-weights.md](lord-vllm-daniel-weights.md#lords-mtp-draft-head)). GPU memory per setup is in
+[MEMORY_BUDGET.md](MEMORY_BUDGET.md).
 
-The harnesses and runs differ, so the small gaps between rows are within run-to-run variation. What the table shows
-is that NVFP4 or INT4 experts cost no measurable acceptance: Intel BF16 2.75, Lord NVFP4 2.73–2.74, albucino 2.69.
-Lord's head pays off in memory (1.6 GB against 5.2 GB, which went to the KV pool) and speed, from smaller expert
-reads in each draft pass, not acceptance. The vcintel-to-lorddraft switch raised mean throughput from 737 to 820 tok/s at the same score
-(56.92 vs 56.89; see [lord-vllm-daniel-weights.md](lord-vllm-daniel-weights.md#lords-mtp-draft-head)).
-[MEMORY_BUDGET.md](MEMORY_BUDGET.md) has the GPU memory of each setup, including the RadixArk NVFP4 MTP draft of
-another team's notebook.
+### Drafter KV precision
 
-## Drafter KV precision
+The target's KV is FP8 throughout. Keeping the drafter's own KV in FP8 costs about 0.13 acceptance length, all at draft
+positions 2–3, where the head reads back its own drafts.
 
-Conclusion: keeping the MTP drafter's own KV cache in FP8 costs acceptance. Real vLLM on v6's own requests measures
-2.78 with an FP8 drafter KV and 2.91 with a BF16 one (+0.13, +4.6%); the offline simulation predicted 0.10–0.13. The
-per-step cost does not change, so decode gets about 5% faster per token. The cost is 6.9% of the KV pool. The target's
-KV stays FP8. A BF16 drafter KV needs a runtime patch on Lord's runtime (below); it has not been run on Kaggle yet.
-
-### Measurement
-
-The offline acceptance of Lord's NVFP4 head (step 0, untrained) on the 48 eval samples of `mtp_v1`, with the K/V and
-QSA-indexer caches rounded to e4m3 where vLLM's `fp8_e4m3` / `fp8` caches would be:
+**Offline** (transformers, 48 held-out `mtp_v1` samples, Lord's untrained head). K/V and QSA-indexer caches are rounded
+to e4m3 where vLLM's caches would be FP8:
 
 | FP8 simulated in | Per position | Acceptance length | Frida job | Log |
 |---|---|---|---|---|
-| nothing (all BF16) | 0.813 / 0.642 / 0.489 | 2.943 | 209705 (step-0 eval of the training run) | `runs/local/frida/mtp-eval-fp8/none/train_log.jsonl` |
-| target only | 0.813 / 0.642 / 0.490 | 2.945 | 209816 | `runs/local/frida/mtp-eval-fp8/target/train_log.jsonl` |
-| drafter only | 0.804 / 0.598 / 0.407 | **2.809** | 209815 | `runs/local/frida/mtp-eval-fp8/mtp/train_log.jsonl` |
-| both (as v6 serves) | 0.804 / 0.606 / 0.432 | 2.842 | 209817 | `runs/local/frida/mtp-eval-fp8/both/train_log.jsonl` |
-| served, porting-advaith v6 | 0.767 / 0.568 / 0.412 | 2.743 | Kaggle v6 | `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log` |
+| nothing | .813 / .642 / .489 | 2.943 | 209705 (step 0) | `runs/local/frida/mtp-eval-fp8/none/train_log.jsonl` |
+| target only | .813 / .642 / .490 | 2.945 | 209816 | `runs/local/frida/mtp-eval-fp8/target/train_log.jsonl` |
+| drafter only | .804 / .598 / .407 | 2.809 | 209815 | `runs/local/frida/mtp-eval-fp8/mtp/train_log.jsonl` |
+| both (as v6 serves) | .804 / .606 / .432 | 2.842 | 209817 | `runs/local/frida/mtp-eval-fp8/both/train_log.jsonl` |
 
-What the table shows:
-- Rounding the target's KV changes nothing. The drafter's own FP8 KV costs 0.10–0.13, almost all of it at draft
-  positions 2 and 3, where the head reads its own previous output.
-- The drafter-only simulation reproduces the served third position (0.407 vs 0.412).
-- "Both" scoring above "drafter only" is not explained.
+The drafter-only row reproduces v6's served third position (.407 vs .412). "Both" scoring above "drafter only" is not
+explained. Code: [`qsa.set_kv_fp8`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/qsa.py#L43-L49),
+switched on by [`mtp_train.py --fp8-kv`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/mtp_train.py#L235-L237)
+at `97c3655d` (`--eval-only --no-compile-layers`).
 
-How it was measured:
-- The rounding is [`qsa.set_kv_fp8`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/qsa.py#L43-L49):
-  K/V are rounded in [`qsa_project`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/qsa.py#L287),
-  and the indexer queries and block keys [here](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/qsa.py#L96).
-- It is switched on for the target and for the head separately by
-  [`mtp_train.py --fp8-kv`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/mtp_train.py#L235-L237)
-  ([flag](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/97c3655d8db698c685140aae948eb1d1beb89c60/ARC3-Inference/inference/rft/mtp_train.py#L441)),
-  on branch `mtp-data` at
-  [`97c3655d`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/97c3655d8db698c685140aae948eb1d1beb89c60),
-  as recorded in each job's `commit_<job>.txt`.
-- All runs use the same 48 eval samples (seed 0) and the same numeric path (no compiled layers). The FP8 jobs ran with
-  `--eval-only --no-compile-layers`.
-- The full outputs are on Frida in `/shared/workspace/arc-agi-3/mtp_finetune/runs/eval-fp8-{mtp,target,both}/`.
+**In vLLM on Frida** (one B200; the [replay](#frida-vllm-replay) of v6's 141 requests). The step cost is the same in
+all four arms (time per token × tokens per step ≈ 103 ms), so the gains are pure acceptance:
 
-This is not vLLM. The target is the transformers Qwen4Exp model with the RFT patches (QSA Triton kernel, grouped INT4
-experts), and the head is vLLM's `Qwen4ExpMultiTokenPredictor` rebuilt from transformers modules. FP8 is a rounding of
-the stored K/V with scale 1.0, not vLLM's FP8 cache kernels. Even with FP8, offline stays above served at positions 1–2.
-The likely reasons:
-- the eval set is 5 held-out games, not v6's 25;
-- the offline count leaves out `uncertain` requests and requests over 124K tokens;
-- draft steps 2–3 attend to keys from the same step, an approximation of the drafter.
-
-The two implementations were not compared layer by layer.
-
-### Cost in KV
-
-- The MTP layer stores 2 KV heads × 256 dims for K and V
-  ([config](https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/blob/07915ee79ec217c117e8a57bf2557a4a1418c10f/mtp_nvfp4/config.json)).
-  That is 1,024 B per token in FP8 and 2,048 B in BF16.
-- v6's pool is 21.73 GiB for 1,564,172 tokens, about 14.9 KB per token (`porting-advaith/v06/vllm-openai-server.log`).
-- +1,024 B per token is +6.9%, so about 1.46M tokens instead of 1.56M. This is a geometry estimate; a run will give the
-  real number.
-
-### Serving it
-
-- The setting exists: `speculative_config` `kv_cache_dtype`
-  ([vLLM at the runtime's base commit](https://github.com/vllm-project/vllm/blob/e9757321527ca1ecd514c07c1418dd2c53da3d19/vllm/config/speculative.py#L429)).
-  The draft loader applies it to the drafter's cache config only
-  ([`_DRAFT_VLLM_CONFIG_OVERRIDES`](https://github.com/vllm-project/vllm/blob/e9757321527ca1ecd514c07c1418dd2c53da3d19/vllm/config/speculative.py#L383)).
-- The launcher passes it as `kaggle.vllm.draft_kv_cache_dtype`, branch `draft-bf16-kv` at
-  [`5831f199`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/5831f1992f5c381c17c4aa40fb717bf8d9cf6c15)
-  (`auto` = BF16; the runtime's docs call `bfloat16` invalid for models whose KV does not default to FP8).
-- **Plain `auto` fails on Lord's runtime.**
-  [`jonathanwang2022/draft-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/draft-bf16-kv) v1 (v6 + `auto`)
-  died at startup: "To serve at least one request with the model's max seq len (147072), (211.88 GiB KV cache is needed,
-  which is larger than the available KV cache memory (21.71 GiB)" (`runs/kaggle/jonathanwang2022/draft-bf16-kv/v01/vllm-openai-server.log`
-  line 190).
-- **Why** (traced on Frida, job 209822, with every KV spec and group logged before the memory check): the draft
-  `kv_cache_dtype` gives the drafter a `replace()`d copy of the cache config. The platform then raises the attention
-  block size to 1664 in place on the engine's config, after the model has loaded, so the copy keeps block size 16.
-  The drafter's QSA indexer compressed-key cache reads its own copy, so it became a KV group of 16-token blocks.
-  Lord's packed layout strides every block by the widest group's page (24.5 MB), so one 147,072-token request needed
-  147,072 / 16 = 9,192 such blocks, the "211.88 GiB". The BF16 page size itself was not the problem.
-- **The fix** ([`use_engine_block_size_for_draft_qsa`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6c8bffd173c72b657e10052c755d749411614f6f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1464-L1501),
-  branch `draft-bf16-kv` at
-  [`6c8bffd1`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6c8bffd173c72b657e10052c755d749411614f6f)):
-  - a setup-time patch with 3 anchored edits in `vllm/models/qwen4_exp/common/qsa_cache.py`, so the QSA caches read
-    `vllm_config.cache_config.block_size` (the engine's) instead of their own copy;
-  - applied only when a draft KV dtype is set, and the setup fails if an anchor does not match exactly once.
-
-  With it (job 209823), the drafter's indexer cache joins the 1664-token group, and one full-length request needs
-  2.19 GiB. v6 with the FP8 drafter needs about 2.04 GiB.
-
-### Measured in vLLM on Frida
-
-Lord's runtime rebuilt on one B200:
-- the image `vllm/vllm-openai@sha256:e0eee5c5…` (the digest in his `runtime-manifest.json`; the tag is pruned) plus his
-  32 overlay files, each checked against the manifest's sha256;
-- the launcher's setup-time patches and Lord's MTP draft, then v6's exact `vllm serve` command;
-- the harness is `runs/local/frida/vllm-replay-draft-kv/` (`run_vllm.sbatch`, `inside.sh`, `setup_runtime.py`).
-
-The replay ([`replay.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/replay.py)):
-- porting-advaith v6's own 141 samples from `mtp_v1` (all 25 games), one request each: the context before the sample's
-  last trained reply, mean 104K prompt tokens;
-- the harness's sampling (T 0.7, top-p 0.95, top-k 20), a fixed seed per request, up to 2,048 generated tokens, 14 at a
-  time;
-- the two arms ran alone, one after the other, and got identical prefix-cache hits (3.15%).
-
-Numbers are the differences of vLLM's `/metrics` counters before and after the replay
-([`analyze.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/analyze.py)).
-
-| Drafter KV | Acceptance length | Per position | Time per output token | Decode tok/s per request | Decode time, all requests | Prefill time | KV pool (B200) | Job |
-|---|---|---|---|---|---|---|---|---|
-| FP8 (`fp8_e4m3`, as v6 serves) | 2.777 | 0.776 / 0.578 / 0.422 | 37.10 ms | 26.52 | 7,695 s | 971 s | 7,447,052 tokens | 209838 |
-| BF16 (`auto` + the fix) | **2.910** | 0.790 / 0.624 / 0.496 | **35.23 ms** | **27.77** | 7,258 s | 974 s | 6,930,768 tokens | 209834 |
-| change | +0.133 (+4.8%) | +0.014 / +0.046 / +0.074 | −5.0% | +4.7% | −5.7% | same | −6.9% | |
-
-Reading the table:
-- **Acceptance:** the served FP8 number reproduces Kaggle's v6 live 2.743 (0.767 / 0.568 / 0.412) to within 0.03.
-  BF16 gains most at draft positions 2 and 3, as the simulation showed.
-- **Speed:** a decode step costs the same in both: time per token × tokens per step is 103.0 ms (FP8) vs 102.5 ms
-  (BF16). QSA reads only about 2,048 selected tokens per draft query, so doubling the drafter's KV bytes costs almost
-  nothing per step. The whole gain is acceptance.
-- **Wall time:** 946 s in both. That is end to end: the replay is prefill-bound (about 14.7M prompt tokens against
-  0.2M generated), so it shows no difference.
-
-What this does not show:
-- the RTX PRO 6000 (Kaggle's GPU) kernels;
-- KV pressure. The B200's pool is 7× Kaggle's, so the 6.9% smaller pool was never stressed. v6 ran its 21.7 GiB pool at
-  89% (p99) and 93% (peak) with 14 streams. The first Kaggle run with BF16 drafter KV hit a prefill storm at minute 13
-  (see [Served on Kaggle](#served-on-kaggle-with-bf16-drafter-kv-tuned-mtp-bf16-kv-v1)).
-
-The files are in `runs/local/frida/vllm-replay-draft-kv/runs/`: `metrics_before.txt`, `metrics_after.txt`,
-`replay.jsonl`, `server.log`, and the job output.
-
-## Fine-tuned MTP head (mtp-v1-50m)
-
-Lord's NVFP4 head with its 29 dense (non-expert) tensors retrained; the routed experts, `embed_tokens` and `lm_head`
-are frozen.
-
-### Training
-
-- **Trainer:** [`inference/rft/mtp_train.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_train.py) (branch
-  `mtp-data`, commit [`e0d1f88e`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/e0d1f88e36af708602cc026a973bd70ccbf1529f), as recorded by the job), Slurm job 209705 on one Frida B200.
-  The frozen Intel W4A16 target runs forward only. The head learns the target's sampling distribution (T 0.7, top-k 20,
-  top-p 0.95) with a soft cross-entropy at each of the 3 draft positions. Embedding and `lm_head` are the target's.
-- **Data:** `mtp_v1` from [`inference/rft/mtp_data.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_data.py),
-  every request of 54 Intel-W4A16 runs. Train: 3,821 samples, 137M trained tokens. Eval: 842 samples from games ar25,
-  cd82, cn04, g50t and sk48, none of which are in train.
-- **Run:** 1,400 samples drawn round-robin over games (about 50M trained tokens), LR 3e-5, eval every 100 steps on 48
-  eval samples, best checkpoint kept.
-- **Offline result:** the acceptance length rises from 2.943 at step 0 (Lord's head as loaded) to **3.080** at step 1300
-  (per position 0.839 / 0.686 / 0.555), the best of 15 evals. This offline eval runs in transformers with BF16 KV
-  everywhere. Log: `/shared/workspace/arc-agi-3/mtp_finetune/runs/mtp-v1-50m/train_log.jsonl` on Frida.
-
-### The served checkpoint
-
-The trainer's own export (`draft/`) cannot be served as it is:
-- It adds the retrained tensors in `mtp-finetuned-bf16.safetensors` and hard-links Lord's other files.
-- Three of those files (`carry-model-bf16-00010/11/12`) are needed for `embed_tokens` and `lm_head`, but they also
-  still hold Lord's original 29 dense tensors.
-- The runtime's loader picks tensors by name (`mtp.*`), not by the file the index assigns them to
-  (`_filter_safetensors_files_by_weight_name` in `vllm/model_executor/model_loader/default_loader.py`). Both copies
-  would load, and the load order would decide which one is served.
-
-[`inference/rft/frida/build_tuned_draft.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/68b1a5c63fc476652f69e82f077a1bcdfd603285/ARC3-Inference/inference/rft/frida/build_tuned_draft.py)
-(standard library only) writes each draft tensor once:
-
-| File | Tensors | Bytes |
-|---|---|---|
-| `mtp-experts-nvfp4.safetensors` | 6,144: Lord's NVFP4 experts, unchanged | 1,416,330,416 |
-| `mtp-finetuned-bf16.safetensors` | 29: the retrained dense tensors | 181,140,352 |
-| `draft-shared-bf16.safetensors` | `lm_head.weight` and `model.language_model.embed_tokens.weight`, byte copies | 2,542,797,048 |
-| `config.json`, `model.safetensors.index.json` | Lord's config; an index of exactly these 6,175 tensors | |
-
-- **Checks:** the build stops unless the retrained tensors have Lord's exact names, dtypes and shapes.
-- **Embedding and `lm_head`:** these are byte-identical in Intel's target, Lord's checkpoint and this folder (SHA-256
-  of the tensor bytes begins `40bddd25` for `lm_head` and `62288a3f` for `embed_tokens`).
-- **What VRAM holds:** at load the runtime replaces the draft's embedding and `lm_head` with the target's
-  (`maybe_share_target_embed` and the `lm_head` share in `vllm/v1/worker/gpu/spec_decode/eagle/utils.py`;
-  `Qwen4ExpMTP` sets no `has_own_*` flag).
-- **The 32K draft-vocabulary head:** it is cut from the draft's own `lm_head` before that swap (`build_draft_vocab_head`
-  in `vllm/models/qwen4_exp/nvidia/mtp.py`), and that copy is identical to the target's.
-- **Weight memory:** the drafter adds 1.597 GB, as Lord's head does. "Model loading took 69.54 GiB" in both v6 and the
-  Kaggle run below.
-
-### Measured in vLLM on Frida
-
-The same harness, requests and sampling as [the drafter KV replay](#measured-in-vllm-on-frida), on one B200 (job
-209913). The draft directory is the folder above, mounted in place of Lord's through the `LORD_DIR` override in
-`run_vllm.sbatch`.
-
-| Head | Drafter KV | Acceptance length | Per position | Time per output token | Decode tok/s per request | Job |
-|---|---|---|---|---|---|---|
-| Lord | FP8 | 2.777 | 0.776 / 0.578 / 0.422 | 37.10 ms | 26.52 | 209838 |
-| Lord | BF16 | 2.910 | 0.790 / 0.624 / 0.496 | 35.23 ms | 27.77 | 209834 |
-| fine-tuned | FP8 | 2.898 | 0.799 / 0.623 / 0.476 | 35.38 ms | 27.80 | 209926 |
-| **fine-tuned** | BF16 | **3.020** | 0.820 / 0.664 / 0.537 | **34.14 ms** | **28.75** | 209913 |
-
-- **Where the gain comes from:** the head and the drafter KV add up independently:
-  - the fine-tuned head adds +0.122 with FP8 drafter KV and +0.110 with BF16;
-  - BF16 drafter KV adds +0.133 with Lord's head and +0.122 with the fine-tuned one;
-  - together that is +0.243 (+8.8%) over v6's served setup.
-- **The head was trained with BF16 KV but keeps its gain on FP8:** with FP8 drafter KV it matches Lord's head with BF16
-  (2.898 vs 2.910) at v6's pool size (7,447,052 tokens on the B200), so it pays no KV.
-- **Speed:** time per token × tokens per step is 103.1 ms, the same step cost as both Lord arms, so the gain is all
-  acceptance.
-- **Wall time:** 946 s end to end, the same as the other arms (the replay is prefill-bound).
-- **Files:** `runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-{fp8,bf16}/` and
-  `arc3_vllm_lord-2099{26,13}.txt`.
-
-### Served on Kaggle with BF16 drafter KV (tuned-mtp-bf16-kv v1)
-
-[`jonathanwang2022/tuned-mtp-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-bf16-kv) v1:
-- **Config:** [`configs/tuned-mtp-bf16-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/d2532fe17c3e2ea709bd23126739a62b48752269/ARC3-Inference/configs/tuned-mtp-bf16-kv/v1.json)
-  at [`d2532fe1`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/d2532fe17c3e2ea709bd23126739a62b48752269) on branch `draft-bf16-kv`.
-- **Against porting-advaith v6:** the fine-tuned draft, `draft_kv_cache_dtype: auto` with the
-  [block-size fix](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6c8bffd173c72b657e10052c755d749411614f6f), and a 30-minute public run (17.7 minutes after the server came up). Everything
-  else is identical.
-- **KV pool:** 1,455,400 tokens against v6's 1,564,172 (−7.0%), from the same 21.73 GiB.
-
-Minutes after the server's first metrics line, means of vLLM's 10 s lines, per-position rates as in the table above:
-
-| Minutes | Run | Prompt tok/s | Gen tok/s | KV % (max) | Prefix hit % | Acceptance length | Per position |
+| Head | Drafter KV | Acceptance length | Per position | Time per output token | KV pool (B200) | Job | Log |
 |---|---|---|---|---|---|---|---|
-| 0–5 | fine-tuned + BF16 | 2,090 | 916 | 28.7 (46.3) | 80.7 | 2.825 | 0.783 / 0.594 / 0.463 |
-| | v6 | 2,018 | 862 | 26.9 (41.6) | 80.9 | 2.601 | 0.731 / 0.518 / 0.363 |
-| 5–10 | fine-tuned + BF16 | 1,754 | 1,016 | 60.3 (75.8) | 90.0 | 2.888 | 0.790 / 0.617 / 0.484 |
-| | v6 | 1,649 | 957 | 55.0 (67.0) | 90.4 | 2.671 | 0.745 / 0.541 / 0.385 |
-| 10–15 | fine-tuned + BF16 | 4,677 | 750 | 86.9 (94.7) | 91.8 | 2.947 | 0.806 / 0.642 / 0.511 |
-| | v6 | 1,644 | 959 | 77.9 (86.5) | 92.7 | 2.708 | 0.755 / 0.557 / 0.398 |
-| 15–17.7 | fine-tuned + BF16 | 9,232 | 229 | 74.0 (91.9) | 85.1 | 3.007 | 0.818 / 0.664 / 0.541 |
-| | v6 | 1,753 | 942 | 69.5 (87.5) | 93.6 | 2.700 | 0.753 / 0.551 / 0.396 |
-| **0–17.7** | **fine-tuned + BF16** | | | | | **2.888** | 0.797 / 0.625 / 0.494 |
-| | **v6** | | | | | **2.668** | 0.746 / 0.541 / 0.384 |
+| Lord | FP8 (v6) | 2.777 | .776 / .578 / .422 | 37.10 ms | 7,447,052 | 209838 | `…/runs/replay3-draft-fp8/`, `arc3_vllm_lord-209838.txt` |
+| Lord | BF16 | 2.910 | .790 / .624 / .496 | 35.23 ms | 6,930,768 (−6.9%) | 209834 | `…/runs/replay3-draft-bf16/`, `arc3_vllm_lord-209834.txt` |
+| fine-tuned | FP8 | 2.898 | .799 / .623 / .476 | 35.38 ms | 7,447,052 | 209926 | `…/runs/replay3-tuned-fp8/`, `arc3_vllm_lord-209926.txt` |
+| fine-tuned | BF16 | **3.020** | .820 / .664 / .537 | **34.14 ms** | 6,930,768 | 209913 | `…/runs/replay3-tuned-bf16/`, `arc3_vllm_lord-209913.txt` |
 
-- **Acceptance:** +0.220 (+8.2%) over the same window, close to the Frida replay's +0.243.
-- **Before the storm (minutes 0–12):** generation ran about 5–7% faster than v6 (1,000–1,030 against 944–989 tok/s).
-- **The storm:**
-  - The smaller pool, filled by faster generation, was 90.5% full at minute 12; v6 was at 79.8%.
-  - From minute 13, at 93–95%, prompt throughput jumped from about 1.7K to 8–10K tok/s. Generation fell to 190–430 tok/s
-    and the prefix-cache hit rate slid from 93% to 83%.
-  - v6 never stormed at 14 streams; its maximum in the first hour was 88.5%.
-  - The run ended during the storm, so it does not show whether it recovers.
-- **Cause:** the storm comes from the BF16 drafter KV's smaller pool, not from the head, whose weights are the same size.
-- **Ways to keep the gain without the storm:**
-  - Serve the fine-tuned head with FP8 drafter KV. The pool is then v6's, and on Frida the head keeps +0.122 there
-    (2.898). Measured on Kaggle [below](#served-on-kaggle-with-fp8-drafter-kv-tuned-mtp-fp8-kv-v1); this is the setup we
-    chose.
-  - Keep BF16 drafter KV at 13 streams: 1,455,400 / 13 ≈ 112.0K tokens per stream, against v6's 111.7K.
-- **Logs:** `runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log` and
-  `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log`.
+`…` = `runs/local/frida/vllm-replay-draft-kv`.
+- The head and the drafter KV add up independently. Each is worth about +0.12; together +0.243 (+8.8%) over v6.
+- The FP8 Lord arm reproduces Kaggle v6's 2.743 to within 0.03.
+- Wall time is 946 s in every arm, because the replay is prefill-bound.
+- The B200 pool is 7× Kaggle's, so the smaller BF16 pool is never under pressure here.
 
-### Served on Kaggle with FP8 drafter KV (tuned-mtp-fp8-kv v1)
+**KV cost:** the MTP layer stores 2 KV heads × 256 dims, 1,024 B per token in FP8. BF16 adds 1,024 B to v6's ~14.9 KB
+per token: −6.9% pool, 1.455M instead of 1.564M tokens on Kaggle.
 
-[`jonathanwang2022/tuned-mtp-fp8-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv) v1
-([log](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv/log?scriptVersionId=364283059)):
-- **Config:** [`configs/tuned-mtp-fp8-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/b35f2e9715d09f9bc80a1315c4a4d15bd774f059/ARC3-Inference/configs/tuned-mtp-fp8-kv/v1.json)
-  at [`b35f2e97`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/b35f2e9715d09f9bc80a1315c4a4d15bd774f059).
-- **Against porting-advaith v6:** only the draft source (the fine-tuned checkpoint) and a 30-minute public run. The
-  drafter KV stays FP8, so the block-size patch does not apply.
-- **Server:** it came up about 15 minutes into the notebook and served for 15 minutes. "Model loading took 69.54 GiB"
-  and the KV pool of 1,564,172 tokens (21.73 GiB) are both v6's.
+**Serving a BF16 drafter KV** needs a runtime patch. The launcher sets `speculative_config.kv_cache_dtype` through
+`kaggle.vllm.draft_kv_cache_dtype` (`auto` = BF16).
+- Without the patch it fails at startup:
+  [`draft-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/draft-bf16-kv) v1 died with "211.88 GiB KV cache is
+  needed, which is larger than the available KV cache memory (21.71 GiB)"
+  (`runs/kaggle/jonathanwang2022/draft-bf16-kv/v01/vllm-openai-server.log` line 190).
+- Cause, traced in Frida job 209822 (`…/runs/arc3_vllm_lord-209822.txt`, `…/runs/draftkv-auto-debug/server.log`):
+  - The draft dtype gives the drafter a copied cache config. The platform raises the attention block to 1664 only on
+    the engine's config, so the drafter's QSA indexer cache stays a separate group of 16-token blocks.
+  - Lord's packed layout strides every block by the widest page (24.5 MB), so one 147K-token request needs 9,192 of them.
+- Fix: [`use_engine_block_size_for_draft_qsa`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6c8bffd173c72b657e10052c755d749411614f6f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1464-L1501)
+  (`6c8bffd1`). It makes 3 anchored edits to `qsa_cache.py` so the QSA caches read the engine's block size, and is
+  applied only when a draft KV dtype is set. With it, a full-length request needs 2.19 GiB, against 2.04 GiB for v6
+  (job 209823: `…/runs/arc3_vllm_lord-209823.txt`, `…/runs/draftkv-auto-fix1/server.log`).
 
-The first 15 minutes after the server's first metrics line (90 lines each; minute 15 onwards of this run is
-wind-down):
+### Fine-tuned head (mtp-v1-50m)
 
-| | v6 | fine-tuned + FP8 | fine-tuned + BF16 |
+- **What is trained:** Lord's 29 dense tensors only. Experts, `embed_tokens` and `lm_head` are frozen.
+- **Trainer:** [`mtp_train.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_train.py)
+  at `e0d1f88e` (branch `mtp-data`), Frida job 209705 on one B200. The frozen Intel W4A16 target runs forward only.
+  The loss is a soft cross-entropy at the 3 draft positions, against the target's sampling distribution (T 0.7,
+  top-k 20, top-p 0.95).
+- **Data:** `mtp_v1` from [`mtp_data.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/e0d1f88e36af708602cc026a973bd70ccbf1529f/ARC3-Inference/inference/rft/mtp_data.py),
+  every request of 54 Intel-W4A16 runs. Train: 3,821 samples (137M tokens). Eval: 842 samples from 5 held-out games
+  (ar25, cd82, cn04, g50t, sk48).
+- **Run:** 1,400 samples round-robin over games (~50M tokens), LR 3e-5, eval on 48 samples every 100 steps.
+- **Offline result:** 2.943 → **3.080** at step 1300 (.839 / .686 / .555), the best of 15 evals. Log:
+  `runs/local/frida/mtp-v1-50m/train_log.jsonl` (job output `arc3_mtp_train-209705.txt`, commit `commit_209705.txt`).
+- **Served checkpoint:** the trainer's export cannot be served as it is. Its hard-linked `carry-model-bf16-0001{0,1,2}`
+  files still hold Lord's original dense tensors, and vLLM loads tensors by name, so load order would pick the winner.
+  [`build_tuned_draft.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/68b1a5c63fc476652f69e82f077a1bcdfd603285/ARC3-Inference/inference/rft/frida/build_tuned_draft.py)
+  writes each tensor once:
+
+  | File | Tensors | Bytes |
+  |---|---|---|
+  | `mtp-experts-nvfp4.safetensors` | 6,144 Lord experts, unchanged | 1,416,330,416 |
+  | `mtp-finetuned-bf16.safetensors` | 29 retrained dense tensors (names, dtypes and shapes checked against Lord's) | 181,140,352 |
+  | `draft-shared-bf16.safetensors` | `lm_head`, `embed_tokens`: byte copies of the target's (SHA-256 `40bddd25…`, `62288a3f…`) | 2,542,797,048 |
+
+  At load the runtime swaps in the target's embedding and `lm_head`. The 32K draft-vocabulary head is cut from an
+  identical copy, so VRAM grows by 1.597 GB, the same as Lord's ("Model loading took 69.54 GiB" in v6 and both
+  fine-tuned Kaggle runs).
+
+### On Kaggle
+
+Both runs are v6 with only the draft changed, 30-minute public runs. The table covers the first 15 minutes after the
+server's first metrics line (90 lines each; the FP8 run winds down after that).
+
+| | v6 | **fine-tuned + FP8 KV** | fine-tuned + BF16 KV |
 |---|---|---|---|
-| Acceptance length (`accept --until 15`) | 2.662 | **2.805** (+0.143, +5.4%) | 2.882 (+0.220) |
-| Per position | 0.744 / 0.539 / 0.382 | 0.778 / 0.590 / 0.443 | 0.793 / 0.618 / 0.486 |
+| Notebook | [`porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith) v6 | [`tuned-mtp-fp8-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv) v1 ([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/b35f2e9715d09f9bc80a1315c4a4d15bd774f059/ARC3-Inference/configs/tuned-mtp-fp8-kv/v1.json) @ `b35f2e97`) | [`tuned-mtp-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-bf16-kv) v1 ([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/d2532fe17c3e2ea709bd23126739a62b48752269/ARC3-Inference/configs/tuned-mtp-bf16-kv/v1.json) @ `d2532fe1`) |
+| Acceptance length (`accept --until 15`) | 2.662 | **2.805** (+5.4%) | 2.882 (+8.3%) |
+| Per position | .744 / .539 / .382 | .778 / .590 / .443 | .793 / .618 / .486 |
 | KV pool | 1,564,172 tokens | 1,564,172 | 1,455,400 (−7.0%) |
-| KV maximum, minutes 0–15 | 86.5% | **82.5%** | 94.7% |
+| KV maximum | 86.5% | 82.5% | 94.7% |
 | Prefill storm | no | **no** | from minute 13 |
-| Mean generation tok/s, minutes 0–14 | 922 | **952** (+3.3%) | 941 (977 over minutes 0–12) |
+| Mean gen tok/s, minutes 0–14 | 922 | **952** (+3.3%) | 941 (977 over minutes 0–12) |
 | Mean prompt tok/s, minutes 0–14 | 1,787 | 1,887 | 2,335 |
+| Log (`vllm-openai-server.log` in) | `runs/kaggle/jonathanwang2022/porting-advaith/v06/` | `runs/kaggle/jonathanwang2022/tuned-mtp-fp8-kv/v01/` | `runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/` |
 
-- **Acceptance:** the gain matches Frida's (+0.122 there, +0.143 here), largest at position 3 (+0.06). Each 5-minute
-  block is 0.15–0.21 above v6.
-- **No storm:** prompt throughput stays at 1.5–2.1K tok/s and the prefix-cache hit rate at 92–94%, as in v6.
-- **Throughput gains less than acceptance (+3.3% against +5.4%):** faster decoding brings more turns, so prefill rose
-  5.6% (1,887 against 1,787 tok/s). The 10 s throughput lines are also noisy between runs. Frida's time per output
-  token (−4.6%) is the cleaner measure.
-- **Score:** 15 minutes of play (mean 6.84) says nothing about the score.
-- **Log:** `runs/kaggle/jonathanwang2022/tuned-mtp-fp8-kv/v01/vllm-openai-server.log`.
+- **FP8:** each 5-minute block is 0.15–0.21 above v6. Throughput gains less than acceptance (+3.3% against +5.4%),
+  because faster decoding brings more turns and prefill rises 5.6%. 15 minutes of play says nothing about the score.
+- **BF16 storm:** the pool was 90.5% full at minute 12, against v6's 79.8%. From minute 13, at 93–95%, prompt
+  throughput jumped from ~1.7K to 8–10K tok/s, generation fell to 190–430 tok/s, and prefix hits slid from 93% to 83%.
+  v6's first-hour maximum is 88.5%. The run ended inside the storm. The head's weights are the same size as Lord's,
+  so the smaller pool is the cause.
 
-### Decision: fine-tuned head with FP8 drafter KV
+### Decision
 
-We serve the fine-tuned head with FP8 drafter KV, not BF16:
-- **BF16's extra acceptance is small:** +0.08 on Kaggle (2.882 against 2.805) and +0.12 on Frida (3.020 against
-  2.898).
-- **BF16 costs 7% of the pool and storms at 14 streams.** Avoiding the storm takes 13 streams (1,455,400 / 13 ≈ 112.0K
-  tokens each, v6's 111.7K). The lost stream, about −3.5% throughput by our earlier measurement, takes back the gain.
-- **FP8 keeps v6's pool:** it gets most of the gain (+5.4% acceptance on Kaggle) at no KV cost, and leaves room to try
-  a fourth draft token.
+Serve the fine-tuned head with the FP8 drafter KV.
+- BF16 adds only +0.08 acceptance on Kaggle (2.882 vs 2.805) and +0.12 on Frida (3.020 vs 2.898).
+- BF16 costs 7% of the pool and storms at 14 streams. Avoiding the storm takes 13 streams (1,455,400 / 13 ≈ 112.0K
+  tokens each, as v6's 111.7K). Losing a stream likely costs more than the gain; that is not measured.
+- FP8 keeps v6's pool and leaves room for a fourth draft token.
 
-### Next: k = 4 (tuned-mtp-k4 v1)
+### k = 4 (in progress)
 
-[`jonathanwang2022/tuned-mtp-k4`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-k4) v1:
-- **Config:** [`configs/tuned-mtp-k4/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/a4da31c0340096ef827985b007e441ad8214d7ac/ARC3-Inference/configs/tuned-mtp-k4/v1.json) at
-  [`a4da31c0`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/a4da31c0340096ef827985b007e441ad8214d7ac): `tuned-mtp-fp8-kv` v1 with `mtp_tokens: 4`, a 30-minute public run.
-- **CUDA graphs:** the launcher sizes them from k: 14 × (1 + 4) = 70, rounded up to 72 (from 56).
-- **The fourth draft position:** the head was trained on 3 positions, so position 4 reuses it untrained. A rough
-  guess, if the drop from position 3 to 4 matches the one from 2 to 3 (×0.75): 0.443 × 0.75 ≈ 0.33, giving about
-  2.805 + 0.33 ≈ 3.14 on Kaggle.
-- **What decides it:** whether one more draft row per sequence costs less per decode step than the ~0.33 extra tokens
-  it brings.
-- **v1 cannot start.** k = 4 raises the attention block from 1664 to 1680 tokens, and 1680 is not divisible by v6's
-  `prefix_match_unit` 128. Frida job 209959 stopped at engine start with "Invalid prefix_match_unit=128;
-  prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit. Got group block sizes=[1680,
-  1680, 1680, 8, 1680]" (`runs/local/frida/vllm-replay-draft-kv/runs/arc3_vllm_lord-209959.txt`). Kaggle v1
-  has the same config.
-- **v2:** [`configs/tuned-mtp-k4/v2.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/ece901afb5ef701260b1a6e4d12798a4251e0a5c/ARC3-Inference/configs/tuned-mtp-k4/v2.json) at
-  [`ece901af`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/ece901afb5ef701260b1a6e4d12798a4251e0a5c), v1 with `prefix_match_unit: 112`.
-  - **Why 112:** the unit only sets where a hit may land; states are stored as before (`prefix_match_unit` in
-    `vllm/config/cache.py`). It must divide every prefix-cacheable block size and be a multiple of each cache's
-    per-state compression, which divides 16 (DFlash2 k = 7 booted with 16).
-  - 112 = 1680 / 15 is the valid value closest to v6's 128, so matching stays nearly as before and the run tests
-    k = 4 alone.
-- **On Frida with 112:** job 209961 boots in 220 s with a KV pool of 7,452,680 tokens (k = 3: 7,447,052), and replays
-  v6's 141 requests (the harness's `MTP_TOKENS` and `PREFIX_MATCH_UNIT` settings).
+[`tuned-mtp-k4`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-k4) is `tuned-mtp-fp8-kv` v1 with
+`mtp_tokens: 4`. CUDA graphs go to 14 × 5 = 70, rounded to 72. Position 4 reuses the head untrained.
+- **Guess:** if it decays like 2 → 3 (×0.75), position 4 is ≈ 0.33, giving ≈ 3.14 on Kaggle. It pays off if one more
+  verify row per sequence costs less than that.
+- **v1** ([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/a4da31c0340096ef827985b007e441ad8214d7ac/ARC3-Inference/configs/tuned-mtp-k4/v1.json)
+  @ `a4da31c0`) **cannot start.** k = 4 raises the attention block to 1680, which v6's `prefix_match_unit` 128 does not
+  divide: "Invalid prefix_match_unit=128 … Got group block sizes=[1680, 1680, 1680, 8, 1680]" (Frida job 209959,
+  `runs/local/frida/vllm-replay-draft-kv/runs/arc3_vllm_lord-209959.txt`).
+- **v2** ([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/ece901afb5ef701260b1a6e4d12798a4251e0a5c/ARC3-Inference/configs/tuned-mtp-k4/v2.json)
+  @ `ece901af`) uses `prefix_match_unit: 112`.
+  - The unit only sets where a hit may land. It must divide every prefix-cacheable block size and be a multiple of
+    each cache's per-state compression, which divides 16.
+  - 112 = 1680 / 15 is the valid value closest to 128.
+- **Frida replay with 112** (job 209961, the [same replay](#frida-vllm-replay); the pool is 7,452,680 tokens):
+
+  | k | Acceptance length | Per position | Time per output token | Step cost | Log (`runs/local/frida/vllm-replay-draft-kv/runs/`) |
+  |---|---|---|---|---|---|
+  | 3 | 2.898 | .799 / .623 / .476 | 35.38 ms | 102.5 ms | `replay3-tuned-fp8/`, `arc3_vllm_lord-209926.txt` |
+  | 4 | **3.249** | .799 / .620 / .473 / .357 | **31.87 ms** (−9.9%) | 103.5 ms | `replay3-tuned-fp8-k4/`, `arc3_vllm_lord-209961.txt` |
+
+  Position 4 is 1 + .357 more tokens per step for about 1% more step cost. `analyze.py` prints 3 positions; the fourth
+  is the length minus the rest. The job's tail ("unexpected EOF" in `inside.sh`) came after the replay finished.
+- **v3:** k = 4 needs its own CUDA graph list. FULL decode graphs round up to multiples of 1 + k, and the default list
+  has no FULL graph at 14 requests (70 rows). `kaggle.vllm.cudagraph_capture_sizes` (`7f240b3f`) adds
+  [1, 2, 4, 5, 10, 20, …, 70]. Results for v2/v3 are not in yet.
 
 ## DFlash2 block drafter (incoai)
 
-Conclusion: once both prefix-cache patches are in, DFlash2 matches MTP-3's prefix-hit rate. It still does not beat
-MTP-3 on throughput:
-- **k = 3:** the same acceptance as MTP-3 at about the same step cost.
-- **k = 7, B200 replay:** acceptance length 3.66 against 2.87 (+28% tokens per step), but each step takes 1.25× as
-  long, prefill included. The decode part alone is 1.09–1.13× MTP-3's and 1.25× DFlash2 k = 3's, because the target
-  verifies 8 rows per sequence instead of 4. Net +2%.
-- **k = 7, Kaggle (RTX PRO 6000):** acceptance length 3.34 against v6's 2.74, but generation is 10% slower over
-  the first 30 minutes. The decode part of a step costs 1.21× MTP-3's, and the prefix-hit rate stays at 88–89%
-  against 92–93%, which adds prefill.
-- **k = 4, Kaggle, BF16 drafter KV:** acceptance length 2.90, equal to k = 7's first four positions, so BF16 adds
-  nothing. The pool shrinks by 35.5%, and a prefill storm starts at minute 10. k = 7 is better than or equal to
-  k = 4 ([k = 7 vs k = 4](#k--7-vs-k--4)): DFlash2's drafting cost barely depends on k, so a shorter block saves
-  only verify rows.
+DFlash2 drafts its whole block in one pass, so drafting is cheaper than MTP's three sequential passes. But the target
+verifies k + 1 rows per sequence, and for this MoE more rows cost more. Even with both prefix-cache patches, it does
+not beat MTP-3:
+- **k = 3 (B200):** same acceptance as MTP-3 at about the same step time (0.98×).
+- **k = 7 (B200):** acceptance 3.66 against 2.87 (+28%), but steps are 1.25× longer. Net +2%.
+- **k = 7 (Kaggle):** acceptance 3.34 against 2.74, but generation is 10% slower over the first 30 minutes.
+- **k = 4 (Kaggle, BF16 drafter KV):** acceptance 2.90, the same as k = 7's first four positions, so BF16 adds
+  nothing and costs a third of the pool. A shorter block saves only verify rows, so k = 7 ≥ k = 4.
 
-Drafting is cheaper than MTP's three sequential passes: at k = 3 the decode part of a step is 0.87–0.90× MTP-3's on
-the B200. At k = 7 the extra verify rows outweigh that saving. [Step time](#step-time-drafting-vs-verification) has
-the split.
+### Serving it
 
-### The checkpoint
-
-| | |
-|---|---|
-| Source | HF [`incoai/Qwen3.8-Flash-Next-DFlash2@a22a1744`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/tree/a22a1744e85c17364dcc54a6a420af7135d4c7f6) ([`config.json`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/blob/a22a1744e85c17364dcc54a6a420af7135d4c7f6/config.json)) |
-| Our Kaggle copy | `jonathanwang2022/qwen3-8-flash-next-dflash2/Transformers/default/1` (private) |
-| File | `model.safetensors`, 1,206,140,008 B, BF16, sha256 `d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f` (HF `x-linked-etag`) |
-| Layers | 5, all `sliding_attention`, window 2048, non-causal (`is_causal: false`); hidden 2560, 32 query / 8 KV heads × 128 |
-| Draft block | `block_size` 8; `selector_top_k` 16, `selector_rank` 256 |
-| Target taps | `target_layer_ids` [5, 15, 25, 35, 45] of the target's 48 layers |
-| Embed / lm_head | not in the checkpoint; shared with the target |
-
-Serving it on Lord's runtime takes setup-time patches,
+Lord's runtime needs setup-time patches,
 [`DFLASH_RUNTIME_PATCHES`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1621-L1822)
-in the launcher (branch `dflash2-drafter`). They are:
-- admitting `dflash` for Qwen4Exp;
-- guarding the MTP hidden-state buffer;
-- capturing the five taps in the target;
-- rounding the QSA key ring for k > 4;
-- the two prefix-cache fixes below.
-
-### KV pool
-
-From each run's `vllm-openai-server.log` ("GPU KV cache size", "Available KV cache memory", "kv cache group sizes"):
-
-| Run | Drafter | KV pool | Group block sizes |
-|---|---|---|---|
-| porting-advaith v6 | Lord MTP-3 | 1,564,172 tokens / 21.73 GiB | 1664 × 4, 8 |
-| dflash2-k3 v2 | DFlash2, k = 3 | 1,616,364 tokens / 22.23 GiB | 1664 × 6, 8 |
-| dflash2-k7 v3 | DFlash2, k = 7 | 1,580,652 tokens / 21.91 GiB | 1744 × 6, 16 |
-
-- DFlash2 adds two sliding-window groups. The pool is still larger: "Model loading took" 69.11 GiB against v6's
-  69.54 GiB (drafter 1.2 GB vs 1.6 GB).
-- Every block of any group costs the same page in Lord's pool (22.23 GiB / 971 blocks ≈ 24.6 MB per block). So each
-  sequence's sliding-window blocks (about 3 per group) cost full blocks, even though they hold only 2048 tokens.
-- With k = 7 the GDN conv state grows by 4 rows, and the attention block grows from 1664 to 1744 to stay at least as
-  large as the GDN page. 1744 is not a multiple of 128, so
-  [`dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v2 died at startup with "Invalid
-  prefix_match_unit=128; prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit"
-  (`runs/kaggle/jonathanwang2022/dflash2-k7/v02/vllm-openai-server.log` line 199).
-- v3 uses `prefix_match_unit` 16
-  ([`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json)).
-
-### Prefix cache
-
-Without patches, DFlash2's prefix-hit rate collapses. Two runtime patches fix it, and both are needed (B200 table below):
+(branch `dflash2-drafter`). They admit `dflash` for Qwen4Exp, guard the MTP hidden-state buffer, capture the five taps,
+and round the QSA key ring for k > 4. They also include two prefix-cache fixes, both needed:
 - **Draft-group rule**
-  ([L1722-L1733](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1722-L1733)).
-  - vLLM did not identify DFlash2's KV group as the drafter's, so it applied the EAGLE drop to every group.
-  - The target's GDN groups then fell back to a recurrent checkpoint they do not keep, and turns missed down to
-    0 tokens.
-  - Adding `dflash` to `_uses_trailing_mtp_layers` flags exactly the drafter's group.
+  ([L1722–1733](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1722-L1733)).
+  vLLM did not recognise DFlash2's group as the drafter's, so it applied the EAGLE drop to every group. The target's
+  GDN groups then missed down to 0 tokens. Adding `dflash` to `_uses_trailing_mtp_layers` fixes it.
 - **Replay-tail hold**
-  ([L1734-L1821](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1734-L1821)).
-  - A hit at the replay boundary (the previous prompt's end) needs the sliding-window blocks just below it.
-  - The window frees those blocks during decode, so they are evicted before the request's full-attention blocks.
-  - The request now keeps them out of its block table until it finishes. The cost is up to 3 more blocks per
-    sliding-window group per running request.
+  ([L1734–1821](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1734-L1821)).
+  A hit at the previous prompt's end needs the sliding-window blocks just below it, but the window frees them during
+  decode. The request now holds them until it finishes, at the cost of up to 3 blocks per sliding-window group.
 
-### Served on Kaggle, k = 3, no prefix-cache patches
+KV pool, from "GPU KV cache size" and "kv cache group sizes" in each run's `vllm-openai-server.log`:
 
-[`jonathanwang2022/dflash2-k3`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k3) v2
-([`fc12dafd`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/fc12dafdeaada5ab6fa1f1cf73ae08a15f51bc81),
-[`configs/dflash2-k3/v2.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/fc12dafdeaada5ab6fa1f1cf73ae08a15f51bc81/ARC3-Inference/configs/dflash2-k3/v2.json),
-45-minute public run) against [`porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith) v6.
-Per 10 minutes from the first stats line: mean "Avg generation throughput" / last "Prefix cache hit rate".
+| Run | KV pool | Group block sizes | Log |
+|---|---|---|---|
+| porting-advaith v6 (MTP-3) | 1,564,172 tokens / 21.73 GiB | 1664 × 4, 8 | `runs/kaggle/jonathanwang2022/porting-advaith/v06/` |
+| [`dflash2-k3`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k3) v2 | 1,616,364 / 22.23 GiB | 1664 × 6, 8 | `runs/kaggle/jonathanwang2022/dflash2-k3/v02/` |
+| [`dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v3 | 1,580,652 / 21.91 GiB | 1744 × 6, 16 | `runs/kaggle/jonathanwang2022/dflash2-k7/v03/` |
+
+- DFlash2 weighs less than Lord's MTP (model loading 69.11 vs 69.54 GiB), but it adds two sliding-window groups.
+  Each sequence's ~3 window blocks per group cost full 24.6-MB pages, though they hold only 2048 tokens.
+- k = 7 grows the attention block to 1744, which 128 does not divide, so dflash2-k7 v2 died at startup
+  (`runs/kaggle/jonathanwang2022/dflash2-k7/v02/vllm-openai-server.log` line 199). v3 uses `prefix_match_unit` 16
+  ([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json)).
+
+### B200 replay
+
+Frida `ixb2`, Lord's runtime, each arm with its Kaggle pool size. The load is recorded GRPO episodes (v6 harness)
+replayed at 14 streams from 40K-token contexts over a 900-s window
+([README](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/README.md),
+[`bench.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/bench.py)).
+The step time is acceptance length ÷ gen tok/s, relative to MTP-3, prefill included.
+
+| Drafter | Patches | Prefix hit | Gen tok/s | Acceptance per position | Acceptance length | Step vs MTP-3 | Log (`runs/local/frida/dflash2-b200/`) |
+|---|---|---|---|---|---|---|---|
+| MTP-3 (v6) | n/a | 92.8% | 1,298 | .785 .610 .470 | 2.865 | 1 | `209821/C/` |
+| DFlash2 k = 3 | none | 47.4% | 545 | .791 .619 .485 | 2.894 | | `209821/B/` |
+| DFlash2 k = 3 | hold only | 53.5% | 588 | .777 .600 .461 | 2.838 | | `209824/B/` |
+| DFlash2 k = 3 | rule only | 62.1% | 681 | .786 .612 .478 | 2.876 | | `209829/D/` |
+| DFlash2 k = 3 | rule + hold | 90.1% | 1,315 | .780 .600 .463 | 2.843 | 0.98 | `209829/B/` |
+| DFlash2 k = 7 | none | 41.5% | 505 | .754 .559 .418 .324 .258 .211 .176 | 3.700 | | `209821/A/` |
+| DFlash2 k = 7 | rule + hold | 90.0% | **1,329** | .744 .552 .414 .318 .253 .207 .174 | **3.662** | **1.25** | `209829/A/` |
+
+Each arm folder holds `bench/summary.json` (these numbers) and `vllm-openai-server.log`. The job output is
+`<job>.txt`. Unpatched hit rates differ from the README's by up to 0.9 points.
+
+### On Kaggle
+
+**k = 3 without the prefix-cache patches**: [`dflash2-k3`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k3) v2
+([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/fc12dafdeaada5ab6fa1f1cf73ae08a15f51bc81/ARC3-Inference/configs/dflash2-k3/v2.json)
+@ `fc12dafd`). Acceptance was 2.676 against v6's 2.743, but the prefix cache collapsed. Mean gen tok/s / last
+prefix-hit rate per 10 minutes:
 
 | Minutes | 0–10 | 10–20 | 20–30 | 30–40 |
 |---|---|---|---|---|
 | dflash2-k3 v2 | 764 / 74% | 382 / 58% | 283 / 47% | 359 / 43% |
-| porting-advaith v6 | 909 / 92% | 930 / 93% | 916 / 93% | 869 / 93% |
+| v6 | 909 / 92% | 930 / 93% | 916 / 93% | 869 / 93% |
 
-- Acceptance length: 2.676 (0.757 / 0.554 / 0.397), against v6's 2.743 (0.767 / 0.568 / 0.412). Both are from
-  `drafter_stats accept` on the runs' `vllm-openai-server.log`.
-- The collapse is the prefix cache, not the drafter. The draft attention runs on `TRITON_ATTN` (v1 failed when
-  FlashInfer JIT-built its sliding-window kernel against a missing `libcudart.so`).
+Logs: `runs/kaggle/jonathanwang2022/dflash2-k3/v02/vllm-openai-server.log`, `…/porting-advaith/v06/vllm-openai-server.log`.
 
-### B200 replay, both patches
+**k = 7 with both patches**: [`dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v3
+([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json)
+@ `6fd99257`). The games ran for 30 minutes before the time cap, so the comparison covers the first 30 minutes of stats
+lines (180 each).
 
-Frida `ixb2`, Lord's runtime rebuilt from his image and overlay, each arm's Kaggle setup with
-`--kv-cache-memory-bytes` set to its Kaggle pool. The load is recorded GRPO episodes (porting-advaith v6 harness)
-replayed at 14 streams from 40K-token contexts, with the harness's sampling, over a 900-s window
-([`scripts/dflash2_b200/README.md`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/README.md),
-[`bench.py`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/scripts/dflash2_b200/bench.py)).
-Numbers are from each arm's `bench/summary.json` on Frida in
-`/shared/workspace/arc-agi-3/dflash2_b200/out/<job>/<arm>/`. The acceptance length is 1 + the sum of the
-per-position rates. The step time is acceptance length ÷ gen tok/s, relative to MTP-3, prefill included.
-
-| Job | Drafter | Patches | Prefix hit | Gen tok/s | Acceptance per position | Acceptance length | Step time vs MTP-3 |
-|---|---|---|---|---|---|---|---|
-| 209821 | MTP-3 (v6) | n/a | 92.8% | 1,298 | .785 .610 .470 | 2.865 | 1 |
-| 209821 | DFlash2 k = 3 | none | 47.4% | 545 | .791 .619 .485 | 2.894 | |
-| 209829 | DFlash2 k = 3 | rule only | 62.1% | 681 | .786 .612 .478 | 2.876 | |
-| 209829 | DFlash2 k = 3 | rule + hold | 90.1% | 1,315 | .780 .600 .463 | 2.843 | 0.98 |
-| 209821 | DFlash2 k = 7 | none | 41.5% | 505 | .754 .559 .418 .324 .258 .211 .176 | 3.700 | |
-| 209829 | DFlash2 k = 7 | rule + hold | 90.0% | **1,329** | .744 .552 .414 .318 .253 .207 .174 | **3.662** | **1.25** |
-
-What the table shows:
-- Both patches together bring DFlash2 to MTP-3's hit rate. The rule alone gets 62%, and the hold alone 54% (job
-  209824, in the README).
-- At positions 1–3, DFlash2 accepts slightly less than MTP-3 (k = 7: .744 / .552 / .414 against .785 / .610 / .470).
-  Positions 4–7 add 0.95 tokens per step, at the price of 4 more verify rows per sequence.
-- The step-time column is the ratio of two measured numbers, filled only for the patched rows; an unpatched run's gen
-  tok/s is set by prefill. [Step time](#step-time-drafting-vs-verification) splits it into decode and prefill.
-- B200 tokens/s are not Kaggle numbers.
-- Unpatched hit rates here are from `summary.json` and differ from the README's table by up to 0.9 points
-  (42.1% / 48.3%). The patched rows agree.
-
-### Served on Kaggle, k = 7, both patches
-
-[`jonathanwang2022/dflash2-k7`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k7) v3
-([`6fd99257`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6fd992579012872e5f8926468d78f4c7fb53137f),
-[`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6fd992579012872e5f8926468d78f4c7fb53137f/ARC3-Inference/configs/dflash2-k7/v3.json),
-2026-10-31, 55-minute run), against [`porting-advaith`](https://www.kaggle.com/code/jonathanwang2022/porting-advaith)
-v6. The games ran 14:42–15:13 UTC, when the run's time cap stopped them (KV use 80% → 16%, then 1–3 requests drained
-until 15:15). So the comparison covers the first 30 minutes of stats lines in each `vllm-openai-server.log`
-(180 lines each).
-
-| First 30 min | dflash2-k7 v3 | porting-advaith v6 | change |
+| First 30 min | dflash2-k7 v3 | v6 | change |
 |---|---|---|---|
-| Acceptance length (`drafter_stats accept`, whole run) | **3.336** | 2.743 | +21.6% |
+| Acceptance length (whole run) | **3.336** | 2.743 | +21.6% |
 | Per position | .740 .529 .376 .270 .197 .148 .111 | .767 .568 .412 | |
-| Mean "Avg generation throughput" | **825** tok/s | 918 tok/s | −10.1% |
-| Mean "Avg prompt throughput" (prefill) | 3,106 tok/s | 1,923 tok/s | +62% |
-| Mean running requests | 13.73 | 13.91 | |
-| Prefix hit rate at 2 / 10 / 20 / 30 min | 61% / 85% / 88% / 89% | 92% from 10 min | |
+| Gen tok/s | **825** | 918 | −10.1% |
+| Prompt tok/s | 3,106 | 1,923 | +62% |
+| Prefix hit at 2 / 10 / 20 / 30 min | 61 / 85 / 88 / 89% | 92% from 10 min | |
+| Harness tok/s, minutes 0–10 / 10–20 / 20–30 (`stdout.log`) | 702 / 744 / 847 | 806 / 956 / 852 | |
 
-The harness's own 10-minute summaries in each `stdout.log` (the token difference ÷ the time between summaries, each time being "total tokens" ÷ "generated tokens/sec") show the
-gap closing:
-
-| Minutes of play | 0–10 | 10–20 | 20–30 |
-|---|---|---|---|
-| dflash2-k7 v3 | 702 tok/s | 744 | 847 |
-| porting-advaith v6 | 806 | 956 | 852 |
-
-What this shows:
-- **Acceptance.** Kaggle accepts less than the B200 replay: 3.34 against 3.66, almost all of it at positions
-  4–7 (.270 / .197 / .148 / .111 against .318 / .253 / .207 / .174). MTP-3 loses less in the same comparison
-  (2.74 against 2.87). Why is not known: the replay starts at 40K-token contexts and skips early-game turns.
-- **Prefix hits.** They now work on Kaggle, but they reach 85% only after 10 minutes and level off at 88–89%, below
-  v6's 92–93%. The extra prefill is +62%.
-- **Throughput.** With +21.6% tokens per step and −10.1% generation, a k = 7 step takes about 1.35× an MTP-3 step
-  over these 30 minutes, prefill included. Over the whole run it takes 1.28× (57.4 vs 45.0 ms, below).
-- **Over time.** Most of the shortfall is in the first 20 minutes, while the hit rate builds. In minutes 20–30
-  the harness rates are equal (847 vs 852), and the server rate is −6% (864 vs 916).
-
-This is one run, and 30 minutes of play is not a score comparison.
+Logs: `runs/kaggle/jonathanwang2022/dflash2-k7/v03/{vllm-openai-server,stdout}.log`, `…/porting-advaith/v06/{…}.log`.
+- Kaggle accepts less than the B200 (3.34 vs 3.66), almost all at positions 4–7. MTP-3 loses less (2.74 vs 2.87).
+  The cause is not known; the replay skips early-game turns.
+- Prefix hits work now, but they level off at 88–89% against 92–93%, which adds prefill.
+- Most of the shortfall is in the first 20 minutes. In minutes 20–30 the harness rates are equal (847 vs 852).
+- This is one run; 30 minutes of play is not a score comparison.
 
 ### Step time: drafting vs verification
 
-From `drafter_stats steps` on each run's server log (10-s intervals with at least 12 running requests):
+From `drafter_stats steps` (10-s intervals with ≥ 12 running requests), fitted as fixed cost + cost per prefill token.
+The logs are each run's `vllm-openai-server.log` above.
 
-| Run | GPU | Mean step | Prefill tokens per step | Fit: fixed + per prefill token | R² |
+| Run | GPU | Mean step | Prefill tokens per step | Fit | R² |
 |---|---|---|---|---|---|
-| porting-advaith v6, MTP-3 | RTX PRO 6000 | 45.0 ms | 130 | 35.5 ms + 73.0 µs | 0.82 |
+| v6, MTP-3 | RTX PRO 6000 | 45.0 ms | 130 | 35.5 ms + 73.0 µs | 0.82 |
 | dflash2-k7 v3 | RTX PRO 6000 | 57.4 ms | 199 | 44.9 ms + 62.8 µs | 0.80 |
-| dflash2-k3 v2 (no patches) | RTX PRO 6000 | 101.5 ms | 905 | 48.5 ms + 58.6 µs | 0.75 |
 | 209821 C, MTP-3 | B200 | 32.0 ms | 166 | 25.2 ms + 40.8 µs | 0.93 |
 | 209829 B, DFlash2 k = 3 | B200 | 31.3 ms | 210 | 20.4 ms + 52.0 µs | 0.81 |
 | 209829 A, DFlash2 k = 7 | B200 | 40.1 ms | 283 | 25.2 ms + 52.4 µs | 0.96 |
 
-When a run's prefill varies little, the fixed term trades off against the slope: B200 k = 7 and MTP-3 both fit
-25.2 ms. A steadier split subtracts prefill at one per-token cost per GPU, across the range of that GPU's fitted
-slopes:
+dflash2-k3 v2 is left out: its storm made most steps mixed prefill/decode. Because the fixed term trades off against
+the slope, the steadier split subtracts prefill at one per-token cost per GPU, taken across that GPU's fitted slopes:
 
 | Decode part of a step | MTP-3 | DFlash2 k = 3 | DFlash2 k = 7 |
 |---|---|---|---|
-| B200 (prefill at 41–52 µs per token) | 23.4–25.2 ms | 20.4–22.7 ms (0.87–0.90×) | 25.4–28.5 ms (1.09–1.13×) |
-| RTX PRO 6000 (prefill at 63–73 µs per token) | 35.5–36.8 ms | not measured | 42.9–44.9 ms (1.21–1.22×) |
+| B200 (prefill 41–52 µs/token) | 23.4–25.2 ms | 20.4–22.7 ms (0.87–0.90×) | 25.4–28.5 ms (1.09–1.13×) |
+| RTX PRO 6000 (prefill 63–73 µs/token) | 35.5–36.8 ms | not measured | 42.9–44.9 ms (1.21–1.22×) |
 
-What the tables show:
-- **Drafting.** At k = 3 both drafters' steps verify 4 rows per sequence, so the gap is the drafter.
-  - DFlash2's single pass costs about 3 ms less per step on the B200 than MTP's three sequential passes, 10–13% of
-    the step.
-  - DFlash2 drafts the whole block in that one pass, so its draft cost barely grows with k.
-- **Verification.** With the same drafter, k = 3 → 7 adds 25% to the decode part on the B200.
-  - The target runs 14 × (k + 1) rows through its 48 layers: 56 rows at k = 3, 112 at k = 7.
-  - Each token routes to 10 of 512 experts. With independent routing, a layer touches about 342 experts at 56 rows
-    and 456 at 112: 33% more expert weights to read. Attention and GDN work also grow linearly with rows.
-  - So verifying more is not free for this MoE, unlike a dense model at small batch. Even for one sequence, 8 rows
-    touch about 75 experts against 39 for 4.
-- **RTX PRO 6000.** The k = 7 decode part is 1.21× MTP-3's, against 1.09–1.13× on the B200. With no clean RTX
-  k = 3 run, the drafting saving and the verify growth cannot be separated there.
-- **Prefill.** k = 7 computes more prefill per second than MTP-3 on both GPUs. On the B200 that is
-  283 / 40.1 ms ≈ 7.1K against 166 / 32.0 ms ≈ 5.2K tokens/s. This is the cost of the lower hit rate (90% vs
-  92.8% on the B200, 88–89% vs 92–93% on Kaggle).
-- **dflash2-k3 v2 is not used.** Its fixed term is inflated: during its prefill storm, most steps were mixed
-  prefill and decode batches.
+- **Drafting:** at k = 3 both drafters verify 4 rows, so the 10–13% gap is DFlash2's single pass against MTP's three.
+- **Verification:** k = 3 → 7 adds 25% to the decode part. The target runs 14 × (k + 1) rows. With 10 of 512 experts
+  per token, a layer touches ~342 experts at 56 rows and ~456 at 112 (+33% expert reads).
+- **Prefill:** k = 7 prefills more per second (B200: 7.1K vs 5.2K tok/s), the cost of its lower hit rate.
+- Requests in prefill do not draft, so steps are slightly undercounted.
 
-The step count assumes that every running request drafts in every step. A request in prefill does not draft, so
-steps are slightly undercounted. That is at most about one request in 14 while a 2,048-token chunk prefills, and
-more in prefill-heavy runs.
+### k = 4 vs k = 7
 
-### k = 4 with a BF16 drafter KV (dflash2-k4-bf16-kv v1)
+[`dflash2-k4-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k4-bf16-kv) v1
+([config](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6a3a741ff60b07babf2d2918354a28855f51410c/ARC3-Inference/configs/dflash2-k4-bf16-kv/v1.json)
+@ `6a3a741f`, branch `dflash2-k4-bf16kv` = `dflash2-drafter` + `draft-bf16-kv`) is dflash2-k7 v3 with `mtp_tokens` 4 and
+`draft_kv_cache_dtype` `auto` (BF16). The target KV stays FP8.
 
-[`jonathanwang2022/dflash2-k4-bf16-kv`](https://www.kaggle.com/code/jonathanwang2022/dflash2-k4-bf16-kv) v1
-([`6a3a741f`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6a3a741ff60b07babf2d2918354a28855f51410c),
-[`configs/dflash2-k4-bf16-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6a3a741ff60b07babf2d2918354a28855f51410c/ARC3-Inference/configs/dflash2-k4-bf16-kv/v1.json),
-branch [`dflash2-k4-bf16kv`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/tree/dflash2-k4-bf16kv), 2026-10-31).
-- The branch is `dflash2-drafter` with `draft-bf16-kv` merged.
-- The config is [`configs/dflash2-k7/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6a3a741ff60b07babf2d2918354a28855f51410c/ARC3-Inference/configs/dflash2-k7/v3.json) with two
-  changes: `mtp_tokens` 7 → 4 and `draft_kv_cache_dtype` `"auto"` (BF16).
-- The target KV stays `fp8_e4m3`, the indexer `fp8`, at 14 sequences.
-
-From each run's `vllm-openai-server.log` (`drafter_stats accept`, `timeline --bucket 10`,
-`steps --from 2 --until 10 --prefill-us 68`, and the "GPU KV cache size" / "kv cache group sizes" lines):
-
-| | dflash2-k4-bf16-kv v1 | dflash2-k7 v3 | porting-advaith v6 |
+| | dflash2-k4-bf16-kv v1 | dflash2-k7 v3 | v6 (MTP-3) |
 |---|---|---|---|
-| Drafter, drafter KV | DFlash2 k = 4, BF16 | DFlash2 k = 7, FP8 | MTP-3, FP8 |
 | Acceptance, whole run | 2.902 (.743 .533 .378 .270) | 3.336; first 4 positions 2.915 | 2.743 |
 | Acceptance, first 10 min | 2.890 | 3.203; first 4 positions 2.874 | 2.638 |
-| KV pool | **1,019,208 tokens** / 22.21 GiB | 1,580,652 / 21.91 GiB | 1,564,172 / 21.73 GiB |
-| KV group block sizes | 1680 × 5, 8 | 1744 × 6, 16 | 1664 × 4, 8 |
-| Min 0–10: gen tok/s, KV max, prefix hit | 738, 97.8%, 75.0% | 790, 68.1%, 68.8% | 909, 67.0%, 85.6% |
-| Min 10–20 | **261**, 99.7%, 64.3% | 820, 89.1%, 87.8% | 930, 87.5%, 93.1% |
-| Min 20–30 | **231**, 99.7%, 45.9% | 864, 79.4%, 88.2% | 916, 85.1%, 92.9% |
-| Min 2–10: mean step, prefill tokens per step | 60.2 ms, 286 | 53.1 ms, 150 | 39.4 ms, 69 |
-| Min 2–10: decode part (prefill at 68 µs per token) | 40.8 ms | 42.9 ms | 34.7 ms |
+| KV pool | **1,019,208** / 22.21 GiB (1680 × 5, 8) | 1,580,652 / 21.91 GiB | 1,564,172 / 21.73 GiB |
+| Gen tok/s, KV max, prefix hit: min 0–10 | 738, 97.8%, 75.0% | 790, 68.1%, 68.8% | 909, 67.0%, 85.6% |
+| min 10–20 | **261**, 99.7%, 64.3% | 820, 89.1%, 87.8% | 930, 87.5%, 93.1% |
+| min 20–30 | **231**, 99.7%, 45.9% | 864, 79.4%, 88.2% | 916, 85.1%, 92.9% |
+| Min 2–10: mean step / prefill tokens per step | 60.2 ms / 286 | 53.1 ms / 150 | 39.4 ms / 69 |
+| Min 2–10: decode part (prefill at 68 µs/token) | 40.8 ms | 42.9 ms | 34.7 ms |
+| Log (`vllm-openai-server.log` in) | `runs/kaggle/jonathanwang2022/dflash2-k4-bf16-kv/v01/` | `…/dflash2-k7/v03/` | `…/porting-advaith/v06/` |
 
-68 µs is mid-range of the RTX PRO 6000 fitted slopes (63–73 µs, [above](#step-time-drafting-vs-verification)).
-Minutes 2–10 are before k = 4's storm, and they skip each run's ramp-up.
+- **A BF16 drafter KV gives DFlash2 nothing.** Every position is within .004 of k = 7's FP8 one, because DFlash2 never
+  reads its own drafts back.
+- **It costs a third of the pool.** Doubling the sliding-window pages raises the per-block stride from ~26.0 to
+  ~39.3 MB. KV is 97.8% full within 10 minutes, then a prefill storm follows (hits 75 → 46%, generation 738 → 231).
+- **Drafting is flat in k.** One pass reads the 1.206 GB drafter and at most the 1.271 GB BF16 `lm_head`: ~1.4 ms at
+  the RTX PRO 6000's 1.79 TB/s, whatever k is. Compute is 0.17–0.28 TFLOP. MTP, by contrast, runs one pass per token.
+- **Verification grows less than acceptance.** k = 7 verifies 112 rows against 70. With 10 of 512 experts per token,
+  a layer touches 456 against 383 experts (+19% routed weights), while positions 5–7 add 0.456 tokens (+15.7%).
 
-What this shows:
-- **BF16 drafter KV gives DFlash2 nothing.** k = 4 accepts what k = 7's FP8 first four positions accept: 2.902 vs
-  2.915 over the whole run, 2.890 vs 2.874 in the first 10 minutes, each position within .004. That fits the
-  prediction: DFlash2 drafts its block in one pass and never reads its own drafts back from the cache.
-- **It costs a third of the pool.** BF16 doubles the drafter's sliding-window pages, and Lord's pool spaces every
-  block by its largest page ([KV pool](#kv-pool)). Space per block rises from about 26.0 MB (21.91 GiB / 906 blocks
-  of 1744) to about 39.3 MB (22.21 GiB / 607 blocks of 1680), so the pool falls by 35.5%.
-  - KV use reaches 97.8% within 10 minutes. A prefill storm follows: the hit rate falls 75 → 64 → 46% and generation
-    falls 738 → 261 → 231 tok/s.
-  - tuned-mtp-bf16-kv v1 showed the same pattern ([above](#served-on-kaggle-with-bf16-drafter-kv-tuned-mtp-bf16-kv-v1)),
-    later and milder: it lost 7% of the pool, not 35.5%.
-- **Three fewer draft positions save 5% of the decode part.** Before the storm, k = 4's decode part is 40.8 ms
-  against k = 7's 42.9 ms. Prefill per step was already about twice k = 7's, so 40.8 ms may still hold some cost
-  from mixed prefill and decode batches.
+Time per accepted token = decode part / acceptance + prefill per accepted token. Prefill is taken at k = 7's
+150 × 68 µs, since the games, not k, set it. A clean FP8 k = 4 accepts k = 7's first four positions.
 
-### k = 7 vs k = 4
-
-Conclusion: for DFlash2 on this target, k = 7 is better than or equal to k = 4. As measured, k = 7 is 4–8% faster.
-For a clean FP8 k = 4, the estimate is a tie. Even under a bound that favours k = 4, k = 7 gives up at most 3% over
-the run. The reason is that a shorter DFlash2 block saves almost no drafting, unlike MTP. It saves only verify
-rows, and those cost less than the tokens positions 5–7 add.
-
-- **Drafting is flat in k.** DFlash2 drafts all k positions in one pass of its 5 layers and the target's lm_head
-  ([checkpoint](#the-checkpoint)).
-  - That pass reads 1.206 GB of drafter weights
-    ([`model.safetensors@a22a1744`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/blob/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors)).
-    At most it also reads the 1.271 GB BF16 lm_head (248,320 × 2,560, untied, in
-    [`model-00017-of-00017.safetensors`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/blob/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/model-00017-of-00017.safetensors)).
-    That is about 1.4 ms at the RTX PRO 6000's 1.79 TB/s
-    ([spec](https://www.nvidia.com/en-us/products/workstations/professional-desktop-gpus/rtx-pro-6000/)), whatever k is.
-  - Its compute is 14 × (k + 1) rows × 2 × about 1.24 B parameters: 0.17 TFLOP at k = 4 and 0.28 TFLOP at k = 7.
-    That is a fraction of a millisecond either way.
-  - MTP is different: it runs one full drafter pass per draft token, so a shorter k saves drafting time.
-- **Verification grows less than acceptance.**
-  - k = 7 verifies 14 × 8 = 112 rows against 70 at k = 4.
-  - Each token routes to 10 of 512 experts in each of 48 layers
-    ([`config.json`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/blob/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/config.json)).
-    With independent routing, 512 · (1 − (1 − 10/512)ⁿ) gives 456 experts touched per layer against 383: +19% routed
-    weights.
-  - Attention, GDN and dense weights are read once per step, whatever k is.
-  - Positions 5–7 add .197 + .148 + .111 = 0.456 accepted tokens per step: +15.7% over k = 4's 2.902.
-- **Throughput.** Time per accepted token is (decode part / acceptance) + prefill per accepted token. The games and
-  the hit rate set the prefill tokens, not k, so the prefill term is taken equal in both: k = 7's, 150 × 68 µs ÷
-  acceptance. A clean k = 4's acceptance is k = 7's first four positions, since BF16 added nothing.
-
-| k = 4 decode part | Basis | k = 7 vs k = 4, whole-run acceptance | First 10 minutes |
+| k = 4 decode part | Basis | k = 7 vs k = 4, whole run | First 10 min |
 |---|---|---|---|
-| 40.8 ms | measured (BF16 drafter KV run, minutes 2–10) | **k = 7 +7.5%** | **+4.4%** |
-| 37.4 ms | B200's k = 3 → 7 growth (+25% for +114 experts), interpolated to 383 experts, applied to RTX k = 7's 42.9 ms | −0.2% (tie) | −2.3% |
-| 36.1 ms | bound: the whole decode part scales with routed experts (42.9 / 1.189) | −3.0% | −5.1% |
+| 40.8 ms | measured (BF16 run, before the storm) | **+7.5%** | **+4.4%** |
+| 37.4 ms | B200's k = 3 → 7 growth interpolated to 383 experts | −0.2% (tie) | −2.3% |
+| 36.1 ms | bound: whole decode part scales with routed experts | −3.0% | −5.1% |
 
-- The bound is pessimistic for k = 7. The drafter pass, attention and GDN state reads, and the dense weights do not
-  grow with rows.
-- The first 10 minutes favour k = 4 because k = 7's later positions accept least early on (3.203 vs 3.336 over the
-  whole run).
-- Neither k reaches MTP-3: v6's decode part is 34.7 ms over the same minutes. The MTP comparison that counts is now
-  `tuned-mtp-fp8-kv`, the fine-tuned MTP head with FP8 drafter KV ([the chosen
-  setup](#decision-fine-tuned-head-with-fp8-drafter-kv)), not v6.
-- These are one run per arm, compared on server step times, not scores.
+So k = 7 ≥ k = 4. The bound is pessimistic for k = 7, because drafting, attention, GDN and dense weights do not grow
+with rows. Neither k reaches MTP-3's 34.7 ms. These are one run per arm, compared on step times, not scores.
+
+## Method notes
+
+### Acceptance and throughput from server logs
+
+([`drafter_stats.py`](../../ARC3-Inference/inference/tools/drafter_stats.py)):
+- vLLM: token-weighted from "SpecDecoding metrics", `1 + accepted / (drafted / k)`. Per-position rates are the mean
+  of the logged rates.
+- SGLang: unweighted mean of `accept len`.
+- tok/s: mean of the 10-s "Avg generation / prompt throughput" lines.
+
+### Frida vLLM replay
+
+(`runs/local/frida/vllm-replay-draft-kv/`: `run_vllm.sbatch`, `inside.sh`, `setup_runtime.py`,
+[`replay.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/replay.py),
+[`analyze.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/analyze.py)):
+- Lord's runtime is rebuilt on one B200 from `vllm/vllm-openai@sha256:e0eee5c5…` plus his 32 overlay files
+  (sha256-checked against `runtime-manifest.json`), with the launcher's patches and v6's exact `vllm serve` command.
+  `LORD_DIR` swaps the draft.
+- The load is v6's own 141 `mtp_v1` samples, one request each: the context before the last trained reply, mean 104K
+  prompt tokens. Sampling is the harness's, with a fixed seed per request, up to 2,048 generated tokens, 14 at a time.
+- Numbers are differences of `/metrics` counters before and after the replay (`metrics_before.txt` /
+  `metrics_after.txt`).
+
+### Offline eval vs vLLM
+
+- The offline target is transformers Qwen4Exp with the RFT patches, and the head is vLLM's `Qwen4ExpMultiTokenPredictor`
+  rebuilt from transformers modules.
+- FP8 is a scale-1.0 rounding of stored K/V. Draft steps 2–3 attend to keys from the same step.
+- The eval set is 5 held-out games and leaves out `uncertain` requests and requests over 124K tokens. So offline stays
+  above served even with FP8.
+- The two implementations were not compared layer by layer.
 
 ## Reproduce
 
-From `ARC3-Inference/` ([`inference/tools/drafter_stats.py`](../../ARC3-Inference/inference/tools/drafter_stats.py)).
-It reads safetensors headers with HTTP range requests and downloads no weights. Kaggle files need
-`~/.kaggle/access_token`.
-The GitHub commit/config links and the `jonathanwang2022/*` Kaggle notebooks are private: open them while signed in
-with access. The Hugging Face and NVIDIA links are public.
+From `ARC3-Inference/`. `drafter_stats bytes` reads safetensors headers by HTTP range requests (Kaggle needs
+`~/.kaggle/access_token`).
 
 ```sh
 P=https://huggingface.co/primitive-ai/Qwen3.8-Flash-Next-mixed-NVFP4-FP8/resolve/07915ee79ec217c117e8a57bf2557a4a1418c10f
@@ -702,38 +426,32 @@ python -m inference.tools.drafter_stats bytes \
   --prefix mtp.                                                             # Intel: 5.214 GB
 K=https://www.kaggle.com/api/v1/models/dfranzen/albucino-qwen3-8-flash-next-drafter/transformers/default/1/download
 python -m inference.tools.drafter_stats bytes $K/mtp-dense.safetensors $K/mtp-routed-experts-int4.safetensors  # 4.140 GB
-python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log
-python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k3/v02/vllm-openai-server.log   # 2.676
-python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/dflash2-k7/v03/vllm-openai-server.log   # 3.336
-for r in porting-advaith/v06 dflash2-k7/v03 dflash2-k3/v02; do                                    # step-time table
-  python -m inference.tools.drafter_stats steps runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log; done
-# B200 rows: the same on /shared/workspace/arc-agi-3/dflash2_b200/out/{209821/C,209829/B,209829/A}/vllm-openai-server.log
-make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k4-bf16-kv VERSION=1                                    # the k = 4 run
-for r in dflash2-k4-bf16-kv/v01 dflash2-k7/v03 porting-advaith/v06; do L=runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log
-  python -m inference.tools.drafter_stats accept $L; python -m inference.tools.drafter_stats accept $L --until 10  # 2.902 / 3.336 / 2.743; 2.890 / 3.203 / 2.638
-  python -m inference.tools.drafter_stats timeline $L --bucket 10
-  python -m inference.tools.drafter_stats steps $L --from 2 --until 10 --prefill-us 68                    # decode_ms 40.8 / 42.9 / 34.7
-  grep -E "GPU KV cache size|Available KV cache memory|kv cache group sizes" $L; done                       # k = 4: 1,019,208 tokens
+curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
+  | grep -i x-linked                                                        # DFlash2: 1,206,140,008 B, sha256
+
+# Kaggle runs (make pull-kaggle NOTEBOOK=jonathanwang2022/<name> VERSION=<n> if missing)
+L=runs/kaggle/jonathanwang2022
+python -m inference.tools.drafter_stats accept $L/porting-advaith/v06/vllm-openai-server.log           # 2.743
+python -m inference.tools.drafter_stats accept $L/dflash2-k3/v02/vllm-openai-server.log                # 2.676
+python -m inference.tools.drafter_stats accept $L/dflash2-k7/v03/vllm-openai-server.log                # 3.336
+for r in tuned-mtp-fp8-kv/v01 tuned-mtp-bf16-kv/v01 porting-advaith/v06; do
+  python -m inference.tools.drafter_stats accept $L/$r/vllm-openai-server.log --until 15; done          # 2.805 / 2.882 / 2.662
+for r in tuned-mtp-bf16-kv/v01 porting-advaith/v06; do                                                 # storm timeline
+  python -m inference.tools.drafter_stats timeline $L/$r/vllm-openai-server.log --bucket 5; done
+for r in porting-advaith/v06 dflash2-k7/v03 dflash2-k3/v02; do                                         # step-time table
+  python -m inference.tools.drafter_stats steps $L/$r/vllm-openai-server.log; done
+for r in dflash2-k4-bf16-kv/v01 dflash2-k7/v03 porting-advaith/v06; do F=$L/$r/vllm-openai-server.log  # k = 4 vs k = 7
+  python -m inference.tools.drafter_stats accept $F; python -m inference.tools.drafter_stats accept $F --until 10  # 2.902 / 3.336 / 2.743; 2.890 / 3.203 / 2.638
+  python -m inference.tools.drafter_stats timeline $F --bucket 10
+  python -m inference.tools.drafter_stats steps $F --from 2 --until 10 --prefill-us 68                  # decode 40.8 / 42.9 / 34.7 ms
+  grep -E "GPU KV cache size|kv cache group sizes" $F; done                                             # k = 4: 1,019,208 tokens
 python -m inference.tools.drafter_stats bytes \
   https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound/resolve/4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897/model-00017-of-00017.safetensors \
   --prefix lm_head                                                          # target lm_head: 1.271 GB BF16
-make pull-kaggle NOTEBOOK=jonathanwang2022/dflash2-k7 VERSION=3                                             # the k = 7 run
-make pull-kaggle NOTEBOOK=jonathanwang2022/tuned-mtp-bf16-kv VERSION=1                                      # fine-tuned + BF16
-python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log  # 2.888
-python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --until 17.7  # 2.668
-python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log --bucket 5
-python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --bucket 5
-python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16  # 3.020
-python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-fp8   # 2.898
-make pull-kaggle NOTEBOOK=jonathanwang2022/tuned-mtp-fp8-kv VERSION=1                                       # fine-tuned + FP8
-for r in tuned-mtp-fp8-kv/v01 tuned-mtp-bf16-kv/v01 porting-advaith/v06; do
-  python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log --until 15; done  # 2.805 / 2.882 / 2.662
-curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
-  | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256
-```
+for a in 209821/C 209829/B 209829/A; do                                                                # B200 step-time rows
+  python -m inference.tools.drafter_stats steps runs/local/frida/dflash2-b200/$a/vllm-openai-server.log; done
 
-Two checks were done in a Python session on Frida against the shared copies of both checkpoints (2026-10-30), not with
-a script in the repo:
-- the 29-tensor bit-identity of Lord's and Intel's non-expert MTP tensors;
-- the NVFP4 dequantization against Intel's BF16 experts. The same decode is `dequant_nvfp4` in
-  `inference/rft/mtp_train.py` on branch `mtp-data`.
+# Frida vLLM replay
+for a in draft-fp8 draft-bf16 tuned-fp8 tuned-bf16 tuned-fp8-k4; do                                    # 2.777 / 2.910 / 2.898 / 3.020 / 3.249
+  python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-$a; done
+```
