@@ -46,7 +46,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from inference.rft import layer_patches, ple_mmap, smoke_lora, train_rft
-from inference.rft.qsa import patch_qsa_attention
+from inference.rft.qsa import patch_qsa_attention, set_kv_fp8
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 FROZEN = ("mlp.experts.", "self_attn.indexer.")
@@ -232,7 +232,9 @@ def run_sample(target: Target, head: MTPHead, lm_head, embed, rotary, item: dict
     input_ids = item["input_ids"].to(device)
     inputs = {k: v.to(device) for k, v in item.items() if k != "labels" and not k.startswith("_")}
     started = time.perf_counter()
+    set_kv_fp8(args.fp8_kv in ("target", "both"))  # vLLM's fp8_e4m3 KV and indexer caches, simulated (qsa.py)
     hidden, last = target(inputs, item.get("_ngram"))
+    set_kv_fp8(args.fp8_kv in ("mtp", "both"))
     target_s = time.perf_counter() - started
     n = input_ids.shape[1] - 1  # rows 0..n-1: (state i, token i+1) -> token i+2
     rows = torch.nonzero(labels[2:] != -100).squeeze(1)  # rows whose predicted token is a trained reply token
@@ -258,6 +260,7 @@ def run_sample(target: Target, head: MTPHead, lm_head, embed, rotary, item: dict
         # row i of the next step: this step's state of row i-1 (row 0 keeps the target's, never trained)
         state = torch.cat([hidden[:, :1], h2[:, :-1].detach()], dim=1)
         del out, h2, loss
+    set_kv_fp8(False)
     chain = chain_rates(accepted, rows, n)
     return dict(tokens=int(input_ids.shape[1]), rows=int(rows.numel()), losses=[round(x, 5) for x in losses],
                 step1_accept=round(float(accepted[0].mean()), 5) if rows.numel() else None, chain=chain,
@@ -435,6 +438,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="without compile_hc, compile_moe, fast_conv, fast_gdn (train_rft's switch)")
     parser.add_argument("--no-fast-gdn", dest="fast_gdn", action="store_false")
     parser.add_argument("--eval-only", action="store_true", help="measure the head as loaded and stop")
+    parser.add_argument("--fp8-kv", choices=("none", "target", "mtp", "both"), default="none",
+                        help="round K/V (and the QSA indexer) to e4m3 as vLLM's fp8 caches do, in the target's "
+                             "attention, the head's, or both (qsa.set_kv_fp8)")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", help="also log to this wandb project (key: WANDB_API_KEY; offline without it)")
