@@ -62,10 +62,10 @@ another team's notebook.
 
 ## Drafter KV precision
 
-Conclusion: keeping the MTP drafter's own KV cache in FP8 costs about 0.10–0.13 acceptance length. A BF16 drafter KV
-is worth testing in serving. It costs an estimated 6–7% of the KV pool, which 14 streams should still fit (v6 peaked at
-93%). The target's KV can stay FP8. Two caveats: the acceptance numbers are a simulation, and plain `auto` does not
-start on Lord's runtime.
+Conclusion: keeping the MTP drafter's own KV cache in FP8 costs acceptance. Real vLLM on v6's own requests measures
+2.78 with an FP8 drafter KV and 2.91 with a BF16 one (+0.13, +4.6%); the offline simulation predicted 0.10–0.13. The
+per-step cost does not change, so decode gets about 5% faster per token. The cost is 6.9% of the KV pool. The target's
+KV stays FP8. A BF16 drafter KV needs a runtime patch on Lord's runtime (below); it has not been run on Kaggle yet.
 
 ### Measurement
 
@@ -133,15 +133,63 @@ The two implementations were not compared layer by layer.
   died at startup: "To serve at least one request with the model's max seq len (147072), (211.88 GiB KV cache is needed,
   which is larger than the available KV cache memory (21.71 GiB)" (`runs/kaggle/jonathanwang2022/draft-bf16-kv/v01/vllm-openai-server.log`
   line 190).
-- **Why** (my reading of the code; not traced in a run): the BF16 draft page is twice the FP8 page of the target's
-  layers, and
-  [`unify_kv_cache_spec_page_size`](https://github.com/vllm-project/vllm/blob/e9757321527ca1ecd514c07c1418dd2c53da3d19/vllm/v1/core/kv_cache_utils.py#L1368)
-  equalizes pages by raising the other layers' block size and padding the Mamba pages to the largest page. That breaks
-  the 1664-token alignment Lord's runtime sets between attention and Mamba pages. Lord's overlay replaces this file, so
-  the link is to the upstream base.
-- **The fix to try:** a setup-time patch, like the DFlash ones, that halves the drafter group's block size (1664 → 832)
-  before the pages are unified. Its BF16 page then equals the others, and nothing else changes size. The scheduler block
-  stays LCM = 1664, and `prefix_match_unit` 128 divides 832. Not written yet.
+- **Why** (traced on Frida, job 209822, with every KV spec and group logged before the memory check): the draft
+  `kv_cache_dtype` gives the drafter a `replace()`d copy of the cache config. The platform then raises the attention
+  block size to 1664 in place on the engine's config, after the model has loaded, so the copy keeps block size 16.
+  The drafter's QSA indexer compressed-key cache reads its own copy, so it became a KV group of 16-token blocks.
+  Lord's packed layout strides every block by the widest group's page (24.5 MB), so one 147,072-token request needed
+  147,072 / 16 = 9,192 such blocks, the "211.88 GiB". The BF16 page size itself was not the problem.
+- **The fix** ([`use_engine_block_size_for_draft_qsa`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/6c8bffd173c72b657e10052c755d749411614f6f/ARC3-Inference/inference/framework/lordhansolo/kaggle.py#L1464-L1501),
+  branch `draft-bf16-kv` at
+  [`6c8bffd1`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/6c8bffd173c72b657e10052c755d749411614f6f)):
+  - a setup-time patch with 3 anchored edits in `vllm/models/qwen4_exp/common/qsa_cache.py`, so the QSA caches read
+    `vllm_config.cache_config.block_size` (the engine's) instead of their own copy;
+  - applied only when a draft KV dtype is set, and the setup fails if an anchor does not match exactly once.
+
+  With it (job 209823), the drafter's indexer cache joins the 1664-token group, and one full-length request needs
+  2.19 GiB. v6 with the FP8 drafter needs about 2.04 GiB.
+
+### Measured in vLLM on Frida
+
+Lord's runtime rebuilt on one B200:
+- the image `vllm/vllm-openai@sha256:e0eee5c5…` (the digest in his `runtime-manifest.json`; the tag is pruned) plus his
+  32 overlay files, each checked against the manifest's sha256;
+- the launcher's setup-time patches and Lord's MTP draft, then v6's exact `vllm serve` command;
+- the harness is `runs/local/frida/vllm-replay-draft-kv/` (`run_vllm.sbatch`, `inside.sh`, `setup_runtime.py`).
+
+The replay ([`replay.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/replay.py)):
+- porting-advaith v6's own 141 samples from `mtp_v1` (all 25 games), one request each: the context before the sample's
+  last trained reply, mean 104K prompt tokens;
+- the harness's sampling (T 0.7, top-p 0.95, top-k 20), a fixed seed per request, up to 2,048 generated tokens, 14 at a
+  time;
+- the two arms ran alone, one after the other, and got identical prefix-cache hits (3.15%).
+
+Numbers are the differences of vLLM's `/metrics` counters before and after the replay
+([`analyze.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/analyze.py)).
+
+| Drafter KV | Acceptance length | Per position | Time per output token | Decode tok/s per request | Decode time, all requests | Prefill time | KV pool (B200) | Job |
+|---|---|---|---|---|---|---|---|---|
+| FP8 (`fp8_e4m3`, as v6 serves) | 2.777 | 0.776 / 0.578 / 0.422 | 37.10 ms | 26.52 | 7,695 s | 971 s | 7,447,052 tokens | 209838 |
+| BF16 (`auto` + the fix) | **2.910** | 0.790 / 0.624 / 0.496 | **35.23 ms** | **27.77** | 7,258 s | 974 s | 6,930,768 tokens | 209834 |
+| change | +0.133 (+4.8%) | +0.014 / +0.046 / +0.074 | −5.0% | +4.7% | −5.7% | same | −6.9% | |
+
+Reading the table:
+- **Acceptance:** the served FP8 number reproduces Kaggle's v6 live 2.743 (0.767 / 0.568 / 0.412) to within 0.03.
+  BF16 gains most at draft positions 2 and 3, as the simulation showed.
+- **Speed:** a decode step costs the same in both: time per token × tokens per step is 103.0 ms (FP8) vs 102.5 ms
+  (BF16). QSA reads only about 2,048 selected tokens per draft query, so doubling the drafter's KV bytes costs almost
+  nothing per step. The whole gain is acceptance.
+- **Wall time:** 946 s in both. That is end to end: the replay is prefill-bound (about 14.7M prompt tokens against
+  0.2M generated), so it shows no difference.
+
+What this does not show:
+- the RTX PRO 6000 (Kaggle's GPU) kernels;
+- KV pressure. The B200's pool is 7× Kaggle's, so the 6.9% smaller pool was never stressed. v6 ran its 21.7 GiB pool at
+  89% (p99) and 93% (peak) with 14 streams, so only a Kaggle run shows whether the smaller pool costs queueing late in
+  a game.
+
+The files are in `runs/local/frida/vllm-replay-draft-kv/runs/`: `metrics_before.txt`, `metrics_after.txt`,
+`replay.jsonl`, `server.log`, and the job output.
 
 ## Reproduce
 
