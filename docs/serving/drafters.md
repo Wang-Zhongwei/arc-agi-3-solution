@@ -306,11 +306,68 @@ Minutes after the server's first metrics line, means of vLLM's 10 s lines, per-p
 - **Cause:** the storm comes from the BF16 drafter KV's smaller pool, not from the head, whose weights are the same size.
 - **Ways to keep the gain without the storm:**
   - Serve the fine-tuned head with FP8 drafter KV. The pool is then v6's, and on Frida the head keeps +0.122 there
-    (2.898). Kaggle run: `jonathanwang2022/tuned-mtp-fp8-kv` v1 (config `configs/tuned-mtp-fp8-kv/v1.json`, branch
-    `draft-bf16-kv`).
+    (2.898). Measured on Kaggle [below](#served-on-kaggle-with-fp8-drafter-kv-tuned-mtp-fp8-kv-v1); this is the setup we
+    chose.
   - Keep BF16 drafter KV at 13 streams: 1,455,400 / 13 ≈ 112.0K tokens per stream, against v6's 111.7K.
 - **Logs:** `runs/kaggle/jonathanwang2022/tuned-mtp-bf16-kv/v01/vllm-openai-server.log` and
   `runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log`.
+
+### Served on Kaggle with FP8 drafter KV (tuned-mtp-fp8-kv v1)
+
+[`jonathanwang2022/tuned-mtp-fp8-kv`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv) v1
+([log](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-fp8-kv/log?scriptVersionId=364283059)):
+- **Config:** [`configs/tuned-mtp-fp8-kv/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/b35f2e9715d09f9bc80a1315c4a4d15bd774f059/ARC3-Inference/configs/tuned-mtp-fp8-kv/v1.json)
+  at [`b35f2e97`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/b35f2e9715d09f9bc80a1315c4a4d15bd774f059).
+- **Against porting-advaith v6:** only the draft source (the fine-tuned checkpoint) and a 30-minute public run. The
+  drafter KV stays FP8, so the block-size patch does not apply.
+- **Server:** it came up about 15 minutes into the notebook and served for 15 minutes. "Model loading took 69.54 GiB"
+  and the KV pool of 1,564,172 tokens (21.73 GiB) are both v6's.
+
+The first 15 minutes after the server's first metrics line (90 lines each; minute 15 onwards of this run is
+wind-down):
+
+| | v6 | fine-tuned + FP8 | fine-tuned + BF16 |
+|---|---|---|---|
+| Acceptance length (`accept --until 15`) | 2.662 | **2.805** (+0.143, +5.4%) | 2.882 (+0.220) |
+| Per position | 0.744 / 0.539 / 0.382 | 0.778 / 0.590 / 0.443 | 0.793 / 0.618 / 0.486 |
+| KV pool | 1,564,172 tokens | 1,564,172 | 1,455,400 (−7.0%) |
+| KV maximum, minutes 0–15 | 86.5% | **82.5%** | 94.7% |
+| Prefill storm | no | **no** | from minute 13 |
+| Mean generation tok/s, minutes 0–14 | 922 | **952** (+3.3%) | 941 (977 over minutes 0–12) |
+| Mean prompt tok/s, minutes 0–14 | 1,787 | 1,887 | 2,335 |
+
+- **Acceptance:** the gain matches Frida's (+0.122 there, +0.143 here), largest at position 3 (+0.06). Each 5-minute
+  block is 0.15–0.21 above v6.
+- **No storm:** prompt throughput stays at 1.5–2.1K tok/s and the prefix-cache hit rate at 92–94%, as in v6.
+- **Throughput gains less than acceptance (+3.3% against +5.4%):** faster decoding brings more turns, so prefill rose
+  5.6% (1,887 against 1,787 tok/s). The 10 s throughput lines are also noisy between runs. Frida's time per output
+  token (−4.6%) is the cleaner measure.
+- **Score:** 15 minutes of play (mean 6.84) says nothing about the score.
+- **Log:** `runs/kaggle/jonathanwang2022/tuned-mtp-fp8-kv/v01/vllm-openai-server.log`.
+
+### Decision: fine-tuned head with FP8 drafter KV
+
+We serve the fine-tuned head with FP8 drafter KV, not BF16:
+- **BF16's extra acceptance is small:** +0.08 on Kaggle (2.882 against 2.805) and +0.12 on Frida (3.020 against
+  2.898).
+- **BF16 costs 7% of the pool and storms at 14 streams.** Avoiding the storm takes 13 streams (1,455,400 / 13 ≈ 112.0K
+  tokens each, v6's 111.7K). The lost stream, about −3.5% throughput by our earlier measurement, takes back the gain.
+- **FP8 keeps v6's pool:** it gets most of the gain (+5.4% acceptance on Kaggle) at no KV cost, and leaves room to try
+  a fourth draft token.
+
+### Next: k = 4 (tuned-mtp-k4 v1)
+
+[`jonathanwang2022/tuned-mtp-k4`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-k4) v1:
+- **Config:** [`configs/tuned-mtp-k4/v1.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/a4da31c0340096ef827985b007e441ad8214d7ac/ARC3-Inference/configs/tuned-mtp-k4/v1.json) at
+  [`a4da31c0`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/a4da31c0340096ef827985b007e441ad8214d7ac): `tuned-mtp-fp8-kv` v1 with `mtp_tokens: 4`, a 30-minute public run.
+- **CUDA graphs:** the launcher sizes them from k: 14 × (1 + 4) = 70, rounded up to 72 (from 56).
+- **The fourth draft position:** the head was trained on 3 positions, so position 4 reuses it untrained. A rough
+  guess, if the drop from position 3 to 4 matches the one from 2 to 3 (×0.75): 0.443 × 0.75 ≈ 0.33, giving about
+  2.805 + 0.33 ≈ 3.14 on Kaggle.
+- **What decides it:** whether one more draft row per sequence costs less per decode step than the ~0.33 extra tokens
+  it brings.
+- **On Frida:** job 209959 replays v6's 141 requests with k = 4 (the harness's `MTP_TOKENS` setting). It also shows
+  whether k = 4 changes the attention block size or the KV pool, as k = 7 did for DFlash2.
 
 ## DFlash2 block drafter (incoai)
 
@@ -538,7 +595,8 @@ Prediction for Kaggle, against v6's MTP-3:
     pool becomes are also unknown.
 
 The run measures those unknowns: the RTX decode cost at small k and DFlash2 with a BF16 drafter KV. The MTP
-comparison that counts now is `tuned-mtp-bf16-kv` (fine-tuned MTP head plus BF16 drafter KV), not v6.
+comparison that counts now is `tuned-mtp-fp8-kv` (fine-tuned MTP head with FP8 drafter KV, [the chosen
+setup](#decision-fine-tuned-head-with-fp8-drafter-kv)), not v6.
 
 ## Reproduce
 
@@ -570,6 +628,9 @@ python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/tu
 python -m inference.tools.drafter_stats timeline runs/kaggle/jonathanwang2022/porting-advaith/v06/vllm-openai-server.log --bucket 5
 python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-bf16  # 3.020
 python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-fp8   # 2.898
+make pull-kaggle NOTEBOOK=jonathanwang2022/tuned-mtp-fp8-kv VERSION=1                                       # fine-tuned + FP8
+for r in tuned-mtp-fp8-kv/v01 tuned-mtp-bf16-kv/v01 porting-advaith/v06; do
+  python -m inference.tools.drafter_stats accept runs/kaggle/jonathanwang2022/$r/vllm-openai-server.log --until 15; done  # 2.805 / 2.882 / 2.662
 curl -sIL https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2/resolve/a22a1744e85c17364dcc54a6a420af7135d4c7f6/model.safetensors \
   | grep -i x-linked                                                       # DFlash2: 1,206,140,008 B, sha256
 ```
