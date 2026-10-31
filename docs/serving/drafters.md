@@ -209,12 +209,27 @@ Serve the fine-tuned head with the FP8 drafter KV.
   |---|---|---|---|---|---|
   | 3 | 2.898 | .799 / .623 / .476 | 35.38 ms | 102.5 ms | `replay3-tuned-fp8/`, `arc3_vllm_lord-209926.txt` |
   | 4 | **3.249** | .799 / .620 / .473 / .357 | **31.87 ms** (−9.9%) | 103.5 ms | `replay3-tuned-fp8-k4/`, `arc3_vllm_lord-209961.txt` |
+  | 4, v3's graph list | 3.256 | .801 / .622 / .475 / .359 | 31.90 ms | 103.9 ms | `replay3-tuned-fp8-k4-graphs/`, `arc3_vllm_lord-209964.txt` |
 
   Position 4 is 1 + .357 more tokens per step for about 1% more step cost. `analyze.py` prints 3 positions; the fourth
   is the length minus the rest. The job's tail ("unexpected EOF" in `inside.sh`) came after the replay finished.
-- **v3:** k = 4 needs its own CUDA graph list. FULL decode graphs round up to multiples of 1 + k, and the default list
-  has no FULL graph at 14 requests (70 rows). `kaggle.vllm.cudagraph_capture_sizes` (`7f240b3f`) adds
-  [1, 2, 4, 5, 10, 20, …, 70]. Results for v2/v3 are not in yet.
+- **v3:** k = 4 needs its own CUDA graph list.
+  - FULL decode graphs round each capture size up to a multiple of 1 + k and keep it within `max_num_seqs` requests
+    (`vllm/v1/worker/gpu/cudagraph_utils.py`). Lord's runtime adds {44, 52} only for 4 tokens per request at 14
+    sequences (`_set_cudagraph_sizes` in `vllm/config/vllm.py`), which gives k = 3 FULL graphs for 1, 2, 4, 6, 8,
+    10–14 requests.
+  - The default k = 4 list (1, 2, 4, 8, 16, …, 64, 72) covers 1, 2, 4, 5, 7, 8, 10, 12 and 13 requests. 72 rounds to
+    75, past 14 requests, so a full 14-request decode step (v6 averages 13.9 running) runs PIECEWISE.
+  - `kaggle.vllm.cudagraph_capture_sizes`
+    ([`7f240b3f`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/7f240b3f9cd64b1f2aea6b546fdd24485df323ea))
+    passes an explicit list through `--compilation-config`, sets the maximum to its top, and refuses a list without
+    the full decode step (70). [`configs/tuned-mtp-k4/v3.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/7f240b3f9cd64b1f2aea6b546fdd24485df323ea/ARC3-Inference/configs/tuned-mtp-k4/v3.json)
+    = v2 + [1, 2, 4, 5, 10, 20, 30, 40, 50, 55, 60, 65, 70], the same request counts as k = 3.
+  - On the B200 it changes nothing measurable (job 209964, the table's last row): 10 FULL decode graphs instead of
+    9, the same pool, 31.90 against 31.87 ms per token, total decode time 6,640 against 6,666 s (−0.4%). Whether the
+    RTX PRO 6000 gains more is not known; Kaggle v3 against v2 measures it.
+  - Kaggle v3 was pushed at 13:53 EDT, 2026-10-31 (30-minute public run), after v1 and v2 held both GPU sessions.
+    v2 keeps the default list; its acceptance numbers are unaffected. Results for v2/v3 are not in yet.
 
 ## DFlash2 block drafter (incoai)
 
@@ -396,7 +411,8 @@ with rows. Neither k reaches MTP-3's 34.7 ms. These are one run per arm, compare
 [`analyze.py`](../../ARC3-Inference/runs/local/frida/vllm-replay-draft-kv/analyze.py)):
 - Lord's runtime is rebuilt on one B200 from `vllm/vllm-openai@sha256:e0eee5c5…` plus his 32 overlay files
   (sha256-checked against `runtime-manifest.json`), with the launcher's patches and v6's exact `vllm serve` command.
-  `LORD_DIR` swaps the draft.
+  `LORD_DIR` swaps the draft; `MTP_TOKENS`, `PREFIX_MATCH_UNIT` and `CAPTURE_SIZES` (a comma list for
+  `cudagraph_capture_sizes`) change the server command, and `CLIENT` runs the replay.
 - The load is v6's own 141 `mtp_v1` samples, one request each: the context before the last trained reply, mean 104K
   prompt tokens. Sampling is the harness's, with a fixed seed per request, up to 2,048 generated tokens, 14 at a time.
 - Numbers are differences of `/metrics` counters before and after the replay (`metrics_before.txt` /
@@ -452,6 +468,6 @@ for a in 209821/C 209829/B 209829/A; do                                         
   python -m inference.tools.drafter_stats steps runs/local/frida/dflash2-b200/$a/vllm-openai-server.log; done
 
 # Frida vLLM replay
-for a in draft-fp8 draft-bf16 tuned-fp8 tuned-bf16 tuned-fp8-k4; do                                    # 2.777 / 2.910 / 2.898 / 3.020 / 3.249
+for a in draft-fp8 draft-bf16 tuned-fp8 tuned-bf16 tuned-fp8-k4 tuned-fp8-k4-graphs; do                # 2.777 / 2.910 / 2.898 / 3.020 / 3.249 / 3.256
   python3 runs/local/frida/vllm-replay-draft-kv/analyze.py runs/local/frida/vllm-replay-draft-kv/runs/replay3-$a; done
 ```
