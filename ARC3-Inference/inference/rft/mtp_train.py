@@ -528,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         log(event="eval", step=state["step"], **record)
         return record
 
+    state = dict(position=0, step=0, best_length=None, best_step=None)  # evaluate() logs state["step"]
     if args.eval_only:
         evaluate("as loaded")
         return 0
@@ -537,7 +538,6 @@ def main(argv: list[str] | None = None) -> int:
     train_samples = train_rft.load_samples(args.data / "train.jsonl")
     order = game_round_robin(train_samples, args.train_samples, args.seed)
     total_steps = math.ceil(len(order) / args.accumulate)
-    state = dict(position=0, step=0, best_length=None, best_step=None)
     latest = args.out / "latest"
     if args.resume and (latest / "state.json").exists():
         from safetensors.torch import load_file
