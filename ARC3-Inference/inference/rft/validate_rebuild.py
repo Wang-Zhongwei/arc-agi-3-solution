@@ -7,7 +7,7 @@ request index is compared with what was actually sent:
 - size: rebuilt vs logged text chars, and the token estimate vs the server's
   prompt_tokens.
 
-    python -m inference.rl.validate_rebuild runs/kaggle/<owner>/<notebook>/vNN [...]
+    python -m inference.rft.validate_rebuild runs/kaggle/<owner>/<notebook>/vNN [...]
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from inference.rl.context_rebuild import estimate_tokens, message_chars, rebuild
+from inference.rft.context_rebuild import estimate_tokens, message_chars, rebuild, run_tokens_per_image
 
 NOTICE = "Earlier conversation has been trimmed."
 REQUESTS = re.compile(r"(.+)_requests\.jsonl$")
@@ -126,7 +126,8 @@ def compare_game(run: Path, log: Path, stats: dict[str, Any]) -> None:
     if transcript is None:
         stats["games_without_transcript"] += 1
         return
-    game = rebuild(transcript)
+    per_image = run_tokens_per_image(run)
+    game = rebuild(transcript, tokens_per_image=per_image)
     # Only served requests reach the transcript, and only they get a response
     # record (whose messages are the request's), so the two pair up in order.
     # (step, index) alone is ambiguous: a turn retried after a timeout repeats it.
@@ -169,7 +170,7 @@ def compare_game(run: Path, log: Path, stats: dict[str, Any]) -> None:
         if logged_chars:
             stats["char_ratio"].append(rebuilt_chars / logged_chars)
         if tokens:
-            stats["token_error"].append(estimate_tokens(request.messages) / tokens - 1)
+            stats["token_error"].append(estimate_tokens(request.messages, per_image) / tokens - 1)
 
 
 def summary(stats: dict[str, Any]) -> dict[str, Any]:

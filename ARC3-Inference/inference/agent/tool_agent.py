@@ -3693,6 +3693,8 @@ class _ChatCompletionResult:
     finish_reason: str = ""
     usage: dict[str, Any] | None = None
     served_by: str = ""
+    # GRPO mode (inference/grpo/rl_record.py): the ids vLLM saw and sampled, their logprobs, the messages sent
+    rl: dict[str, Any] | None = None
 
 
 class ToolAgent:
@@ -5828,6 +5830,8 @@ class ToolAgent:
         request_timeout_seconds: float | None = None,
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
+        rl_record: bool = False,
+        rl_max_tokens: int | None = None,
     ) -> _ChatCompletionResult:
         payload = build_chat_payload(
             provider=self._model.provider,
@@ -5870,6 +5874,14 @@ class ToolAgent:
                 evicted=getattr(self, "_has_evicted", False),
             )
         )
+        sent_messages = payload["messages"]
+        if rl_record:
+            # after the thinking-budget fields: they are set from the default
+            # max_tokens, which the budget's cap only lowers
+            from inference.grpo.rl_record import EpisodeRecorder
+
+            EpisodeRecorder.augment(payload, rl_max_tokens)
+
         def post_chat(request_payload: dict[str, Any]) -> requests.Response:
             return requests.post(
                 f"{self._model.base_url.rstrip('/')}/chat/completions",
@@ -5940,11 +5952,17 @@ class ToolAgent:
                 f"server returned no choices | body: {str(detail)[:600]}"
             )
         choice = choices[0]
+        rl = None
+        if rl_record:
+            from inference.grpo.rl_record import EpisodeRecorder
+
+            rl = dict(EpisodeRecorder.extract(payload), messages=sent_messages)
         return _ChatCompletionResult(
             message=_extract_leaked_tool_calls(choice.get("message", {})),
             finish_reason=str(choice.get("finish_reason", "") or ""),
             usage=payload.get("usage"),
             served_by=str(payload.get("provider", "") or ""),
+            rl=rl,
         )
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
@@ -7570,10 +7588,25 @@ class ToolAgent:
                     tool_choice=tool_choice,
                     transcript="".join(transcript_parts),
                 )
+                rl_recorder = getattr(self, "_rl_recorder", None)
+                rl_cap = None
+                if rl_recorder is not None:
+                    # GRPO mode: the reply may use only what the episode's
+                    # context budget leaves; when that is too little the
+                    # episode ends here instead of sending
+                    rl_cap = rl_recorder.request_cap(
+                        self._estimate_request_input_tokens(messages, tools=tools)
+                    )
+                    if rl_cap is None:
+                        yielded_control_reason = "stop_requested"
+                        break
                 try:
                     request_kwargs: dict[str, Any] = {"tools": tools}
                     if request_timeout_seconds is not None:
                         request_kwargs["request_timeout_seconds"] = request_timeout_seconds
+                    if rl_recorder is not None:
+                        request_kwargs["rl_record"] = True
+                        request_kwargs["rl_max_tokens"] = rl_cap
                     if self._save_request_logs:
                         _append_request_snapshot(
                             _resolve_request_log_path(state_path),
@@ -7587,6 +7620,14 @@ class ToolAgent:
                             chat_template_kwargs=self._harness_template_kwargs(),
                         )
                     result = self._chat_completion(messages, **request_kwargs)
+                    if rl_recorder is not None:
+                        rl_recorder.after_response(
+                            result.rl,
+                            messages=(result.rl or {}).get("messages") or messages,
+                            finish_reason=result.finish_reason,
+                            max_tokens=rl_cap,
+                            usage=result.usage,
+                        )
                     _calibration_note = self._calibrate_from_usage(
                         messages, request_kwargs.get("tools"), result.usage
                     )
