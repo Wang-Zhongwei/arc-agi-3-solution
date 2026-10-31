@@ -12,7 +12,7 @@ def test_multiple_changes_need_not_return_to_original_color(values, game_over, t
     chain = [((value,),) for value in values]
     assert _transient_cells(chain) == [(0, 0)]
     description = describe_animation(
-        {"frame_count": 2, "transient_pixels": 1, "transient_bbox": (0, 0, 0, 0)},
+        {"frames": 2, "transient_pixels": 1, "transient_bbox": (0, 0, 0, 0)},
         action_display="RIGHT", gameplay_changed=gameplay_changed,
         game_over=game_over, timeline=timeline,
     )
@@ -25,7 +25,7 @@ def test_multiple_changes_need_not_return_to_original_color(values, game_over, t
 def test_single_change_is_visible_in_endpoints():
     assert _transient_cells([((0,),), ((1,),), ((1,),)]) == []
     assert describe_animation(
-        {"frame_count": 2, "transient_pixels": 0},
+        {"frames": 2, "transient_pixels": 0},
         action_display="RIGHT", gameplay_changed=True,
     ) == ""
     assert "changed more than once" in ANIMATION_ADDENDUM
@@ -33,7 +33,7 @@ def test_single_change_is_visible_in_endpoints():
 
 @pytest.mark.parametrize('timeline', [False, True])
 def test_fatal_animation_without_transient_cells_still_identifies_the_fatal_action(timeline):
-    text = describe_animation({'frame_count': 4, 'transient_pixels': 0}, action_display='RIGHT',
+    text = describe_animation({'frames': 4, 'transient_pixels': 0}, action_display='RIGHT',
                               gameplay_changed=True, game_over=True, timeline=timeline)
     assert 'The fatal action RIGHT animated over 4 frames.' in text
     assert 'changed more than once' not in text

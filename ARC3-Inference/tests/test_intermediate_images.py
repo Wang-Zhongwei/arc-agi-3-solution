@@ -163,7 +163,7 @@ def test_sampled_captions_index_the_exposed_animation_frames(values):
         expected = frame(27, exposed[index]['grid'][0][0], level=2)
         expected_image = vision.frame_to_png_data_url(expected, upscale=2)
         assert part['image_url']['url'] == expected_image
-        assert any(diff['frame_index'] == index for diff in timeline['frame_diffs'])
+        assert any(step['step'] == index + 1 for step in timeline['steps'])
 
 
 @pytest.mark.parametrize('fatal', [False, True])
@@ -222,7 +222,7 @@ def test_images_follow_related_prompt_text(monkeypatch, tmp_path, kind):
         monkeypatch.setenv('ARC3_ANIMATION_IMAGE', 'off')
         monkeypatch.setenv('MULTIMODAL_INTERMEDIATE_FRAMES', 'true')
         agent._pending_intermediate_images = vision.intermediate_frame_parts(entries, after_step=0, before_step=2)
-    summary = {'executed_count': 2, 'executed_actions': ['UP', 'RIGHT'], 'animation': {'frame_count': 3, 'transient_pixels': 0}, 'game_over': kind == 'death'}
+    summary = {'executed_count': 2, 'executed_actions': ['UP', 'RIGHT'], 'animation': {'frames': 3, 'transient_pixels': 0}, 'game_over': kind == 'death'}
     prompt = agent._build_user_prompt(3, valid_actions=['UP'], current_frame=frame(3), history_entries=entries, previous_step_summary=summary)
     message = agent._build_user_message(prompt, frame(3))
     parts = message['content']
@@ -399,7 +399,7 @@ def test_shared_event_prompts_and_evidence_order(monkeypatch, tmp_path, mode, ev
         summary['level_transition'] = True
     elif event == 'death':
         summary.update(game_over=True, fatal_action='RIGHT',
-                       animation={'frame_count': 4, 'transient_pixels': 25, 'transient_bbox': (13, 49, 17, 53)})
+                       animation={'frames': 4, 'transient_pixels': 25, 'transient_bbox': (13, 49, 17, 53)})
         entries.append(HistoryEntry('RESET', frame(105)))
         agent._last_animation_chain = [frame(0, v).grid for v in [3, 8, 9, 4]]
     elif event.startswith('noop'):

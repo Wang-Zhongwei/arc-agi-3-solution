@@ -16,9 +16,7 @@ nothing is missing.
 """
 from __future__ import annotations
 
-import zlib
 from collections import defaultdict
-from itertools import chain as _concat
 from typing import Any, Sequence
 
 from inference.utils.grid_utils import ARC_COLOR_CHARS, format_grid_ascii
@@ -101,17 +99,15 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
     ``None`` for the single-frame case means ordinary actions carry no extra
     tokens at all - the key is simply absent from the action result.
 
-    ``frame_count`` counts engine frames after collapsing and excludes the
-    prepended pre-action board, so it answers "how many distinct states did this
-    action pass through" rather than describing the internal representation.
-    It is a number, and named so: as ``frames`` it was read as a list and
-    passed to ``len()``.
+    ``frames`` counts engine frames after collapsing and excludes the prepended
+    pre-action board, so it answers "how many distinct states did this action
+    pass through" rather than describing the internal representation.
     """
     if len(chain) <= 2:
         return None
     transient = _transient_cells(chain)
     summary: dict[str, Any] = {
-        "frame_count": len(chain) - 1,
+        "frames": len(chain) - 1,
         "transient_pixels": len(transient),
     }
     if transient:
@@ -121,63 +117,6 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
         # without spending tokens on a coordinate list.
         summary["transient_bbox"] = [min(rows), min(cols), max(rows), max(cols)]
     return summary
-
-
-class AnimationRecords:
-    """Every animated action's record by action number, for `history[i].animation`.
-
-    The one record `last_animation_*` read is replaced by the next action, so
-    the earlier actions of a batch were never readable at all. These copies are
-    zlib-packed: as tuples a 64x64 frame costs ~37 KB (65 tuples of 8-byte
-    pointers), packed about 0.2 KB, because a frame is mostly one colour and the
-    next frame repeats it. Replaying porting-advaith v7 through this class, its
-    1,585 animated actions held 14,519 frames across 25 games: 511 MB as tuples,
-    4.3 MB packed, every chain unpacking equal to the one packed. Packing took
-    0.8 ms per animated action (8 ms for the longest, 179 frames); unpacking
-    happens only when the model reads that action.
-    """
-
-    def __init__(self) -> None:
-        self._packed: dict[int, dict[str, Any]] = {}
-
-    def add(self, action_num: int, record: dict[str, Any]) -> None:
-        self._packed[action_num] = {**record, "chain": _pack_chain(record.get("chain") or ())}
-
-    def get(self, action_num: int) -> dict[str, Any] | None:
-        packed = self._packed.get(action_num)
-        if packed is None:
-            return None
-        return {**packed, "chain": _unpack_chain(packed["chain"])}
-
-
-def _pack_chain(chain: Sequence[Grid]) -> dict[str, Any]:
-    """One byte per cell, the whole chain compressed together.
-
-    A grid that does not fit that - a cell outside 0-255 or ragged rows - is
-    kept as it is, so an unpacked chain always equals the one packed.
-    """
-    shapes = [(len(grid), len(grid[0]) if grid else 0) for grid in chain]
-    if any(len(row) != cols for grid, (_, cols) in zip(chain, shapes) for row in grid):
-        return {"grids": list(chain)}
-    try:
-        flat = bytes(_concat.from_iterable(_concat.from_iterable(chain)))
-    except ValueError:
-        return {"grids": list(chain)}
-    return {"shapes": shapes, "data": zlib.compress(flat, 1)}
-
-
-def _unpack_chain(packed: dict[str, Any]) -> list[Grid]:
-    if "grids" in packed:
-        return list(packed["grids"])
-    data = zlib.decompress(packed["data"])
-    chain: list[Grid] = []
-    offset = 0
-    for rows, cols in packed["shapes"]:
-        chain.append(tuple(
-            tuple(data[offset + row * cols:offset + (row + 1) * cols]) for row in range(rows)
-        ))
-        offset += rows * cols
-    return chain
 
 
 def _bbox_phrase(bbox: Sequence[int] | None) -> str:
@@ -218,7 +157,7 @@ def describe_animation(
     transient = int(summary.get("transient_pixels") or 0)
     if transient <= 0:
         return ""
-    frames = summary.get("frame_count")
+    frames = summary.get("frames")
     cells = "1 cell changed and changed back" if transient == 1 else (
         f"{transient} cells changed and changed back"
     )
@@ -311,7 +250,8 @@ def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]
     """Every distinct state the action passed through, as FrameView payloads.
 
     The pre-action board is dropped here: the model already has it as
-    `previous_frame`. Index i here is `frame_index` i in the timeline.
+    `previous_frame`, and including it would make index 0 mean something
+    different from the step numbers in the timeline.
 
     Sends the grid as well as the ascii so `segmentation` works on the far
     side. That doubles the payload, but it crosses a pipe rather than the
@@ -337,20 +277,18 @@ def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]
 
 
 def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
-    """The diff timeline: which cells changed into each animation frame.
+    """The diff timeline: which cells changed at each step.
 
-    The cheap first look. Reading a frame verbatim is not this function's job:
-    `last_animation_frames` hands back FrameView objects and the model crops
-    their ascii the same way it crops current_frame.
-
-    Counts are named as counts (`frame_count`, `changed_count`) and the diff
-    list as diffs (`frame_diffs`): with `frames` and `steps` the model called
-    `len()` on the number and mistook frame positions for game steps. Each
-    entry's `frame_index` indexes `last_animation_frames`, so the two line up.
-    The shape is the same with no animation, so code reading `frame_diffs`
-    needs no special case.
+    The cheap first look. Reading a frame verbatim is no longer this
+    function's job - `last_transition.frames()` hands back FrameView objects
+    and the model crops their ascii the same way it crops current_frame, with
+    its own helpers rather than a region parameter it has to guess.
     """
-    empty: dict[str, Any] = {"action": None, "frame_count": 0, "frame_diffs": []}
+    empty = {
+        "error": (
+            "No animation is available: the last executed action returned a single frame."
+        )
+    }
     if not record:
         return empty
     chain: list[Grid] = list(record.get("chain") or ())
@@ -360,24 +298,22 @@ def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
     header: dict[str, Any] = {
         "action": record.get("action_display"),
         # excludes the prepended pre-action board, matching the metadata
-        "frame_count": len(chain) - 1,
+        "frames": len(chain) - 1,
     }
 
     steps: list[dict[str, Any]] = []
     for position in range(1, len(chain)):
         cells = _diff_cells(chain[position - 1], chain[position])
         if cells:
-            # chain[0] is the pre-action board, so chain[position] is
-            # last_animation_frames[position - 1]
-            steps.append({"_frame_index": position - 1, "_cells": cells})
+            steps.append({"_position": position, "_cells": cells})
 
     rendered: list[dict[str, Any]] = []
     remaining = ANIMATION_MAX_TOTAL_CELLS
     for step in steps:
         cells = step["_cells"]
         entry: dict[str, Any] = {
-            "frame_index": step["_frame_index"],
-            "changed_count": len(cells),
+            "step": step["_position"],
+            "changed": len(cells),
             "bbox": _bbox_text(cells),
         }
         budget = min(ANIMATION_MAX_CELLS_PER_STEP, max(0, remaining))
@@ -394,4 +330,4 @@ def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
             remaining -= min(len(cells), budget)
         rendered.append(entry)
 
-    return {**header, "frame_diffs": rendered}
+    return {**header, "steps": rendered}
