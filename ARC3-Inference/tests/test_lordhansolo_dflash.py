@@ -84,6 +84,39 @@ def test_anchors_match_the_real_runtime(tmp_path):
         compile((tmp_path / DIST / relative_path).read_text(), relative_path, "exec")
 
 
+def _draft_qsa_namespace(runtime_root: Path) -> dict:
+    """Execute the rendered draft-QSA block-size patcher with a BF16 drafter KV."""
+    script = lord._DUCK_VLLM_SETUP_SCRIPT
+    start = script.index("DRAFT_QSA_BLOCK_SIZE_PATCHES = (")
+    end = script.index("\n\n\n", script.index("def use_engine_block_size_for_draft_qsa"))
+    namespace = {"Path": Path, "IMAGE_RUNTIME_ROOT": runtime_root, "VLLM_DRAFT_KV_CACHE_DTYPE": "auto"}
+    exec(script[start:end], namespace)
+    return namespace
+
+
+@pytest.mark.skipif(not os.environ.get("ARC3_LORD_RUNTIME_TREE"), reason="needs an unpacked e975732 rc3 vllm/ tree")
+def test_anchors_match_the_real_runtime_with_a_bf16_draft_kv(tmp_path):
+    # The setup applies the draft-QSA block-size patch first; both edit qsa_cache.py.
+    shutil.copytree(Path(os.environ["ARC3_LORD_RUNTIME_TREE"]), tmp_path / DIST / "vllm")
+    _draft_qsa_namespace(tmp_path)["use_engine_block_size_for_draft_qsa"]({"dist_packages": DIST})
+    _patch_namespace("dflash", tmp_path)["patch_runtime_for_dflash"]({"dist_packages": DIST})
+    for relative_path in {p for p, _, _ in _patch_namespace("dflash", tmp_path)["DFLASH_RUNTIME_PATCHES"]}:
+        compile((tmp_path / DIST / relative_path).read_text(), relative_path, "exec")
+
+
+def test_render_combines_a_dflash_draft_with_a_draft_kv_dtype(monkeypatch):
+    monkeypatch.setenv("LOCAL_ANALYZER_PROVIDER", "vllm")
+    script = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
+        model_source=TARGET_REF, draft_model_source=DFLASH_REF, draft_method="dflash",
+        draft_attention_backend="TRITON_ATTN", draft_kv_cache_dtype="auto", mtp_tokens=4))
+    assert "VLLM_DRAFT_METHOD = 'dflash'" in script
+    assert "VLLM_DRAFT_KV_CACHE_DTYPE = 'auto'" in script
+    assert "VLLM_MTP_TOKENS = 4" in script
+    assert "speculative_config['kv_cache_dtype'] = VLLM_DRAFT_KV_CACHE_DTYPE" in script
+    assert re.search(r"use_engine_block_size_for_draft_qsa\(manifest\)\n(.*\n)*?\s+patch_runtime_for_dflash\(manifest\)",
+                     script)
+
+
 def test_render_serves_the_mounted_checkpoint_as_a_dflash_draft(monkeypatch):
     monkeypatch.setenv("LOCAL_ANALYZER_PROVIDER", "vllm")
     script = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
