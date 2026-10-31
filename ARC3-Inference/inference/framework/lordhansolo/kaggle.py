@@ -92,6 +92,13 @@ DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
 # server.draft_kv_cache_dtype: the draft model's KV cache dtype (speculative_config kv_cache_dtype); "auto" is the
 # model dtype (BF16). Empty lets the draft inherit kv_cache_dtype, as every run before draft-bf16-kv did.
 DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE = ""
+# server.cudagraph_capture_sizes: explicit CUDA graph capture sizes (tokens), passed as
+# --compilation-config cudagraph_capture_sizes with --max-cudagraph-capture-size at their maximum. Empty keeps the
+# runtime's list under max_num_seqs * (1 + mtp_tokens) rounded up to 8. A FULL decode graph serves n requests only at
+# a size that rounds up to a multiple of (1 + mtp_tokens) within max_num_seqs requests
+# (vllm/v1/worker/gpu/cudagraph_utils.py), and the runtime adds its tuned {44, 52} only for 4 tokens per request and
+# 14 seqs, so another mtp_tokens needs its own list. The list must contain max_num_seqs * (1 + mtp_tokens).
+DEFAULT_VLLM_CUDAGRAPH_CAPTURE_SIZES: tuple[int, ...] = ()
 # kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
 # weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
 # carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
@@ -162,6 +169,7 @@ class DuckKaggleVllmConfig:
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
     draft_kv_cache_dtype: str = DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE
+    cudagraph_capture_sizes: tuple[int, ...] = DEFAULT_VLLM_CUDAGRAPH_CAPTURE_SIZES
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
 
 
@@ -238,6 +246,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
         "__VLLM_DRAFT_KV_CACHE_DTYPE__": repr(str(cfg.draft_kv_cache_dtype)),
+        "__VLLM_CUDAGRAPH_CAPTURE_SIZES__": repr(sorted({int(size) for size in cfg.cudagraph_capture_sizes})),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
@@ -984,6 +993,8 @@ MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
 # The draft model's KV cache dtype, or '' to inherit the target's.
 VLLM_DRAFT_KV_CACHE_DTYPE = __VLLM_DRAFT_KV_CACHE_DTYPE__
+# Explicit CUDA graph capture sizes in tokens, or [] for the runtime's list (see build_vllm_server_command).
+VLLM_CUDAGRAPH_CAPTURE_SIZES = __VLLM_CUDAGRAPH_CAPTURE_SIZES__
 # A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
 PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
@@ -1821,6 +1832,18 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
     cudagraph_capture_size = (
         math.ceil(decode_step_tokens / VLLM_CUDAGRAPH_CAPTURE_STEP) * VLLM_CUDAGRAPH_CAPTURE_STEP
     )
+    compilation_args = []
+    if VLLM_CUDAGRAPH_CAPTURE_SIZES:
+        # A full decode step must have its own FULL graph; the runtime requires the maximum to match the list.
+        if decode_step_tokens not in VLLM_CUDAGRAPH_CAPTURE_SIZES:
+            raise ValueError(
+                f'cudagraph_capture_sizes {VLLM_CUDAGRAPH_CAPTURE_SIZES} lacks the full decode step '
+                f'{max_num_seqs} x (1 + {VLLM_MTP_TOKENS}) = {decode_step_tokens}'
+            )
+        cudagraph_capture_size = max(VLLM_CUDAGRAPH_CAPTURE_SIZES)
+        compilation_args = [
+            '--compilation-config', json.dumps({'cudagraph_capture_sizes': VLLM_CUDAGRAPH_CAPTURE_SIZES}),
+        ]
     cmd = [
         sys.executable,
         '-m',
@@ -1851,6 +1874,7 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
         '--enable-chunked-prefill',
         '--max-cudagraph-capture-size',
         str(cudagraph_capture_size),
+        *compilation_args,
         '--enable-prefix-caching' if VLLM_ENABLE_PREFIX_CACHING else '--no-enable-prefix-caching',
         '--enable-auto-tool-choice',
         '--tool-call-parser',

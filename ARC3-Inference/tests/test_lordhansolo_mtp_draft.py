@@ -132,3 +132,34 @@ def test_draft_qsa_patch_fails_on_a_missing_anchor(tmp_path):
 def test_setup_patches_the_draft_qsa_block_size_after_the_ple_pin():
     assert re.search(r"pin_ple_table_at_exact_size\(manifest\)\n\s+use_engine_block_size_for_draft_qsa\(manifest\)",
                      lord._DUCK_VLLM_SETUP_SCRIPT)
+
+
+def full_decode_requests(capture_sizes, query_len, max_num_seqs, max_capture):
+    """Request counts with a FULL decode graph, by the rule in vllm/v1/worker/gpu/cudagraph_utils.py: each capture
+    size rounds up to a multiple of the query length and is kept only within max_num_seqs requests and the maximum."""
+    counts = set()
+    for size in capture_sizes:
+        rounded = -(-size // query_len) * query_len
+        if rounded <= max_num_seqs * query_len and rounded <= max_capture and rounded // query_len <= max_num_seqs:
+            counts.add(rounded // query_len)
+    return counts
+
+
+def test_k4_capture_sizes_cover_what_v6s_k3_list_covers():
+    v6_k3 = [1, 2, 4, 8, 16, 24, 32, 40, 44, 48, 52, 56]  # the runtime's list at 14 seqs, k = 3 (with its {44, 52})
+    default_k4 = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72]  # the runtime's list under 72 at k = 4
+    k4 = [1, 2, 4, 5, 10, 20, 30, 40, 50, 55, 60, 65, 70]  # configs/tuned-mtp-k4/v3.json
+    covered = full_decode_requests(v6_k3, 4, 14, 56)
+    assert covered == {1, 2, 4, 6, 8, 10, 11, 12, 13, 14}
+    assert 14 not in full_decode_requests(default_k4, 5, 14, 72)  # 72 rounds to 75: no graph at 14 requests
+    assert full_decode_requests(k4, 5, 14, 70) == covered
+
+
+@pytest.mark.parametrize("sizes", [(), (1, 2, 4, 5, 10, 20, 30, 40, 50, 55, 60, 65, 70)])
+def test_cudagraph_capture_sizes_reach_the_server_command(monkeypatch, sizes):
+    monkeypatch.setenv("LOCAL_ANALYZER_PROVIDER", "vllm")
+    script = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
+        model_source=TARGET_REF, mtp_tokens=4, cudagraph_capture_sizes=sizes))
+    assert f"VLLM_CUDAGRAPH_CAPTURE_SIZES = {sorted(sizes)!r}" in script
+    assert "'--compilation-config', json.dumps({'cudagraph_capture_sizes': VLLM_CUDAGRAPH_CAPTURE_SIZES})" in script
+    assert "if decode_step_tokens not in VLLM_CUDAGRAPH_CAPTURE_SIZES:" in script
