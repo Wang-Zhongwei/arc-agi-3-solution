@@ -366,8 +366,20 @@ We serve the fine-tuned head with FP8 drafter KV, not BF16:
   2.805 + 0.33 ≈ 3.14 on Kaggle.
 - **What decides it:** whether one more draft row per sequence costs less per decode step than the ~0.33 extra tokens
   it brings.
-- **On Frida:** job 209959 replays v6's 141 requests with k = 4 (the harness's `MTP_TOKENS` setting). It also shows
-  whether k = 4 changes the attention block size or the KV pool, as k = 7 did for DFlash2.
+- **v1 cannot start.** k = 4 raises the attention block from 1664 to 1680 tokens, and 1680 is not divisible by v6's
+  `prefix_match_unit` 128. Frida job 209959 stopped at engine start with "Invalid prefix_match_unit=128;
+  prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit. Got group block sizes=[1680,
+  1680, 1680, 8, 1680]" (`runs/local/frida/vllm-replay-draft-kv/runs/replay3-tuned-fp8-k4/server.log`). Kaggle v1
+  has the same config.
+- **v2:** [`configs/tuned-mtp-k4/v2.json`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/blob/ece901afb5ef701260b1a6e4d12798a4251e0a5c/ARC3-Inference/configs/tuned-mtp-k4/v2.json) at
+  [`ece901af`](https://github.com/Wang-Zhongwei/arc-agi-3-solution/commit/ece901afb5ef701260b1a6e4d12798a4251e0a5c), v1 with `prefix_match_unit: 112`.
+  - **Why 112:** the unit only sets where a hit may land; states are stored as before (`prefix_match_unit` in
+    `vllm/config/cache.py`). It must divide every prefix-cacheable block size and be a multiple of each cache's
+    per-state compression, which divides 16 (DFlash2 k = 7 booted with 16).
+  - 112 = 1680 / 15 is the valid value closest to v6's 128, so matching stays nearly as before and the run tests
+    k = 4 alone.
+- **On Frida with 112:** job 209961 boots in 220 s with a KV pool of 7,452,680 tokens (k = 3: 7,447,052), and replays
+  v6's 141 requests (the harness's `MTP_TOKENS` and `PREFIX_MATCH_UNIT` settings).
 
 ## DFlash2 block drafter (incoai)
 
