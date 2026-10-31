@@ -16,7 +16,7 @@ against v6's 2.662 over the same 15 minutes, with v6's KV pool and no prefill st
 | Lord MTP, BF16 drafter KV | 2.910 (Frida) | step cost unchanged | +0.13 acceptance, −6.9% pool | [Drafter KV](#drafter-kv-precision) |
 | **Fine-tuned MTP, FP8 drafter KV** | **2.805** (v6: 2.662, first 15 min) | **+3.3%** | **served** | [Kaggle](#on-kaggle) |
 | Fine-tuned MTP, BF16 drafter KV | 2.882 (first 15 min) | +5–7% until a storm at minute 13 | rejected | [Kaggle](#on-kaggle) |
-| Fine-tuned MTP, FP8 KV, 4 tokens | 3.249 (Frida; k = 3: 2.898) | −9.9% time per token (Frida) | promising; Kaggle v2/v3 pending | [k = 4](#k--4-in-progress) |
+| Fine-tuned MTP, FP8 KV, 4 tokens | 3.055 (Kaggle 0–15 min; k = 3: 2.805); Frida 3.249 | Kaggle gen −1.2% vs k = 3 (Frida −9.9% time per token) | no gain on the RTX: a step costs ~10% more | [k = 4](#k--4) |
 | DFlash2 k = 3 (B200 replay) | 2.843 (B200) | +1% (B200) | no gain | [DFlash2](#dflash2-block-drafter-incoai) |
 | DFlash2 k = 7 | 3.336 | −10.1% (first 30 min) | slower | [DFlash2](#dflash2-block-drafter-incoai) |
 | DFlash2 k = 4, BF16 drafter KV | 2.902 | storm from minute 10 (pool −35.5%) | rejected; k = 7 ≥ k = 4 | [k = 4 vs k = 7](#k--4-vs-k--7) |
@@ -188,7 +188,7 @@ Serve the fine-tuned head with the FP8 drafter KV.
   tokens each, as v6's 111.7K). Losing a stream likely costs more than the gain; that is not measured.
 - FP8 keeps v6's pool and leaves room for a fourth draft token.
 
-### k = 4 (in progress)
+### k = 4
 
 [`tuned-mtp-k4`](https://www.kaggle.com/code/jonathanwang2022/tuned-mtp-k4) is `tuned-mtp-fp8-kv` v1 with
 `mtp_tokens: 4`. CUDA graphs go to 14 × 5 = 70, rounded to 72. Position 4 reuses the head untrained.
@@ -229,7 +229,30 @@ Serve the fine-tuned head with the FP8 drafter KV.
     9, the same pool, 31.90 against 31.87 ms per token, total decode time 6,640 against 6,666 s (−0.4%). Whether the
     RTX PRO 6000 gains more is not known; Kaggle v3 against v2 measures it.
   - Kaggle v3 was pushed at 13:53 EDT, 2026-10-31 (30-minute public run), after v1 and v2 held both GPU sessions.
-    v2 keeps the default list; its acceptance numbers are unaffected. Results for v2/v3 are not in yet.
+    v2 keeps the default list; its acceptance numbers are unaffected.
+- **Kaggle v3** (completed 2026-10-31; `runs/kaggle/jonathanwang2022/tuned-mtp-k4/v03`): the server was ready after
+  10.5 minutes and served 18 minutes; the harness began its tail fade at 14.6 minutes, so the comparison is minutes
+  0–15 of stats lines (`drafter_stats accept --until 15`, `timeline --bucket 5`, `steps --until 15`). Same pool
+  (1,565,155 tokens), FULL 10 decode graphs.
+
+  | Minutes 0–15 | tuned-mtp-k4 v3 (k = 4) | tuned-mtp-fp8-kv v1 (k = 3) | porting-advaith v6 |
+  |---|---|---|---|
+  | Acceptance length | **3.055** | 2.805 | 2.662 |
+  | Per position | .769 / .572 / .423 / .310 | .778 / .590 / .443 | .744 / .539 / .382 |
+  | Gen tok/s per 5 min | 875 / 967 / 961 | 909 / 975 / 950 | 862 / 957 / 959 |
+  | Mean gen tok/s | **934** (−1.2%) | 945 | 926 |
+  | KV max | 92.4% | 82.5% | 86.5% |
+  | `steps` fit: mean step / fixed part | 47.5 / 34.7 ms (R² 0.58) | 41.1 / 31.6 ms (R² 0.95) | 40.3 / 31.9 ms (R² 0.96) |
+
+  - +8.9% tokens per step at −1.2% generation means a k = 4 step costs about 10% more than a k = 3 step on the RTX
+    PRO 6000 ((3.055 / 934) / (2.805 / 945) = 1.10). On the B200 it cost 1% more (103.5 vs 102.5 ms). The extra verify
+    row is far more expensive on the RTX, as DFlash2 k = 7 already showed (decode part 1.21× MTP-3 vs 1.09–1.13×).
+  - The untrained position 4 accepts 0.310 on Kaggle against 0.357 on Frida; positions 1–3 are also a little below
+    k = 3's run, which played different turns.
+  - KV peaked at 92.4% in minute 14–15, near where BF16 drafter KV started storming (93–95%); no storm in 15 minutes.
+  - **v2 is not usable:** its server took 25 minutes to come up (17:25 → 17:50 UTC), leaving about 2.5 minutes of
+    play, so the graph-list A/B on the RTX did not happen.
+  - One run, 15 minutes: k = 4 does not raise throughput on Kaggle; k = 3 with the fine-tuned head stays the setup.
 
 ## DFlash2 block drafter (incoai)
 
