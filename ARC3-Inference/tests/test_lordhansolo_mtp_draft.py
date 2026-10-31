@@ -83,3 +83,12 @@ def test_cache_diagnostics_follow_the_config(monkeypatch, requested):
         model_source=TARGET_REF, cache_diagnostics=requested))
     assert f"VLLM_CACHE_DIAGNOSTICS_REQUESTED = {requested!r}" in script
     assert "enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and namespace['is_test_run']()" in script
+
+
+@pytest.mark.parametrize("dtype", ["", "auto"])
+def test_draft_kv_cache_dtype_reaches_the_speculative_config(monkeypatch, dtype):
+    monkeypatch.setenv("LOCAL_ANALYZER_PROVIDER", "vllm")
+    script = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
+        model_source=TARGET_REF, draft_model_source=DRAFT_REF, draft_kv_cache_dtype=dtype))
+    assert f"VLLM_DRAFT_KV_CACHE_DTYPE = {dtype!r}" in script
+    assert "speculative_config['kv_cache_dtype'] = VLLM_DRAFT_KV_CACHE_DTYPE" in script

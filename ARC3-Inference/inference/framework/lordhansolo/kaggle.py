@@ -89,6 +89,9 @@ DEFAULT_VLLM_DRAFT_VOCAB = ""
 # the target checkpoint's own MTP layer. Empty keeps the target's head. The setup script mounts
 # it next to the target and loads only its mtp.* tensors, lm_head and embed_tokens.
 DEFAULT_VLLM_DRAFT_MODEL_SOURCE = ""
+# server.draft_kv_cache_dtype: the draft model's KV cache dtype (speculative_config kv_cache_dtype); "auto" is the
+# model dtype (BF16). Empty lets the draft inherit kv_cache_dtype, as every run before draft-bf16-kv did.
+DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE = ""
 # kaggle.ple_fp8_model_source: a Kaggle model ref whose FP8 PLE table, stored with one global
 # weight_scale, replaces the target's BF16 table. dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple
 # carries RadixArk's table next to Intel's unchanged W4A16 body. The pinned host copy then takes
@@ -158,6 +161,7 @@ class DuckKaggleVllmConfig:
     draft_vocab: str = DEFAULT_VLLM_DRAFT_VOCAB
     prefetch_threads: int = 8
     draft_model_source: str = DEFAULT_VLLM_DRAFT_MODEL_SOURCE
+    draft_kv_cache_dtype: str = DEFAULT_VLLM_DRAFT_KV_CACHE_DTYPE
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
 
 
@@ -233,6 +237,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__RUNTIME_SLUG__": repr(runtime_slug),
         "__MODEL_SOURCE_PARTS__": repr(model_source_parts),
         "__DRAFT_MODEL_SOURCE_PARTS__": repr(draft_model_source_parts),
+        "__VLLM_DRAFT_KV_CACHE_DTYPE__": repr(str(cfg.draft_kv_cache_dtype)),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__SERVED_MODEL_NAME__": repr(cfg.served_model_name),
         "__VLLM_PORT__": repr(int(cfg.vllm_port)),
@@ -977,6 +982,8 @@ RUNTIME_SLUG = __RUNTIME_SLUG__
 MODEL_SOURCE_PARTS = __MODEL_SOURCE_PARTS__
 # A separate checkpoint whose MTP head drafts for the target, or None for the target's own head.
 DRAFT_MODEL_SOURCE_PARTS = __DRAFT_MODEL_SOURCE_PARTS__
+# The draft model's KV cache dtype, or '' to inherit the target's.
+VLLM_DRAFT_KV_CACHE_DTYPE = __VLLM_DRAFT_KV_CACHE_DTYPE__
 # A checkpoint whose FP8 PLE table replaces the target's, or None for the target's own table.
 PLE_FP8_MODEL_SOURCE_PARTS = __PLE_FP8_MODEL_SOURCE_PARTS__
 SERVED_MODEL_NAME = __SERVED_MODEL_NAME__
@@ -1833,6 +1840,8 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
         speculative_config = {'method': 'mtp', 'num_speculative_tokens': VLLM_MTP_TOKENS}
         if draft_model_dir is not None:
             speculative_config['model'] = str(draft_model_dir)
+        if VLLM_DRAFT_KV_CACHE_DTYPE:
+            speculative_config['kv_cache_dtype'] = VLLM_DRAFT_KV_CACHE_DTYPE
         if VLLM_DRAFT_VOCAB:
             speculative_config['use_local_argmax_reduction'] = True
         cmd += ['--speculative-config', json.dumps(speculative_config)]
