@@ -7440,7 +7440,7 @@ class ToolAgent:
         # so none of them is built (no header write, no directory scan, no
         # per-request deep copy of every history image).
         debug_artifacts = debug_artifacts_enabled()
-        prompt_log = _resolve_prompt_log_path(state_path) if debug_artifacts else analyzer_log
+        prompt_log = _resolve_prompt_log_path(state_path) if debug_artifacts else Path(os.devnull)
         current_frame, history_entries = load_runtime_state(state_path)
         self._trace_state_path = state_path
         if current_frame is not None:
