@@ -164,3 +164,61 @@ def test_control_pruning_alone_releases_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(tool_agent, "_prune_control_messages", lambda messages: [messages[0], *history])
     assert agent._persistent_history_messages([SYSTEM, *history, *spin_out]) == history
     assert agent._rules_ledger().message() is None
+
+
+REFUTED_1 = "So “g→base” is definitively refuted by level 3."
+REFUTED_2 = "So U is ruled out for all three bars."
+
+
+def test_refuted_filter_needs_strong_words_and_no_hedge():
+    text = (
+        REFUTED_1 + " " + REFUTED_2 + "\n"
+        "My model of the slide was wrong: the white cell stops the player.\n"  # weak word
+        "That contradicts my earlier reading of the board entirely.\n"  # weak word
+        "So the wrap hypothesis is NOT ruled out by level 1!\n"
+        "Let me click A again to rule out a coordinate issue.\n"
+        "No, that wouldn’t disprove the all-eight rule at all.\n"
+        "Hmm, but it may rule out valid plans for this level.\n"
+        "That will reveal the structure and support/refute the hypothesis."
+    )
+    assert confirmed_rules.refuted_sentences(text) == [REFUTED_1, REFUTED_2]
+
+
+def test_both_lists_by_level(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC3_REFUTED_RULES", "1")
+    agent = _agent(monkeypatch, tmp_path)
+    both = "I refuted the dynamic model, and the absolute moves are confirmed by two probes."
+    history = [
+        *_turn(agent, "first", RULE_1 + " " + REFUTED_1 + " " + both, level=2),
+        *_turn(agent, "second", REFUTED_2, level=1),
+        *_turn(agent, "third"),
+        *_turn(agent, "fourth"),
+    ]
+    agent._context_budget_tokens = agent._estimate_request_input_tokens([SYSTEM, *history[6:]]) + 50
+    agent._persistent_history_messages([SYSTEM, *history])
+    assert agent._rules_ledger().text() == "\n\n".join([
+        confirmed_rules.HEADER_BOTH,
+        confirmed_rules.INTRO_BOTH,
+        "Level 1:\nRuled out:\n- " + REFUTED_2,
+        "Level 2:\nConfirmed:\n- " + RULE_1 + "\nRuled out:\n- " + REFUTED_1 + "\n- " + both,
+    ])
+
+
+def test_refuted_alone(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC3_REFUTED_RULES", "1")
+    agent = _agent(monkeypatch, tmp_path, enabled=False)
+    history = [*_turn(agent, "first", RULE_1 + " " + REFUTED_2), *_turn(agent, "second"), *_turn(agent, "third")]
+    _over_budget_by_one_turn(agent, history)
+    trimmed = agent._trim_messages_for_context([SYSTEM, *history])
+    assert trimmed[1]["content"].endswith("Level 1:\nRuled out:\n- " + REFUTED_2)
+    assert RULE_1 not in trimmed[1]["content"]
+
+
+def test_confirmed_only_layout_is_unchanged(monkeypatch, tmp_path):
+    agent = _agent(monkeypatch, tmp_path)
+    history = [*_turn(agent, "first", RULE_1 + " " + REFUTED_1, level=2), *_turn(agent, "second"), *_turn(agent, "third")]
+    _over_budget_by_one_turn(agent, history)
+    trimmed = agent._trim_messages_for_context([SYSTEM, *history])
+    assert trimmed[1]["content"] == "\n\n".join(
+        [HEADER, confirmed_rules.INTRO, "Level 2:\n- " + RULE_1]
+    )
