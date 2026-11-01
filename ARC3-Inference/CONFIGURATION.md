@@ -236,6 +236,7 @@ The dimension estimate uses 32-pixel patches plus two image marker tokens. For e
 | `ARC3_HISTORY_ASSISTANT_TURNS` | `30` | Configures the separate assistant-message history cap. Zero or negative disables it. Counts assistant messages, not game actions or whole analyzer turns. |
 | `ARC3_HISTORY_TURN_DRAIN` | `0` | Adds hysteresis to the assistant-message cap. |
 | `ARC3_HISTORY_DRAIN_COALESCE` | Off | Coordinates token- and message-count drains to avoid closely spaced independent trims. |
+| `ARC3_STUCK_CONTEXT_RESET` | Off | When a trim (token budget or assistant-message cap) falls on a level with no level-up since the previous trim, or since the game started, drops every earlier turn instead of draining the oldest: at the end of a turn nothing carries over (a timeout resumption keeps its own turn), and mid-turn only the current turn is kept. The next opener (or the kept opener) starts with a one-paragraph notice that `history`, `transitions` and retained functions still hold the game record; the transcript gets a `context reset` status line. Sandbox state is untouched. |
 
 The original `LOCAL_ANALYZER_CONTEXT_WINDOW` and `LOCAL_ANALYZER_MAX_OUTPUT` still determine the ordinary prompt budget, reserving generation space plus a safety margin. A large context setting does not override a smaller assistant-message cap or a smaller server context limit.
 

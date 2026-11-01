@@ -156,6 +156,24 @@ def _level_up_history_enabled() -> bool:
     return _get_env_bool("ARC3_LEVEL_UP_HISTORY", False)
 
 
+def _stuck_context_reset_enabled() -> bool:
+    """A context trim that falls on a level not cleared since the previous trim
+    (or since the game started) empties the conversation instead of draining
+    the oldest turns: the next request is the system prompt plus the current
+    turn only. `history`, `transitions`, `level_up_history` and retained
+    functions are sandbox state, not context, so they stay readable.
+    ARC3_STUCK_CONTEXT_RESET defaults off."""
+    return _get_env_bool("ARC3_STUCK_CONTEXT_RESET", False)
+
+
+_STUCK_CONTEXT_RESET_NOTICE = (
+    "Your earlier turns were removed from this conversation because this level "
+    "has not been cleared since the context was last trimmed. The game record is "
+    "intact: `history` and `transitions` still hold every action and frame of "
+    "this game, and your retained functions are still available."
+)
+
+
 def _touching_split() -> bool:
     """A turn-message line when one segmentation node is k >= 2 same-colour
     objects of the level start that now touch, with the colour's pixel total
@@ -3784,6 +3802,11 @@ class ToolAgent:
         self._pending_diff_image: dict[str, Any] | None = None
         self._context_was_trimmed = False
         self._has_evicted = False
+        # ARC3_STUCK_CONTEXT_RESET: a level-up since the last trim means the
+        # agent is not stuck, so the next trim drains as usual
+        self._levelup_since_trim = False
+        self._context_reset_notice = ""
+        self._context_reset_log = ""
         self._actions_at_level_start = 0
         self._tokens_at_level_start = 0
         self._progress_pace = ProgressPace()
@@ -3893,6 +3916,9 @@ class ToolAgent:
                 self._kept_functions = {}
                 self._retained_clear_notice = ""
             self._history_messages = []
+            self._levelup_since_trim = False
+            self._context_reset_notice = ""
+            self._context_reset_log = ""
             self._reset_level_up_history()
             self._reset_trace_state()
             self._session_total_tokens = 0
@@ -4151,6 +4177,7 @@ class ToolAgent:
                     self._pace_last_completed_level = completed_level
             self._actions_at_level_start = _priority_action_count(summary)
             self._tokens_at_level_start = self._session_generated_tokens
+            self._levelup_since_trim = True
         if summary.get("level_transition") and _persistent_functions_scope() == "levelup":
             # a helper can encode the old layout in its code even when it holds
             # no stale data, so the level boundary is where it stops being safe
@@ -5089,6 +5116,10 @@ class ToolAgent:
             payload["function_retention"] = "Your retained functions were cleared after a retention error; redefine any you need."
 
     def _build_user_message(self, user_prompt: str, current_frame: Frame | None) -> dict[str, Any]:
+        notice = getattr(self, "_context_reset_notice", "")
+        if notice:
+            self._context_reset_notice = ""
+            user_prompt = notice + "\n\n" + user_prompt
         user_prompt += self._retained_function_context()
         image_part = current_grid_image_part(current_frame)
         diff_part = self._pending_diff_image
@@ -7096,6 +7127,43 @@ class ToolAgent:
             reasons = self._pending_trim_reasons = []
         reasons.append(reason)
 
+    def _stuck_reset_due(self) -> bool:
+        """ARC3_STUCK_CONTEXT_RESET is on and no level-up since the last trim."""
+        return _stuck_context_reset_enabled() and not getattr(self, "_levelup_since_trim", False)
+
+    def _record_context_reset(self, where: str, before: int, after: int) -> None:
+        self._context_reset_log = (
+            f"context reset ({where}): no level-up since the previous trim; "
+            f"history messages {before} -> {after}"
+        )
+
+    def _log_context_reset(self, append_transcript: Callable[[str, str], None]) -> None:
+        note = getattr(self, "_context_reset_log", "")
+        if note:
+            self._context_reset_log = ""
+            append_transcript("ANALYZER STATUS", note)
+
+    @staticmethod
+    def _current_turn_start(history: list[dict[str, Any]]) -> int | None:
+        """Index of the newest user message that opens a turn (a nudge does not)."""
+        for index in range(len(history) - 1, -1, -1):
+            message = history[index]
+            if (
+                str(message.get("role", "")).strip() == "user"
+                and message.get(_CONTROL_MESSAGE_KEY) != "nudge"
+            ):
+                return index
+        return None
+
+    @staticmethod
+    def _with_notice(message: dict[str, Any], notice: str) -> dict[str, Any]:
+        content = message.get("content")
+        if isinstance(content, str):
+            return {**message, "content": notice + "\n\n" + content}
+        if isinstance(content, list):
+            return {**message, "content": [{"type": "text", "text": notice + "\n\n"}, *content]}
+        return message
+
     def _persistent_history_messages(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         # the trace is rebuilt per request, never stored with the history
         messages = [messages[0], *_without_trace(messages[1:])] if messages else messages
@@ -7107,10 +7175,15 @@ class ToolAgent:
             # after pruning, so a dropped resumption opener cannot consume a
             # retention slot
             messages = _apply_history_image_window(messages, keep_images)
+        stuck = self._stuck_reset_due()
         before_trim = len(messages)
-        trimmed = _without_trace(self._trim_messages_for_context(messages, tools=tools))
+        # the stuck reset is decided below, where the turn cap is known too
+        trimmed = _without_trace(
+            self._trim_messages_for_context(messages, tools=tools, stuck_reset=False)
+        )
         if not trimmed:
             if original_history:
+                self._levelup_since_trim = False
                 self._note_history_evicted(f"history_cleared msgs={len(original_history)}")
             return []
         token_trim_dropped = len(trimmed) < before_trim
@@ -7130,13 +7203,31 @@ class ToolAgent:
             if str(previous_message.get("role", "")).strip() == "user":
                 history = [previous_message, *history]
         history = self._drop_until_first_user_message(history)
+        reset = ""
+        if token_trim_dropped or len(history) < len(trimmed_history):
+            if stuck:
+                # Nothing carries over to the next turn, except the current one
+                # when a resumption continues it (its opener may be short).
+                kept: list[dict[str, Any]] = []
+                if getattr(self, "_resume_after_yield", False):
+                    start = self._current_turn_start(original_history)
+                    kept = (
+                        list(original_history[start:])
+                        if start is not None and len(original_history) - start < len(history)
+                        else history
+                    )
+                history = kept
+                self._context_reset_notice = _STUCK_CONTEXT_RESET_NOTICE
+                self._record_context_reset("end of turn", len(original_history), len(history))
+                reset = " stuck_reset=1"
+            self._levelup_since_trim = False
         # Include turn-cap eviction, control pruning and image removal, which
         # can change the cached prefix without the token trimmer dropping any
         # messages. Image removal can leave the message count unchanged.
         if history != original_history:
             self._note_history_evicted(
                 f"persist msgs={len(original_history)}->{len(history)}"
-                f" token_trim={int(token_trim_dropped)}"
+                f" token_trim={int(token_trim_dropped)}{reset}"
             )
         return history
 
@@ -7357,6 +7448,7 @@ class ToolAgent:
         preserve_recent: int = 1,
         extra_safety_tokens: int = 0,
         force_drain: bool = False,
+        stuck_reset: bool = True,
     ) -> list[dict[str, Any]]:
         if not messages:
             return []
@@ -7459,13 +7551,28 @@ class ToolAgent:
         # conversation, so the next request has to be prefilled from the
         # divergence point regardless. That makes it the one moment when
         # yielding the slot to another game costs nothing.
+        reset = ""
+        if len(history) != history_count and stuck_reset:
+            if self._stuck_reset_due():
+                # keep only the current turn: a request needs its opener. The
+                # drain never cuts into it, so at most it lands on it too.
+                original = _without_trace(messages[1:])
+                start = self._current_turn_start(original)
+                if start is not None and len(original) - start <= len(history):
+                    kept = list(original[start:])
+                    kept[0] = self._with_notice(kept[0], _STUCK_CONTEXT_RESET_NOTICE)
+                    history = kept
+                    head = [system_message, *self._compressed_trace_messages(history)]
+                    self._record_context_reset("request", history_count, len(history))
+                    reset = " stuck_reset=1"
+            self._levelup_since_trim = False
         if len(history) != history_count:
             after = self._estimate_request_input_tokens([*head, *history], tools=tools)
             self._note_history_evicted(
                 f"{'forced_drain' if force_drain else 'token_budget'}"
                 f" msgs={history_count}->{len(history)}"
                 f" est={estimate_before or 0}->{after}"
-                f" budget={budget_tokens} target={target_tokens}"
+                f" budget={budget_tokens} target={target_tokens}{reset}"
             )
         return [*head, *history]
 
@@ -7638,6 +7745,7 @@ class ToolAgent:
             preserve_recent=1,
         )
         self._log_trace_change(append_transcript)
+        self._log_context_reset(append_transcript)
         step_executed = False
         turn_tool_call_count = 0
         captured_reasoning = ""
@@ -7679,6 +7787,7 @@ class ToolAgent:
                 tool_choice = _request_tool_choice(tools)
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 self._log_trace_change(append_transcript)
+                self._log_context_reset(append_transcript)
                 self._maybe_handover()
                 if debug_artifacts or self._save_request_logs:
                     latest_request_messages = json.loads(json.dumps(messages))
