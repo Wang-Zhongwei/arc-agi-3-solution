@@ -63,6 +63,7 @@ from inference.agent.prompts import (
     STRUCTURED_RUNTIME_STATE_ADDENDUM,
     ANIMATION_ADDENDUM,
     ANIMATION_ADDENDUM_TIMELINE,
+    LEVEL_UP_HISTORY_ADDENDUM,
     MULTIMODAL_CONTEXT_ADDENDUM,
     TOOL_CALL_FORMAT_GUIDANCE,
     VISUAL_GAME_ADDENDUM,
@@ -146,6 +147,13 @@ def _levelup_board_image() -> bool:
     death board. Without it the opener after a level-up carries only the next
     level's first board. ARC3_LEVELUP_BOARD_IMAGE defaults off."""
     return _get_env_bool("ARC3_LEVELUP_BOARD_IMAGE", False)
+
+
+def _level_up_history_enabled() -> bool:
+    """The sandbox global `level_up_history`: per completed level, a history
+    entry whose frame is the solved board, which `history` never holds.
+    ARC3_LEVEL_UP_HISTORY defaults off."""
+    return _get_env_bool("ARC3_LEVEL_UP_HISTORY", False)
 
 
 def _touching_split() -> bool:
@@ -2860,6 +2868,8 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
         prompt = f"{_prefix}\n\n{prompt}"
     prompt += GAME_OVERVIEW_ADDENDUM
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
+    if _level_up_history_enabled():
+        prompt += LEVEL_UP_HISTORY_ADDENDUM
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
             border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 3)} cells"
@@ -3789,6 +3799,7 @@ class ToolAgent:
         self._kept_functions: dict[str, str] = {}
         self._last_animation_chain: list[Any] = []
         self._level_end_grid: Any = None
+        self._reset_level_up_history()
         self._reset_trace_state()
         self._pending_levelup_image: dict[str, Any] | None = None
         self._last_shown_grid: Any = None
@@ -3882,6 +3893,7 @@ class ToolAgent:
                 self._kept_functions = {}
                 self._retained_clear_notice = ""
             self._history_messages = []
+            self._reset_level_up_history()
             self._reset_trace_state()
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
@@ -6375,6 +6387,52 @@ class ToolAgent:
             compact["error"] = payload.get("error")
         return compact
 
+    def _reset_level_up_history(self) -> None:
+        """Per-game solved boards for `level_up_history` (ARC3_LEVEL_UP_HISTORY),
+        keyed by the step of the action that completed the level."""
+        self._level_up_boards: dict[int, Any] = {}
+        self._level_up_views: dict[int, dict[str, Any]] = {}
+
+    def _record_level_up_board(self, raw_payload: dict[str, Any]) -> None:
+        """Keep the solved board of a level-completing call. A batch stops at the
+        level-completing action, so the call's payload is that action's and
+        `action_num` is its step."""
+        if not _level_up_history_enabled() or not raw_payload.get("level_completed"):
+            return
+        grid = raw_payload.get("level_end_grid")
+        try:
+            step = int(raw_payload.get("action_num"))
+        except (TypeError, ValueError):
+            return
+        if grid is not None:
+            self._level_up_boards[step] = grid
+
+    def _level_up_history_view(self, history: list[HistoryEntry]) -> list[dict[str, Any]]:
+        """`level_up_history` for the sandbox: one entry per level-completing
+        action in `history`, with that entry's action and result and the solved
+        board as its frame (None when the engine sent no solved board)."""
+        entries: list[dict[str, Any]] = []
+        for entry in history:
+            result = getattr(entry, "result", None) or {}
+            if not result.get("level_completed") or entry.frame is None:
+                continue
+            step = int(entry.frame.step)
+            view = self._level_up_views.get(step)
+            if view is None:
+                grid = self._level_up_boards.get(step)
+                frame = None
+                if grid is not None:
+                    frame = _ascii_frame_view_payload(Frame(
+                        grid=tuple(tuple(int(cell) for cell in row) for row in grid),
+                        step=step,
+                        # the history frame is the next level's first board
+                        level=max(1, int(entry.frame.level) - 1),
+                    ))
+                view = {"action": entry.action, "frame": frame, "result": dict(result)}
+                self._level_up_views[step] = view
+            entries.append(view)
+        return entries
+
     def _history_view_json(self, entries: list[HistoryEntry]) -> RawJSON:
         """The sandbox's view of `entries` as a JSON array, each entry
         serialized once: entries never change after they are appended, and
@@ -6411,6 +6469,7 @@ class ToolAgent:
         # history entries the sandbox already holds: the first state carries the
         # whole history, every later one only what was appended since
         sandbox_history: list[int] = []
+        sandbox_level_ups: list[int] = []
 
         def _serialized_runtime_state(
             *,
@@ -6427,6 +6486,18 @@ class ToolAgent:
             else:
                 history_fields = {"history": self._history_view_json(refreshed_history)}
             sandbox_history[:] = [len(refreshed_history)]
+            level_up_fields: dict[str, Any] = {}
+            if _level_up_history_enabled():
+                # like history: the whole list once, then only the new entries
+                level_ups = self._level_up_history_view(refreshed_history)
+                if sandbox_level_ups and sandbox_level_ups[0] <= len(level_ups):
+                    level_up_fields = {
+                        "level_up_history_start": sandbox_level_ups[0],
+                        "level_up_history_tail": level_ups[sandbox_level_ups[0]:],
+                    }
+                else:
+                    level_up_fields = {"level_up_history": level_ups}
+                sandbox_level_ups[:] = [len(level_ups)]
             if isinstance(next_valid_actions, list):
                 sanitized_actions = [str(item).strip() for item in next_valid_actions if str(item).strip()]
             else:
@@ -6439,6 +6510,7 @@ class ToolAgent:
             return {
                 "current_frame": current_frame_payload,
                 **history_fields,
+                **level_up_fields,
                 "valid_actions": sanitized_actions,
                 "death_ledger": (
                     self._death_ledger_payload()
@@ -6544,6 +6616,7 @@ class ToolAgent:
                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
             if raw_payload.get("level_end_grid") is not None:
                 self._level_end_grid = raw_payload["level_end_grid"]
+            self._record_level_up_board(raw_payload)
             self._record_trace_batch(raw_payload)
             if reset_exposed() and raw_payload.get("executed"):
                 # Use actual execution, not submitted batch size: a refused
