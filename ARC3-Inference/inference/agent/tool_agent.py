@@ -2862,7 +2862,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
     if _explain_gameplay_changed():
         prompt += GAMEPLAY_CHANGED_ADDENDUM.format(
-            border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 4)} cells"
+            border=f"{_get_env_int('ARC3_NOOP_GUARD_BORDER', 3)} cells"
         )
     if _animation_enabled():
         prompt += ANIMATION_ADDENDUM
@@ -4812,7 +4812,7 @@ class ToolAgent:
             return
         if mode == "composite":
             part = animation_composite_part(
-                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 3)
             )
             label = (
                 "Fatal action animation image: the cells that changed during the fatal "
@@ -4869,7 +4869,7 @@ class ToolAgent:
             return
         if mode == "composite":
             part = animation_composite_part(
-                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+                chain, cells, border=_get_env_int("ARC3_NOOP_GUARD_BORDER", 3)
             )
             label = (
                 "Animation image: the cells that changed during the animation, each in "
@@ -4987,7 +4987,7 @@ class ToolAgent:
         grid, self._level_end_grid = self._level_end_grid, None
         if grid is None or not _levelup_board_image():
             return
-        border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+        border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 3)
         interior = lambda g: [row[border:len(row) - border] for row in g[border:len(g) - border]]
         if self._last_shown_grid is not None and interior(grid) == interior(self._last_shown_grid):
             return
@@ -5412,7 +5412,7 @@ class ToolAgent:
                 # older one it replaced has ever reached a transcript. On a
                 # single-action turn no per-action trace is built either, so the
                 # model had no account of the outcome from any source.
-                border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 4)
+                border = _get_env_int("ARC3_NOOP_GUARD_BORDER", 3)
                 if previous_step_summary.get("gameplay_changed"):
                     lines.append("That sequence changed cells inside the board area.")
                 elif previous_step_summary.get("board_changed"):

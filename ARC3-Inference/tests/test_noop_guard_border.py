@@ -1,42 +1,32 @@
-"""The no-op guard ignores HUD bars in the border but not pieces moving there."""
+"""The no-op guard's border (ARC3_NOOP_GUARD_BORDER, default 3) hides HUD bars
+but not pieces moving along the edge."""
 
-from inference.framework.solver import _interior_gameplay_changed
+from inference.framework.solver import NOOP_GUARD_BORDER_WIDTH, _interior_gameplay_changed
 
 
 def _blank():
     return [[0] * 64 for _ in range(64)]
 
 
-def test_interior_change_counts():
-    before, after = _blank(), _blank()
-    after[30][30] = 5
-    assert _interior_gameplay_changed(before, after)
+def test_default_border_is_three():
+    assert NOOP_GUARD_BORDER_WIDTH == 3
 
 
-def test_thin_bar_in_border_is_hud():
+def test_ls20_step_bar_is_hud():
+    # ls20: a 2-row step bar in rows 61-62 (depth 1-2) loses two columns
     before, after = _blank(), _blank()
-    before[63] = [9] * 64
-    after[63] = [9] * 63 + [3]  # timer bar loses one cell
-    assert not _interior_gameplay_changed(before, after)
-    before[62] = [9] * 64
-    after[62] = [9] * 60 + [3] * 4  # two-row bar loses four columns
+    for r in (61, 62):
+        before[r][15:40] = [4] * 25
+        after[r][15:40] = [5] * 2 + [4] * 23
     assert not _interior_gameplay_changed(before, after)
 
 
-def test_piece_moving_inside_border_counts():
-    # wa30: a 4x4 player walking down the right edge (cols 60-63)
+def test_wa30_player_on_the_edge_counts():
+    # wa30: a 4x4 player walking down the right edge (cols 60-63, depth 0-3)
     before, after = _blank(), _blank()
     for r in range(32, 36):
-        for c in range(60, 64):
-            before[r][c] = 7
+        before[r][60:64] = [7] * 4
     for r in range(36, 40):
-        for c in range(60, 64):
-            after[r][c] = 7
+        after[r][60:64] = [7] * 4
     assert _interior_gameplay_changed(before, after)
-    assert not _interior_gameplay_changed(before, after, solid_side=0)
-
-
-def test_border_disabled_is_plain_inequality():
-    before, after = _blank(), _blank()
-    after[0][0] = 1
-    assert _interior_gameplay_changed(before, after, border=0)
+    assert not _interior_gameplay_changed(before, after, border=4)

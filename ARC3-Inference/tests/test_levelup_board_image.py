@@ -91,7 +91,7 @@ def test_levelup_opener_shows_solved_board_before_current(monkeypatch, tmp_path,
 
 
 def test_levelup_image_skipped_when_interior_matches_last_turn(monkeypatch, tmp_path):
-    fringe_only = tuple((5,) * 64 if r < 4 else (3,) * 64 for r in range(64))
+    fringe_only = tuple((5,) * 64 if r < 3 else (3,) * 64 for r in range(64))
     agent, parts = _opener(monkeypatch, tmp_path, True, last_shown=fringe_only)
     assert sum(part["type"] == "image_url" for part in parts) == 1
     assert "Last level-complete image:" not in parts[0]["text"]
