@@ -43,6 +43,11 @@ from inference.agent.compressed_trace import (
     compressed_trace_enabled,
     compressed_trace_levelup_frames,
 )
+from inference.agent.confirmed_rules import (
+    RULES_MESSAGE_KEY as _RULES_MESSAGE_KEY,
+    SEQ_KEY as _RULES_SEQ_KEY,
+    ConfirmedRules,
+)
 from inference.utils.retained_functions import function_signature
 from inference.agent.prompts import (
     apply_level_transfer_system_guidance,
@@ -164,6 +169,14 @@ def _stuck_context_reset_enabled() -> bool:
     functions are sandbox state, not context, so they stay readable.
     ARC3_STUCK_CONTEXT_RESET defaults off."""
     return _get_env_bool("ARC3_STUCK_CONTEXT_RESET", False)
+
+
+def _confirmed_rules_enabled() -> bool:
+    """The thinking sentences that say "confirmed", collected from replies a
+    context trim dropped, grouped by level and pinned as one user message after
+    the system prompt (inference/agent/confirmed_rules.py). No message until a
+    trim has released at least one. ARC3_CONFIRMED_RULES defaults off."""
+    return _get_env_bool("ARC3_CONFIRMED_RULES", False)
 
 
 _STUCK_CONTEXT_RESET_NOTICE = (
@@ -729,7 +742,8 @@ def _post_with_retries(
 
 
 _CONTROL_MESSAGE_KEY = "_arc3_control"
-_TRACE_KEYS = (_TRACE_MESSAGE_KEY, _TRACE_STEP_KEY)
+# the confirmed-rules tags ride along: pinned like the trace, never sent
+_TRACE_KEYS = (_TRACE_MESSAGE_KEY, _TRACE_STEP_KEY, _RULES_MESSAGE_KEY, _RULES_SEQ_KEY)
 _PRIVATE_MESSAGE_KEYS = (_CONTROL_MESSAGE_KEY, *_TRACE_KEYS)
 
 _YIELD_RESUME_PROMPT_WITH_TOOLS = (
@@ -1307,7 +1321,9 @@ def _strip_trace_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _is_trace_message(message: dict[str, Any]) -> bool:
-    return _TRACE_MESSAGE_KEY in message
+    """A pinned head message rebuilt per request: the compressed trace or the
+    confirmed rules. Neither is ever stored with the history."""
+    return _TRACE_MESSAGE_KEY in message or _RULES_MESSAGE_KEY in message
 
 
 def _without_trace(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3921,6 +3937,7 @@ class ToolAgent:
             self._context_reset_log = ""
             self._reset_level_up_history()
             self._reset_trace_state()
+            self._confirmed_rules = ConfirmedRules()
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
             self._last_call_reasoning_tokens = None
@@ -5013,6 +5030,51 @@ class ToolAgent:
             cache = (key, message)
             self._trace_cache = cache
         return [cache[1]] if cache[1] is not None else []
+
+    def _rules_ledger(self) -> ConfirmedRules:
+        ledger = getattr(self, "_confirmed_rules", None)
+        if ledger is None:
+            ledger = self._confirmed_rules = ConfirmedRules()
+        return ledger
+
+    def _tag_confirmed_rules(self, message: dict[str, Any]) -> None:
+        """Tag an assistant reply with the level its thinking was written on
+        (the level before its own tool calls run)."""
+        if not _confirmed_rules_enabled():
+            return
+        summary = getattr(self, "_last_step_summary", None) or {}
+        try:
+            level = int(summary.get("level") or 1)
+        except (TypeError, ValueError):
+            level = 1
+        self._rules_ledger().tag(message, level, _extract_reasoning_text(message))
+
+    def _harvest_confirmed_rules(self, retained: list[dict[str, Any]]) -> None:
+        """After a trim: tagged replies missing from `retained` release their sentences."""
+        if _confirmed_rules_enabled():
+            self._rules_ledger().harvest(retained)
+
+    def _pinned_head_messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Messages between the system prompt and the retained history: the
+        compressed trace, then the confirmed rules."""
+        head = self._compressed_trace_messages(history=history)
+        if _confirmed_rules_enabled():
+            rules = self._rules_ledger().message()
+            if rules is not None:
+                head = [*head, rules]
+        return head
+
+    def _log_confirmed_rules(self, append_transcript) -> None:
+        """Write the rules section to the transcript each time it changes."""
+        if not _confirmed_rules_enabled():
+            return
+        ledger = self._rules_ledger()
+        if ledger.version == ledger.logged_version:
+            return
+        ledger.logged_version = ledger.version
+        message = ledger.message()
+        if message is not None:
+            append_transcript("CONFIRMED RULES", message["content"])
 
     def _log_trace_change(self, append_transcript) -> None:
         """Write the trace to the transcript once each time it is rebuilt."""
@@ -6824,6 +6886,7 @@ class ToolAgent:
         itself bypasses this helper and starts a fresh interval.
         """
         self._tag_trace_step(message)
+        self._tag_confirmed_rules(message)
         messages.append(message)
         if _summary_interval_tokens() <= 0:
             return
@@ -6879,7 +6942,7 @@ class ToolAgent:
         )
         messages = [
             {"role": "system", "content": self._system_prompt},
-            *self._compressed_trace_messages(history),
+            *self._pinned_head_messages(history),
             *history,
             request,
         ]
@@ -7185,6 +7248,7 @@ class ToolAgent:
             if original_history:
                 self._levelup_since_trim = False
                 self._note_history_evicted(f"history_cleared msgs={len(original_history)}")
+                self._harvest_confirmed_rules([])
             return []
         token_trim_dropped = len(trimmed) < before_trim
         trimmed_history = trimmed[1:]
@@ -7229,6 +7293,10 @@ class ToolAgent:
                 f"persist msgs={len(original_history)}->{len(history)}"
                 f" token_trim={int(token_trim_dropped)}{reset}"
             )
+        if token_trim_dropped or len(history) < len(trimmed_history):
+            # a real trim only: control pruning alone must not change the
+            # pinned message, which would re-prefill the whole context
+            self._harvest_confirmed_rules(history)
         return history
 
     def _priority_total_levels(self) -> int:
@@ -7457,7 +7525,7 @@ class ToolAgent:
         history_count = len(history)
         # The trace is pinned after the system prompt: it is never evicted, only
         # rebuilt below for wherever the retained history now starts.
-        head = [system_message, *self._compressed_trace_messages(history)]
+        head = [system_message, *self._pinned_head_messages(history)]
         preserve_recent = max(0, preserve_recent)
         budget_tokens = max(1, self._context_budget_tokens - max(0, extra_safety_tokens))
         # capped at half the budget: a mis-set knob should cost history depth,
@@ -7534,7 +7602,9 @@ class ToolAgent:
             if not self._drop_oldest_history_block(history, preserve_recent=preserve_recent):
                 break
         history = self._drop_until_first_user_message(history)
-        head = [system_message, *self._compressed_trace_messages(history)]
+        if len(history) != history_count:
+            self._harvest_confirmed_rules(history)
+        head = [system_message, *self._pinned_head_messages(history)]
         # The loop priced the trace for where history started; a trim that
         # moves the start rebuilds it, and the new one can be larger (the first
         # trim goes from no trace to a full one). Rare, so it pays one rebuild
@@ -7546,7 +7616,8 @@ class ToolAgent:
             and self._drop_oldest_history_block(history, preserve_recent=preserve_recent)
         ):
             history = self._drop_until_first_user_message(history)
-            head = [system_message, *self._compressed_trace_messages(history)]
+            self._harvest_confirmed_rules(history)
+            head = [system_message, *self._pinned_head_messages(history)]
         # A dropped message invalidates the server's prefix for this
         # conversation, so the next request has to be prefilled from the
         # divergence point regardless. That makes it the one moment when
@@ -7562,7 +7633,8 @@ class ToolAgent:
                     kept = list(original[start:])
                     kept[0] = self._with_notice(kept[0], _STUCK_CONTEXT_RESET_NOTICE)
                     history = kept
-                    head = [system_message, *self._compressed_trace_messages(history)]
+                    self._harvest_confirmed_rules(history)
+                    head = [system_message, *self._pinned_head_messages(history)]
                     self._record_context_reset("request", history_count, len(history))
                     reset = " stuck_reset=1"
             self._levelup_since_trim = False
@@ -7590,7 +7662,8 @@ class ToolAgent:
         if not self._drop_oldest_history_block(history, preserve_recent=max(0, preserve_recent)):
             return list(messages)
         self._note_history_evicted(f"force_reduce msgs={history_count}->{len(history)}")
-        return [system_message, *self._compressed_trace_messages(history), *history]
+        self._harvest_confirmed_rules(history)
+        return [system_message, *self._pinned_head_messages(history), *history]
 
     def analyze(
         self,
@@ -7746,6 +7819,7 @@ class ToolAgent:
         )
         self._log_trace_change(append_transcript)
         self._log_context_reset(append_transcript)
+        self._log_confirmed_rules(append_transcript)
         step_executed = False
         turn_tool_call_count = 0
         captured_reasoning = ""
@@ -7788,6 +7862,7 @@ class ToolAgent:
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 self._log_trace_change(append_transcript)
                 self._log_context_reset(append_transcript)
+                self._log_confirmed_rules(append_transcript)
                 self._maybe_handover()
                 if debug_artifacts or self._save_request_logs:
                     latest_request_messages = json.loads(json.dumps(messages))
