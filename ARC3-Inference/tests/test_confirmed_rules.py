@@ -222,3 +222,40 @@ def test_confirmed_only_layout_is_unchanged(monkeypatch, tmp_path):
     assert trimmed[1]["content"] == "\n\n".join(
         [HEADER, confirmed_rules.INTRO, "Level 2:\n- " + RULE_1]
     )
+
+
+def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
+    text = (
+        "So the target is confirmed.\n"
+        "That's confirmed by the win.\n"
+        "So max 2 confirmed ✗✗✗.\n"
+        "Good enough ✓ CCW confirmed.\n"
+        "So white = wall, confirmed.\n"
+        "Hmm, so (17,2) unreachable ✓ confirmed.\n"
+        "So the rule set is confirmed:\n- pushing moves the box one cell\n- walls stop the box"
+    )
+    assert confirmed_sentences(text) == [
+        "So the target is confirmed.",
+        "That's confirmed by the win.",
+        "So max 2 confirmed ✗✗✗.",
+        "Good enough ✓ CCW confirmed.",
+        "So white = wall, confirmed.",
+        "Hmm, so (17,2) unreachable ✓ confirmed.",
+        "So the rule set is confirmed:",
+    ]
+    assert confirmed_sentences(text, content_filter=True) == [
+        "White = wall, confirmed.",
+        "(17,2) unreachable ✓ confirmed.",
+        "The rule set is confirmed: pushing moves the box one cell walls stop the box",
+    ]
+    assert confirmed_rules.refuted_sentences("So the dynamic model is refuted ✓.", content_filter=True) == []
+    assert confirmed_rules.refuted_sentences("So U is ruled out for all three.", content_filter=True) == [
+        "U is ruled out for all three."
+    ]
+
+
+def test_content_filter_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC3_RULES_CONTENT_FILTER", "1")
+    assert _agent(monkeypatch, tmp_path)._rules_ledger().content_filter
+    monkeypatch.setenv("ARC3_RULES_CONTENT_FILTER", "0")
+    assert not _agent(monkeypatch, tmp_path / "b")._rules_ledger().content_filter

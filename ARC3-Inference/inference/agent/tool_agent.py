@@ -187,6 +187,12 @@ def _refuted_rules_enabled() -> bool:
     return _get_env_bool("ARC3_REFUTED_RULES", False)
 
 
+def _rules_content_filter_enabled() -> bool:
+    """Drop low-information sentences from both rules lists and tidy the rest
+    (inference/agent/confirmed_rules.py). ARC3_RULES_CONTENT_FILTER defaults off."""
+    return _get_env_bool("ARC3_RULES_CONTENT_FILTER", False)
+
+
 def _rules_section_enabled() -> bool:
     return _confirmed_rules_enabled() or _refuted_rules_enabled()
 
@@ -5045,7 +5051,11 @@ class ToolAgent:
 
     @staticmethod
     def _new_rules_ledger() -> ConfirmedRules:
-        return ConfirmedRules(confirmed=_confirmed_rules_enabled(), refuted=_refuted_rules_enabled())
+        return ConfirmedRules(
+            confirmed=_confirmed_rules_enabled(),
+            refuted=_refuted_rules_enabled(),
+            content_filter=_rules_content_filter_enabled(),
+        )
 
     def _rules_ledger(self) -> ConfirmedRules:
         ledger = getattr(self, "_confirmed_rules", None)

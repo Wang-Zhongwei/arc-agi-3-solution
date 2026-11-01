@@ -30,6 +30,17 @@ negated or planned refutation ("NOT ruled out", "can't rule out", "to refute").
 A sentence with a refutation word goes to the ruled-out list only. v01+v02:
 about 20 such sentences in 50 games.
 
+ARC3_RULES_CONTENT_FILTER drops low-information sentences from both lists
+(v01+v02: 43 of 496 dropped). A sentence ending in ":" first takes in up to
+COLON_JOIN_PIECES following lines when the part before the colon says nothing
+on its own ("The push rule is CONFIRMED:" - its list is the content). Leading fillers
+(Hmm, So, OK, Good, ...) and trailing check marks are stripped. A sentence is
+dropped when it never says what was confirmed ("That's confirmed by the win.",
+"Confirmed by this death.") or has fewer than MIN_CONTENT_WORDS words left once
+the marker words, fillers, function words and generic nouns (model,
+hypothesis, rule, mechanic, goal, target, map, ...) are removed: "So the target
+is confirmed." goes, "White = wall, confirmed." stays.
+
 The section is capped at MAX_SECTION_CHARS by dropping the oldest sentences;
 v02's largest whole-game ledger was 781 tokens (~3,100 chars), so the cap only
 binds on games far longer than any seen so far.
@@ -46,6 +57,9 @@ SEQ_KEY = "_arc3_rules_seq"
 MIN_WORDS = 5
 MAX_SENTENCE_CHARS = 500
 MAX_SECTION_CHARS = 8000
+MIN_CONTENT_WORDS = 2
+COLON_JOIN_PIECES = 4
+COLON_JOIN_CHARS = 400
 
 _CONFIRMED = re.compile(r"\bconfirmed\b", re.IGNORECASE)
 _SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -66,6 +80,66 @@ _REFUTED_EXTRA = re.compile(
     r"(refute|disprove|falsify|debunk|rule out|ruled out|refuted|disproved|falsified)\b",
     re.IGNORECASE,
 )
+
+_FILLER_WORDS = frozenset("""
+confirmed confirm confirms refuted refute refutes refutation disproved disproves disprove
+falsified debunked ruled rules rule out
+so hmm hmmm ok okay good enough great yes wait well now anyway also then thus hence again
+definitively finally indeed really actually fully clearly partially directly empirically
+strongly definitely obviously basically
+the a an is are was were be been being this that it its it's that's there's my our we i
+and or but of to in on at by for with as all both here there which what
+level level's case model hypothesis theory idea guess mechanic mechanics goal target test
+result results behavior behaviour pattern picture map
+""".split())
+_TOKEN_EDGES = ".,:;!()[]\"'“”‘’✓✗*"
+_LEAD_FILLER = re.compile(
+    r"^(?:(?:hmm+|ok(?:ay)?|so|good|great|yes|wait|right|anyway|and|but|now|alright|well)\b[\s,:;!.—-]*)+",
+    re.IGNORECASE,
+)
+_TRAIL_MARKS = re.compile(r"[\s✓✗!]+(?=[.)]*$)")
+_SUBJECTLESS = re.compile(
+    r"^(?:(?:that|this|it|which)(?:'s| is| was)?\s+(?:also\s+)?(?:confirmed|refuted|ruled out|disproved)\b"
+    r"|confirmed by\b[^:]*$|confirmed[.!]?$)",
+    re.IGNORECASE,
+)
+
+
+def _tidy(sentence: str) -> str:
+    sentence = _LEAD_FILLER.sub("", sentence).strip()
+    sentence = _TRAIL_MARKS.sub("", sentence).strip()
+    return sentence[:1].upper() + sentence[1:]
+
+
+def _informative(sentence: str) -> bool:
+    if _SUBJECTLESS.search(sentence.replace("\u2019", "'")):
+        return False
+    words = [w.strip(_TOKEN_EDGES) for w in sentence.split()]
+    content = [
+        w for w in words
+        if w and w.lower() not in _FILLER_WORDS and not set(w) <= set("✓✗=→-") and not w.isdigit()
+    ]
+    return len(content) >= MIN_CONTENT_WORDS
+
+
+def _segments(reasoning: str, join_colon: bool) -> list[str]:
+    pieces = [p for p in _SPLIT.split(reasoning or "") if p and p.strip()]
+    if not join_colon:
+        return pieces
+    out: list[str] = []
+    index = 0
+    while index < len(pieces):
+        piece = pieces[index]
+        index += 1
+        if piece.rstrip().endswith(":") and not _informative(_tidy(_LEAD.sub("", piece).strip())):
+            taken = 0
+            while index < len(pieces) and taken < COLON_JOIN_PIECES and len(piece) < COLON_JOIN_CHARS:
+                piece = piece.rstrip() + " " + _LEAD.sub("", pieces[index]).strip()
+                index += 1
+                taken += 1
+        out.append(piece)
+    return out
+
 
 CONFIRMED = "confirmed"
 REFUTED = "refuted"
@@ -97,10 +171,10 @@ def _cut(sentence: str) -> str:
     return sentence
 
 
-def refuted_sentences(reasoning: str) -> list[str]:
+def refuted_sentences(reasoning: str, *, content_filter: bool = False) -> list[str]:
     """The usable strong-refutation sentences of one reply's thinking, in order."""
     found: list[str] = []
-    for raw in _SPLIT.split(reasoning or ""):
+    for raw in _segments(reasoning, content_filter):
         sentence = _LEAD.sub("", raw).strip()
         plain = sentence.replace("\u2019", "'")
         if not _REFUTED.search(plain) or "?" in plain:
@@ -109,17 +183,23 @@ def refuted_sentences(reasoning: str) -> list[str]:
             continue
         if len(sentence.split()) < MIN_WORDS:
             continue
+        if content_filter:
+            sentence = _tidy(sentence)
+            if not _informative(sentence):
+                continue
         found.append(_cut(sentence))
     return found
 
 
-def classified_sentences(reasoning: str, *, confirmed: bool, refuted: bool) -> list[tuple[str, str]]:
+def classified_sentences(
+    reasoning: str, *, confirmed: bool, refuted: bool, content_filter: bool = False
+) -> list[tuple[str, str]]:
     """(kind, sentence) in order; a sentence with a refutation word is never
     also listed as confirmed when the ruled-out list is on."""
     found: list[tuple[str, str]] = []
-    ruled_out = refuted_sentences(reasoning) if refuted else []
+    ruled_out = refuted_sentences(reasoning, content_filter=content_filter) if refuted else []
     if confirmed:
-        for sentence in confirmed_sentences(reasoning):
+        for sentence in confirmed_sentences(reasoning, content_filter=content_filter):
             if refuted and _REFUTED.search(sentence.replace("\u2019", "'")):
                 continue
             found.append((CONFIRMED, sentence))
@@ -127,15 +207,19 @@ def classified_sentences(reasoning: str, *, confirmed: bool, refuted: bool) -> l
     return found
 
 
-def confirmed_sentences(reasoning: str) -> list[str]:
+def confirmed_sentences(reasoning: str, *, content_filter: bool = False) -> list[str]:
     """The usable "confirmed" sentences of one reply's thinking, in order."""
     found: list[str] = []
-    for raw in _SPLIT.split(reasoning or ""):
+    for raw in _segments(reasoning, content_filter):
         sentence = _LEAD.sub("", raw).strip()
         if not _CONFIRMED.search(sentence) or "?" in sentence or _HEDGED.search(sentence):
             continue
         if len(sentence.split()) < MIN_WORDS:
             continue
+        if content_filter:
+            sentence = _tidy(sentence)
+            if not _informative(sentence):
+                continue
         found.append(_cut(sentence))
     return found
 
@@ -147,9 +231,10 @@ def _dedupe_key(sentence: str) -> str:
 class ConfirmedRules:
     """Per-game ledger: pending sentences per tagged reply, and the rules."""
 
-    def __init__(self, *, confirmed: bool = True, refuted: bool = False) -> None:
+    def __init__(self, *, confirmed: bool = True, refuted: bool = False, content_filter: bool = False) -> None:
         self.confirmed = confirmed
         self.refuted = refuted
+        self.content_filter = content_filter
         self.reset()
 
     def reset(self) -> None:
@@ -174,7 +259,9 @@ class ConfirmedRules:
         seq = self._next_seq
         self._next_seq += 1
         message[SEQ_KEY] = seq
-        sentences = classified_sentences(reasoning, confirmed=self.confirmed, refuted=self.refuted)
+        sentences = classified_sentences(
+            reasoning, confirmed=self.confirmed, refuted=self.refuted, content_filter=self.content_filter
+        )
         if sentences:
             self._pending[seq] = (max(1, int(level)), sentences)
 
