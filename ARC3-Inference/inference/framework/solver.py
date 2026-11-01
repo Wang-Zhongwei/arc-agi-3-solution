@@ -128,6 +128,14 @@ ANIMATION_ENABLED = os.environ.get("ARC3_ANIMATION", "0").strip().lower() in (
     "on",
 )
 NOOP_GUARD_BORDER_WIDTH = max(0, int(os.environ.get("ARC3_NOOP_GUARD_BORDER", "4")))
+# A change inside the border still counts as gameplay when it fills a solid
+# square of this side. HUD bars are 1-2 cells thick, so they never fill a 3x3
+# square, but a piece that walks along the edge does: wa30's 4x4 player moving
+# in the outer 4 cells was reported as a NO-OP on 41 of 436 actions
+# (main-tuned-drafter v1), and ka59/vc33 have the same pattern. Over every
+# pulled Kaggle run, 3 flips only those three games' moves and no bar update.
+# 0 restores the plain border crop.
+NOOP_GUARD_SOLID_SIDE = max(0, int(os.environ.get("ARC3_NOOP_GUARD_SOLID", "3")))
 # Print one line per action(...) call into the snippet's stdout. Costs a line of
 # tool output per call, which is charged against tool_output_tokens.
 # The patch-110 rewordings, behind one switch. They replaced "changed nothing"
@@ -289,13 +297,18 @@ def _interior_gameplay_changed(
     new_grid: list[list[int]] | None,
     *,
     border: int = NOOP_GUARD_BORDER_WIDTH,
+    solid_side: int | None = None,
 ) -> bool:
-    """True when any cell outside the border frame differs between grids.
+    """True when any cell outside the border frame differs between grids, or
+    the changed border cells fill a solid ``solid_side`` square (a game piece
+    moving along the edge rather than a thin HUD bar).
 
     Falls back to a plain inequality check (treat as changed) when the guard
     is disabled, grids are missing, shapes differ, or the border swallows the
     whole grid — the guard must fail open.
     """
+    if solid_side is None:
+        solid_side = NOOP_GUARD_SOLID_SIDE
     if border <= 0 or previous_grid is None or new_grid is None:
         return previous_grid != new_grid
     rows = len(previous_grid)
@@ -309,7 +322,22 @@ def _interior_gameplay_changed(
         new_row = new_grid[r]
         if prev_row[border:cols - border] != new_row[border:cols - border]:
             return True
-    return False
+    if solid_side <= 0:
+        return False
+    # the interior is unchanged, so every differing cell is a border cell
+    changed = {
+        (r, c)
+        for r in range(rows)
+        for c in range(cols)
+        if previous_grid[r][c] != new_grid[r][c]
+    }
+    if len(changed) < solid_side * solid_side:
+        return False
+    span = range(solid_side)
+    return any(
+        all((r + dr, c + dc) in changed for dr in span for dc in span)
+        for r, c in changed
+    )
 
 _LOCAL_SERVER_PROCESS_ENV_KEYS = (
     "LOCAL_ANALYZER_API_KEY",

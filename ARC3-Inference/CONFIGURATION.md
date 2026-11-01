@@ -145,6 +145,7 @@ Animation correctness fixes preserve fatal-action information through automatic 
 | `ARC3_DEATH_LEDGER` | Off | Adds advisory information about previously fatal routes and exposes the structured ledger for inspection. |
 | `ARC3_GUARDS_FROM_LEVEL` | `1` | Starts the per-action stale/repeat/death guards at this level. Does not defer the batch no-op guard or terminal latch. |
 | `ARC3_NOOP_GUARD_BORDER` | `4` | Excludes the outer border when deciding whether gameplay changed, so HUD/bar changes do not count as progress. Zero disables the border-dependent batch no-op behavior. |
+| `ARC3_NOOP_GUARD_SOLID` | `3` | A change inside the `ARC3_NOOP_GUARD_BORDER` frame still counts as gameplay when the changed cells fill a solid square of this side, so a piece moving along the edge (wa30, ka59, vc33) is not reported as a NO-OP. HUD bars are 1-2 cells thick and never fill one. Zero restores the plain border crop. |
 | `ARC3_STATE_IDENTITY_BORDER` | `0` | Separately controls the border ignored when identifying states for repeat/fatal checks. |
 
 Death recording is enabled whenever either the ledger display or the death guard is enabled. The guard works independently of the advisory display.
