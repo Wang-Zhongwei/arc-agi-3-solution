@@ -170,6 +170,15 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_call_result` are refreshed.\n"
 )
 
+LEVEL_UP_HISTORY_ADDENDUM = (
+    "- `level_up_history` is a Python list with one entry per completed level, in order: "
+    "`level_up_history[0]` is how level 1 was solved. Each entry is a history entry with "
+    "`.action` (the action that completed the level), `.frame` (the board at the moment the "
+    "level was solved; its `.level` is the completed level) and `.result`. `history` does not "
+    "contain these boards: the `history` frame of a level-completing action is already the "
+    "next level's first board. `.frame` is `None` when the solved board was not captured.\n"
+)
+
 ANIMATION_ADDENDUM_TIMELINE = (
     "- `last_animation_timeline` is a diff timeline of those frames. It is a dict "
     "with `action`, `frame_count` and `frame_diffs`, one entry per frame that "

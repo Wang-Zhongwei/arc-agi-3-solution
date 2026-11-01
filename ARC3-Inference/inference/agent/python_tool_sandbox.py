@@ -560,6 +560,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         # then only the entries appended after each action. Kept apart from the
         # `history` global, which the snippet is free to mutate.
         _history_items = []
+        _level_up_items = []
 
         def _refresh_state(state_payload):
             current_frame = _frame_from_payload(state_payload.get("current_frame"))
@@ -569,6 +570,14 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
             else:
                 _history_items[:] = _history_from_payload(state_payload.get("history"))
             history = list(_history_items)
+            # ARC3_LEVEL_UP_HISTORY: sent only when on, so the global exists only then
+            if "level_up_history_tail" in state_payload:
+                start = int(state_payload.get("level_up_history_start") or 0)
+                _level_up_items[start:] = _history_from_payload(state_payload.get("level_up_history_tail"))
+                runtime_globals["level_up_history"] = list(_level_up_items)
+            elif "level_up_history" in state_payload:
+                _level_up_items[:] = _history_from_payload(state_payload.get("level_up_history"))
+                runtime_globals["level_up_history"] = list(_level_up_items)
             last_action_call_result = state_payload.get("last_action_call_result")
             action_result = (
                 _record(last_action_call_result, _Result)
