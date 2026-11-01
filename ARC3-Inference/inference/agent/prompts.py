@@ -171,18 +171,20 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
 )
 
 ANIMATION_ADDENDUM_TIMELINE = (
-    "- `last_animation_timeline` is a diff timeline of those frames: it "
-    "shows which cells changed at each step. It is a dict with `action`, `frames` and "
-    "`steps`, one entry per step that changed anything. Each entry has `step`, "
-    "`changed`, `bbox`, and "
+    "- `last_animation_timeline` is a diff timeline of those frames. It is a dict "
+    "with `action`, `frame_count` and `frame_diffs`, one entry per frame that "
+    "differs from the frame before it (from the board before the action, for the "
+    "first frame). Each entry has `frame_index` (its index in "
+    "`last_animation_frames`), `changed_count`, `bbox`, and "
     "either `changes` (the cells, as `old>new @ (row,col) ...`) or `transitions` (a "
-    "count per colour change, when there were too many cells to list).\n"
+    "count per colour change, when there were too many cells to list). "
+    "`frame_diffs` is empty when the action did not animate.\n"
 )
 
 ANIMATION_ADDENDUM = (
     "- One action can return a short animation. `current_frame` is its final frame.\n"
     "- When the final executed action of the latest model-issued call animated, `last_action_call_result['animation']` "
-    "reports `frames`, `transient_pixels` and `transient_bbox`. Transient cells "
+    "reports `frame_count`, `transient_pixels` (both counts) and `transient_bbox`. Transient cells "
     "changed and then changed BACK during the animation, so they appear in no frame "
     "you can otherwise reach - not in `current_frame`, not in `previous_frame`, not "
     "in `history`.\n"

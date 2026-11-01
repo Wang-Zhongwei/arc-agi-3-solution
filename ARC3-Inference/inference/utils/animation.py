@@ -99,15 +99,17 @@ def summarize_animation(chain: Sequence[Grid]) -> dict[str, Any] | None:
     ``None`` for the single-frame case means ordinary actions carry no extra
     tokens at all - the key is simply absent from the action result.
 
-    ``frames`` counts engine frames after collapsing and excludes the prepended
-    pre-action board, so it answers "how many distinct states did this action
-    pass through" rather than describing the internal representation.
+    ``frame_count`` counts engine frames after collapsing and excludes the
+    prepended pre-action board, so it answers "how many distinct states did this
+    action pass through" rather than describing the internal representation.
+    It is a number, and named so: as ``frames`` it was read as a list and
+    passed to ``len()``.
     """
     if len(chain) <= 2:
         return None
     transient = _transient_cells(chain)
     summary: dict[str, Any] = {
-        "frames": len(chain) - 1,
+        "frame_count": len(chain) - 1,
         "transient_pixels": len(transient),
     }
     if transient:
@@ -157,7 +159,7 @@ def describe_animation(
     transient = int(summary.get("transient_pixels") or 0)
     if transient <= 0:
         return ""
-    frames = summary.get("frames")
+    frames = summary.get("frame_count")
     cells = "1 cell changed and changed back" if transient == 1 else (
         f"{transient} cells changed and changed back"
     )
@@ -250,8 +252,7 @@ def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]
     """Every distinct state the action passed through, as FrameView payloads.
 
     The pre-action board is dropped here: the model already has it as
-    `previous_frame`, and including it would make index 0 mean something
-    different from the step numbers in the timeline.
+    `previous_frame`. Index i here is `frame_index` i in the timeline.
 
     Sends the grid as well as the ascii so `segmentation` works on the far
     side. That doubles the payload, but it crosses a pipe rather than the
@@ -277,18 +278,20 @@ def build_animation_frames(record: dict[str, Any] | None) -> list[dict[str, Any]
 
 
 def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
-    """The diff timeline: which cells changed at each step.
+    """The diff timeline: which cells changed into each animation frame.
 
-    The cheap first look. Reading a frame verbatim is no longer this
-    function's job - `last_transition.frames()` hands back FrameView objects
-    and the model crops their ascii the same way it crops current_frame, with
-    its own helpers rather than a region parameter it has to guess.
+    The cheap first look. Reading a frame verbatim is not this function's job:
+    `last_animation_frames` hands back FrameView objects and the model crops
+    their ascii the same way it crops current_frame.
+
+    Counts are named as counts (`frame_count`, `changed_count`) and the diff
+    list as diffs (`frame_diffs`): with `frames` and `steps` the model called
+    `len()` on the number and mistook frame positions for game steps. Each
+    entry's `frame_index` indexes `last_animation_frames`, so the two line up.
+    The shape is the same with no animation, so code reading `frame_diffs`
+    needs no special case.
     """
-    empty = {
-        "error": (
-            "No animation is available: the last executed action returned a single frame."
-        )
-    }
+    empty: dict[str, Any] = {"action": None, "frame_count": 0, "frame_diffs": []}
     if not record:
         return empty
     chain: list[Grid] = list(record.get("chain") or ())
@@ -298,22 +301,24 @@ def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
     header: dict[str, Any] = {
         "action": record.get("action_display"),
         # excludes the prepended pre-action board, matching the metadata
-        "frames": len(chain) - 1,
+        "frame_count": len(chain) - 1,
     }
 
     steps: list[dict[str, Any]] = []
     for position in range(1, len(chain)):
         cells = _diff_cells(chain[position - 1], chain[position])
         if cells:
-            steps.append({"_position": position, "_cells": cells})
+            # chain[0] is the pre-action board, so chain[position] is
+            # last_animation_frames[position - 1]
+            steps.append({"_frame_index": position - 1, "_cells": cells})
 
     rendered: list[dict[str, Any]] = []
     remaining = ANIMATION_MAX_TOTAL_CELLS
     for step in steps:
         cells = step["_cells"]
         entry: dict[str, Any] = {
-            "step": step["_position"],
-            "changed": len(cells),
+            "frame_index": step["_frame_index"],
+            "changed_count": len(cells),
             "bbox": _bbox_text(cells),
         }
         budget = min(ANIMATION_MAX_CELLS_PER_STEP, max(0, remaining))
@@ -330,4 +335,4 @@ def build_animation_view(record: dict[str, Any] | None) -> dict[str, Any]:
             remaining -= min(len(cells), budget)
         rendered.append(entry)
 
-    return {**header, "steps": rendered}
+    return {**header, "frame_diffs": rendered}

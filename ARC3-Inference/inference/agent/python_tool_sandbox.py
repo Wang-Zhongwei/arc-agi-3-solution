@@ -179,10 +179,10 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
         return json.loads(line)
 
 
-    # Safe fixes for the wrong guesses porting-advaith v6 made about these
-    # names (16 of its 266 runtime errors, 7 more from the timeline's shape).
-    # Nothing here changes what the model sees: names, printed values and the
-    # prompt stay as they were; only code that used to raise now reads.
+    # Fixes for the wrong guesses porting-advaith v6 made about these names
+    # (16 of its 266 runtime errors, 7 more from the timeline's shape). The
+    # animation fields carry clearer names (utils/animation.py); everything
+    # else here only lets code that used to raise read what it meant.
     #
     # Every view reads both ways, `frame.step` and `frame["step"]`, and so does
     # every record dict, `result.level` and `result["level"]`: the model picks
@@ -208,16 +208,41 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 return default
 
 
-    # `frames` in an animation summary or timeline is a count, and the model
-    # reads it as the list: `len(timeline['frames'])` (4 TypeErrors in v6).
-    # The count answers len() with itself; it prints, compares and serializes
-    # as the plain int it is.
+    # Counts in an animation summary or timeline (`frame_count`,
+    # `changed_count`) answer len() with themselves: as `frames` the count was
+    # read as the list, `len(timeline['frames'])` (4 TypeErrors in v6). They
+    # print, compare and serialize as the plain ints they are.
     class _Count(int):
         def __len__(self):
             return int(self)
 
 
+    _COUNT_KEYS = ("frame_count", "changed_count")
+    # The animation fields' v6 names still read, as keys and as attributes,
+    # without showing up when a record is printed or iterated. `step` was the
+    # frame's position counted from 1; it now reads `frame_index`, the index
+    # the name suggests.
+    _ALIASES = {
+        "frames": "frame_count",
+        "steps": "frame_diffs",
+        "step": "frame_index",
+        "changed": "changed_count",
+    }
+
+
     class _Record(dict):
+        def __missing__(self, key):
+            alias = _ALIASES.get(key)
+            if alias is not None and dict.__contains__(self, alias):
+                return self[alias]
+            raise KeyError(key)
+
+        def get(self, key, default=None):
+            try:
+                return self[key]
+            except KeyError:
+                return default
+
         def __getattr__(self, name):
             if name.startswith("_"):
                 raise AttributeError(name)
@@ -235,30 +260,21 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
     # (v6: KeyError 'action'). Missing keys only: printing is unchanged.
     class _Result(_Record):
         def __missing__(self, key):
-            if key == "action" and "action_display" in self:
+            if key == "action" and dict.__contains__(self, "action_display"):
                 return self["action_display"]
-            raise KeyError(key)
+            return super().__missing__(key)
 
 
-    # Without an animation the timeline is just {"error": ...}; reading its
-    # usual keys returns an empty timeline instead of raising (v6: 4 x
-    # KeyError 'steps'). The message still prints as before.
-    class _Timeline(_Record):
-        def __missing__(self, key):
-            if key == "steps":
-                return []
-            if key == "frames":
-                return _Count(0)
-            if key == "action":
-                return None
-            raise KeyError(key)
+    def _empty_timeline():
+        # the shape of a real timeline (v6's {"error": ...} cost 4 x KeyError 'steps')
+        return _Record(action=None, frame_count=_Count(0), frame_diffs=[])
 
 
     def _record(value, cls=_Record):
         if isinstance(value, dict):
             return cls(
                 {
-                    key: _Count(item) if key == "frames" and type(item) is int else _record(item)
+                    key: _Count(item) if key in _COUNT_KEYS and type(item) is int else _record(item)
                     for key, item in value.items()
                 }
             )
@@ -752,7 +768,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                 raise RuntimeError("Invalid animation response from sandbox host.")
             payload = reply.get("animation")
             if kind != "frames":
-                return _record(payload or {}, _Timeline)
+                return _record(payload) if payload else _empty_timeline()
             return [
                 FrameView(
                     ascii=item.get("ascii", ""),
@@ -824,7 +840,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
                     return repr(self._get())
 
             runtime_globals["last_animation_frames"] = _LazyAnimation("frames", [])
-            runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", _Timeline())
+            runtime_globals["last_animation_timeline"] = _LazyAnimation("timeline", _empty_timeline())
             _animation_views.extend((runtime_globals["last_animation_frames"],
                                      runtime_globals["last_animation_timeline"]))
 
