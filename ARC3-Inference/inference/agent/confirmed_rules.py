@@ -21,6 +21,15 @@ thinking: 251 of 384 "confirmed" sentences kept):
 - leading list/markdown markers stripped; one sentence is cut at
   MAX_SENTENCE_CHARS (v02's longest kept sentence is 114 tokens, ~450 chars);
 - exact duplicates (case and spacing ignored) are kept once per game.
+ARC3_REFUTED_RULES adds a "Ruled out" list beside each level's confirmed
+list, from thinking sentences with a strong refutation word only (refuted,
+disproved, falsified, debunked, ruled out; "my model was wrong" and
+"contradicts" are left out as too weak or too temporary). Same filter as above
+on text with curly apostrophes made straight, plus no "may"/"will" and no
+negated or planned refutation ("NOT ruled out", "can't rule out", "to refute").
+A sentence with a refutation word goes to the ruled-out list only. v01+v02:
+about 20 such sentences in 50 games.
+
 The section is capped at MAX_SECTION_CHARS by dropping the oldest sentences;
 v02's largest whole-game ledger was 781 tokens (~3,100 chars), so the cap only
 binds on games far longer than any seen so far.
@@ -48,6 +57,18 @@ _HEDGED = re.compile(
     re.IGNORECASE,
 )
 _LEAD = re.compile(r"^[\s\-*#>•]+")
+_REFUTED = re.compile(
+    r"\b(refut\w*|disprov\w*|falsif\w*|debunk\w*|ruled out|rules out|rule out)\b", re.IGNORECASE
+)
+_REFUTED_EXTRA = re.compile(
+    r"\b(may|will|won't|wouldn't)\b|\bfalsifiab\w*|"
+    r"\b(to|can't|cannot|can not|couldn't|not( yet)?|haven't|hasn't|never)\s+(be\s+)?"
+    r"(refute|disprove|falsify|debunk|rule out|ruled out|refuted|disproved|falsified)\b",
+    re.IGNORECASE,
+)
+
+CONFIRMED = "confirmed"
+REFUTED = "refuted"
 
 HEADER = "## Confirmed rules from trimmed turns"
 INTRO = (
@@ -59,6 +80,53 @@ INTRO = (
 )
 
 
+HEADER_BOTH = "## Confirmed and ruled-out rules from trimmed turns"
+INTRO_BOTH = (
+    "Earlier turns of this game were trimmed from this conversation. These are "
+    "the statements your reasoning in those turns marked as confirmed, and the "
+    "hypotheses it marked as refuted or ruled out, grouped by the level you were "
+    "on when you wrote them. They are your own past conclusions, not verified "
+    "facts: use them as a starting point and re-check any that new evidence "
+    "contradicts."
+)
+
+
+def _cut(sentence: str) -> str:
+    if len(sentence) > MAX_SENTENCE_CHARS:
+        return sentence[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
+    return sentence
+
+
+def refuted_sentences(reasoning: str) -> list[str]:
+    """The usable strong-refutation sentences of one reply's thinking, in order."""
+    found: list[str] = []
+    for raw in _SPLIT.split(reasoning or ""):
+        sentence = _LEAD.sub("", raw).strip()
+        plain = sentence.replace("\u2019", "'")
+        if not _REFUTED.search(plain) or "?" in plain:
+            continue
+        if _HEDGED.search(plain) or _REFUTED_EXTRA.search(plain):
+            continue
+        if len(sentence.split()) < MIN_WORDS:
+            continue
+        found.append(_cut(sentence))
+    return found
+
+
+def classified_sentences(reasoning: str, *, confirmed: bool, refuted: bool) -> list[tuple[str, str]]:
+    """(kind, sentence) in order; a sentence with a refutation word is never
+    also listed as confirmed when the ruled-out list is on."""
+    found: list[tuple[str, str]] = []
+    ruled_out = refuted_sentences(reasoning) if refuted else []
+    if confirmed:
+        for sentence in confirmed_sentences(reasoning):
+            if refuted and _REFUTED.search(sentence.replace("\u2019", "'")):
+                continue
+            found.append((CONFIRMED, sentence))
+    found.extend((REFUTED, s) for s in ruled_out)
+    return found
+
+
 def confirmed_sentences(reasoning: str) -> list[str]:
     """The usable "confirmed" sentences of one reply's thinking, in order."""
     found: list[str] = []
@@ -68,9 +136,7 @@ def confirmed_sentences(reasoning: str) -> list[str]:
             continue
         if len(sentence.split()) < MIN_WORDS:
             continue
-        if len(sentence) > MAX_SENTENCE_CHARS:
-            sentence = sentence[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
-        found.append(sentence)
+        found.append(_cut(sentence))
     return found
 
 
@@ -81,15 +147,17 @@ def _dedupe_key(sentence: str) -> str:
 class ConfirmedRules:
     """Per-game ledger: pending sentences per tagged reply, and the rules."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, confirmed: bool = True, refuted: bool = False) -> None:
+        self.confirmed = confirmed
+        self.refuted = refuted
         self.reset()
 
     def reset(self) -> None:
         self._next_seq = 0
-        # seq -> (level, sentences) for replies still in the conversation
-        self._pending: dict[int, tuple[int, list[str]]] = {}
-        # (level, sentence) in the order the trims released them
-        self._rules: list[tuple[int, str]] = []
+        # seq -> (level, [(kind, sentence)]) for replies still in the conversation
+        self._pending: dict[int, tuple[int, list[tuple[str, str]]]] = {}
+        # (level, kind, sentence) in the order the trims released them
+        self._rules: list[tuple[int, str, str]] = []
         self._seen: set[str] = set()
         self._version = 0
         self._cache: tuple[int, dict[str, Any] | None] = (0, None)
@@ -106,7 +174,7 @@ class ConfirmedRules:
         seq = self._next_seq
         self._next_seq += 1
         message[SEQ_KEY] = seq
-        sentences = confirmed_sentences(reasoning)
+        sentences = classified_sentences(reasoning, confirmed=self.confirmed, refuted=self.refuted)
         if sentences:
             self._pending[seq] = (max(1, int(level)), sentences)
 
@@ -120,12 +188,12 @@ class ConfirmedRules:
         added = False
         for seq in dropped:
             level, sentences = self._pending.pop(seq)
-            for sentence in sentences:
+            for kind, sentence in sentences:
                 key = _dedupe_key(sentence)
                 if key in self._seen:
                     continue
                 self._seen.add(key)
-                self._rules.append((level, sentence))
+                self._rules.append((level, kind, sentence))
                 added = True
         if added:
             self._enforce_cap()
@@ -133,20 +201,32 @@ class ConfirmedRules:
         return added
 
     def _enforce_cap(self) -> None:
-        total = sum(len(s) + 3 for _, s in self._rules)
+        total = sum(len(s) + 3 for _, _, s in self._rules)
         while self._rules and total > MAX_SECTION_CHARS:
-            _, sentence = self._rules.pop(0)
+            _, _, sentence = self._rules.pop(0)
             total -= len(sentence) + 3
 
     def text(self) -> str:
         if not self._rules:
             return ""
-        by_level: dict[int, list[str]] = {}
-        for level, sentence in self._rules:
-            by_level.setdefault(level, []).append(sentence)
-        blocks = [HEADER, INTRO]
+        by_level: dict[int, dict[str, list[str]]] = {}
+        for level, kind, sentence in self._rules:
+            by_level.setdefault(level, {}).setdefault(kind, []).append(sentence)
+        if not self.refuted:
+            # the confirmed-only layout, unchanged from ARC3_CONFIRMED_RULES alone
+            blocks = [HEADER, INTRO]
+            for level in sorted(by_level):
+                lines = by_level[level].get(CONFIRMED, [])
+                blocks.append(f"Level {level}:\n" + "\n".join(f"- {s}" for s in lines))
+            return "\n\n".join(blocks)
+        blocks = [HEADER_BOTH, INTRO_BOTH]
         for level in sorted(by_level):
-            blocks.append(f"Level {level}:\n" + "\n".join(f"- {s}" for s in by_level[level]))
+            parts = [f"Level {level}:"]
+            for kind, title in ((CONFIRMED, "Confirmed:"), (REFUTED, "Ruled out:")):
+                lines = by_level[level].get(kind)
+                if lines:
+                    parts.append(title + "\n" + "\n".join(f"- {s}" for s in lines))
+            blocks.append("\n".join(parts))
         return "\n\n".join(blocks)
 
     def message(self) -> dict[str, Any] | None:

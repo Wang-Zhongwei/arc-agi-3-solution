@@ -179,6 +179,18 @@ def _confirmed_rules_enabled() -> bool:
     return _get_env_bool("ARC3_CONFIRMED_RULES", False)
 
 
+def _refuted_rules_enabled() -> bool:
+    """A "Ruled out" list per level in the same pinned section, from thinking
+    sentences with a strong refutation word (refuted, disproved, falsified,
+    debunked, ruled out). ARC3_REFUTED_RULES defaults off; it works with or
+    without ARC3_CONFIRMED_RULES."""
+    return _get_env_bool("ARC3_REFUTED_RULES", False)
+
+
+def _rules_section_enabled() -> bool:
+    return _confirmed_rules_enabled() or _refuted_rules_enabled()
+
+
 _STUCK_CONTEXT_RESET_NOTICE = (
     "Your earlier turns were removed from this conversation because this level "
     "has not been cleared since the context was last trimmed. The game record is "
@@ -3937,7 +3949,7 @@ class ToolAgent:
             self._context_reset_log = ""
             self._reset_level_up_history()
             self._reset_trace_state()
-            self._confirmed_rules = ConfirmedRules()
+            self._confirmed_rules = self._new_rules_ledger()
             self._session_total_tokens = 0
             self._session_generated_tokens = 0
             self._last_call_reasoning_tokens = None
@@ -5031,16 +5043,20 @@ class ToolAgent:
             self._trace_cache = cache
         return [cache[1]] if cache[1] is not None else []
 
+    @staticmethod
+    def _new_rules_ledger() -> ConfirmedRules:
+        return ConfirmedRules(confirmed=_confirmed_rules_enabled(), refuted=_refuted_rules_enabled())
+
     def _rules_ledger(self) -> ConfirmedRules:
         ledger = getattr(self, "_confirmed_rules", None)
         if ledger is None:
-            ledger = self._confirmed_rules = ConfirmedRules()
+            ledger = self._confirmed_rules = self._new_rules_ledger()
         return ledger
 
     def _tag_confirmed_rules(self, message: dict[str, Any]) -> None:
         """Tag an assistant reply with the level its thinking was written on
         (the level before its own tool calls run)."""
-        if not _confirmed_rules_enabled():
+        if not _rules_section_enabled():
             return
         summary = getattr(self, "_last_step_summary", None) or {}
         try:
@@ -5051,14 +5067,14 @@ class ToolAgent:
 
     def _harvest_confirmed_rules(self, retained: list[dict[str, Any]]) -> None:
         """After a trim: tagged replies missing from `retained` release their sentences."""
-        if _confirmed_rules_enabled():
+        if _rules_section_enabled():
             self._rules_ledger().harvest(retained)
 
     def _pinned_head_messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Messages between the system prompt and the retained history: the
         compressed trace, then the confirmed rules."""
         head = self._compressed_trace_messages(history=history)
-        if _confirmed_rules_enabled():
+        if _rules_section_enabled():
             rules = self._rules_ledger().message()
             if rules is not None:
                 head = [*head, rules]
@@ -5066,7 +5082,7 @@ class ToolAgent:
 
     def _log_confirmed_rules(self, append_transcript) -> None:
         """Write the rules section to the transcript each time it changes."""
-        if not _confirmed_rules_enabled():
+        if not _rules_section_enabled():
             return
         ledger = self._rules_ledger()
         if ledger.version == ledger.logged_version:
