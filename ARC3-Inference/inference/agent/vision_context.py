@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import io
 from collections import defaultdict
 import os
@@ -115,14 +116,28 @@ def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
         raise ValueError("Cannot render an empty grid as an image.")
 
     scale = current_grid_image_upscale() if upscale is None else max(1, int(upscale))
+    grid = tuple(tuple(int(value) for value in row) for row in frame.grid)
+    return _grid_png_data_url(grid, scale, multimodal_resample())
+
+
+@functools.lru_cache(maxsize=512)
+def _grid_png_data_url(
+    grid: tuple[tuple[int, ...], ...], scale: int, resample: Image.Resampling
+) -> str:
+    """PNG data URL of one board. Cached: resumptions re-show the same board
+    and undo/RESET revisit earlier ones, and each render costs ~8 ms of
+    GIL-holding work at upscale 12. An entry is the key's grid tuple
+    (~36 KB) plus the URL (~5-12 KB), so 512 entries cap it near 25 MB."""
+    rows = len(grid)
+    cols = max((len(row) for row in grid), default=0)
     image = Image.new("RGB", (cols, rows), ARC_COLOR_MAP[0])
     pixels = image.load()
-    for row_idx, row in enumerate(frame.grid):
+    for row_idx, row in enumerate(grid):
         for col_idx in range(cols):
             value = row[col_idx] if col_idx < len(row) else 0
             pixels[col_idx, row_idx] = ARC_COLOR_MAP.get(int(value), ARC_COLOR_MAP[0])
     if scale > 1:
-        image = image.resize((cols * scale, rows * scale), multimodal_resample())
+        image = image.resize((cols * scale, rows * scale), resample)
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")

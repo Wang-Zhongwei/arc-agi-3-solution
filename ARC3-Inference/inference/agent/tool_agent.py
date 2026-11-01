@@ -4304,9 +4304,14 @@ class ToolAgent:
                        for frame in (previous_frame, current_frame)]
             if all(index is not None for index in indices):
                 span = f"history[{indices[0]}].frame -> history[{indices[1]}].frame"
-        if _DIFF_IMAGE:
+        if (
+            _DIFF_IMAGE
+            and previous_frame is not None
+            and current_frame is not None
+            and previous_frame.grid != current_frame.grid
+        ):
             part = diff_image_part(previous_frame, current_frame)
-            if part is not None and previous_frame.grid != current_frame.grid:
+            if part is not None:
                 label = (
                     f"Diff image ({span}): cells that changed keep their true color; "
                     "unchanged cells dimmed to dark navy."
@@ -7430,7 +7435,12 @@ class ToolAgent:
         self._current_valid_actions = _normalize_valid_actions(valid_actions)
 
         analyzer_log = transcript_path or (state_path.parent / f"{state_path.stem}_analyzer.txt")
-        prompt_log = _resolve_prompt_log_path(state_path)
+        # Competition reruns turn debug artifacts off: then nothing reads the
+        # transcript, the prompt log or the request-time copy of the context,
+        # so none of them is built (no header write, no directory scan, no
+        # per-request deep copy of every history image).
+        debug_artifacts = debug_artifacts_enabled()
+        prompt_log = _resolve_prompt_log_path(state_path) if debug_artifacts else Path(os.devnull)
         current_frame, history_entries = load_runtime_state(state_path)
         self._trace_state_path = state_path
         if current_frame is not None:
@@ -7445,16 +7455,19 @@ class ToolAgent:
         display_action_num = _display_action_number(action_num)
         self._wm_absorbed_in_turn = False
 
-        with open(analyzer_log, "a", encoding="utf-8") as f:
-            step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
-            transcript_header = (
-                f"\n--- {step_label}action={display_action_num} | "
-                f"{time.strftime('%H:%M:%S')} | tool-agent ---\n"
-            )
-            f.write(transcript_header)
+        step_label = f"analysis_step={analysis_step} | " if analysis_step is not None else ""
+        transcript_header = (
+            f"\n--- {step_label}action={display_action_num} | "
+            f"{time.strftime('%H:%M:%S')} | tool-agent ---\n"
+        )
+        if debug_artifacts:
+            with open(analyzer_log, "a", encoding="utf-8") as f:
+                f.write(transcript_header)
         transcript_parts = [transcript_header]
 
         def append_transcript(label: str, content: str) -> None:
+            if not debug_artifacts and transcript_updated is None:
+                return
             _append_transcript_section(analyzer_log, label, content)
             transcript_parts.append(_render_transcript_section(label, content))
             if transcript_updated is not None:
@@ -7594,8 +7607,13 @@ class ToolAgent:
                 messages = self._trim_messages_for_context(messages, tools=tools)
                 self._log_trace_change(append_transcript)
                 self._maybe_handover()
-                latest_request_messages = json.loads(json.dumps(messages))
-                latest_request_tools = json.loads(json.dumps(tools))
+                if debug_artifacts or self._save_request_logs:
+                    latest_request_messages = json.loads(json.dumps(messages))
+                    latest_request_tools = json.loads(json.dumps(tools))
+                else:
+                    # only the (disabled) prompt/request logs read these
+                    latest_request_messages = messages
+                    latest_request_tools = tools
                 latest_request_tool_choice = tool_choice
                 latest_request_index = turn_count
                 _write_prompt_log_snapshot(
