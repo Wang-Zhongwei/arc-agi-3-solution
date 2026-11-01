@@ -120,14 +120,14 @@ def frame_to_png_data_url(frame: Frame, *, upscale: int | None = None) -> str:
     return _grid_png_data_url(grid, scale, multimodal_resample())
 
 
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=512)
 def _grid_png_data_url(
     grid: tuple[tuple[int, ...], ...], scale: int, resample: Image.Resampling
 ) -> str:
     """PNG data URL of one board. Cached: resumptions re-show the same board
     and undo/RESET revisit earlier ones, and each render costs ~8 ms of
-    GIL-holding work at upscale 12. ~12 KB per entry, so 2048 entries cap
-    the cache near 25 MB."""
+    GIL-holding work at upscale 12. An entry is the key's grid tuple
+    (~36 KB) plus the URL (~5-12 KB), so 512 entries cap it near 25 MB."""
     rows = len(grid)
     cols = max((len(row) for row in grid), default=0)
     image = Image.new("RGB", (cols, rows), ARC_COLOR_MAP[0])
