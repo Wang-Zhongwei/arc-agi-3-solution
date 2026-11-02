@@ -1,13 +1,13 @@
 export const meta = {
-  name: 'verify-confirmed-refuted-claims-v01',
-  description: 'Verify every confirmed/refuted claim of main-tuned-drafter v01 plus its following sentence, two lenses + judge',
+  name: 'verify-confirmed-refuted-claims-v06',
+  description: 'Verify every confirmed/refuted claim of main-tuned-drafter v06 plus its following sentence, two lenses + judge',
   phases: [
     { title: 'Verify', detail: 'two independent verifiers per batch: in-run evidence and cross-run evidence' },
     { title: 'Judge', detail: 'resolve fields where the two verifiers disagree' },
   ],
 }
 
-const FILE = '/Users/wang/.claude/jobs/910e124b/tmp/verify/v01/batches_v01.json'
+const FILE = '/Users/wang/Library/CloudStorage/GoogleDrive-thetheoryofeverythingcn@gmail.com/My Drive/CS Projects/Kaggles/arc-agi-3-solution/runs/kaggle/jonathanwang2022/main-tuned-drafter/v06/rules_audit/batches_v06.json'
 const VERDICTS = ['correct', 'partially_correct', 'incorrect', 'not_a_claim', 'unverifiable']
 const ROLES = ['consequence', 'elaboration', 'doubt_about_claim', 'moves_on', 'none']
 const CONSEQ = ['correct', 'partially_correct', 'incorrect', 'unverifiable', 'na']
@@ -34,7 +34,7 @@ const BATCH_SCHEMA = {
   required: ['assessments'],
 }
 
-const COMMON = `You are verifying claims an AI agent made in its private reasoning while playing an ARC-AGI-3 game (a turn-based 64x64 grid puzzle with several levels; actions are moves like UP/DOWN/LEFT/RIGHT, ACTION5, or clicks at (x,y)). Run: Kaggle notebook main-tuned-drafter v01.
+const COMMON = `You are verifying claims an AI agent made in its private reasoning while playing an ARC-AGI-3 game (a turn-based 64x64 grid puzzle with several levels; actions are moves like UP/DOWN/LEFT/RIGHT, ACTION5, or clicks at (x,y)). Run: Kaggle notebook main-tuned-drafter v06.
 
 Each claim is one sentence from the model's THINKING where it said something was "confirmed" (kind=confirmed) or that a hypothesis was "refuted / ruled out / disproved / falsified" (kind=refuted). in_section=true means the harness would carry the sentence (shown = the text it would show) across context trims; in_section=false (refuted only) means one of the harness filters dropped it, with dropped_by naming the filter. We need to know whether each claim is TRUE about the game, and how the sentence right after it relates to it.
 

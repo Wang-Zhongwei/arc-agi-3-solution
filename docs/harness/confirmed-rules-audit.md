@@ -56,7 +56,7 @@ Agitated means uppercase `CONFIRMED` or at least two ✓. **This signal did not 
 
 - **Truth of the next sentence:** consequences 37/78 correct, 26/78 wrong. Elaborations 70/81 correct, but mostly stale detail.
 - **Doubted lines:** 5/13 wrong. Too few to act on by themselves.
-- **Hedge regex on the next sentence (`HEDGE`, broader than doubt):** kept 183 lines, 81% correct, 7% wrong. Dropped 52 lines, 63% correct, 27% wrong, costing 33 correct lines to remove 14 wrong ones.
+- **Hedge regex on the next sentence (**`HEDGE`**, broader than doubt):** kept 183 lines, 81% correct, 7% wrong. Dropped 52 lines, 63% correct, 27% wrong, costing 33 correct lines to remove 14 wrong ones.
 - **Refuted:** a hedge after it doesn't predict error (6/6 correct without, 11/12 with). The filter would empty most "Ruled out" lists, so it applies to confirmed only.
 
 ## Can a reader use the line?
@@ -178,8 +178,8 @@ The one useful line lost is `lp85-114`. Filters overlap, so the union removes 18
 
 These numbers are upper bounds, since the patterns were written after reading the labels. The weak points:
 
-- **`dead_coords`** matched 7 of the 66 invented sentences, such as "Hazard confirmed at (8,8): anything entering it dies".
-- **`dead_layout` and `dead_literal`** fall below 4 lines without their largest game. Drop these first if the held-out test is weak.
+- `dead_coords` matched 7 of the 66 invented sentences, such as "Hazard confirmed at (8,8): anything entering it dies".
+- `dead_layout` **and** `dead_literal` fall below 4 lines without their largest game. Drop these first if the held-out test is weak.
 
 ### What rules can't catch
 
