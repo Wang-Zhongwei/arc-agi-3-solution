@@ -5,7 +5,7 @@ from inference.agent.confirmed_rules import HEADER, RULES_MESSAGE_KEY, SEQ_KEY, 
 
 SYSTEM = {"role": "system", "content": "sys"}
 RULE_1 = "The recoloring mechanic is confirmed: a shape touching a slot takes its colour."
-RULE_2 = "So the rule is confirmed: clicks within distance 12 move the square."
+RULE_2 = "The rule is confirmed: clicks within distance 12 move the square."
 
 
 def _agent(monkeypatch, tmp_path, enabled=True):
@@ -42,7 +42,7 @@ def test_sentence_filter():
         "The wall is not confirmed as solid yet."
     )
     assert confirmed_sentences(text) == [RULE_1, RULE_2]
-    long = "So it is confirmed that " + "a" * 900 + "."
+    long = "The wall is confirmed to block the red piece at " + "a" * 900 + "."
     assert len(confirmed_sentences(long)[0]) == confirmed_rules.MAX_SENTENCE_CHARS
 
 
@@ -166,20 +166,23 @@ def test_control_pruning_alone_releases_nothing(monkeypatch, tmp_path):
     assert agent._rules_ledger().message() is None
 
 
-REFUTED_1 = "So “g→base” is definitively refuted by level 3."
-REFUTED_2 = "So U is ruled out for all three bars."
+REFUTED_1 = "The notch-relative model is refuted by the rotate test: the plug moved right."
+REFUTED_2 = "U is ruled out for all three bars."
 
 
 def test_refuted_filter_needs_strong_words_and_no_hedge():
     text = (
-        REFUTED_1 + " " + REFUTED_2 + "\n"
+        REFUTED_1 + " So " + REFUTED_2 + "\n"
         "My model of the slide was wrong: the white cell stops the player.\n"  # weak word
         "That contradicts my earlier reading of the board entirely.\n"  # weak word
         "So the wrap hypothesis is NOT ruled out by level 1!\n"
         "Let me click A again to rule out a coordinate issue.\n"
         "No, that wouldn’t disprove the all-eight rule at all.\n"
         "Hmm, but it may rule out valid plans for this level.\n"
-        "That will reveal the structure and support/refute the hypothesis."
+        "That will reveal the structure and support/refute the hypothesis.\n"
+        "So the moves are absolute \u2713\u2713 REFUTED definitively.\n"  # verdict of what?
+        "The trail model is strongly supported (28 steps, including a refutation of greedy).\n"
+        "So rule (b') is refuted."  # a label only
     )
     assert confirmed_rules.refuted_sentences(text) == [REFUTED_1, REFUTED_2]
 
@@ -200,7 +203,7 @@ def test_both_lists_by_level(monkeypatch, tmp_path):
         confirmed_rules.HEADER_BOTH,
         confirmed_rules.INTRO_BOTH,
         "Level 1:\nRuled out:\n- " + REFUTED_2,
-        "Level 2:\nConfirmed:\n- " + RULE_1 + "\nRuled out:\n- " + REFUTED_1 + "\n- " + both,
+        "Level 2:\nConfirmed:\n- " + RULE_1 + "\n- " + both + "\nRuled out:\n- " + REFUTED_1,
     ])
 
 
@@ -234,7 +237,7 @@ def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
         "Hmm, so (17,2) unreachable ✓ confirmed.\n"
         "So the rule set is confirmed:\n- pushing moves the box one cell\n- walls stop the box"
     )
-    assert confirmed_sentences(text) == [
+    assert confirmed_sentences(text, content_filter=False) == [
         "So the target is confirmed.",
         "That's confirmed by the win.",
         "So max 2 confirmed ✗✗✗.",
@@ -243,19 +246,13 @@ def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
         "Hmm, so (17,2) unreachable ✓ confirmed.",
         "So the rule set is confirmed:",
     ]
-    assert confirmed_sentences(text, content_filter=True) == [
+    assert confirmed_sentences(text) == [
         "White = wall, confirmed.",
         "(17,2) unreachable ✓ confirmed.",
         "The rule set is confirmed: pushing moves the box one cell walls stop the box",
     ]
-    assert confirmed_rules.refuted_sentences("So the dynamic model is refuted ✓.", content_filter=True) == []
-    assert confirmed_rules.refuted_sentences("So U is ruled out for all three.", content_filter=True) == [
+    assert confirmed_rules.refuted_sentences("So the dynamic model is refuted ✓.") == []
+    assert confirmed_rules.refuted_sentences("So U is ruled out for all three.") == [
         "U is ruled out for all three."
     ]
 
-
-def test_content_filter_flag(monkeypatch, tmp_path):
-    monkeypatch.setenv("ARC3_RULES_CONTENT_FILTER", "1")
-    assert _agent(monkeypatch, tmp_path)._rules_ledger().content_filter
-    monkeypatch.setenv("ARC3_RULES_CONTENT_FILTER", "0")
-    assert not _agent(monkeypatch, tmp_path / "b")._rules_ledger().content_filter
