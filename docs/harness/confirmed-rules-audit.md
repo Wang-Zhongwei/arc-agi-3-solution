@@ -189,7 +189,7 @@ These numbers are upper bounds, since the patterns were written after reading th
 | Undefined private names | Good rules use them too | 21% junk in the current phase |
 | Coordinates on a live level | Readers want them while playing | 53% junk with 15 useful lost when there's no cause word |
 
-16 noise lines remain in the current phase and 19 in the past phase.
+16 noise lines remain in the current phase and 19 in the past phase. The evidence column comes from the designers' and critic's scorer runs in `noise_design_result.json`; `reproduce.py` doesn't recompute it.
 
 ## The section changes the thinking
 
@@ -222,7 +222,7 @@ From the repo root, with the run folders synced from Drive:
 
 ```bash
 cd docs/harness/scripts/rules_audit
-python3 reproduce.py                 # every table above except the section-change one
+python3 reproduce.py                 # the tables above, except the section-change one and the evidence for what rules can't catch
 python3 noise_harness.py noise_candidates/cand_shortlist.py --list   # lines each v9 filter catches
 python3 priming.py ../../../../ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-drafter v06 v03 v02
 python3 show_claim.py bp35-016       # one claim: labels, evidence and the transcript around it
