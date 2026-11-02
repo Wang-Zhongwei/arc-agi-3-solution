@@ -4,16 +4,16 @@
 
 The pinned section lists sentences from the model's own thinking that say "confirmed" (and, with `ARC3_REFUTED_RULES`, "refuted"). This audit asks whether those lines are true and whether a later reader can use them. Labels come from Claude verifier and reader agents, not from people. See [Limits](#limits).
 
-**Status.** The numbers below are in-sample on `main-tuned-drafter` v02. Two candidate filters, v8 and v9, are frozen but not yet tested on held-out v01, and neither is in the harness.
+**Status.** Rules were designed on `main-tuned-drafter` v02 and tested on held-out v01 ([results](#held-out-test-on-v01)). Numbers are from v02 unless they say v01. The useless-line filters held up at about half their v02 effect. The agitated filter failed. No filter is in the harness.
 
 ## Main findings
 
 1. **No score gain so far.** v06 scored 60.80 against 65.68 for v03: paired difference −4.89, SD 21.98, t = −1.11, p = 0.28, 25 games. This does not rule out either a gain or a loss: at this SD, a single pass only detects about ±13 points (80% power, two-sided 5%). Configs differ only by `ARC3_STUCK_CONTEXT_RESET=0`, `ARC3_CONFIRMED_RULES=1`, `ARC3_REFUTED_RULES=1`.
-2. **Most lines are true, but 11% are wrong.** Of 235 confirmed lines: 182 correct (77%), 25 partly correct (11%), 26 wrong (11%), 1 unverifiable, 1 not a claim. 16 of the 26 wrong lines are in bp35, ka59 and g50t.
-3. **Readers can't spot the bad lines.** Of 40 wrong or misleading lines, the same-level reader rated 33 meaningful. A section with wrong lines costs more than its share suggests.
-4. **Wrong lines cluster where the model is stuck.** See the level table below.
-5. **Hedging in the next sentence is a usable signal.** Lines followed by a hedge are 27% wrong, against 7% otherwise.
-6. **Don't attach the sentence after a confirmation.** Consequences are only 47% true (33% wrong).
+2. **Most lines are true, but about 1 in 10 is wrong.** Of 235 confirmed lines: 182 correct (77%), 25 partly correct (11%), 26 wrong (11%), 1 unverifiable, 1 not a claim. 16 of the 26 wrong lines are in bp35, ka59 and g50t. v01 replicates this: 76% correct, 13% partly, 9% wrong.
+3. **Readers can't spot the bad lines.** Of 40 wrong or misleading lines, the same-level reader rated 33 meaningful (v01: 20 of 31). A section with wrong lines costs more than its share suggests.
+4. **Wrong lines cluster where the model is stuck.** On levels never cleared, 17% are wrong against 7% on cleared levels (v01: 13% against 7%).
+5. **Hedging in the next sentence is a usable signal.** Lines followed by a hedge are 27% wrong, against 7% otherwise (v01: 22% against 7%).
+6. **Don't attach the sentence after a confirmation.** Consequences are only 47% true, 33% wrong (v01: 58% true, 20% wrong).
 7. **The section changes what the model writes.** "Confirmed" is said 1.79× more often after the section appears, with flat placebo words. Accuracy measured on v02, which never had a section, may not carry over.
 8. **Rules can remove useless lines, but not wrong ones.** After v8, 28 of the 32 current-phase noise lines are correct: they go stale or a reader can't tell what they refer to. v9's new filters remove about half of that noise for 1 useful line, and almost no bad lines, because wrong claims read just like good rules.
 
@@ -26,6 +26,8 @@ The pinned section lists sentences from the model's own thinking that say "confi
 | Confirmed | 235 | 182 (77%) | 25 (11%) | 26 (11%) | 2 |
 | Refuted, real claims | 18 | 17 (94%) | 0 | 1 (6%) | 0 |
 | Refuted, in section | 6 | 5 | 0 | 1 | 0 |
+
+**The 94% did not replicate.** On v01, real refuted claims are 5/9 correct, 3/9 partly correct and 1/9 wrong, and only 3 lines reach the section. Treat refuted accuracy as uncertain.
 
 Another 7 of the 25 refuted sentences are not claims at all. The existing hedge filter drops all 7. Four of the 6 refuted lines in the section are not meaningful to a same-level reader, and 3 of the 6 are from tn36. Refuted is accurate but rare: v06's final sections hold 315 confirmed and 15 ruled-out lines, across 25 games, with 9 games having any ruled-out line.
 
@@ -41,7 +43,7 @@ Another 7 of the 25 refuted sentences are not claims at all. The existing hedge 
 | Never cleared, calm | 75 | | | | 73% | 12% |
 | Cleared, agitated | 8 | | | | 100% | 0% |
 
-Agitated means uppercase `CONFIRMED` or at least two ✓. The same marks are harmless once a level is cleared, so the signal is only used on the level being played.
+Agitated means uppercase `CONFIRMED` or at least two ✓. **This signal did not replicate.** On v01's never-cleared levels, agitated lines are 14% wrong and calm ones 13%.
 
 ### What follows a confirmation
 
@@ -191,6 +193,70 @@ These numbers are upper bounds, since the patterns were written after reading th
 
 16 noise lines remain in the current phase and 19 in the past phase. The evidence column comes from the designers' and critic's scorer runs in `noise_design_result.json`; `reproduce.py` doesn't recompute it.
 
+## Held-out test on v01
+
+v8 and v9 were frozen before v01's verdicts existed, and scored with the committed scripts without edits. v01 has 218 confirmed lines from 25 games. Verifiers agreed on 220/232 verdicts, with 24 claims sent to the judge, and all 232 claims match their transcript locations.
+
+| Phase | Rule | Lines | Useful | Bad | Noise | Correct | Wrong |
+|---|---|---|---|---|---|---|---|
+| Current | v7 | 218 | 134 (61%) | 31 (14%) | 53 (24%) | 76% | 9% |
+| Current | v8 | 162 | 100 (62%) | 17 (10%) | 45 (28%) | 81% | 5% |
+| Current | v9 | 149 | 98 (66%) | 17 (11%) | 34 (23%) | 81% | 5% |
+| Past | v7 | 133 | 69 (52%) | 14 (11%) | 50 (38%) | 79% | 7% |
+| Past | v8 | 113 | 63 (56%) | 8 (7%) | 42 (37%) | 83% | 4% |
+| Past | v9 | 92 | 59 (64%) | 7 (8%) | 26 (28%) | 84% | 3% |
+
+Change in share, in points, game bootstrap 95% interval, with the v02 estimate alongside:
+
+| Phase | Comparison | Useful, v01 | Useful, v02 | Bad, v01 | Bad, v02 | Noise, v01 |
+|---|---|---|---|---|---|---|
+| Current | v8 vs v7 | +0.2 [−3.8, +4.4] | +9.8 | −3.6 [−8.3, +0.3] | −6.1 | +3.4 [+1.2, +5.8] |
+| Current | v9 vs v7 | +4.2 [−1.4, +9.9] | +18.2 | −2.7 [−7.5, +1.3] | −5.4 | −1.4 [−5.4, +2.2] |
+| Current | v9 vs v8 | +3.9 [+1.2, +7.6] | +8.4 | +0.9 [+0.3, +1.7] | +0.7 | −4.8 [−8.8, −1.6] |
+| Past | v8 vs v7 | +3.7 [−0.7, +8.7] | +6.0 | −3.3 [−7.7, −0.1] | −4.0 | −0.3 [−4.8, +4.2] |
+| Past | v9 vs v7 | +11.9 [+5.1, +20.2] | +22.3 | −2.8 [−7.5, +1.2] | −3.2 | −9.2 [−16.9, −1.4] |
+| Past | v9 vs v8 | +8.3 [+3.1, +14.1] | +16.0 | +0.6 [−1.9, +2.6] | +0.9 | −8.9 [−15.8, −2.5] |
+
+In the current phase, v9 doesn't clearly beat v7 on any share, because A throws away useful lines. Removing useless lines holds up: v9 beats v8 in both phases. As expected, bad lines stay.
+
+### Each filter on v01
+
+The bar is at least 4 lines, 3 games and 70% junk. H and A never passed it in the current phase, on v02 either, but they were kept for other reasons.
+
+| Filter | Phase | Lines | Useful | Bad | Noise | Games | Junk, v01 | Junk, v02 | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| H | Current | 32 | 17 | 9 | 6 | 13 | 47% | 58% | Keeps its signal (22% wrong), at a real cost |
+| H | Past | 20 | 6 | 6 | 8 | 10 | 70% | 78% | Holds |
+| M | Current | 2 | 0 | 0 | 2 | 2 | 100% | 100% | Too rare to test on v01; never lost a useful line |
+| M | Past | 1 | 0 | 0 | 1 | 1 | 100% | 100% | Too rare to test on v01; never lost a useful line |
+| A | Current | 23 | 19 | 3 | 1 | 11 | 17% | 54% | **Fails: drop it** |
+| I | Current | 4 | 1 | 3 | 0 | 2 | 75% | 82% | Same direction, but 2 games and only 4 lines |
+| fragment | Current | 6 | 0 | 0 | 6 | 5 | 100% | 88% | Holds |
+| fragment | Past | 6 | 0 | 0 | 6 | 5 | 100% | 100% | Holds |
+| snapshot | Current | 8 | 2 | 0 | 6 | 5 | 75% | 100% | Holds, with some cost |
+| snapshot | Past | 6 | 1 | 0 | 5 | 3 | 83% | 100% | Holds, with some cost |
+| dead_coords | Past | 14 | 3 | 1 | 10 | 10 | 79% | 100% | Holds, with some cost |
+| dead_layout | Past | 0 | | | | | | 100% | Untested: caught nothing |
+| dead_literal | Past | 1 | 0 | 0 | 1 | 1 | 100% | 100% | Untested: 1 line |
+
+The useful lines lost to the new filters on v01 are real ones:
+
+- **snapshot:** `g50t-060`, "(7,4) is now fully black (25 B) — the vacated blob cell becomes walkable."
+- **dead_coords:** `r11l-124`, "column 0 is a vertical white bar that shrinks from the top — a step/time budget bar."
+
+A's catches on v01 are mostly good rules, such as `bp35-013`, "The sparks are harmless (the sprite passes through them freely) ✓✓ (confirmed twice more)." Across both runs, A removes 27 useful lines to remove 10 bad and 6 noise lines. It would pay off only if a wrong line costs at least 2.7× a useful one. H removes 39 useful lines to remove 24 bad and 21 noise lines in the current phase, a break-even of about 1.6×.
+
+### Recommended rule: v9 without A
+
+This drops A and keeps the rest. **It was chosen after seeing v01, so v01 isn't a clean test of it.**
+
+| Run | Phase | Lines | Useful | Bad | Noise | Useful change vs v7 | Bad change vs v7 | Noise change vs v7 |
+|---|---|---|---|---|---|---|---|---|
+| v01 | Current | 169 | 114 (67%) | 20 (12%) | 35 (21%) | +5.8 [+1.4, +10.7] | −2.3 [−6.6, +0.9] | −3.4 [−7.2, −0.2] |
+| v01 | Past | 92 | 59 (64%) | 7 (8%) | 26 (28%) | +11.9 [+5.1, +20.2] | −2.8 [−7.5, +1.2] | −9.2 [−16.9, −1.4] |
+| v02 | Current | 154 | 111 (72%) | 22 (14%) | 21 (14%) | +14.2 [+9.7, +18.3] | −2.5 [−5.6, −0.1] | −11.5 [−15.2, −7.8] |
+| v02 | Past | 76 | 51 (67%) | 6 (8%) | 19 (25%) | +22.3 [+15.3, +30.6] | −3.2 [−8.9, +1.5] | −19.0 [−27.5, −11.6] |
+
 ## The section changes the thinking
 
 Each v06 game is split where its section first appears, and the control runs are split at the same thinking-character count. Rates are per 100K thinking characters, over the 23 games with thinking after the split in every run.
@@ -213,8 +279,9 @@ The refuted family is too rare to judge (vs v03: 3.33 [0.65, 15.16]).
 - Verdicts and readers are Claude agents. Nobody has hand-checked a sample. Each claim got two verifiers, one reading this run and one also using other runs of the game, with a judge on disputes: they agreed on 240/260 verdicts, and 51 claims went to the judge.
 - v02 had no section. Finding 7 means the same extraction on a run with the section may behave differently.
 - The audit covers every line v7 extracts from v02, whether or not a trim would have released it.
-- v8 and v9 were designed on these same labels. Treat these numbers as optimistic until the v01 test is in. The designer agents had no access to v01 labels. A few v01 reader lines (bp35) were seen in the main session before v9 was frozen, and weren't used to design it.
-- One run, 25 games. The bootstrap resamples games, not lines.
+- v8 and v9 were designed on v02's labels, so v02 numbers are optimistic: effects roughly halved on v01. The designer agents had no access to v01. A few v01 reader lines (bp35) were seen in the main session before v9 was frozen, and weren't used to design it.
+- Readers vary between runs. v01's later-level reader rated 61% of lines meaningful, against 49% on v02, and level facts 43% against 14%. Compare shares within a run.
+- v01 and v02 share the same 25 games and neither had a section. The bootstrap resamples games, not lines. A filter's effect on score hasn't been tested at all.
 
 ## How to check this
 
@@ -223,7 +290,10 @@ From the repo root, with the run folders synced from Drive:
 ```bash
 cd docs/harness/scripts/rules_audit
 python3 reproduce.py                 # the tables above, except the section-change one and the evidence for what rules can't catch
-python3 noise_harness.py noise_candidates/cand_shortlist.py --list   # lines each v9 filter catches
+python3 noise_harness.py noise_candidates/cand_shortlist.py --list   # lines each v9 filter catches on v02
+R=../../../../ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-drafter/v01/rules_audit
+python3 holdout_eval.py $R/wf_result_v01.json $R/cold_result_v01.json $R/claims_v01.json /tmp/joined_v01.json   # held-out test
+python3 holdout_extra.py             # replication, each filter on both runs, v9 without A
 python3 priming.py ../../../../ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-drafter v06 v03 v02
 python3 show_claim.py bp35-016       # one claim: labels, evidence and the transcript around it
 ```
@@ -255,7 +325,7 @@ Claims worth spot-checking with `show_claim.py`:
 
 ## Files
 
-Data is in Drive at `ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-drafter/v02/rules_audit/`, because run artifacts stay out of Git:
+Data is in Drive, because run artifacts stay out of Git. The v02 audit is at `ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-drafter/v02/rules_audit/`:
 
 | File | Contents |
 |---|---|
@@ -268,6 +338,8 @@ Data is in Drive at `ARC3-Inference/runs/kaggle/jonathanwang2022/main-tuned-draf
 | `dev_lines_v02.json` | Lines v8 keeps with labels, as given to the rule designers |
 | `noise_design_result.json` | Designer and critic output, with reasons for each rejected rule |
 
+The held-out test is in `v01/rules_audit/` of the same run folder, with the same kinds of file, `*_v01` names and its own `MANIFEST.sha256`. Start with `joined_v01.json`. `holdout_output.txt` and `holdout_extra_output.txt` are the saved results.
+
 Code is in [`scripts/rules_audit/`](scripts/rules_audit/):
 
 | File | Purpose |
@@ -276,7 +348,7 @@ Code is in [`scripts/rules_audit/`](scripts/rules_audit/):
 | `rule_v8.py`, `rule_v9.py` | The frozen candidate filters |
 | `build_claims.py`, `make_batches.py`, `cross_index.py` | Build the claims and verifier inputs |
 | `aggregate.py`, `cold_agg.py`, `rule_eval.py` | Original tabulations |
-| `holdout_eval.py`, `make_batches_v01.py` | Held-out scoring on v01 |
+| `holdout_eval.py`, `holdout_extra.py`, `make_batches_v01.py` | Held-out scoring on v01 |
 | `noise_harness.py`, `noise_scan.py`, `noise_v02.py` | Score filters for useless lines |
 | `noise_candidates/` | Each designer's candidates and the critic's shortlist. `critic/` holds its helpers as they ran, with temp paths |
 | `v6_vs_v7.py` | Extraction counts by code version |
@@ -285,5 +357,5 @@ Code is in [`scripts/rules_audit/`](scripts/rules_audit/):
 
 ## Still open
 
-- **Held-out test.** Score frozen v8 and v9 on v01 with `holdout_eval.py`. Verification is still running.
-- **Harness change.** Nothing here is implemented in `confirmed_rules.py` yet. It would need the next sentence at harvest and the current level at render.
+- **Harness change.** Nothing here is implemented in `confirmed_rules.py` yet. The recommended rule would need the next sentence at harvest and the current level at render, because I and the past-only filters depend on level status.
+- **Score.** Only a Kaggle run can show whether a cleaner section helps. A single pass detects about ±13 points, so a small gain won't be visible.
