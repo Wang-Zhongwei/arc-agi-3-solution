@@ -5061,17 +5061,20 @@ class ToolAgent:
         (the level before its own tool calls run)."""
         if not _rules_section_enabled():
             return
+        self._rules_ledger().tag(message, self._rules_level(), _extract_reasoning_text(message))
+
+    def _rules_level(self) -> int:
         summary = getattr(self, "_last_step_summary", None) or {}
         try:
-            level = int(summary.get("level") or 1)
+            return int(summary.get("level") or 1)
         except (TypeError, ValueError):
-            level = 1
-        self._rules_ledger().tag(message, level, _extract_reasoning_text(message))
+            return 1
 
     def _harvest_confirmed_rules(self, retained: list[dict[str, Any]]) -> None:
-        """After a trim: tagged replies missing from `retained` release their sentences."""
+        """After a trim: tagged replies missing from `retained` release their sentences,
+        and confirmed sentences of levels cleared since the last trim join the rules."""
         if _rules_section_enabled():
-            self._rules_ledger().harvest(retained)
+            self._rules_ledger().harvest(retained, self._rules_level())
 
     def _pinned_head_messages(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Messages between the system prompt and the retained history: the

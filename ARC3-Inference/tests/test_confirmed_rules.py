@@ -34,6 +34,11 @@ def _over_budget_by_one_turn(agent, history):
     agent._context_budget_tokens = agent._estimate_request_input_tokens([SYSTEM, *history]) - 10
 
 
+def _cleared_up_to(agent, level):
+    """The game has moved past `level`, so its confirmed rules can be shown."""
+    agent._last_step_summary = {"level": level + 1}
+
+
 def test_sentence_filter():
     text = (
         "Let me look. " + RULE_1 + " Confirmed. Confirmed again.\n"
@@ -70,6 +75,7 @@ def test_request_trim_pins_the_dropped_rules_before_the_history(monkeypatch, tmp
         *_turn(agent, "second", RULE_2, level=3),
         *_turn(agent, "third"),
     ]
+    _cleared_up_to(agent, 3)
     _over_budget_by_one_turn(agent, history)
     trimmed = agent._trim_messages_for_context([SYSTEM, *history])
     rules = trimmed[1]
@@ -98,6 +104,7 @@ def test_end_of_turn_trim_groups_by_level_and_dedupes(monkeypatch, tmp_path):
         *_turn(agent, "third"),
         *_turn(agent, "fourth"),
     ]
+    _cleared_up_to(agent, 3)
     agent._context_budget_tokens = agent._estimate_request_input_tokens([SYSTEM, *history[6:]]) + 50
     stored = agent._persistent_history_messages([SYSTEM, *history])
     assert stored[0]["content"] in ("third", "fourth")
@@ -125,7 +132,7 @@ def test_cap_drops_the_oldest_rules(monkeypatch):
     ledger = ConfirmedRules()
     for index, level in enumerate((1, 2, 3)):
         ledger.tag({"role": "assistant"}, level, sentence.format(index))
-    assert ledger.harvest([])
+    assert ledger.harvest([], 4)
     text = ledger.text()
     assert "Rule 0" not in text and "Rule 1" in text and "Rule 2" in text
 
@@ -133,6 +140,7 @@ def test_cap_drops_the_oldest_rules(monkeypatch):
 def test_transcript_logs_each_change_once(monkeypatch, tmp_path):
     agent = _agent(monkeypatch, tmp_path)
     history = [*_turn(agent, "first", RULE_1), *_turn(agent, "second"), *_turn(agent, "third")]
+    _cleared_up_to(agent, 1)
     _over_budget_by_one_turn(agent, history)
     agent._trim_messages_for_context([SYSTEM, *history])
     notes = []
@@ -145,6 +153,7 @@ def test_transcript_logs_each_change_once(monkeypatch, tmp_path):
 def test_new_game_starts_empty(monkeypatch, tmp_path):
     agent = _agent(monkeypatch, tmp_path)
     history = [*_turn(agent, "first", RULE_1), *_turn(agent, "second"), *_turn(agent, "third")]
+    _cleared_up_to(agent, 1)
     _over_budget_by_one_turn(agent, history)
     agent._trim_messages_for_context([SYSTEM, *history])
     assert agent._rules_ledger().message() is not None
@@ -197,6 +206,7 @@ def test_both_lists_by_level(monkeypatch, tmp_path):
         *_turn(agent, "third"),
         *_turn(agent, "fourth"),
     ]
+    _cleared_up_to(agent, 2)
     agent._context_budget_tokens = agent._estimate_request_input_tokens([SYSTEM, *history[6:]]) + 50
     agent._persistent_history_messages([SYSTEM, *history])
     assert agent._rules_ledger().text() == "\n\n".join([
@@ -220,6 +230,7 @@ def test_refuted_alone(monkeypatch, tmp_path):
 def test_confirmed_only_layout_is_unchanged(monkeypatch, tmp_path):
     agent = _agent(monkeypatch, tmp_path)
     history = [*_turn(agent, "first", RULE_1 + " " + REFUTED_1, level=2), *_turn(agent, "second"), *_turn(agent, "third")]
+    _cleared_up_to(agent, 2)
     _over_budget_by_one_turn(agent, history)
     trimmed = agent._trim_messages_for_context([SYSTEM, *history])
     assert trimmed[1]["content"] == "\n\n".join(
@@ -234,7 +245,7 @@ def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
         "So max 2 confirmed ✗✗✗.\n"
         "Good enough ✓ CCW confirmed.\n"
         "So white = wall, confirmed.\n"
-        "Hmm, so (17,2) unreachable ✓ confirmed.\n"
+        "The next probe goes left.\n"
         "So the rule set is confirmed:\n- pushing moves the box one cell\n- walls stop the box"
     )
     assert confirmed_sentences(text, content_filter=False) == [
@@ -243,12 +254,10 @@ def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
         "So max 2 confirmed ✗✗✗.",
         "Good enough ✓ CCW confirmed.",
         "So white = wall, confirmed.",
-        "Hmm, so (17,2) unreachable ✓ confirmed.",
         "So the rule set is confirmed:",
     ]
     assert confirmed_sentences(text) == [
         "White = wall, confirmed.",
-        "(17,2) unreachable ✓ confirmed.",
         "The rule set is confirmed: pushing moves the box one cell walls stop the box",
     ]
     assert confirmed_rules.refuted_sentences("So the dynamic model is refuted ✓.") == []
@@ -256,3 +265,118 @@ def test_content_filter_drops_empty_sentences_and_tidies_the_rest():
         "U is ruled out for all three."
     ]
 
+
+def test_confirmed_rules_wait_until_their_level_is_cleared(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARC3_REFUTED_RULES", "1")
+    agent = _agent(monkeypatch, tmp_path)
+    history = [
+        *_turn(agent, "first", RULE_1 + " " + REFUTED_1, level=2),
+        *_turn(agent, "second"),
+        *_turn(agent, "third"),
+    ]
+    _over_budget_by_one_turn(agent, history)
+    trimmed = agent._trim_messages_for_context([SYSTEM, *history])
+    # still on level 2: the ruled-out line shows at once, the confirmed one waits
+    assert REFUTED_1 in trimmed[1]["content"]
+    assert RULE_1 not in trimmed[1]["content"]
+    version = agent._rules_ledger().version
+
+    # the level is cleared, but the section stays the same until the next trim
+    _cleared_up_to(agent, 2)
+    agent._context_budget_tokens = 10**9
+    stored = agent._persistent_history_messages(trimmed)
+    again = agent._trim_messages_for_context([SYSTEM, *stored])
+    assert again[1] == trimmed[1]
+    assert agent._rules_ledger().version == version
+
+    # that trim drops a reply with no sentences of its own and still releases it
+    _over_budget_by_one_turn(agent, stored)
+    after = agent._trim_messages_for_context([SYSTEM, *stored])
+    assert "Level 2:\nConfirmed:\n- " + RULE_1 + "\nRuled out:\n- " + REFUTED_1 in after[1]["content"]
+    assert agent._rules_ledger().version == version + 1
+
+
+def test_no_message_while_only_uncleared_rules_exist():
+    ledger = ConfirmedRules()
+    ledger.tag({"role": "assistant"}, 3, RULE_1)
+    assert ledger.harvest([], 3) is False
+    assert ledger.message() is None
+    assert ledger.harvest([], 3) is False  # nothing new
+    assert ledger.harvest([], 4) is True
+    assert RULE_1 in ledger.text()
+    assert ledger.harvest([], 5) is False  # moved once
+
+
+def test_a_line_from_a_cleared_level_shows_at_once():
+    ledger = ConfirmedRules()
+    ledger.tag({"role": "assistant"}, 1, RULE_1)
+    assert ledger.harvest([], 2) is True
+    assert RULE_1 in ledger.text()
+
+
+def test_held_rules_are_deduped_once():
+    ledger = ConfirmedRules()
+    ledger.tag({"role": "assistant"}, 1, RULE_1)
+    ledger.tag({"role": "assistant"}, 1, RULE_1)
+    ledger.harvest([], 1)
+    ledger.harvest([], 2)
+    assert ledger.text().count(RULE_1) == 1
+
+
+def test_reset_clears_held_rules():
+    ledger = ConfirmedRules()
+    ledger.tag({"role": "assistant"}, 1, RULE_1)
+    ledger.harvest([], 1)
+    ledger.reset()
+    assert ledger.harvest([], 2) is False
+    assert ledger.message() is None
+
+
+def test_hedged_next_sentence_drops_a_confirmed_line():
+    assert confirmed_sentences(RULE_1 + " Hmm, but the second box did not move.") == []
+    assert confirmed_sentences(RULE_1 + " Let me double-check that.") == []
+    assert confirmed_sentences(RULE_1 + " Now the next probe goes left.") == [RULE_1]
+    assert confirmed_sentences(RULE_1) == [RULE_1]  # nothing follows
+
+
+def test_filters_drop_useless_lines():
+    for name, line in (
+        ("generic_artifact", "So the rotation model is confirmed."),
+        ("generic_artifact", "My plan is now confirmed by the last frame."),
+        ("fragment", "I've now confirmed all buttons' effects:"),
+        ("fragment", "(17,2) unreachable ✓ confirmed."),
+        ("snapshot", "Fresh state confirmed: P (2,3), O (9,6), bar 64."),
+        ("snapshot", "Confirmed: the plus is at rows 15-23, cols 6-14."),
+        ("snapshot", "Confirmed: at steps 2 and 3, cell (0,1) is black (no gray)."),
+        ("dead_coords", "Confirmed: row 4 col 2 = M (wall), col 3 = B (open)."),
+        ("dead_layout", "The maze map is confirmed with 3 rooms."),
+        ("dead_literal", "B = {r+c<=9} level 2 confirmed it."),
+    ):
+        assert name in confirmed_rules.confirmed_line_filters(line, None), line
+
+
+def test_filters_keep_useful_lines():
+    for line in (
+        RULE_1,
+        RULE_2,
+        "Confirmed: the arm PUSHES beads right (b went from slot2 to slot3).",
+        "✓ Confirmed: the flowers are lethal.",
+        "White = wall, confirmed.",
+        "Clicking a red block REMOVES it, confirmed at step 180.",
+        "Dots move rigidly with the shape (now at col 15), confirmed.",
+        "Confirmed: the push rule applies to every bead on the row.",
+    ):
+        assert confirmed_rules.confirmed_line_filters(line, None) == [], line
+
+
+def test_uppercase_and_impossibility_lines_stay_for_cleared_levels():
+    # these only predicted errors on a live level, and the section no longer shows one
+    assert confirmed_rules.confirmed_line_filters("The sparks are harmless ✓✓ CONFIRMED twice more.", None) == []
+    assert confirmed_rules.confirmed_line_filters("The chamber is a dead end, CONFIRMED by the bar.", None) == []
+
+
+def test_refuted_lines_ignore_the_new_filters():
+    # same sentence shape the filters drop on the confirmed side; "as before" for ruled-out lines
+    assert confirmed_rules.refuted_sentences(REFUTED_1 + " Hmm, but the second box did not move.") == [REFUTED_1]
+    line = "Column 4 at row 2 is ruled out for the green bar."
+    assert confirmed_rules.refuted_sentences(line) == [line]
