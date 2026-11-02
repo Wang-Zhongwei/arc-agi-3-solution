@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build the inputs for labelling run v06's pinned rules: its real lines, verifier batches and reader sections.
+"""Build the inputs for labelling run v06's pinned rules: its real lines and reader sections.
 
 Lines come from the last copy of the section in each v06 transcript, so they are what the run actually showed.
-Each line is mapped back to its thinking to get the next sentence and the v7-tidied text that rule v9 filters.
+Each line is mapped back to its thinking to get the next sentence and the v7-tidied text that the filters run on.
 Writes to <v06 run>/rules_audit: claims_v06.json, batches_v06.json, batch_ids_v06.json, cold_args_v06.json, cross_runs_v06.json.
 """
 import collections as C
