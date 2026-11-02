@@ -27,11 +27,14 @@ disproved, falsified, debunked, ruled out; "my model was wrong" and
 "contradicts" are left out as too weak or too temporary). Same filter as above
 on text with curly apostrophes made straight, plus no "may"/"will" and no
 negated or planned refutation ("NOT ruled out", "can't rule out", "to refute").
-A sentence with a refutation word goes to the ruled-out list only. v01+v02:
-about 20 such sentences in 50 games.
+Two kinds of sentence state the surviving rule, not the refuted one, and would
+read backwards under "Ruled out": one that also says confirm*/support*
+("the trail model is strongly supported (... a refutation of greedy)"), which
+goes to the confirmed list when it says "confirmed" and is dropped otherwise;
+and one that ends in a bare verdict with no subject ("So the moves are
+absolute ✓✓ REFUTED definitively."), which is dropped.
 
-ARC3_RULES_CONTENT_FILTER drops low-information sentences from both lists
-(v01+v02: 43 of 496 dropped). A sentence ending in ":" first takes in up to
+Both lists then drop low-information sentences (always on). A sentence ending in ":" first takes in up to
 COLON_JOIN_PIECES following lines when the part before the colon says nothing
 on its own ("The push rule is CONFIRMED:" - its list is the content). Leading fillers
 (Hmm, So, OK, Good, ...) and trailing check marks are stripped. A sentence is
@@ -165,13 +168,30 @@ INTRO_BOTH = (
 )
 
 
+_SUPPORTS = re.compile(r"\b(confirm\w*|support\w*)\b", re.IGNORECASE)
+_VERDICT_TAIL = re.compile(
+    r"(\S+)\s+(?:refuted|ruled out|disproved|falsified|debunked)\b(?:\s+(?:definitively|empirically|again))?\W*$",
+    re.IGNORECASE,
+)
+_VERDICT_SUBJECT_LINKS = {"is", "was", "are", "were", "be", "been", "being", "now", "also", "definitively"}
+
+
+def _bare_verdict(sentence: str) -> bool:
+    """`<claim> ✓✓ REFUTED`: the verdict word closes the sentence with no
+    is/was before it, so it is unclear what it refutes."""
+    match = _VERDICT_TAIL.search(sentence)
+    if not match:
+        return False
+    return match.group(1).strip(_TOKEN_EDGES).lower() not in _VERDICT_SUBJECT_LINKS
+
+
 def _cut(sentence: str) -> str:
     if len(sentence) > MAX_SENTENCE_CHARS:
         return sentence[: MAX_SENTENCE_CHARS - 1].rstrip() + "…"
     return sentence
 
 
-def refuted_sentences(reasoning: str, *, content_filter: bool = False) -> list[str]:
+def refuted_sentences(reasoning: str, *, content_filter: bool = True) -> list[str]:
     """The usable strong-refutation sentences of one reply's thinking, in order."""
     found: list[str] = []
     for raw in _segments(reasoning, content_filter):
@@ -180,6 +200,8 @@ def refuted_sentences(reasoning: str, *, content_filter: bool = False) -> list[s
         if not _REFUTED.search(plain) or "?" in plain:
             continue
         if _HEDGED.search(plain) or _REFUTED_EXTRA.search(plain):
+            continue
+        if _SUPPORTS.search(plain) or _bare_verdict(plain):
             continue
         if len(sentence.split()) < MIN_WORDS:
             continue
@@ -192,22 +214,19 @@ def refuted_sentences(reasoning: str, *, content_filter: bool = False) -> list[s
 
 
 def classified_sentences(
-    reasoning: str, *, confirmed: bool, refuted: bool, content_filter: bool = False
+    reasoning: str, *, confirmed: bool, refuted: bool, content_filter: bool = True
 ) -> list[tuple[str, str]]:
-    """(kind, sentence) in order; a sentence with a refutation word is never
-    also listed as confirmed when the ruled-out list is on."""
+    """(kind, sentence) in order. The lists never share a sentence: one that
+    says "confirmed" is a confirmed rule even when it also names what it refuted."""
     found: list[tuple[str, str]] = []
     ruled_out = refuted_sentences(reasoning, content_filter=content_filter) if refuted else []
     if confirmed:
-        for sentence in confirmed_sentences(reasoning, content_filter=content_filter):
-            if refuted and _REFUTED.search(sentence.replace("\u2019", "'")):
-                continue
-            found.append((CONFIRMED, sentence))
+        found.extend((CONFIRMED, s) for s in confirmed_sentences(reasoning, content_filter=content_filter))
     found.extend((REFUTED, s) for s in ruled_out)
     return found
 
 
-def confirmed_sentences(reasoning: str, *, content_filter: bool = False) -> list[str]:
+def confirmed_sentences(reasoning: str, *, content_filter: bool = True) -> list[str]:
     """The usable "confirmed" sentences of one reply's thinking, in order."""
     found: list[str] = []
     for raw in _segments(reasoning, content_filter):
@@ -231,7 +250,7 @@ def _dedupe_key(sentence: str) -> str:
 class ConfirmedRules:
     """Per-game ledger: pending sentences per tagged reply, and the rules."""
 
-    def __init__(self, *, confirmed: bool = True, refuted: bool = False, content_filter: bool = False) -> None:
+    def __init__(self, *, confirmed: bool = True, refuted: bool = False, content_filter: bool = True) -> None:
         self.confirmed = confirmed
         self.refuted = refuted
         self.content_filter = content_filter
