@@ -1,9 +1,9 @@
 export const meta = {
-  name: 'cold-read-rules-section',
+  name: 'cold-read-rules-section-v06',
   description: 'Cold readers judge whether each pinned confirmed/ruled-out line is meaningful without its trimmed context',
   phases: [{ title: 'Cold read', detail: 'two readers per game: one placed at a later level, one at the same level as each line' }],
 }
-const FILE = '/Users/wang/.claude/jobs/910e124b/tmp/verify/cold_args.json'
+const FILE = '/Users/wang/Library/CloudStorage/GoogleDrive-thetheoryofeverythingcn@gmail.com/My Drive/CS Projects/Kaggles/arc-agi-3-solution/runs/kaggle/jonathanwang2022/main-tuned-drafter/v06/rules_audit/cold_args_v06.json'
 const LINE = {
   type: 'object',
   properties: {
