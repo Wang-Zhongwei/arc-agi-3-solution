@@ -94,13 +94,13 @@ def test_anchors_match_the_real_runtime(tmp_path):
         compile((tmp_path / DIST / patch["path"]).read_text(), patch["path"], "exec")
 
 
-def test_the_config_keeps_the_drafter_on_int4_and_lands_on_its_block_size():
-    config = json.loads((Path(lord.__file__).parents[3] / "configs" / "int4-kv" / "v1.json").read_text())
+def test_the_config_keeps_the_drafter_on_int4_and_fits_the_measured_block_size():
+    config = json.loads((Path(lord.__file__).parents[3] / "configs" / "int4-kv" / "v2.json").read_text())
     vllm = config["kaggle"]["vllm"]
     assert vllm["kv_cache_dtype"] == INT4
     assert not vllm.get("draft_kv_cache_dtype")
-    # 16 * ceil(mamba page / (16 * 544)) = 3120, from the FP8 block of 1664 and its 0.48% padding.
-    assert 3120 % vllm["prefix_match_unit"] == 0
+    # int4-kv v1 logged group block sizes of 1664: alignment sizes the block from the non-QSA 1024 B page.
+    assert 1664 % vllm["prefix_match_unit"] == 0
     assert vllm["max_num_seqs"] * (1 + vllm["mtp_tokens"]) in vllm["cudagraph_capture_sizes"]
 
 
