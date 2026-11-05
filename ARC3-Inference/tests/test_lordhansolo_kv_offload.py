@@ -61,7 +61,8 @@ def test_config_shape():
 
 
 def test_setup_command_fits_one_argument(setup):
-    assert len(setup[0].encode()) < 120 * 1024
+    # Linux caps one argument at 131,072 bytes, and the notebook adds a few hundred; keep 4 KiB spare.
+    assert len(setup[0].encode()) < 124 * 1024
 
 
 def test_server_command_has_the_tier_once(setup):
