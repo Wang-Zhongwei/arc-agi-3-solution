@@ -610,7 +610,7 @@ def log_host_memory() -> None:
     output_path = Path(config['host_memory_log'])
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open('w', encoding='utf-8') as output:
+        with output_path.open('a', encoding='utf-8') as output:
             while True:
                 record = {'ts': round(time.time(), 3), **read_host_memory(), **read_memory_breakdown()}
                 output.write(json.dumps(record) + '\n')
@@ -2622,9 +2622,13 @@ def relaunch_without_kv_offload(reason: str) -> None:
 def kv_offload_copy_available(server_env: dict[str, str]) -> bool:
     '''The connector raises at registration, 7-11 minutes into a load, when this batch copy is missing. Check first.'''
     check = "import torch; torch.zeros(1, device='cuda'); from vllm.v1.simple_kv_offload.cuda_mem_ops import _resolve_batch_memcpy as r; r()"
-    result = subprocess.run(
-        [sys.executable, '-c', check], env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, '-c', check], env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f'cuMemcpyBatchAsync check timed out: {error}', flush=True)
+        return False
     if result.returncode:
         print(f'cuMemcpyBatchAsync check failed:\n{result.stdout[-2000:]}', flush=True)
     return result.returncode == 0
@@ -2758,14 +2762,21 @@ print_vllm_backend_summary()
 if os.environ.get('TAAF_RUN_AS_SUBMISSION') == '1':
     print('Skipping vLLM smoke test (submission mode)', flush=True)
 else:
-    run_vllm_api_smoke_test()
+    try:
+        run_vllm_api_smoke_test()
+    except Exception as error:
+        if not KV_OFFLOAD_RELAUNCH:
+            raise
+        relaunch_without_kv_offload(f'smoke test failed: {error!r}')
+        run_vllm_api_smoke_test()
+    # First the tier, so the token-exact verdict comes from the server the games will use.
+    run_kv_offload_probe()
     try:
         run_token_exact_probe()
     except Exception as error:
         # The renderer cannot be trusted, so the harness goes back to text. A failed anchor still stops the setup.
         print(f'TOKEN_EXACT_PROBE_FAILED {error!r}', flush=True)
         LATE_SETUP_ENV['ARC3_TOKEN_EXACT_HISTORY'] = '0'
-    run_kv_offload_probe()
 start_vllm_profiler()
 setup_env = {
     'ARC3_CACHE_DIAGNOSTICS': '1' if is_test_run() else '0',
