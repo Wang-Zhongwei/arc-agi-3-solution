@@ -1,7 +1,9 @@
 """Does a prefix reloaded from the CPU KV tier give the same output as the GPU hit it replaces?
 
 Run once on the live server in test runs, before the games start, and needs VLLM_SERVER_DEV_MODE=1 for the reset route.
-Serves one prompt from a GPU hit twice, clears the GPU prefix cache only, then serves it again from the tier.
+Serves one prompt from a GPU hit twice, clears the GPU prefix cache only, then serves it again from the tier. Two GPU hits
+are not identical on this runtime (int4-kv v4: up to 1.3 nats on a low-ranked token, different greedy ids), so ids cannot
+gate. The test is the distance between next-token distributions, against the distance between the two GPU hits.
 
 Exit 0: same output at the expected depth. Exit 1: the reload failed or differs; the launcher drops the tier.
 Exit 3: could not judge, because the server refused a request before the reload; the tier stays and the log says so.
@@ -9,6 +11,7 @@ A crash, hang or server error before the reload counts as a failure: those promp
 """
 import http.client
 import json
+import math
 import random
 import sys
 import time
@@ -25,7 +28,8 @@ REQUEST_TIMEOUT_SECONDS = 180
 RESET_RETRY_SECONDS = 30
 # A hit stops at the last Mamba checkpoint: between 128 and 255 tokens before the prompt's end.
 MAX_HIT_GAP_TOKENS = 300
-LOGPROB_FLOOR = 0.02
+# Total variation, on the top-5 probabilities, averaged over the positions where the replies agree so far.
+DISTANCE_FLOOR = 0.02
 WORDS = 'red green blue amber slate north south east west river stone cloud field ridge lantern copper'.split()
 
 
@@ -52,20 +56,33 @@ def serve(base_url: str, model: str, messages: list) -> dict:
     })
     choice = response['choices'][0]
     content = (choice.get('logprobs') or {}).get('content') or []
-    first = {item['token']: item['logprob'] for item in content[0]['top_logprobs']} if content else {}
     usage = response.get('usage') or {}
     return {
         'ids': choice.get('token_ids') or [item['token'] for item in content],
-        'first': first,
+        'tokens': [item['token'] for item in content],
+        'steps': [{top['token']: math.exp(top['logprob']) for top in item['top_logprobs']} for item in content],
         'prompt_tokens': usage.get('prompt_tokens', 0),
         'cached_tokens': (usage.get('prompt_tokens_details') or {}).get('cached_tokens') or 0,
     }
 
 
-def logprob_gap(left: dict, right: dict) -> float:
-    if set(left) != set(right):
-        return float('inf')
-    return max((abs(left[token] - right[token]) for token in left), default=0.0)
+def distance(left: dict, right: dict) -> float:
+    '''Mean total variation over the positions with the same context. A token missing from a top-5 counts as 0.'''
+    gaps = []
+    for position, (a, b) in enumerate(zip(left['steps'], right['steps'])):
+        gaps.append(0.5 * sum(abs(a.get(token, 0.0) - b.get(token, 0.0)) for token in {*a, *b}))
+        if left['tokens'][position] != right['tokens'][position]:
+            break
+    return sum(gaps) / len(gaps) if gaps else 0.0
+
+
+def common_prefix(left: dict, right: dict) -> int:
+    count = 0
+    for a, b in zip(left['ids'], right['ids']):
+        if a != b:
+            break
+        count += 1
+    return count
 
 
 def reset_gpu_prefix_cache(root: str) -> None:
@@ -90,8 +107,8 @@ def prepare(base_url: str, model: str, image_url: str) -> tuple[list, dict, dict
     ]
     serve(base_url, model, messages)
     first_hit, second_hit = serve(base_url, model, messages), serve(base_url, model, messages)
-    if not first_hit['ids']:
-        raise Inconclusive('the server returned no token ids')
+    if not first_hit['steps']:
+        raise Inconclusive('the server returned no logprobs')
     if first_hit['cached_tokens'] < first_hit['prompt_tokens'] - MAX_HIT_GAP_TOKENS:
         raise Inconclusive(f'GPU hit is too shallow: {first_hit["cached_tokens"]} of {first_hit["prompt_tokens"]}')
     reset_gpu_prefix_cache(base_url.removesuffix('/v1'))
@@ -99,15 +116,16 @@ def prepare(base_url: str, model: str, image_url: str) -> tuple[list, dict, dict
 
 
 def judge(reload: dict, first_hit: dict, second_hit: dict) -> str | None:
-    '''Why the reload is wrong, or None. Two GPU hits that differ set how much difference means nothing.'''
+    '''Why the reload is wrong, or None. The difference between two GPU hits sets how much means nothing.'''
     depth = reload['prompt_tokens'] - MAX_HIT_GAP_TOKENS
     if reload['cached_tokens'] < depth:
         return f'tier hit too shallow: {reload["cached_tokens"]} cached, needed {depth}'
-    if first_hit['ids'] == second_hit['ids'] and reload['ids'] != first_hit['ids']:
-        return f'greedy ids differ: {reload["ids"]} vs {first_hit["ids"]}'
-    allowed = max(LOGPROB_FLOOR, 3 * logprob_gap(first_hit['first'], second_hit['first']))
-    if logprob_gap(reload['first'], first_hit['first']) > allowed:
-        return f'first-token logprobs differ: {reload["first"]} vs {first_hit["first"]} (allowed {allowed:.3f})'
+    if not reload['steps']:
+        return 'the reload returned no logprobs'
+    allowed = max(DISTANCE_FLOOR, 3 * distance(first_hit, second_hit))
+    gap = distance(reload, first_hit)
+    if gap > allowed:
+        return f'next-token distributions differ: distance {gap:.4f}, allowed {allowed:.4f}, first {reload["steps"][0]} vs {first_hit["steps"][0]}'
     return None
 
 
@@ -135,7 +153,8 @@ def main() -> int:
         return FAILED
     print(f'KV_OFFLOAD_PROBE prompt={reload["prompt_tokens"]} gpu_cached={first_hit["cached_tokens"]} '
           f'tier_cached={reload["cached_tokens"]} seconds={time.monotonic() - started:.2f} '
-          f'gpu_hits_identical={first_hit["ids"] == second_hit["ids"]}', flush=True)
+          f'distance_gpu_gpu={distance(first_hit, second_hit):.4f} distance_tier_gpu={distance(reload, first_hit):.4f} '
+          f'same_ids_gpu_gpu={common_prefix(first_hit, second_hit)} same_ids_tier_gpu={common_prefix(reload, first_hit)}', flush=True)
     reason = judge(reload, first_hit, second_hit)
     if reason:
         print(f'KV_OFFLOAD_PROBE_FAILED {reason}', flush=True)

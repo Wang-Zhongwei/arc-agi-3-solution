@@ -218,7 +218,7 @@ def test_probe_skipped_without_a_tier(setup, monkeypatch):
 class _FakeServer:
     """A vLLM stand-in: the request after the prefix-cache reset gets `reload`, others a GPU hit."""
 
-    def __init__(self, reload_ids=(1, 2, 3), reload_cached=11_800, reset_results=(True,), reload_status=200, gpu_cached=11_800, status_before_reset=200):
+    def __init__(self, reload_top=None, reload_cached=11_800, reset_results=(True,), reload_status=200, gpu_cached=11_800, status_before_reset=200):
         fake = self
         self.was_reset = False
         self.resets = list(reset_results)
@@ -245,11 +245,10 @@ class _FakeServer:
                     return self._send(status_before_reset, {})
                 if fake.was_reset and reload_status != 200:
                     return self._send(reload_status, {})
-                ids = list(reload_ids) if fake.was_reset else [1, 2, 3]
                 cached = reload_cached if fake.was_reset else gpu_cached
-                top = [{"token": "a", "logprob": -0.1}, {"token": "b", "logprob": -2.0}]
+                top = (reload_top if fake.was_reset and reload_top else None) or [{"token": "a", "logprob": -0.1}, {"token": "b", "logprob": -2.3}]
                 self._send(200, {
-                    "choices": [{"token_ids": ids, "logprobs": {"content": [{"token": "a", "top_logprobs": top}]}}],
+                    "choices": [{"token_ids": [1], "logprobs": {"content": [{"token": top[0]["token"], "top_logprobs": top}]}}],
                     "usage": {"prompt_tokens": 12_000, "prompt_tokens_details": {"cached_tokens": cached}},
                 })
 
@@ -278,10 +277,27 @@ def test_probe_passes_on_identical_reload():
     assert "reset_external=false" in fake.queries[0] and "reset_running_requests=false" in fake.queries[0]
 
 
-def test_probe_fails_on_different_ids():
-    with _FakeServer(reload_ids=(1, 2, 9)) as fake:
+def test_probe_fails_on_a_different_distribution():
+    with _FakeServer(reload_top=[{"token": "b", "logprob": -0.1}, {"token": "a", "logprob": -2.3}]) as fake:
         result = fake.run()
-    assert result.returncode == 1 and "greedy ids differ" in result.stdout
+    assert result.returncode == 1 and "next-token distributions differ" in result.stdout
+
+
+def test_probe_passes_a_swap_in_the_tail():
+    # int4-kv v4's real values: a healthy reload that the old set comparison failed as an infinite gap.
+    def top(items):
+        return [{"token": token, "logprob": logprob} for token, logprob in items]
+    v4_gpu = top([("We", -0.014230557717382908), ("The", -4.514230728149414), ("Okay", -6.514230728149414), ("Got", -7.514230728149414), ("I", -8.139230728149414)])
+    v4_tier = top([("We", -0.012726283632218838), ("The", -4.762726306915283), ("Okay", -6.137726306915283), ("Got", -7.012726306915283), ("User", -7.887726306915283)])
+    spec = __import__("importlib.util").util.spec_from_file_location("probe", OFFLOAD / "probe.py")
+    probe = __import__("importlib.util").util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    def served(items):
+        return {"tokens": ["We"], "ids": [1], "prompt_tokens": 12402, "cached_tokens": 12160,
+                "steps": [{item["token"]: probe.math.exp(item["logprob"]) for item in items}]}
+    assert probe.judge(served(v4_tier), served(v4_gpu), served(v4_gpu)) is None
+    assert probe.distance(served(v4_tier), served(v4_gpu)) < 0.005
 
 
 def test_probe_fails_on_a_shallow_tier_hit():
