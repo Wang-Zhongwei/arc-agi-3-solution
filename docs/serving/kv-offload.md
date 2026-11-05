@@ -75,7 +75,26 @@ That makes v4 the C=25 control below: 25 streams, no tier, 2 passes, token-exact
 - Throughput, generated tok/s: minutes 5-45 1,233 at 24.6 running (v3 1,183 at 24.0). Minutes 45-90 1,150 at 24.6 running with prefill 3,424 tok/s, the first sustained reading with all lanes full. The FP8 baseline at 14 streams gives 917 in the same window, so +25%. Job level 1,125.
 - KV reached 99.0% at minute 15-20 with no storm: prefill stayed near 2,300 tok/s, and the lowest host available memory was 55.34 GiB.
 
-**v5:** the same settings with the probe fixed. Compare with v4, not v3.
+**v5 (commit `0e63209e`, 27 streams, 40 GiB tier):** the tier works, but 27 streams do not beat 25 in steady state.
+
+- The probe passed. Distance tier-to-GPU was 0.0372 against GPU-to-GPU 0.0395, 12,160 of 12,402 tokens came from the tier, and the request took 0.60 s. No fallback; 105 min of play.
+- The tier was used: 881 loads, 44,613 blocks (about 556 GB) over the run. Load-to-ready p50 was about 135 ms and p95 220-540 ms. No `dropped_cpu_full`, no preemptions, and acceptance was unchanged (2.92 in minutes 45-90, the same as v4), so reloaded state looks healthy.
+- Hits: the local prefix hit rate fell from 92.9% to 70.3% and the external one rose to 73.8%. Combined, 70.3 + 29.7 × 0.738 = 92.2%, about the same as v4.
+- No storm: KV reached 99.8-100%, the worst 5-min bin from minutes 14 to 90 was 1,025 generated / 4,610 prefill tok/s, and no 1-minute bin fell below 600 generated with prefill above 7,000.
+- Host: lowest `host_available_bytes` was 15.52 GiB (v4 55.34).
+- The scheduler logged 2,491 `manager.py:408` partial-tail warnings. They are harmless but noisy.
+
+| Generated tok/s | v4, 25 streams, no tier | v5, 27 streams, tier | Change |
+|---|---|---|---|
+| Minutes 5-14 | 1,280 at 24.7 running | 1,327 at 26.8 | +3.7% |
+| Minutes 15-45 | 1,219 at 24.6 | 1,267 at 26.1 | +3.9% |
+| Minutes 45-90 | 1,150 at 24.6 | 1,148 at 26.0 | −0.2% |
+| Prefill, minutes 45-90 | 3,424 | 3,723 | +8.7% |
+| Job level | 1,125 | 1,134 | +0.8% |
+
+Against the adoption rule (minutes 45-90 at least 1.5% higher), C=27 fails. 1.4 more running lanes bring about 4% while contexts are young, and nothing once contexts are mature, where reload remainders and extra prefill eat the lanes. The scores, 41.56 and 40.37 over 2 passes, are not comparable: v4 lost about 12 minutes to the relaunch.
+
+For the 110-game rerun: stay at 25 streams. The tier is cheap insurance against a storm, at no measured cost in throughput at 27, but it has not been measured at 25.
 
 ## What to read from v5
 
