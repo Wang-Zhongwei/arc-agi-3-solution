@@ -109,6 +109,8 @@ def assemble_streamed_chat_response(lines) -> dict[str, Any]:
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
+    token_ids: list[int] = []
+    prompt_token_ids: list[int] | None = None
     finish_reason = ""
     usage: dict[str, Any] | None = None
     error: Any = None
@@ -138,9 +140,14 @@ def assemble_streamed_chat_response(lines) -> dict[str, Any]:
             usage = chunk["usage"]
         if chunk.get("provider") and not provider_name[0]:
             provider_name[0] = str(chunk["provider"])
+        if chunk.get("prompt_token_ids"):
+            prompt_token_ids = chunk["prompt_token_ids"]
         for choice in chunk.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
+            if choice.get("prompt_token_ids"):
+                prompt_token_ids = choice["prompt_token_ids"]
+            token_ids.extend(choice.get("token_ids") or [])
             if choice.get("finish_reason"):
                 finish_reason = str(choice["finish_reason"])
             delta = choice.get("delta") or {}
@@ -187,6 +194,10 @@ def assemble_streamed_chat_response(lines) -> dict[str, Any]:
     result: dict[str, Any] = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
     }
+    if token_ids:
+        result["choices"][0]["token_ids"] = token_ids
+    if prompt_token_ids:
+        result["prompt_token_ids"] = prompt_token_ids
     if usage is not None:
         result["usage"] = usage
     if error is not None:
