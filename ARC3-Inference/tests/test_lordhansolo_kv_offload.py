@@ -89,7 +89,8 @@ def test_setup_order_and_late_environment(setup):
         "check_int4_kv_kernels(server_env)", "extend_sm120_gemm_rows(manifest, server_env)", "launch_vllm_watchdog(cmd",
     )]
     assert positions == sorted(positions)
-    assert source.index("run_token_exact_probe()\n    except") < source.index("run_kv_offload_probe()\nstart_vllm_profiler")
+    assert source.index("    run_kv_offload_probe()\n    try:\n        run_token_exact_probe()") > 0
+    assert source.index("relaunch_without_kv_offload(f'smoke test failed") < source.index("    run_kv_offload_probe()\n")
     # The fallback's stream count must beat the config's value in the handoff.
     assert source.index("setup_env.update(") < source.index("existing_setup_env.update(setup_env)") < source.index("existing_setup_env.update(LATE_SETUP_ENV)")
 
@@ -216,7 +217,7 @@ def test_probe_skipped_without_a_tier(setup, monkeypatch):
 class _FakeServer:
     """A vLLM stand-in: the request after the prefix-cache reset gets `reload`, others a GPU hit."""
 
-    def __init__(self, reload_ids=(1, 2, 3), reload_cached=11_800, reset_results=(True,), reload_status=200, gpu_cached=11_800):
+    def __init__(self, reload_ids=(1, 2, 3), reload_cached=11_800, reset_results=(True,), reload_status=200, gpu_cached=11_800, status_before_reset=200):
         fake = self
         self.was_reset = False
         self.resets = list(reset_results)
@@ -239,6 +240,8 @@ class _FakeServer:
                     fake.queries.append(self.path)
                     fake.was_reset = fake.resets.pop(0) if fake.resets else True
                     return self._send(200, {"success": fake.was_reset})
+                if not fake.was_reset and status_before_reset != 200:
+                    return self._send(status_before_reset, {})
                 if fake.was_reset and reload_status != 200:
                     return self._send(reload_status, {})
                 ids = list(reload_ids) if fake.was_reset else [1, 2, 3]
@@ -296,6 +299,25 @@ def test_probe_retries_a_held_reset():
     with _FakeServer(reset_results=(False, True)) as fake:
         result = fake.run()
     assert result.returncode == 0 and len(fake.queries) == 2
+
+
+def test_probe_fails_when_the_server_errors_before_the_reload():
+    with _FakeServer(status_before_reset=500) as fake:
+        result = fake.run()
+    assert result.returncode == 1 and "before the reload" in result.stdout
+
+
+def test_probe_is_inconclusive_when_a_route_is_missing():
+    with _FakeServer(status_before_reset=404) as fake:
+        result = fake.run()
+    assert result.returncode == 3 and "KV_OFFLOAD_PROBE_INCONCLUSIVE" in result.stdout
+
+
+def test_copy_check_timeout_means_no_tier(setup, monkeypatch):
+    def run(*args, **kwargs):
+        raise subprocess.TimeoutExpired("check", 120)
+    monkeypatch.setattr(subprocess, "run", run)
+    assert setup[2]["kv_offload_copy_available"]({}) is False
 
 
 def test_probe_is_inconclusive_when_gpu_hits_are_shallow():

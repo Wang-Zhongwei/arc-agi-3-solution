@@ -36,7 +36,7 @@ The first two gates are stated by the code with no reason given, so passing them
 
 1. `kv_offload_copy_available`: `cuMemcpyBatchAsync` resolves before the model load. Missing means fallback.
 2. `kv_offload/probe.py`, test runs only, with `VLLM_SERVER_DEV_MODE=1`: one prompt of about 12,000 tokens with an image is served twice from GPU hits, `/reset_prefix_cache?reset_external=false` clears the GPU cache, and it is served again. Greedy ids must match, first-token top-5 logprobs must agree within max(0.02, 3 × the difference between the two GPU hits), and cached tokens must reach P − 300.
-3. A wrong reload, a failed reload request, or a shallow tier hit logs `KV_OFFLOAD_PROBE_FAILED` and relaunches. Failure in the setup before the reload logs `KV_OFFLOAD_PROBE_INCONCLUSIVE`, keeps the tier, and means no tier speed from that run counts.
+3. A wrong reload, a shallow tier hit, or a server crash, hang or 5xx at any point in the probe logs `KV_OFFLOAD_PROBE_FAILED` and relaunches. A refused request or a GPU hit too shallow to judge logs `KV_OFFLOAD_PROBE_INCONCLUSIVE`, keeps the tier, and means no tier speed from that run counts. A failed smoke test also relaunches.
 
 Fallback: 25 sequences, no tier, top graph 100, the same as v3. It logs `KV_OFFLOAD_FALLBACK`, and the first server's log is kept as `vllm-openai-server.offload-failed.log`. A crash during the games restarts on this command, but the harness keeps its 27 streams.
 

@@ -4,12 +4,15 @@ Run once on the live server in test runs, before the games start, and needs VLLM
 Serves one prompt from a GPU hit twice, clears the GPU prefix cache only, then serves it again from the tier.
 
 Exit 0: same output at the expected depth. Exit 1: the reload failed or differs; the launcher drops the tier.
-Exit 3: could not judge, because the setup before the reload failed; the tier stays and the log says so.
+Exit 3: could not judge, because the server refused a request before the reload; the tier stays and the log says so.
+A crash, hang or server error before the reload counts as a failure: those prompts are the first the tier stores.
 """
+import http.client
 import json
 import random
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -112,6 +115,15 @@ def main() -> int:
     base_url, model, image_url = sys.argv[1:4]
     try:
         messages, first_hit, second_hit = prepare(base_url, model, image_url)
+    except urllib.error.HTTPError as error:
+        if error.code >= 500:
+            print(f'KV_OFFLOAD_PROBE_FAILED the server failed before the reload: {error!r}', flush=True)
+            return FAILED
+        print(f'KV_OFFLOAD_PROBE_INCONCLUSIVE {error!r}', flush=True)
+        return INCONCLUSIVE
+    except (OSError, http.client.HTTPException) as error:  # refused, reset, disconnected or timed out
+        print(f'KV_OFFLOAD_PROBE_FAILED the server failed before the reload: {error!r}', flush=True)
+        return FAILED
     except Exception as error:
         print(f'KV_OFFLOAD_PROBE_INCONCLUSIVE {error!r}', flush=True)
         return INCONCLUSIVE
