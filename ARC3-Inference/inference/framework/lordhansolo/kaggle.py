@@ -1560,6 +1560,49 @@ def use_engine_block_size_for_draft_qsa(manifest: dict) -> None:
     print(f'Draft QSA caches take the engine block size in {path}', flush=True)
 
 
+# int4 KV (int4_per_token_head: 4-bit K/V with a randomized Hadamard rotation). The e975732 QSA owner only reads BF16
+# and FP8-e4m3, so int4_kv/runtime_patches.json routes int4 to the vendored kernels in int4_kv/taaf_qsa_kv8.py. nvidia/qsa.py and the
+# warmup are stock image files, not part of the overlay. The drafter must inherit int4: an FP8 draft page does not
+# divide an int4 page, so unify_kv_cache_spec_page_size would pad every int4 page back up to the FP8 size.
+INT4_KV_DTYPE = 'int4_per_token_head'
+INT4_KV_DIR = Path(os.environ.get('TAAF_KAGGLE_BUNDLE_DIR', '.')) / 'src' / __PROJECT_DIR_NAME__ / 'inference' / 'framework' / 'lordhansolo' / 'int4_kv'
+
+
+def install_int4_kv(manifest: dict) -> None:
+    '''With int4 KV, install the vendored kernels and route the QSA owner and its warmup to them.
+
+    Each anchor must occur exactly once in the stock runtime file, otherwise the setup fails before the load.
+    '''
+    if VLLM_KV_CACHE_DTYPE != INT4_KV_DTYPE:
+        return
+    if VLLM_DRAFT_KV_CACHE_DTYPE:
+        raise RuntimeError('int4 KV needs the drafter to inherit int4: leave draft_kv_cache_dtype empty')
+    dist_packages = IMAGE_RUNTIME_ROOT / manifest['dist_packages']
+    shutil.copyfile(INT4_KV_DIR / 'taaf_qsa_kv8.py', dist_packages / 'vllm' / 'taaf_qsa_kv8.py')
+    for patch in json.loads((INT4_KV_DIR / 'runtime_patches.json').read_text(encoding='utf-8')):
+        path = dist_packages / patch['path']
+        source = path.read_text(encoding='utf-8') if path.is_file() else ''
+        for edit in patch['replacements']:
+            if source.count(edit['anchor']) != 1:
+                raise RuntimeError(f"int4 KV anchor appears {source.count(edit['anchor'])} times in {path}:\n{edit['anchor']}")
+            source = source.replace(edit['anchor'], edit['replacement'])
+        path.write_text(source, encoding='utf-8')
+    print('int4 KV kernels installed; QSA owner and warmup patched', flush=True)
+
+
+def check_int4_kv_kernels(server_env: dict[str, str]) -> None:
+    '''Run the GPU self-test before the server takes the GPU; a mismatch stops the notebook here.'''
+    if VLLM_KV_CACHE_DTYPE != INT4_KV_DTYPE:
+        return
+    result = subprocess.run(
+        [sys.executable, str(INT4_KV_DIR / 'preflight.py')],
+        env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900,
+    )
+    print(result.stdout, flush=True)
+    if result.returncode:
+        raise RuntimeError(f'int4 KV preflight failed with exit code {result.returncode}')
+
+
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
 # INCConfig that check comes before the unquantized route above, which the FP8 table needs.
 FP8_PLE_RUNTIME_MARKERS = (
@@ -2368,6 +2411,7 @@ def start_vllm_server() -> None:
     route_inc_ple_to_unquantized(manifest)
     pin_ple_table_at_exact_size(manifest)
     use_engine_block_size_for_draft_qsa(manifest)
+    install_int4_kv(manifest)
     check_runtime_reads_fp8_ple(manifest)
     patch_runtime_for_dflash(manifest)
     draft_model_dir = resolve_dflash_draft() if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft()
@@ -2375,6 +2419,7 @@ def start_vllm_server() -> None:
     cmd = build_vllm_server_command(draft_model_dir)
     configure_cache_diagnostics(manifest, server_env, cmd)
     configure_vllm_profiler(cmd)
+    check_int4_kv_kernels(server_env)
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_LOG.unlink(missing_ok=True)
     VLLM_SHARD_PREFETCH_REPORT.unlink(missing_ok=True)
