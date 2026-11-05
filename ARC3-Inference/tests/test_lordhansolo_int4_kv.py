@@ -95,7 +95,7 @@ def test_anchors_match_the_real_runtime(tmp_path):
 
 
 def test_the_config_keeps_the_drafter_on_int4_and_fits_the_measured_block_size():
-    config = json.loads((Path(lord.__file__).parents[3] / "configs" / "int4-kv" / "v2.json").read_text())
+    config = json.loads((Path(lord.__file__).parents[3] / "configs" / "int4-kv" / "v3.json").read_text())
     vllm = config["kaggle"]["vllm"]
     assert vllm["kv_cache_dtype"] == INT4
     assert not vllm.get("draft_kv_cache_dtype")

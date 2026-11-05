@@ -20,14 +20,14 @@ The e975732 QSA owner only reads BF16 and FP8-e4m3, so the flag alone is rejecte
 
 ## Settings and why
 
-| Setting | v3 | int4-kv v2 | Reason |
+| Setting | main-tuned-drafter v3 | int4-kv v3 | Reason |
 |---|---|---|---|
 | `kv_cache_dtype` | `fp8_e4m3` | `int4_per_token_head` | 544 vs 1,024 B per token per layer |
-| `max_num_seqs` | 14 | 30 | Doubled streams, as asked |
-| `ARC3_MAX_ACTIVE_STREAMS` | 15 | 30 | Same |
+| `max_num_seqs` | 14 | 25 | The pool grew 1.69×, not 2×; v2 collapsed at 30 |
+| `ARC3_MAX_ACTIVE_STREAMS` | 15 | 25 | No extra gate stream; each live context takes pool |
 | `prefix_match_unit` | 128 | 128 | Must divide the block size, which stays 1,664 |
-| `cudagraph_capture_sizes` | default | 1, 2, 4, multiples of 8 to 120, and 100 | Full graphs at 30 streams (120) and 25 games (100) |
-| `public_runtime_minutes` | 120 | 60 | A test; long enough for KV to fill and drain |
+| `cudagraph_capture_sizes` | default | 1, 2, 4, multiples of 8 to 96, and 100 | Full graphs up to 25 streams × 4 rows |
+| `public_runtime_minutes` | 120 | 120 | Same as main-tuned-drafter v3, with 1 pass, so scores compare |
 
 - **Block size:** 1,664 tokens, same as FP8. `_align_hybrid_block_size` sizes it from the first non-SSM backend, which
   reports 1,024 B per token. v1 predicted 3,120 and set `prefix_match_unit` to 120, so it stopped at boot; v2 only
@@ -36,3 +36,11 @@ The e975732 QSA owner only reads BF16 and FP8-e4m3, so the flag alone is rejecte
   per token, about 13 attention pages × 480 B less, so int4 pages are not padded: BLNHC takes the packed group path.
 - **Drafter:** inherits int4. An FP8 draft would probably cost only its own page on this path; not tested.
   Drafter acceptance may fall; compare with v3.
+
+## Results
+
+- **v2 (30 streams, cancelled at 44 min):** 1,400 generated tok/s until minute 15, then KV 98%, about 230 generated and
+  10,000 prefill tok/s, with no recovery. 30 streams outgrew the 2,645,854-token pool, so LRU evicted prefixes while
+  requests queued. Run: `runs/kaggle/jonathanwang2022/int4-kv/v02`.
+- **v3 (25 streams):** predicted first-peak KV 92-96%, against a limit near 94-95%. Check minutes 13-20: 1-minute KV
+  at or below about 92% and prefill under 5,000 tok/s.
