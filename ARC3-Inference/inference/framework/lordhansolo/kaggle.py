@@ -193,6 +193,12 @@ class DuckKaggleVllmConfig:
     draft_attention_backend: str = DEFAULT_VLLM_DRAFT_ATTENTION_BACKEND
     ple_fp8_model_source: str = DEFAULT_VLLM_PLE_FP8_MODEL_SOURCE
     ple_model_source: str = DEFAULT_VLLM_PLE_MODEL_SOURCE
+    # Host KV tier, eager SimpleCPUOffloadConnector: GiB passed as --kv-offloading-size; 0 keeps every KV block on the GPU.
+    kv_offloading_gib: float = 0
+    # When the tier fails its checks or crashes the server, relaunch at this many seqs without it. Needed with a tier.
+    kv_offload_fallback_seqs: int = 0
+    # Decode rows above 64 to try on the SM120 GEMM plans, most used first; the GPU preflight accepts or rejects each.
+    sm120_gemm_candidate_rows: tuple[int, ...] = ()
 
 
 def resolve_draft_vocab(path: str) -> str:
@@ -252,6 +258,10 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
             "(the draft vocabulary restricts the MTP head only)"
         )
     ple_model_source_parts = _split_model_source(cfg.ple_model_source) if cfg.ple_model_source else None
+    if not set(cfg.sm120_gemm_candidate_rows) <= set(cfg.cudagraph_capture_sizes):
+        raise ValueError("sm120_gemm_candidate_rows must be graph sizes in cudagraph_capture_sizes")
+    if cfg.kv_offloading_gib and cfg.kv_offload_fallback_seqs * (1 + cfg.mtp_tokens) not in cfg.cudagraph_capture_sizes:
+        raise ValueError("kv_offloading_gib needs kv_offload_fallback_seqs with its full decode step in cudagraph_capture_sizes")
     configured_context_window = os.environ.get("LOCAL_ANALYZER_CONTEXT_WINDOW")
     analyzer_context_window = int(configured_context_window or cfg.max_model_len)
     prompt_window = int(cfg.max_model_len) - VLLM_OUTPUT_RESERVE_TOKENS
@@ -279,6 +289,9 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__VLLM_DRAFT_KV_CACHE_DTYPE__": repr(str(cfg.draft_kv_cache_dtype)),
         "__VLLM_CUDAGRAPH_CAPTURE_SIZES__": repr(sorted({int(size) for size in cfg.cudagraph_capture_sizes})),
         "__VLLM_DRAFT_METHOD__": repr(cfg.draft_method),
+        "__VLLM_KV_OFFLOADING_GIB__": repr(float(cfg.kv_offloading_gib)),
+        "__VLLM_KV_OFFLOAD_FALLBACK_SEQS__": repr(int(cfg.kv_offload_fallback_seqs)),
+        "__VLLM_SM120_GEMM_CANDIDATE_ROWS__": repr([int(rows) for rows in cfg.sm120_gemm_candidate_rows]),
         "__VLLM_DRAFT_ATTENTION_BACKEND__": repr(cfg.draft_attention_backend),
         "__PLE_FP8_MODEL_SOURCE_PARTS__": repr(ple_fp8_model_source_parts),
         "__PLE_MODEL_SOURCE_PARTS__": repr(ple_model_source_parts),
@@ -326,7 +339,6 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__VLLM_PREFIX_MATCH_UNIT__": repr(int(cfg.prefix_match_unit)),
         "__VLLM_PREFIX_CACHE_RETENTION_INTERVAL__": repr(int(cfg.prefix_cache_retention_interval)),
         "__WATCHDOG_SCRIPT__": repr(_DUCK_VLLM_WATCHDOG_SCRIPT),
-        "__CACHE_DIAGNOSTICS_SOURCE__": repr(Path(__file__).with_name("cache_diagnostics.py").read_text(encoding="utf-8")),
         "__VLLM_QUANTIZATION__": repr(str(cfg.quantization)),
         "__VLLM_MOE_BACKEND__": repr(str(cfg.moe_backend)),
         "__VLLM_GDN_DECODE_KERNEL__": repr(str(cfg.gdn_decode_kernel)),
@@ -948,6 +960,7 @@ def exit_watchdog(signal_number: int, frame) -> None:
 
 def run_watchdog() -> None:
     '''Spawn the server, wait for it to exit, log the exit and start it again while that is allowed.'''
+    global server_command
     restart_count = 0
     prefetch_process = None
     while True:
@@ -987,6 +1000,10 @@ def run_watchdog() -> None:
             log_event(f'giving up after {MAX_RESTARTS} restarts; the server stays down')
             sys.exit(1)
         restart_count += 1
+        if config.get('fallback_command') and server_command != config['fallback_command']:
+            # A crash under the host tier: drop it on the first restart rather than repeat a deterministic crash.
+            server_command = config['fallback_command']
+            log_event('KV_OFFLOAD_FALLBACK restarting without the host tier')
         log_event(f'restarting vLLM server in {RESTART_DELAY_SECONDS}s (restart {restart_count} of {MAX_RESTARTS})')
         time.sleep(RESTART_DELAY_SECONDS)
 
@@ -1005,6 +1022,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import struct
@@ -1063,7 +1081,6 @@ VLLM_WATCHDOG_LOG = WORKING_DIR / 'vllm-watchdog.log'
 VLLM_WATCHDOG_PID = WORKING_DIR / 'vllm-watchdog.pid'
 VLLM_SHARD_PREFETCH_REPORT = WORKING_DIR / 'vllm-shard-prefetch.json'
 WATCHDOG_SCRIPT_TEXT = __WATCHDOG_SCRIPT__
-CACHE_DIAGNOSTICS_SOURCE = __CACHE_DIAGNOSTICS_SOURCE__
 VLLM_QUANTIZATION = __VLLM_QUANTIZATION__
 VLLM_MOE_BACKEND = __VLLM_MOE_BACKEND__
 VLLM_GDN_DECODE_KERNEL = __VLLM_GDN_DECODE_KERNEL__
@@ -1092,6 +1109,9 @@ VLLM_MAX_NUM_BATCHED_TOKENS = __VLLM_MAX_NUM_BATCHED_TOKENS__
 VLLM_DTYPE = __VLLM_DTYPE__
 VLLM_KV_CACHE_DTYPE = __VLLM_KV_CACHE_DTYPE__
 VLLM_TOKEN_EXACT_HISTORY = __VLLM_TOKEN_EXACT_HISTORY__
+VLLM_KV_OFFLOADING_GIB = __VLLM_KV_OFFLOADING_GIB__
+VLLM_KV_OFFLOAD_FALLBACK_SEQS = __VLLM_KV_OFFLOAD_FALLBACK_SEQS__
+VLLM_SM120_GEMM_CANDIDATE_ROWS = __VLLM_SM120_GEMM_CANDIDATE_ROWS__
 VLLM_INDEXER_KV_DTYPE = __VLLM_INDEXER_KV_DTYPE__
 VLLM_MAMBA_SSM_CACHE_DTYPE = __VLLM_MAMBA_SSM_CACHE_DTYPE__
 VLLM_ENABLE_PREFIX_CACHING = __VLLM_ENABLE_PREFIX_CACHING__
@@ -1308,6 +1328,11 @@ def build_image_runtime_env(manifest: dict) -> dict[str, str]:
     env.pop('VLLM_PLE_OFFLOAD_READY_TIMEOUT', None)
     env.pop('VLLM_PREFIX_CACHE_RETENTION_INTERVAL', None)
     env['PYTHONPATH'] = prepend_path_entries(env.get('PYTHONPATH', ''), build_runtime_python_paths(manifest))
+    if VLLM_KV_OFFLOADING_GIB:
+        env['VLLM_USE_SIMPLE_KV_OFFLOAD'] = '1'
+        if is_test_run():
+            # For /reset_prefix_cache, which the reload probe needs; the routes are off in submissions.
+            env['VLLM_SERVER_DEV_MODE'] = '1'
     env['PATH'] = prepend_path_entries(env.get('PATH', ''), [cuda_home / 'bin', IMAGE_RUNTIME_ROOT / 'usr' / 'local' / 'bin'])
     env['LD_LIBRARY_PATH'] = prepend_path_entries(
         env.get('LD_LIBRARY_PATH', ''), [path for path in build_runtime_library_paths(manifest) if path.is_dir()]
@@ -1676,6 +1701,81 @@ def run_token_exact_probe() -> None:
     if start is None or prompt.count(image_pad[0]) < 2:
         raise RuntimeError(f'Token-exact probe failed: reply found {start is not None}, image tokens {prompt.count(image_pad[0])}')
     print(f'Token-exact probe passed: {len(prompt)} prompt tokens, {prompt.count(image_pad[0])} image tokens', flush=True)
+
+
+# KV offload through SimpleCPUOffloadConnector. kv_offload/runtime_patches.json lets it start on this runtime, where QSA
+# and RecoverSSM refuse any connector and any connector drops the PLE/GDN grouping (104 blocks per request, not 102), makes
+# a block still in use move to the CPU pool's evict-last end, and logs the tier's counters.
+KV_OFFLOAD_DIR = INT4_KV_DIR.parent / 'kv_offload'
+
+
+def install_kv_offload(manifest: dict) -> None:
+    '''Patch the runtime for the CPU tier. Each anchor must occur once, else setup fails before the load.'''
+    if not VLLM_KV_OFFLOADING_GIB:
+        return
+    dist_packages = IMAGE_RUNTIME_ROOT / manifest['dist_packages']
+    shutil.copyfile(KV_OFFLOAD_DIR / 'arc3_offload_stats.py', dist_packages / 'vllm' / 'arc3_offload_stats.py')
+    for patch in json.loads((KV_OFFLOAD_DIR / 'runtime_patches.json').read_text(encoding='utf-8')):
+        path = dist_packages / patch['path']
+        source = path.read_text(encoding='utf-8') if path.is_file() else ''
+        for edit in patch['replacements']:
+            if source.count(edit['anchor']) != 1:
+                raise RuntimeError(f"KV offload anchor appears {source.count(edit['anchor'])} times in {path}:\n{edit['anchor']}")
+            source = source.replace(edit['anchor'], edit['replacement'])
+        path.write_text(source, encoding='utf-8')
+    print(f'KV offload patched: {VLLM_KV_OFFLOADING_GIB} GiB CPU tier, eager', flush=True)
+
+
+def without_kv_offload(cmd: list[str]) -> list[str]:
+    '''The server command without the host tier, at the fallback sequence count.'''
+    out = []
+    args = iter(cmd)
+    for arg in args:
+        if arg in ('--kv-offloading-size', '--kv-offloading-backend'):
+            next(args)
+            continue
+        out.append(arg)
+    sizes = [s for s in VLLM_CUDAGRAPH_CAPTURE_SIZES if s <= VLLM_KV_OFFLOAD_FALLBACK_SEQS * (1 + VLLM_MTP_TOKENS)]
+    out[out.index('--max-num-seqs') + 1] = str(VLLM_KV_OFFLOAD_FALLBACK_SEQS)
+    out[out.index('--max-cudagraph-capture-size') + 1] = str(max(sizes))
+    out[out.index('--compilation-config') + 1] = json.dumps({'cudagraph_capture_sizes': sizes})
+    return out
+
+
+# The rows at which the rc3 SM120 BF16 plans run. Lord tuned their tiles for M up to 64, so a larger row joins only
+# after sm120_gemm/preflight.py finds it close to the original method and faster; otherwise it keeps that method.
+SM120_GEMM_ROWS = (40, 44, 48, 52, 56, 64)
+SM120_GEMM_ROWS_ANCHOR = f'GEMM_ROWS = {SM120_GEMM_ROWS}\n'
+SM120_GEMM_ROWS_LOG = 'target M=' + '/'.join(map(str, SM120_GEMM_ROWS))
+
+
+def extend_sm120_gemm_rows(manifest: dict, server_env: dict[str, str]) -> None:
+    '''Add the candidate rows that pass the preflight. Any failure logs and keeps the runtime's rows.'''
+    candidates = VLLM_SM120_GEMM_CANDIDATE_ROWS
+    if not candidates:
+        return
+    path = IMAGE_RUNTIME_ROOT / manifest['dist_packages'] / 'vllm' / 'models' / 'qwen4_exp' / 'nvidia' / 'arc3_sm120_gemm.py'
+    source = path.read_text(encoding='utf-8') if path.is_file() else ''
+    accepted = []
+    if source.count(SM120_GEMM_ROWS_ANCHOR) == 1:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(INT4_KV_DIR.parent / 'sm120_gemm' / 'preflight.py'), json.dumps(candidates)],
+                env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600,
+            )
+            print(result.stdout[-6000:], flush=True)
+            for line in result.stdout.splitlines():
+                if line.startswith('SM120_GEMM_ACCEPTED ') and not result.returncode:
+                    accepted = json.loads(line.split(' ', 1)[1])
+        except subprocess.TimeoutExpired:
+            print('SM120 GEMM preflight timed out', flush=True)
+    if not accepted:
+        print(f'SM120 GEMM keeps rows {SM120_GEMM_ROWS}; candidates were {candidates}', flush=True)
+        return
+    rows = tuple(sorted({*SM120_GEMM_ROWS, *accepted}))
+    source = source.replace(SM120_GEMM_ROWS_ANCHOR, f'GEMM_ROWS = {rows}\n')
+    path.write_text(source.replace(SM120_GEMM_ROWS_LOG, 'target M=' + '/'.join(map(str, rows))), encoding='utf-8')
+    print(f'SM120 GEMM rows extended to {rows}', flush=True)
 
 
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
@@ -2373,6 +2473,8 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
         cmd += ['--attention-config', json.dumps({'indexer_kv_dtype': VLLM_INDEXER_KV_DTYPE})]
     if VLLM_MAMBA_SSM_CACHE_DTYPE and VLLM_MAMBA_SSM_CACHE_DTYPE != 'auto':
         cmd += ['--mamba-ssm-cache-dtype', VLLM_MAMBA_SSM_CACHE_DTYPE]
+    if VLLM_KV_OFFLOADING_GIB:
+        cmd += ['--kv-offloading-size', str(VLLM_KV_OFFLOADING_GIB), '--kv-offloading-backend', 'native']
     chat_template = MODEL_PATH / 'chat_template.jinja'
     if chat_template.exists():
         cmd += ['--chat-template', str(chat_template)]
@@ -2382,13 +2484,12 @@ def build_vllm_server_command(draft_model_dir: Path | None = None) -> list[str]:
 
 def configure_cache_diagnostics(manifest: dict, server_env: dict, cmd: list[str]) -> None:
     '''Install observational hooks only in test mode, and only when the config asks for them.'''
-    namespace = {'__name__': 'arc3_cache_diagnostics'}
-    exec(CACHE_DIAGNOSTICS_SOURCE, namespace)
-    enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and namespace['is_test_run']()
+    enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and is_test_run()
     server_env['ARC3_CACHE_DIAGNOSTICS'] = '1' if enabled else '0'
     server_env.pop('ARC3_CACHE_DIAGNOSTICS_DIR', None)
     if not enabled:
         return
+    CACHE_DIAGNOSTICS_SOURCE = (INT4_KV_DIR.parent / 'cache_diagnostics.py').read_text(encoding='utf-8')
     dist_packages = IMAGE_RUNTIME_ROOT / manifest['dist_packages']
     (dist_packages / 'arc3_cache_diagnostics.py').write_text(CACHE_DIAGNOSTICS_SOURCE, encoding='utf-8')
     metadata = dist_packages / 'arc3_cache_diagnostics-1.0.dist-info'
@@ -2464,6 +2565,86 @@ def build_watchdog_config(cmd: list[str]) -> dict:
     return watchdog_config
 
 
+# Set after a probe or fallback, and applied last to the benchmark's environment, over the config's harness_env.
+LATE_SETUP_ENV: dict[str, str] = {}
+# What a later fallback needs. Empty once no tier is running.
+KV_OFFLOAD_RELAUNCH: dict = {}
+
+
+def launch_vllm_watchdog(command: list[str], server_env: dict[str, str], fallback: list[str] | None = None) -> subprocess.Popen:
+    config = build_watchdog_config(command)
+    if fallback:
+        config['fallback_command'] = fallback
+    VLLM_WATCHDOG_CONFIG.write_text(json.dumps(config), encoding='utf-8')
+    with VLLM_WATCHDOG_LOG.open('a', encoding='utf-8') as watchdog_log_handle:
+        watchdog_process = subprocess.Popen(
+            [sys.executable, str(VLLM_WATCHDOG_SCRIPT), str(VLLM_WATCHDOG_CONFIG)],
+            env=server_env,
+            stdout=watchdog_log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    VLLM_WATCHDOG_PID.write_text(str(watchdog_process.pid), encoding='utf-8')
+    return watchdog_process
+
+
+def signal_recorded_process(pid_path: Path, signal_number: int) -> None:
+    try:
+        os.kill(int(pid_path.read_text(encoding='utf-8').strip()), signal_number)
+    except (OSError, ValueError):
+        pass
+
+
+def stop_server_for_relaunch() -> None:
+    '''Stop the watchdog, then the server, and give the engine time to release the GPU and the pinned host tier.'''
+    for pid_path in (VLLM_WATCHDOG_PID, VLLM_SERVER_PID):
+        signal_recorded_process(pid_path, signal.SIGTERM)
+    time.sleep(30)
+    for pid_path in (VLLM_WATCHDOG_PID, VLLM_SERVER_PID):
+        signal_recorded_process(pid_path, signal.SIGKILL)
+    time.sleep(10)
+
+
+def relaunch_without_kv_offload(reason: str) -> None:
+    '''Serve at the fallback sequence count without the tier, and tell the benchmark to match.'''
+    print(f'KV_OFFLOAD_FALLBACK {reason}', flush=True)
+    fallback, server_env = KV_OFFLOAD_RELAUNCH.pop('fallback'), KV_OFFLOAD_RELAUNCH.pop('server_env')
+    stop_server_for_relaunch()
+    if VLLM_SERVER_LOG.exists():
+        shutil.copyfile(VLLM_SERVER_LOG, VLLM_SERVER_LOG.with_suffix('.offload-failed.log'))
+    VLLM_SERVER_READY.unlink(missing_ok=True)
+    server_env.pop('VLLM_USE_SIMPLE_KV_OFFLOAD', None)
+    LATE_SETUP_ENV['ARC3_MAX_ACTIVE_STREAMS'] = str(VLLM_KV_OFFLOAD_FALLBACK_SEQS)
+    wait_for_vllm_server(launch_vllm_watchdog(fallback, server_env), VLLM_SERVER_READY_TIMEOUT_SECONDS)
+    VLLM_SERVER_READY.write_text(datetime.now().isoformat(timespec='seconds'), encoding='utf-8')
+
+
+def kv_offload_copy_available(server_env: dict[str, str]) -> bool:
+    '''The connector raises at registration, 7-11 minutes into a load, when this batch copy is missing. Check first.'''
+    check = "import torch; torch.zeros(1, device='cuda'); from vllm.v1.simple_kv_offload.cuda_mem_ops import _resolve_batch_memcpy as r; r()"
+    result = subprocess.run(
+        [sys.executable, '-c', check], env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+    )
+    if result.returncode:
+        print(f'cuMemcpyBatchAsync check failed:\n{result.stdout[-2000:]}', flush=True)
+    return result.returncode == 0
+
+
+def run_kv_offload_probe() -> None:
+    '''Compare a reloaded prefix with a GPU hit on the live server. A wrong or failed reload drops the tier.'''
+    if not KV_OFFLOAD_RELAUNCH:
+        return
+    command = [sys.executable, '-I', str(KV_OFFLOAD_DIR / 'probe.py'), VLLM_BASE_URL, SERVED_MODEL_NAME, tiny_png_data_url()]
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+    except subprocess.TimeoutExpired as error:
+        relaunch_without_kv_offload(f'reload probe timed out: {error}')
+        return
+    print(result.stdout, flush=True)
+    if result.returncode not in (0, 3):
+        relaunch_without_kv_offload(f'reload probe exit code {result.returncode}')
+
+
 def start_vllm_server() -> None:
     '''Unpack the image runtime and launch the vLLM OpenAI server against the mounted model.
 
@@ -2488,6 +2669,7 @@ def start_vllm_server() -> None:
     use_engine_block_size_for_draft_qsa(manifest)
     install_int4_kv(manifest)
     install_token_exact_history(manifest)
+    install_kv_offload(manifest)
     check_runtime_reads_fp8_ple(manifest)
     patch_runtime_for_dflash(manifest)
     draft_model_dir = resolve_dflash_draft() if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft()
@@ -2496,6 +2678,7 @@ def start_vllm_server() -> None:
     configure_cache_diagnostics(manifest, server_env, cmd)
     configure_vllm_profiler(cmd)
     check_int4_kv_kernels(server_env)
+    extend_sm120_gemm_rows(manifest, server_env)
     VLLM_SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
     VLLM_SERVER_LOG.unlink(missing_ok=True)
     VLLM_SHARD_PREFETCH_REPORT.unlink(missing_ok=True)
@@ -2508,17 +2691,19 @@ def start_vllm_server() -> None:
 
     print('Starting vLLM OpenAI server:', ' '.join(cmd), flush=True)
     VLLM_WATCHDOG_SCRIPT.write_text(WATCHDOG_SCRIPT_TEXT, encoding='utf-8')
-    VLLM_WATCHDOG_CONFIG.write_text(json.dumps(build_watchdog_config(cmd)), encoding='utf-8')
-    watchdog_log_handle = VLLM_WATCHDOG_LOG.open('w', encoding='utf-8')
-    watchdog_process = subprocess.Popen(
-        [sys.executable, str(VLLM_WATCHDOG_SCRIPT), str(VLLM_WATCHDOG_CONFIG)],
-        env=server_env,
-        stdout=watchdog_log_handle,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    VLLM_WATCHDOG_PID.write_text(str(watchdog_process.pid), encoding='utf-8')
-    wait_for_vllm_server(watchdog_process, VLLM_SERVER_READY_TIMEOUT_SECONDS)
+    fallback = without_kv_offload(cmd) if VLLM_KV_OFFLOADING_GIB else None
+    if fallback:
+        KV_OFFLOAD_RELAUNCH.update(fallback=fallback, server_env=server_env)
+        if not kv_offload_copy_available(server_env):
+            relaunch_without_kv_offload('the batch copy the tier needs is missing')
+            return
+    try:
+        wait_for_vllm_server(launch_vllm_watchdog(cmd, server_env, fallback), VLLM_SERVER_READY_TIMEOUT_SECONDS)
+    except RuntimeError as error:
+        if not fallback:
+            raise
+        relaunch_without_kv_offload(f'boot failed:\n{error}')
+        return
     VLLM_SERVER_READY.write_text(datetime.now().isoformat(timespec='seconds'), encoding='utf-8')
 
 
@@ -2574,7 +2759,13 @@ if os.environ.get('TAAF_RUN_AS_SUBMISSION') == '1':
     print('Skipping vLLM smoke test (submission mode)', flush=True)
 else:
     run_vllm_api_smoke_test()
-    run_token_exact_probe()
+    try:
+        run_token_exact_probe()
+    except Exception as error:
+        # The renderer cannot be trusted, so the harness goes back to text. A failed anchor still stops the setup.
+        print(f'TOKEN_EXACT_PROBE_FAILED {error!r}', flush=True)
+        LATE_SETUP_ENV['ARC3_TOKEN_EXACT_HISTORY'] = '0'
+    run_kv_offload_probe()
 start_vllm_profiler()
 setup_env = {
     'ARC3_CACHE_DIAGNOSTICS': '1' if is_test_run() else '0',
@@ -2611,6 +2802,7 @@ if setup_env_path.exists():
     if not isinstance(existing_setup_env, dict):
         raise RuntimeError('TAAF_KAGGLE_SETUP_ENV must contain a JSON object.')
 existing_setup_env.update(setup_env)
+existing_setup_env.update(LATE_SETUP_ENV)
 setup_env_path.write_text(json.dumps(existing_setup_env, indent=2), encoding='utf-8')
 """
 

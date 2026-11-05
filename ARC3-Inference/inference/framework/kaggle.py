@@ -246,6 +246,9 @@ def lordhansolo_setup_command() -> str:
     if command.count(marker) != 1:
         raise ValueError("Lord Hansolo launcher handoff changed; review the adapter")
     overrides = kaggle_harness_env()
+    token_exact_harness = str(overrides.get("ARC3_TOKEN_EXACT_HISTORY", "0")).strip().lower() in ("1", "true", "yes", "on")
+    if token_exact_harness != bool(cfg.get("vllm", {}).get("token_exact_history", False)):
+        raise ValueError("ARC3_TOKEN_EXACT_HISTORY and kaggle.vllm.token_exact_history must agree")
     overrides["ARC3_KAGGLE_PRIVATE_WAVES"] = str(cfg.get("private_waves", 1))
     overrides["ARC3_KAGGLE_PRIVATE_RUNTIME_MINUTES"] = str(cfg.get("private_runtime_minutes", 532))
     handoff = f"setup_env.update({overrides!r})\n"

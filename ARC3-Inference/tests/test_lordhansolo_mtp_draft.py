@@ -82,7 +82,7 @@ def test_cache_diagnostics_follow_the_config(monkeypatch, requested):
     script = lord.duck_kaggle_setup_command(lord.DuckKaggleVllmConfig(
         model_source=TARGET_REF, cache_diagnostics=requested))
     assert f"VLLM_CACHE_DIAGNOSTICS_REQUESTED = {requested!r}" in script
-    assert "enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and namespace['is_test_run']()" in script
+    assert "enabled = VLLM_CACHE_DIAGNOSTICS_REQUESTED and is_test_run()" in script
 
 
 @pytest.mark.parametrize("dtype", ["", "auto"])

@@ -42,5 +42,11 @@ The e975732 QSA owner only reads BF16 and FP8-e4m3, so the flag alone is rejecte
 - **v2 (30 streams, cancelled at 44 min):** 1,400 generated tok/s until minute 15, then KV 98%, about 230 generated and
   10,000 prefill tok/s, with no recovery. 30 streams outgrew the 2,645,854-token pool, so LRU evicted prefixes while
   requests queued. Run: `runs/kaggle/jonathanwang2022/int4-kv/v02`.
-- **v3 (25 streams):** predicted first-peak KV 92-96%, against a limit near 94-95%. Check minutes 13-20: 1-minute KV
-  at or below about 92% and prefill under 5,000 tok/s.
+- **v3 (25 streams, 1 pass, 120 min, commit `85a273fa`):** score 58.32 against main-tuned-drafter v3's 65.68, diff
+  −7.36 (±9.74, t −1.56, p about 0.13), inside the noise, and it mixes int4 with an allocation change (no queue gate).
+  Levels 126 vs 140. Tokens 6.81M vs 5.98M, 1,028 vs 906 tok/s over the job (+13.5%). In minutes 5-45: 1,183 generated
+  and 3,029 prefill tok/s at 24.0 running. KV peaked at 94.9% for one minute at minute 17.3, prefill passed 5,000 tok/s
+  for four one-minute windows from minute 20.5, and it recovered. Acceptance 2.889 vs 2.882. Generated tok/s by running
+  in low-prefill windows: 14 streams 1,037, 20 streams 1,278, 24 streams 1,357, against the FP8 baseline's 1,029 at 14,
+  so int4 costs no measurable speed. Run: `runs/kaggle/jonathanwang2022/int4-kv/v03`.
+- **v4:** adds a CPU KV tier, GEMM rows and token-exact history. See [KV offload](kv-offload.md).

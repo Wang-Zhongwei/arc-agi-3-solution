@@ -18,8 +18,8 @@ REQUESTS = 4
 WIDTH = 2048
 WRITE_CHUNK = 2048
 SAMPLED_ROWS = 16
-# (rows, use_prefill_config): 14 and 30 requests of a k = 3 decode step, then prefill chunks.
-CASES = ((56, False), (120, False), (1024, True), (2048, True))
+# (rows, use_prefill_config): 14, 27 and 30 requests of a k = 3 decode step, then prefill chunks.
+CASES = ((56, False), (108, False), (120, False), (1024, True), (2048, True))
 # Random Gaussian rows lose about 11% to 16 levels, so a healthy read-back sits near cosine 0.99.
 MIN_ROUND_TRIP_COSINE = 0.95
 # The kernel and the same-codes Python reference differ only by BF16 rounding.
