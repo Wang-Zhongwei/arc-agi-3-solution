@@ -171,6 +171,8 @@ class DuckKaggleVllmConfig:
     dtype: str = DEFAULT_VLLM_DTYPE
     gpu_memory_utilization: str = DEFAULT_VLLM_GPU_MEMORY_UTILIZATION
     kv_cache_dtype: str = DEFAULT_VLLM_KV_CACHE_DTYPE
+    # Patch the renderer so the harness's ARC3_TOKEN_EXACT_HISTORY replies reach the model as their sampled ids.
+    token_exact_history: bool = False
     indexer_kv_dtype: str = DEFAULT_VLLM_INDEXER_KV_DTYPE
     mamba_ssm_cache_dtype: str = DEFAULT_VLLM_MAMBA_SSM_CACHE_DTYPE
     max_num_batched_tokens: int = DEFAULT_VLLM_MAX_NUM_BATCHED_TOKENS
@@ -316,6 +318,7 @@ def duck_kaggle_setup_command(config: DuckKaggleVllmConfig | None = None) -> str
         "__VLLM_GPU_MEMORY_UTILIZATION__": repr(str(cfg.gpu_memory_utilization)),
         "__VLLM_DTYPE__": repr(str(cfg.dtype)),
         "__VLLM_KV_CACHE_DTYPE__": repr(str(cfg.kv_cache_dtype)),
+        "__VLLM_TOKEN_EXACT_HISTORY__": repr(bool(cfg.token_exact_history)),
         "__VLLM_INDEXER_KV_DTYPE__": repr(str(cfg.indexer_kv_dtype)),
         "__VLLM_MAMBA_SSM_CACHE_DTYPE__": repr(str(cfg.mamba_ssm_cache_dtype)),
         "__VLLM_MAX_NUM_BATCHED_TOKENS__": repr(int(cfg.max_num_batched_tokens)),
@@ -997,14 +1000,17 @@ if is_test_run():
 run_watchdog()
 """
 
-_DUCK_VLLM_SETUP_SCRIPT = r"""import json
+_DUCK_VLLM_SETUP_SCRIPT = r"""import base64
+import json
 import math
 import os
 import shutil
 import subprocess
 import sys
+import struct
 import time
 import urllib.request
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -1085,6 +1091,7 @@ RUNTIME_MANIFEST_FILE_NAME = 'runtime-manifest.json'
 VLLM_MAX_NUM_BATCHED_TOKENS = __VLLM_MAX_NUM_BATCHED_TOKENS__
 VLLM_DTYPE = __VLLM_DTYPE__
 VLLM_KV_CACHE_DTYPE = __VLLM_KV_CACHE_DTYPE__
+VLLM_TOKEN_EXACT_HISTORY = __VLLM_TOKEN_EXACT_HISTORY__
 VLLM_INDEXER_KV_DTYPE = __VLLM_INDEXER_KV_DTYPE__
 VLLM_MAMBA_SSM_CACHE_DTYPE = __VLLM_MAMBA_SSM_CACHE_DTYPE__
 VLLM_ENABLE_PREFIX_CACHING = __VLLM_ENABLE_PREFIX_CACHING__
@@ -1601,6 +1608,74 @@ def check_int4_kv_kernels(server_env: dict[str, str]) -> None:
     print(result.stdout, flush=True)
     if result.returncode:
         raise RuntimeError(f'int4 KV preflight failed with exit code {result.returncode}')
+
+
+# Token-exact history: token_exact/runtime_patches.json makes HfRenderer splice a reply's sampled ids into the prompt
+# (token_exact/arc3_token_splice.py). renderers/hf.py is a stock image file unless an anchor says otherwise.
+TOKEN_EXACT_DIR = Path(os.environ.get('TAAF_KAGGLE_BUNDLE_DIR', '.')) / 'src' / __PROJECT_DIR_NAME__ / 'inference' / 'framework' / 'lordhansolo' / 'token_exact'
+
+
+def install_token_exact_history(manifest: dict) -> None:
+    '''Install the reply-token splice. Each anchor must occur exactly once, otherwise the setup fails before the load.'''
+    if not VLLM_TOKEN_EXACT_HISTORY:
+        return
+    dist_packages = IMAGE_RUNTIME_ROOT / manifest['dist_packages']
+    shutil.copyfile(TOKEN_EXACT_DIR / 'arc3_token_splice.py', dist_packages / 'vllm' / 'arc3_token_splice.py')
+    for patch in json.loads((TOKEN_EXACT_DIR / 'runtime_patches.json').read_text(encoding='utf-8')):
+        path = dist_packages / patch['path']
+        source = path.read_text(encoding='utf-8') if path.is_file() else ''
+        for edit in patch['replacements']:
+            if source.count(edit['anchor']) != 1:
+                raise RuntimeError(f"Token-exact anchor appears {source.count(edit['anchor'])} times in {path}:\n{edit['anchor']}")
+            source = source.replace(edit['anchor'], edit['replacement'])
+        path.write_text(source, encoding='utf-8')
+    print('Token-exact history installed: HfRenderer splices reply ids', flush=True)
+
+
+def tiny_png_data_url() -> str:
+    '''A 64x64 black PNG, built without PIL, so the probe exercises the image path.'''
+    rows = b''.join(b'\x00' + bytes(64 * 3) for _ in range(64))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+    png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 64, 64, 8, 2, 0, 0, 0))
+    png += chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b'')
+    return 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')
+
+
+def run_token_exact_probe() -> None:
+    '''Check on the live server that sampled ids survive next to an image, using ids re-tokenizing would merge.'''
+    if not VLLM_TOKEN_EXACT_HISTORY:
+        return
+    root = VLLM_BASE_URL.removesuffix('/v1')
+
+    def tokenize(text: str) -> list[int]:
+        return request_json(f'{root}/tokenize', payload={'model': SERVED_MODEL_NAME, 'prompt': text, 'add_special_tokens': False})['tokens']
+
+    space = tokenize(' ')
+    if len(space) != 1 or len(tokenize(' ' * 4)) != 1:
+        raise RuntimeError('Token-exact probe needs four spaces to tokenize to one token')
+    reply = space * 4 + tokenize('</think>\n\n') + tokenize('<|im_end|>')
+    marker = chr(0xE000) + 'ARC3TOKENS:' + ','.join(map(str, reply)) + chr(0xE001)
+    payload = {
+        'model': SERVED_MODEL_NAME,
+        'messages': [
+            {'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': tiny_png_data_url()}}, {'type': 'text', 'text': 'Look.'},
+            ]},
+            {'role': 'assistant', 'content': '', 'reasoning_content': marker},
+            {'role': 'user', 'content': 'Say ok.'},
+        ],
+        'max_tokens': 1,
+        'return_token_ids': True,
+    }
+    prompt = request_json(f'{VLLM_BASE_URL}/chat/completions', payload=payload, timeout=120)['prompt_token_ids']
+    start = next((i for i in range(len(prompt)) if prompt[i:i + len(reply)] == reply), None)
+    image_pad = tokenize('<|image_pad|>')
+    if start is None or prompt.count(image_pad[0]) < 2:
+        raise RuntimeError(f'Token-exact probe failed: reply found {start is not None}, image tokens {prompt.count(image_pad[0])}')
+    print(f'Token-exact probe passed: {len(prompt)} prompt tokens, {prompt.count(image_pad[0])} image tokens', flush=True)
 
 
 # Where the e975732 rc3 runtime picks the FP8 PLE method from config.ple_embedding_dtype. Under
@@ -2412,6 +2487,7 @@ def start_vllm_server() -> None:
     pin_ple_table_at_exact_size(manifest)
     use_engine_block_size_for_draft_qsa(manifest)
     install_int4_kv(manifest)
+    install_token_exact_history(manifest)
     check_runtime_reads_fp8_ple(manifest)
     patch_runtime_for_dflash(manifest)
     draft_model_dir = resolve_dflash_draft() if VLLM_DRAFT_METHOD == 'dflash' else assemble_mtp_draft()
@@ -2498,6 +2574,7 @@ if os.environ.get('TAAF_RUN_AS_SUBMISSION') == '1':
     print('Skipping vLLM smoke test (submission mode)', flush=True)
 else:
     run_vllm_api_smoke_test()
+    run_token_exact_probe()
 start_vllm_profiler()
 setup_env = {
     'ARC3_CACHE_DIAGNOSTICS': '1' if is_test_run() else '0',

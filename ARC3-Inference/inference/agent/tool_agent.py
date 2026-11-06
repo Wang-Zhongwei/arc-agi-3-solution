@@ -99,6 +99,15 @@ from inference.utils.openai_compat import (
     build_headers,
 )
 
+from inference.agent.token_history import (
+    REPLY_KEYS,
+    REPLY_TOKENS_KEY,
+    prompt_holds_reply,
+    render_reply_tokens,
+    seal_reply_tokens,
+    strip_reply_tokens,
+)
+
 log = logging.getLogger(__name__)
 
 _LOCAL_ANALYZER_MODEL_ID = os.environ.get("LOCAL_ANALYZER_MODEL_ID", "")
@@ -756,7 +765,7 @@ def _post_with_retries(
 _CONTROL_MESSAGE_KEY = "_arc3_control"
 # the confirmed-rules tags ride along: pinned like the trace, never sent
 _TRACE_KEYS = (_TRACE_MESSAGE_KEY, _TRACE_STEP_KEY, _RULES_MESSAGE_KEY, _RULES_SEQ_KEY)
-_PRIVATE_MESSAGE_KEYS = (_CONTROL_MESSAGE_KEY, *_TRACE_KEYS)
+_PRIVATE_MESSAGE_KEYS = (_CONTROL_MESSAGE_KEY, *_TRACE_KEYS, *REPLY_KEYS)
 
 _YIELD_RESUME_PROMPT_WITH_TOOLS = (
     "You yielded control on the turn time budget. Your tool results above are "
@@ -3714,6 +3723,17 @@ def _normalize_history_enabled() -> bool:
     return _get_env_bool("ARC3_NORMALIZE_HISTORY", True)
 
 
+def _token_exact_history_enabled() -> bool:
+    """Whether replies go back as their sampled token ids. The marker that carries
+    them sits in the reasoning, which the template only renders with preserve_thinking."""
+    if not _get_env_bool("ARC3_TOKEN_EXACT_HISTORY", False):
+        return False
+    if not _get_env_bool("ARC3_PRESERVE_THINKING", True):
+        log.error("ARC3_TOKEN_EXACT_HISTORY needs ARC3_PRESERVE_THINKING; sending replies as text")
+        return False
+    return True
+
+
 def _verbatim_message_text(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -3771,6 +3791,8 @@ class _ChatCompletionResult:
     served_by: str = ""
     # GRPO mode (inference/grpo/rl_record.py): the ids vLLM saw and sampled, their logprobs, the messages sent
     rl: dict[str, Any] | None = None
+    # ARC3_TOKEN_EXACT_HISTORY: the ids sampled after the prompt's "<think>\n"; None when thinking was off
+    reply_token_ids: list[int] | None = None
 
 
 class ToolAgent:
@@ -5987,6 +6009,9 @@ class ToolAgent:
         rl_record: bool = False,
         rl_max_tokens: int | None = None,
     ) -> _ChatCompletionResult:
+        thinking_on = (
+            bool(_LOCAL_ANALYZER_ENABLE_THINKING) if enable_thinking is None else enable_thinking
+        )
         payload = build_chat_payload(
             provider=self._model.provider,
             model=self._model.model_id,
@@ -5995,11 +6020,7 @@ class ToolAgent:
             temperature=_LOCAL_ANALYZER_TEMPERATURE,
             top_p=_LOCAL_ANALYZER_TOP_P,
             top_k=_LOCAL_ANALYZER_TOP_K,
-            thinking=(
-                bool(_LOCAL_ANALYZER_ENABLE_THINKING)
-                if enable_thinking is None
-                else enable_thinking
-            ),
+            thinking=thinking_on,
             tools=tools,
             tool_choice=_request_tool_choice(tools),
             seed=_LOCAL_ANALYZER_SEED,
@@ -6022,12 +6043,20 @@ class ToolAgent:
             template_kwargs["enable_thinking"] = bool(enable_thinking)
         if template_kwargs:
             payload["chat_template_kwargs"] = template_kwargs
-        payload["messages"] = _strip_control_keys(
-            _apply_summary_visibility(
-                payload.get("messages") or [],
-                evicted=getattr(self, "_has_evicted", False),
-            )
+        visible_messages = _apply_summary_visibility(
+            payload.get("messages") or [],
+            evicted=getattr(self, "_has_evicted", False),
         )
+        token_exact = _token_exact_history_enabled() and not getattr(self, "_token_exact_failed", False)
+        last_sent_reply = ""
+        if token_exact:
+            payload["return_token_ids"] = True
+            visible_messages, last_sent_reply, stale_replies = render_reply_tokens(
+                visible_messages, _reasoning_history_keys()
+            )
+            if stale_replies:
+                log.info("token_exact_history: %d edited replies sent as text", stale_replies)
+        payload["messages"] = _strip_control_keys(visible_messages)
         sent_messages = payload["messages"]
         if rl_record:
             # after the thinking-budget fields: they are set from the default
@@ -6111,12 +6140,22 @@ class ToolAgent:
             from inference.grpo.rl_record import EpisodeRecorder
 
             rl = dict(EpisodeRecorder.extract(payload), messages=sent_messages)
+        reply_token_ids = None
+        if token_exact:
+            prompt_token_ids = payload.get("prompt_token_ids")
+            if last_sent_reply and not (prompt_token_ids and prompt_holds_reply(prompt_token_ids, last_sent_reply)):
+                # A server without the patch tokenized the marker as text, so this game's prompts would be garbage.
+                log.error("token_exact_history: the prompt lacks the reply ids just sent; sending text from now on")
+                self._token_exact_failed = True
+            elif thinking_on:
+                reply_token_ids = choice.get("token_ids") or None
         return _ChatCompletionResult(
             message=_extract_leaked_tool_calls(choice.get("message", {})),
             finish_reason=str(choice.get("finish_reason", "") or ""),
             usage=payload.get("usage"),
             served_by=str(payload.get("provider", "") or ""),
             rl=rl,
+            reply_token_ids=reply_token_ids,
         )
 
     def _trim_tool_text(self, text: str) -> tuple[str, bool]:
@@ -6909,6 +6948,7 @@ class ToolAgent:
         """
         self._tag_trace_step(message)
         self._tag_confirmed_rules(message)
+        seal_reply_tokens(message)
         messages.append(message)
         if _summary_interval_tokens() <= 0:
             return
@@ -7102,8 +7142,8 @@ class ToolAgent:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> int:
-        messages = _apply_summary_visibility(
-            messages, evicted=getattr(self, "_has_evicted", False)
+        messages = strip_reply_tokens(
+            _apply_summary_visibility(messages, evicted=getattr(self, "_has_evicted", False))
         )
         if compressed_trace_enabled():
             messages = _strip_trace_keys(messages)
@@ -8077,6 +8117,8 @@ class ToolAgent:
                     response_meta,
                 )
                 assistant_message: dict[str, Any] = {"role": "assistant"}
+                if result.reply_token_ids:
+                    assistant_message[REPLY_TOKENS_KEY] = ",".join(map(str, result.reply_token_ids))
 
                 if reasoning:
                     captured_reasoning = reasoning
