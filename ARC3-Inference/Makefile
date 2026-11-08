@@ -450,8 +450,8 @@ install-local-sources:
 	fi
 
 prepare-ci:
-	$(UV) run --locked --extra dev ruff check .
-	LOCAL_ANALYZER_PROVIDER=vllm $(UV) run --locked --extra dev pytest
+	$(UV) run --locked ruff check .
+	LOCAL_ANALYZER_PROVIDER=vllm $(UV) run --locked pytest
 
 server:
 	@if [ "$(SERVER_BACKEND)" != "vllm" ]; then \
